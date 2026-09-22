@@ -1236,7 +1236,7 @@ async fn search_using_client(
         coverage.candidate_files = matches.candidate_files;
         coverage.verified_files = matches.verified_files;
         coverage.truncated = matches.truncated;
-        let mut nodes_seen = HashSet::new();
+        let mut node_hits: HashMap<String, usize> = HashMap::new();
         for m in matches.hits {
             let id = m
                 .path
@@ -1263,9 +1263,6 @@ async fn search_using_client(
             let Some(node) = node_at(doc, m.line_number) else {
                 bail!("tree does not cover indexed match");
             };
-            if options.mode != "regex" && !nodes_seen.insert(format!("{}:{}", doc.id, node.id)) {
-                continue;
-            }
             let (start, end) = if options.mode == "regex" {
                 (
                     m.line_number.saturating_sub(options.context).max(1),
@@ -1296,6 +1293,16 @@ async fn search_using_client(
             if options.mode != "regex" {
                 h.score = lexical_score(&h.text, &terms);
                 h.literal_anchor = literal_anchor(query, &m.line);
+                // Compare bounded windows before collapsing a node. An early
+                // incidental match must not hide a later, stronger query match.
+                if let Some(&position) = node_hits.get(&h.node_id) {
+                    let previous: &mut Hit = &mut hits[position];
+                    if h.score.total_cmp(&previous.score).is_gt() {
+                        *previous = h;
+                    }
+                    continue; // Equal windows retain the existing source-order tie.
+                }
+                node_hits.insert(h.node_id.clone(), hits.len());
             }
             hits.push(h);
         }
@@ -2301,6 +2308,192 @@ mod tests {
         assert!(literal_anchor("API", "The api accepts JSON."));
         assert!(!literal_anchor("api", "rapid matching"));
         assert!(!literal_anchor("how to repair", "how to repair a disk"));
+    }
+
+    #[tokio::test]
+    async fn best_node_window_survives_fact_position_query_order_and_file_renaming() -> Result<()> {
+        for (file, padding) in [
+            ("manual.txt", 0),
+            ("renamed-notes.txt", 25),
+            ("文档.txt", 60),
+        ] {
+            let directory = tempfile::tempdir()?;
+            let source = format!(
+                "Saffron paint catalogue.\n{}The saffron capacitor threshold is 17 units.\n{}",
+                "The orchard stones remain quiet.\n".repeat(padding),
+                "Neutral trailing material.\n".repeat(20)
+            );
+            fs::write(directory.path().join(file), &source)?;
+            index(directory.path(), 10).await?;
+            for query in ["saffron capacitor", "capacitor saffron"] {
+                let result = search(
+                    directory.path(),
+                    query,
+                    &SearchOptions {
+                        mode: "lexical".into(),
+                        document: Some(file.into()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                assert_eq!(result.hits.len(), 1);
+                let hit = &result.hits[0];
+                assert_eq!(hit.path, file);
+                assert_eq!(hit.score, 1.0);
+                assert!(hit.text.contains("threshold is 17 units"));
+                assert_eq!(hit.text, source[hit.byte_start..hit.byte_end]);
+                assert_eq!(result.metrics.jev_requests, 0);
+                assert!(hit.source_fresh);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn best_node_window_keeps_source_order_ties_and_regex_occurrences() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let source = format!(
+            "saffron capacitor first\nsaffron capacitor overlapping\n{}saffron capacitor last\n",
+            "Neutral intervening material.\n".repeat(30)
+        );
+        fs::write(directory.path().join("notes.txt"), &source)?;
+        index(directory.path(), 10).await?;
+        let options = SearchOptions {
+            mode: "lexical".into(),
+            ..Default::default()
+        };
+        for query in [
+            "saffron capacitor",
+            "capacitor saffron",
+            "saffron capacitor",
+        ] {
+            let result = search(directory.path(), query, &options).await?;
+            assert_eq!(result.hits.len(), 1);
+            let hit = &result.hits[0];
+            assert_eq!(hit.match_line, Some(1));
+            assert_eq!(hit.byte_start, 0);
+            assert!(hit.text.contains("first"));
+            assert!(hit.text.contains("overlapping"));
+            assert!(!hit.text.contains("last"));
+        }
+        let regex = search(directory.path(), "saffron", &regex_options()).await?;
+        assert_eq!(
+            regex
+                .hits
+                .iter()
+                .map(|hit| hit.match_line)
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(2), Some(33)]
+        );
+        assert!(
+            regex
+                .hits
+                .iter()
+                .all(|hit| hit.node_id == regex.hits[0].node_id)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn best_node_window_preserves_single_term_ties_and_literal_anchor_classification()
+    -> Result<()> {
+        for exact_first in [false, true] {
+            let directory = tempfile::tempdir()?;
+            let (first, last) = if exact_first {
+                ("api accepts records", "rapid matching")
+            } else {
+                ("rapid matching", "api accepts records")
+            };
+            let source = format!("{first}\n{}{last}\n", "Neutral filler.\n".repeat(30));
+            fs::write(directory.path().join("guide.txt"), source)?;
+            index(directory.path(), 10).await?;
+            let result = search(
+                directory.path(),
+                "api",
+                &SearchOptions {
+                    mode: "lexical".into(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            assert_eq!(result.hits.len(), 1);
+            assert_eq!(result.hits[0].literal_anchor, exact_first);
+            assert!(result.hits[0].text.contains(first));
+            assert_eq!(result.hits[0].match_line, Some(1));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn best_node_window_preserves_utf8_crlf_cursors_and_hybrid_candidate_budget() -> Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        let source = format!(
+            "saffron mention\r\n{}{}saffron capacitor threshold is 17 units.{}\r\nTail.\r\n",
+            "Neutral filler.\r\n".repeat(30),
+            "文🙂".repeat(2000),
+            "後".repeat(3000)
+        );
+        fs::write(directory.path().join("long.txt"), &source)?;
+        index(directory.path(), 10).await?;
+        for mode in ["lexical", "hybrid"] {
+            let options = SearchOptions {
+                mode: mode.into(),
+                limit: 3,
+                ..Default::default()
+            };
+            let report = if mode == "hybrid" {
+                let (client, server) = mock_jev(vec![200, 200]).await?;
+                let report =
+                    search_with_client(directory.path(), "saffron capacitor", &options, &client)
+                        .await?;
+                let requests = server.await?;
+                assert_eq!(requests.len(), 2);
+                let candidates = requests[1]["questions"].as_object().unwrap();
+                assert_eq!(candidates.len(), 1); // Same-node semantic dedup keeps the winning lexical window.
+                assert!(
+                    candidates["candidate_0"]["instructions"]["candidate"]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("threshold is 17 units")
+                );
+                assert_eq!(report.coverage.reranked_candidates, 1);
+                assert_eq!(report.metrics.jev_requests, 2);
+                report
+            } else {
+                search(directory.path(), "saffron capacitor", &options).await?
+            };
+            assert_eq!(report.hits.len(), 1);
+            let hit = &report.hits[0];
+            assert!(hit.text.contains("threshold is 17 units"));
+            assert!(hit.text.len() <= if mode == "hybrid" { 1400 } else { 4096 });
+            assert!(hit.text_truncated);
+            assert_eq!(hit.match_line, Some(32));
+            assert!(hit.match_column.unwrap() > 1);
+            assert_eq!(hit.text, source[hit.byte_start..hit.byte_end]);
+            let replay = read_node_window(
+                directory.path(),
+                &hit.node_id,
+                hit.text.len(),
+                hit.node_offset.unwrap(),
+            )?;
+            assert_eq!(replay.text, hit.text);
+            assert_eq!(replay.citation, hit.citation);
+            assert_eq!(
+                (replay.byte_start, replay.byte_end),
+                (hit.byte_start, hit.byte_end)
+            );
+            let next = hit
+                .next_offset
+                .context("long node should retain continuation")?;
+            let continuation = read_node_window(directory.path(), &hit.node_id, 100, next)?;
+            assert_eq!(continuation.byte_start, hit.byte_end);
+            assert_eq!(
+                continuation.text,
+                source[continuation.byte_start..continuation.byte_end]
+            );
+        }
+        Ok(())
     }
     #[tokio::test]
     async fn stale_and_failed_rebuild_preserve_generation() -> Result<()> {
