@@ -7,8 +7,8 @@
 推論ホスト**を組み合わせます。ベクトルデータベース、検索デーモン、MCP サーバーは使用しません。
 
 GPTgrep は、元文書と照合できる根拠を返します。デフォルトの `search` は `hybrid` を使い、
-Jev によるルーティングと再ランキングを必須とします。`ask` と `summarize` もローカル Codex の
-推論前にこの段階を実行し、認証情報の不足やプロバイダーの失敗は明示的なエラーになります。
+Jev によるルーティングと再ランキングを必須とします。`ask` と `summarize` も最終回答を作成する Codex reader の
+実行前にこの段階を実行し、認証情報の不足やプロバイダーの失敗は明示的なエラーになります。
 `semantic` と `judge` もリモートの Jev 推論を使います。明示的な `regex` と `lexical` は
 ローカル検索の基本操作です。推論を行うエージェントは、検索を組み合わせ、ツリーを確認し、
 上限付きでノードを読み取ってから回答できます。
@@ -132,7 +132,7 @@ gptgrep summarize DOCUMENT_ID:NODE_ID --root ./documents \
   --model gpt-5.6-luna --reasoning-effort max --service-tier fast --json
 ```
 
-Codex を起動する前に、ホストは必須の Jev ハイブリッド検索を実行し、上限付きの根拠を
+デフォルトでは回答 worker の起動前に、ホストは必須の Jev ハイブリッド検索を実行し、上限付きの根拠を
 推論モデルに渡します。`--jev-model` は Decisions モデルを選び、Codex の `--model` とは
 独立した設定です。`--document` で質問の対象を絞り、要約では選択したノードの文書を対象にします。
 後続の検索もデフォルトは hybrid です。ツリーの読み取りと明示的な厳密検索は、初期結果を
@@ -150,6 +150,21 @@ GPTgrep の catalog/tree/search/read ツールを提供します。実際に適�
 ソース文書は変更せず、Codex 子プロセスには Jev の認証情報を渡しません。
 引用の同一性の検査だけで、
 根拠が回答内容を意味的に裏付けることまで独立に証明できるわけではありません。
+
+
+`ask` 専用の `--experimental-query-plan` は、ツールを持たない独立した
+`gpt-5.6-luna` / `max` / `fast` の計画 worker を先に実行します。元の質問を保持し、
+検索表現を最大2件追加します。ルーティングは最大2件を並行実行し、同じソース範囲を
+重複除去して既存の候補数上限内にまとめます。その後、Jev が元の質問に対して再評価し、
+回答 worker を開始します。このオプションは初期状態で無効で、全段階が呼び出し元の
+期限を共有します。計画や分岐の失敗は明示されます。追加候補が元の候補を押し出したり、
+待ち時間を増やしたりする場合があり、品質向上は保証しません。`model_attempts` と
+`model_usage` は計画呼び出しを個別に記録し、従来の `usage` は回答 worker のみを表します。
+
+```sh
+gptgrep ask 'How are offline exports recovered?' ./documents \
+  --experimental-query-plan --json
+```
 
 `host-complete --input FILE_OR_DASH` は、同じ分離されたローカルモデルを、型付きワークフローの
 構成要素として提供します。入力は `{instructions, state, schema}` で、出力にはスキーマ検証済みの

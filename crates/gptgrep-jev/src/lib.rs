@@ -23,6 +23,8 @@ pub const MAX_QUESTIONS: usize = 64;
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// Returned identifiers are retained verbatim only within this metadata bound.
+pub const MAX_PROVIDER_METADATA_BYTES: usize = 256;
 
 const RELEVANCE_LEVELS: [&str; 4] = [
     "Unrelated or contains no useful evidence for the query.",
@@ -53,6 +55,11 @@ pub struct RerankResponse {
     pub model: String,
     /// Provider usage metadata; null means unavailable, never zero usage.
     pub usage: Value,
+    /// Provider response identity, when returned; not a transport request ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_response_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -228,6 +235,8 @@ impl JevClient {
             rankings,
             model: result.model,
             usage: result.usage,
+            provider_response_id: result.id,
+            provider: result.provider,
         })
     }
 

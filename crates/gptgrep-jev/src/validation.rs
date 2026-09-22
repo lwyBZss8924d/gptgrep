@@ -1,4 +1,7 @@
-use crate::{DecisionAnswer, DecisionResponse, MAX_QUESTIONS, MAX_RESPONSE_BYTES};
+use crate::{
+    DecisionAnswer, DecisionResponse, MAX_PROVIDER_METADATA_BYTES, MAX_QUESTIONS,
+    MAX_RESPONSE_BYTES,
+};
 use anyhow::{Result, anyhow, ensure};
 use serde::{
     Deserialize, Deserializer,
@@ -95,6 +98,17 @@ pub(crate) fn response(bytes: &[u8], questions: &Value) -> Result<DecisionRespon
             && !response.model.chars().any(char::is_control),
         "Jev response has an invalid model identifier"
     );
+    for value in [response.id.as_deref(), response.provider.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        ensure!(
+            !value.trim().is_empty()
+                && value.len() <= MAX_PROVIDER_METADATA_BYTES
+                && !value.chars().any(char::is_control),
+            "Jev response has invalid provider metadata"
+        );
+    }
     let questions = questions
         .as_object()
         .ok_or_else(|| anyhow!("Invalid Jev question map"))?;
@@ -326,6 +340,33 @@ mod tests {
 
     fn parse(value: Value) -> Result<DecisionResponse> {
         response(&serde_json::to_vec(&value).unwrap(), &questions())
+    }
+
+    #[test]
+    fn provider_metadata_is_optional_bounded_and_retained_verbatim() {
+        let mut value = valid_response();
+        value["id"] = json!("unfamiliar-response-id");
+        value["provider"] = json!("Invented provider 文");
+        let parsed = parse(value.clone()).unwrap();
+        assert_eq!(parsed.id.as_deref(), Some("unfamiliar-response-id"));
+        assert_eq!(parsed.provider.as_deref(), Some("Invented provider 文"));
+        for field in ["id", "provider"] {
+            for invalid in [
+                String::new(),
+                "\t".into(),
+                "x\ny".into(),
+                "x".repeat(MAX_PROVIDER_METADATA_BYTES + 1),
+                "文".repeat(86),
+            ] {
+                let mut rejected = value.clone();
+                rejected[field] = json!(invalid);
+                let error = parse(rejected).unwrap_err().to_string();
+                assert_eq!(error, "Jev response has invalid provider metadata");
+            }
+            let mut bounded = value.clone();
+            bounded[field] = json!("x".repeat(MAX_PROVIDER_METADATA_BYTES));
+            assert!(parse(bounded).is_ok());
+        }
     }
 
     #[test]

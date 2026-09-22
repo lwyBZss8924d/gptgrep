@@ -6,7 +6,7 @@
 无需向量数据库、搜索守护进程或 MCP 服务器。
 
 GPTgrep 返回可核查的源文档证据。默认 `search` 使用 `hybrid`，必须执行 Jev 路由与重排。
-`ask` 和 `summarize` 也会在本地 Codex 推理之前执行这一阶段；缺少凭据或提供方调用失败会明确报错。
+`ask` 和 `summarize` 也会在最终 Codex 回答 worker 之前执行这一阶段；缺少凭据或提供方调用失败会明确报错。
 `semantic` 和 `judge` 同样使用远程 Jev 推理。显式的 `regex` 与 `lexical` 命令是本地检索原语。
 推理智能体可以组合搜索、查看文档树，并在回答前分次读取有大小限制的节点内容。
 
@@ -115,7 +115,7 @@ gptgrep summarize DOCUMENT_ID:NODE_ID --root ./documents \
   --model gpt-5.6-luna --reasoning-effort max --service-tier fast --json
 ```
 
-启动 Codex 之前，宿主会执行必需的 Jev 混合检索，并将有大小限制的证据交给推理模型。
+默认模式在启动回答 worker 之前，宿主会执行必需的 Jev 混合检索，并将有大小限制的证据交给推理模型。
 `--jev-model` 选择 Decisions 模型，与 Codex 的 `--model` 分开配置。
 `--document` 可限制问答范围；摘要则限制到所选节点所属的文档。
 后续搜索默认使用 hybrid；树节点读取和显式精确检索可在初始结果基础上继续补充证据。
@@ -129,6 +129,19 @@ gptgrep summarize DOCUMENT_ID:NODE_ID --root ./documents \
 使后续阶段失败或被中断时，已完成的 Jev 调用仍可核查。源文档保持不变；
 Codex 子进程无法访问 Jev 凭据。
 引用身份检查本身不能独立证明证据在语义上支持答案。
+
+
+仅 `ask` 支持的 `--experimental-query-plan` 会先运行一个独立、无工具的
+`gpt-5.6-luna` / `max` / `fast` 规划 worker。它保留原问题，最多提出两条替代检索表述。
+最多两路文档路由同时执行；候选按真实来源跨度合并，仍受原候选预算限制，随后由 Jev
+按原问题统一重排，再启动回答 worker。该选项默认关闭，所有阶段共享调用方的总截止时间。
+规划或分支失败会明确报错。新增候选可能挤掉原候选并增加延迟，不保证质量提升。
+`model_attempts` 和 `model_usage` 单独记录规划调用；旧的 `usage` 仍只表示回答 worker。
+
+```sh
+gptgrep ask 'How are offline exports recovered?' ./documents \
+  --experimental-query-plan --json
+```
 
 `host-complete --input FILE_OR_DASH` 将同一个隔离的本地模型提供为强类型工作流基础操作。
 其输入为 `{instructions, state, schema}`，输出包含通过 schema 校验的 `value`、

@@ -9,9 +9,13 @@ pub use completion::{
     complete_json,
 };
 mod jev_accounting;
+mod model_attempts;
+mod query_plan;
 mod retrieval;
 mod trace;
 pub use jev_accounting::{HostRetrievalError, JevReport, ReceiptSummary, SearchTelemetry};
+pub use model_attempts::{ModelAttempt, ModelTokenMissingCounts, ModelTokenTotals, ModelUsage};
+pub use query_plan::{QueryPlanConfig, QueryPlanReport};
 
 use anyhow::{Result, anyhow, ensure};
 pub use retrieval::{Citation, ToolReceipt};
@@ -53,6 +57,7 @@ pub struct HostConfig {
     pub trace_path: Option<PathBuf>,
     pub jev_model: Option<String>,
     pub document: Option<String>,
+    pub query_plan: Option<QueryPlanConfig>,
 }
 
 impl Default for HostConfig {
@@ -73,6 +78,7 @@ impl Default for HostConfig {
             trace_path: None,
             jev_model: None,
             document: None,
+            query_plan: None,
         }
     }
 }
@@ -99,6 +105,14 @@ pub struct HostReport {
     pub citations: Vec<Citation>,
     pub tool_calls: Vec<ToolReceipt>,
     pub usage: Option<Value>,
+    #[serde(default = "final_reader_usage_scope")]
+    pub usage_scope: String,
+    #[serde(default)]
+    pub query_plan: Option<QueryPlanReport>,
+    #[serde(default)]
+    pub model_attempts: Vec<ModelAttempt>,
+    #[serde(default)]
+    pub model_usage: ModelUsage,
     pub elapsed_ms: u128,
     pub stderr_bytes: Option<u64>,
     pub stderr_truncated: Option<bool>,
@@ -107,11 +121,16 @@ pub struct HostReport {
     pub ledger_path: PathBuf,
 }
 
+fn final_reader_usage_scope() -> String {
+    "final_reader".into()
+}
+
 pub async fn ask(root: &Path, question: &str, config: &HostConfig) -> Result<HostReport> {
     execute(root, question, None, config).await
 }
 
 pub async fn summarize(root: &Path, node_id: &str, config: &HostConfig) -> Result<HostReport> {
+    ensure!(config.query_plan.is_none(), "host_query_plan_requires_ask");
     ensure!(
         !node_id.is_empty() && node_id.len() <= 256,
         "Invalid summary node ID"
@@ -136,6 +155,10 @@ async fn execute_with_client(
     client: Option<gptgrep_jev::JevClient>,
 ) -> Result<HostReport> {
     validate_config(config, question)?;
+    ensure!(
+        node_id.is_none() || config.query_plan.is_none(),
+        "host_query_plan_requires_ask"
+    );
     let started = Instant::now();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs);
     let root = root
@@ -145,13 +168,69 @@ async fn execute_with_client(
     let accounting = jev_accounting::Accounting::create(&root, &evidence.generation)?;
     let _guard = jev_accounting::AttemptGuard(accounting.clone());
     let mut stage = "scope";
+    let mut query_plan_report = None;
     let outcome:Result<HostReport>=async {
     evidence.configure(config,accounting.clone(),client)?;
+    accounting.bind_workflow(question, evidence.document_scope())?;
+    accounting.set_model_attempt_limit(if config.query_plan.is_some() { 2 } else { 1 })?;
+    if let Some(query_config) = &config.query_plan {
+        stage="query_plan_prepare";
+        let input = evidence.prepare_query_plan(question)?;
+        query_plan_report = Some(QueryPlanReport {
+            strategy: "luna_queries_v1".into(),
+            status: "running".into(),
+            alternate_queries: vec![],
+            duplicates_removed: 0,
+            state_sha256: retrieval::hash(&serde_json::to_vec(&input.state)?),
+            instructions_sha256: retrieval::hash(input.instructions.as_bytes()),
+            schema_sha256: retrieval::hash(&serde_json::to_vec(&input.schema)?),
+        });
+        let mut planner_config = config.clone();
+        planner_config.model = DEFAULT_MODEL.into();
+        planner_config.reasoning_effort = DEFAULT_REASONING_EFFORT.into();
+        planner_config.service_tier = DEFAULT_SERVICE_TIER.into();
+        planner_config.max_input_bytes = config.max_input_bytes.min(query_plan::MAX_PLAN_INPUT_BYTES);
+        planner_config.query_plan = None;
+        planner_config.trace_path = config.trace_path.as_ref().map(|path| {
+            let mut name = path.as_os_str().to_os_string();
+            name.push(".planner-");
+            name.push(accounting.path().file_stem().expect("attempt ledger filename"));
+            PathBuf::from(name)
+        });
+        let planner_deadline = deadline.min(tokio::time::Instant::now()
+            + Duration::from_secs(query_config.planner_timeout_secs));
+        ensure!(tokio::time::Instant::now() < planner_deadline, "host_deadline_exceeded");
+        stage="query_plan";
+        let mut planner = model_attempts::ModelAttemptTracker::reserve(&accounting, "query_planner", &planner_config)?;
+        let planned = completion::complete_json_until(
+            input.instructions, input.state, input.schema, &planner_config,
+            Some(planner_deadline), protocol::RunOptions {
+                observer: Some(planner.observer()),
+                max_output_bytes: Some(query_plan::MAX_PLAN_OUTPUT_BYTES),
+            },
+        ).await.and_then(|completion| query_plan::validate_plan(question, &completion.value));
+        if let Some(report) = &mut query_plan_report {
+            report.status = if planned.is_ok() { "completed" } else { "failed" }.into();
+            if let Ok(plan) = &planned {
+                report.alternate_queries = plan.alternate_queries.clone();
+                report.duplicates_removed = plan.duplicates_removed;
+            }
+        }
+        planner.finish(planned.as_ref().err())?;
+        let plan = planned?;
+        stage="initial_search";
+        tokio::time::timeout_at(deadline, evidence.bootstrap_planned(question, &plan.alternate_queries)).await
+            .map_err(|_| anyhow!("host_jev_initial_timeout"))??;
+    } else {
     stage="initial_search";
     tokio::time::timeout_at(deadline,evidence.bootstrap(question)).await
         .map_err(|_|anyhow!("host_jev_initial_timeout"))??;
+    }
     ensure!(evidence.initial_payload.is_some(),"host_jev_initial_required");
     stage="codex";
+    ensure!(tokio::time::Instant::now() < deadline, "host_deadline_exceeded");
+    let mut reader = model_attempts::ModelAttemptTracker::reserve(&accounting, "final_reader", config)?;
+    let validated: Result<_> = async {
     let completed = run_process_until(
         config,
         protocol::Workflow::Retrieval {
@@ -160,8 +239,15 @@ async fn execute_with_client(
             evidence: &mut evidence,
         },
         Some(deadline),
+        protocol::RunOptions { observer: Some(reader.observer()), max_output_bytes: None },
     )
     .await?;
+    stage="citation_validation";
+    let validated = evidence.finish(&completed.result.answer)?;
+    Ok((completed, validated))
+    }.await;
+    reader.finish(validated.as_ref().err())?;
+    let (completed, (answer, citations, insufficient)) = validated?;
     let ProcessOutcome {
         result,
         home,
@@ -169,8 +255,6 @@ async fn execute_with_client(
         stderr_bytes,
         stderr_truncated,
     } = completed;
-    stage="citation_validation";
-    let (answer, citations, insufficient) = evidence.finish(&result.answer)?;
     let mut warnings = result.warnings;
     warnings.push("Citation validation checks issued snapshot identity and current source freshness; it does not prove semantic entailment.".into());
     let report=HostReport {
@@ -204,6 +288,10 @@ async fn execute_with_client(
         citations,
         tool_calls: evidence.receipts.clone(),
         usage: result.usage,
+        usage_scope: "final_reader".into(),
+        query_plan: query_plan_report.clone(),
+        model_usage: model_attempts::summarize(&accounting.model_attempts()),
+        model_attempts: accounting.model_attempts(),
         elapsed_ms:started.elapsed().as_millis(),
         stderr_bytes,
         stderr_truncated,
@@ -221,6 +309,9 @@ async fn execute_with_client(
             let code = if error
                 .downcast_ref::<gptgrep_core::JevSearchError>()
                 .is_some()
+                || error
+                    .downcast_ref::<gptgrep_core::PlannedSearchError>()
+                    .is_some()
             {
                 "host_jev_search_failed".to_owned()
             } else if let Some(protocol) = error.downcast_ref::<HostProtocolError>() {
@@ -233,6 +324,16 @@ async fn execute_with_client(
             let cause = error
                 .downcast_ref::<gptgrep_core::JevSearchError>()
                 .and_then(|error| serde_json::to_value(error).ok())
+                .or_else(|| {
+                    error
+                        .downcast_ref::<gptgrep_core::PlannedSearchError>()
+                        .and_then(|error| serde_json::to_value(error).ok())
+                })
+                .or_else(|| {
+                    error
+                        .downcast_ref::<CompletionError>()
+                        .map(|error| json!({"code":error.code()}))
+                })
                 .or_else(|| {
                     error
                         .downcast_ref::<HostProtocolError>()
@@ -252,6 +353,10 @@ async fn execute_with_client(
                 receipts: evidence.receipts.iter().map(ReceiptSummary::from).collect(),
                 cause,
                 elapsed_ms: started.elapsed().as_millis(),
+                usage_scope: "final_reader".into(),
+                query_plan: query_plan_report,
+                model_usage: model_attempts::summarize(&accounting.model_attempts()),
+                model_attempts: accounting.model_attempts(),
             }
             .into())
         }
@@ -266,17 +371,11 @@ struct ProcessOutcome {
     stderr_truncated: Option<bool>,
 }
 
-async fn run_process(
-    config: &HostConfig,
-    workflow: protocol::Workflow<'_>,
-) -> Result<ProcessOutcome> {
-    run_process_until(config, workflow, None).await
-}
-
 async fn run_process_until(
     config: &HostConfig,
     workflow: protocol::Workflow<'_>,
     deadline: Option<tokio::time::Instant>,
+    options: protocol::RunOptions<'_>,
 ) -> Result<ProcessOutcome> {
     if let Some(deadline) = deadline {
         ensure!(
@@ -299,6 +398,15 @@ async fn run_process_until(
     };
     ensure!(home.is_dir(), "Selected CODEX_HOME must be a directory");
     let mut command = process_command(&binary, cwd.path(), &home)?;
+    if let Some(deadline) = deadline {
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "host_deadline_exceeded"
+        );
+    }
+    if let Some(observer) = options.observer {
+        observer.running()?;
+    }
     let mut child = command
         .spawn()
         .map_err(|_| anyhow!("Could not start the configured Codex app-server"))?;
@@ -332,13 +440,14 @@ async fn run_process_until(
         (total, total > retained.len() as u64)
     });
     let started = Instant::now();
-    let session = protocol::run(
+    let session = protocol::run_observed(
         BufReader::new(stdout),
         stdin,
         cwd.path(),
         config,
         workflow,
         trace,
+        options,
     );
     let deadline = deadline
         .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs));
@@ -357,8 +466,15 @@ async fn run_process_until(
         }
     };
     let result = outcome.map_err(|_| {
-        anyhow!("Codex host exceeded its time limit; owned app-server was terminated")
+        if options.observer.is_some() {
+            anyhow!("host_model_attempt_timeout")
+        } else {
+            anyhow!("Codex host exceeded its time limit; owned app-server was terminated")
+        }
     })??;
+    if let Some(observer) = options.observer {
+        observer.process_completed()?;
+    }
     Ok(ProcessOutcome {
         result,
         home,
@@ -438,6 +554,9 @@ fn validate_config(config: &HostConfig, question: &str) -> Result<()> {
         "Invalid service tier; supported values are fast, priority, flex, default"
     );
     ensure!(!config.codex_bin.is_empty(), "Codex binary is empty");
+    if let Some(query_plan) = &config.query_plan {
+        query_plan.validate()?;
+    }
     Ok(())
 }
 
@@ -449,5 +568,7 @@ pub(crate) fn final_schema() -> Value {
         "required":["answer","citations","insufficient_evidence"]})
 }
 
+#[cfg(test)]
+mod lifecycle_tests;
 #[cfg(test)]
 mod tests;

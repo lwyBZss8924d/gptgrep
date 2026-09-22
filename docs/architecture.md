@@ -155,7 +155,7 @@ skill-sync entry points are rejected before incur dispatch. `--schema` and
 The local host uses Codex's stdio app-server, not a PageIndex cloud account and
 not an MCP server. It exposes a bounded set of GPTgrep evidence operations to the
 model. The caller owns question, root, timeout, tool-call budget and account home.
-The host performs initial Jev hybrid retrieval before starting the model, then
+By default, the host performs initial Jev hybrid retrieval before starting the reader, then
 supplies the bounded issued evidence in the first prompt. This stage cannot be
 skipped by choosing a tree or read tool. Summaries constrain it to the selected
 node's document. Subsequent searches default to hybrid. The host retains per-search
@@ -180,3 +180,27 @@ does not establish algorithm parity. Local Codex summaries and reasoning replace
 the corresponding agentic service role, while Flash extraction parity remains a
 separate stage-by-stage differential evaluation. See the source research and
 crate notices for implemented stages and remaining differences.
+
+
+## Experimental query planning
+
+The default-off ask option `--experimental-query-plan` inserts one separate
+Luna/max/fast completion before initial retrieval. The planner receives only the
+original question, fixed scope and bounded source-derived descriptors. It can
+propose zero to two retrieval phrases, never a new scope or citable evidence.
+The original question remains unchanged.
+
+Core collection pins one generation and overlaps at most two document-routing
+operations. It keeps distinct windows in a node, deduplicates exact source spans,
+and selects a stable round-robin union capped at 24 candidates. One final Jev
+pass evaluates that union against the original question. Only original-view
+literal anchors can bypass the relevance floor. The host owns evidence issuance
+and applies the existing output cap before citations become available.
+
+This is parallel independent first-hop retrieval; later dependent hops still use
+the existing reader loop. Planner and reader share one absolute deadline, and
+planner/branch failures are explicit. Per-operation Jev receipts and separate
+model-attempt records retain identities, usage and unknowns on failures. Parent
+totals do not add nested totals twice; legacy `usage` covers only the final reader.
+Extra planning/routing work and candidate displacement are measured treatment
+costs. This feature makes no indexing, multi-reader voting or quality claim.

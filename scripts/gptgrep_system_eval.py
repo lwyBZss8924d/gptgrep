@@ -26,6 +26,7 @@ import profiles
 import cohorts
 from bridge import AdapterError, LocalCodex, json_bytes, owned_process
 from role_hosts import RoleHost
+from native_models import PLANNER_PROFILE, attempts_from_report, usage_summary
 from run import checkpoint_attempt, fingerprint, judge_constants, private_directory, run_case_pool, task_concurrency_report, write_json
 
 
@@ -36,7 +37,10 @@ def ask_arguments(binary: Path, root: Path, row: dict, args) -> list[str]:
             "--codex-home", str(args.codex_home.expanduser().resolve()), "--model", args.model,
             "--reasoning-effort", args.reasoning_effort, "--service-tier", args.service_tier,
             "--timeout", str(args.timeout),
-            "--max-tool-calls", str(args.max_tool_calls), "--json", "--", row["question"], str(root)]
+            "--max-tool-calls", str(args.max_tool_calls),
+            "--max-input-bytes", str(getattr(args, "max_input_bytes", 262144))] + (
+                ["--experimental-query-plan"] if getattr(args, "experimental_query_plan", False) else []
+            ) + ["--json", "--", row["question"], str(root)]
 
 
 def build_arguments(binary: Path, corpus: Path, optimize_merge: bool) -> list[str]:
@@ -162,6 +166,16 @@ def invoke_native(shared: LocalCodex, arguments: list[str], payload: dict, timeo
             receipt["jev"] = jev_receipt(report)
             receipt["retrieval_failure"] = report.get("retrieval")
             receipt["host_retrieval_failure"] = report.get("host_retrieval")
+            model_records = attempts_from_report(
+                report, {"model": payload["model"], "reasoning_effort": payload["reasoning_effort"],
+                         "service_tier": payload["service_tier"]},
+                required=payload.get("experimental_query_plan") is True,
+            )
+            if model_records is not None:
+                receipt["model_attempts"] = model_records
+                receipt["model_turn_accounting"] = usage_summary(model_records)
+                receipt["usage_scope"] = "final_reader"
+            receipt["query_plan"] = report.get("query_plan", (report.get("host_retrieval") or {}).get("query_plan"))
             receipt.update(service_tier_metadata(payload["service_tier"], report))
             if process.returncode != 0 or report.get("status") != "completed":
                 raise RuntimeError(str(report.get("code", "native_ask_failed")))
@@ -183,7 +197,8 @@ def invoke_native(shared: LocalCodex, arguments: list[str], payload: dict, timeo
     return report, shared.call_by_ordinal(receipt["ordinal"])
 
 
-def ledger_recovery(path: Path, *, generation=None, query_sha256=None, document=None) -> dict:
+def ledger_recovery(path: Path, *, generation=None, query_sha256=None, document=None,
+                    reader_profile=None, planned=False) -> dict:
     """Retain cumulative latest-per-search evidence when the final CLI JSON is absent."""
     data = path.read_bytes()
     if len(data) > 4 * 1024 * 1024:
@@ -211,12 +226,23 @@ def ledger_recovery(path: Path, *, generation=None, query_sha256=None, document=
     last = events[-1] if events else {}
     initial = [search for search in searches.values() if search.get("required_initial") is True]
     identity_verified = query_sha256 is None
+    workflow_verified = False
+    for event in events:
+        workflow = event.get("workflow")
+        if workflow is not None:
+            if not isinstance(workflow, dict) or (query_sha256 is not None and workflow.get("query_sha256") != query_sha256) or workflow.get("document_scope") != document or (generation is not None and workflow.get("generation") != generation):
+                raise ValueError("Native model ledger workflow binding differs")
+            workflow_verified = True
+        if event.get("model_attempts") and workflow is None:
+            raise ValueError("Native model observations precede a bound workflow")
+    if workflow_verified:
+        identity_verified = True
     if query_sha256 is not None:
         if len(initial) == 1:
             if initial[0].get("query_sha256") != query_sha256 or initial[0].get("document_scope") != document:
                 raise ValueError("Native ledger query/document scope differs from its owning case")
             identity_verified = True
-        elif last.get("attempted_calls", 0):
+        elif last.get("attempted_calls", 0) and not workflow_verified:
             raise ValueError("Native ledger has model attempts without a unique initial query binding")
         if any(search.get("document_scope") != document or search.get("generation") not in (None, generation) for search in searches.values()):
             raise ValueError("Native ledger later search scope/generation differs from its owning case")
@@ -232,9 +258,17 @@ def ledger_recovery(path: Path, *, generation=None, query_sha256=None, document=
            "unobserved_attempts": last.get("unobserved_attempts"),
            "models": sorted(set(models)), "usage": usage, "searches": list(searches.values()),
            "accounting_complete": bool(identity_verified and not torn and last.get("event") == "completed" and last.get("accounting_complete") is True)}
+    model_snapshot = next((event["model_attempts"] for event in reversed(events) if "model_attempts" in event), None)
+    model_records = None
+    if model_snapshot is not None:
+        if not workflow_verified:
+            raise ValueError("Native model snapshot has no workflow binding")
+        if reader_profile is not None:
+            model_records = attempts_from_report({"model_attempts": model_snapshot}, reader_profile, required=planned)
     return {"path": str(path), "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data),
             "complete_events": len(events), "torn_trailing_record": torn,
-            "terminal_event": last.get("event"), "source": "durable_host_ledger", "case_identity_verified": identity_verified, "jev": jev}
+            "terminal_event": last.get("event"), "source": "durable_host_ledger", "case_identity_verified": identity_verified, "jev": jev,
+            "model_attempts": model_records, "model_turn_accounting": usage_summary(model_records)}
 
 
 def owned_ledger_paths(corpus: Path, receipt: dict, prior_names=(), *, not_before_unix_ns=None) -> list[Path]:
@@ -495,6 +529,11 @@ def completed_host_response(ordinal: int, request: dict, model: str, effort: str
     identity = report.get("thread_id"), report.get("turn_id")
     if not all(isinstance(value, str) and value for value in identity) or identity != (call.get("thread_id"), call.get("turn_id")):
         raise ValueError("Retained host native session differs")
+    if request.get("operation") == "ask":
+        model_records = attempts_from_report(report, {"model": model, "reasoning_effort": effort, "service_tier": service_tier},
+                                             required=request.get("experimental_query_plan") is True)
+        if model_records is not None and call.get("model_attempts") != model_records:
+            raise ValueError("Retained nested model accounting differs from its bound response")
     return report, call
 
 
@@ -520,9 +559,13 @@ def validate_cached_reader(case: dict, row: dict, args, run_dir: Path, shared: L
 
 
 def reader_payload(row: dict, args) -> dict:
-    return {"operation": "ask", "phase": f"answer:native:row-{row['source_row']}",
+    payload = {"operation": "ask", "phase": f"answer:native:row-{row['source_row']}",
             "question": row["question"], "document": row["doc_id"],
             "model": args.model, "reasoning_effort": args.reasoning_effort, "service_tier": args.service_tier}
+    if getattr(args, "experimental_query_plan", False):
+        payload["experimental_query_plan"] = True
+        payload["max_input_bytes"] = getattr(args, "max_input_bytes", 262144)
+    return payload
 
 
 def recover_judge(ordinal: int, prompt: str, constants: dict, host: RoleHost) -> tuple[dict, dict] | None:
@@ -576,15 +619,50 @@ def cumulative_accounting(shared: LocalCodex, run_dir: Path) -> dict:
                     pass
         if jev is None and ordinal in recoveries:
             jev, source = recoveries[ordinal].get("jev"), "durable_host_ledger"
+        model_records = call.get("model_attempts")
+        model_source = "host_receipt" if model_records is not None else "unavailable"
+        if model_records is None:
+            response = run_dir / "calls" / f"{ordinal:05d}.response.json"
+            request = run_dir / "calls" / f"{ordinal:05d}.request.json"
+            if (response.exists() and request.exists() and call.get("response_sha256") == locks.digest(response)
+                    and call.get("request_sha256") == locks.digest(request)):
+                payload = locks.read_json(request)
+                try:
+                    model_records = attempts_from_report(
+                        locks.read_json(response),
+                        {"model": payload["model"], "reasoning_effort": payload["reasoning_effort"],
+                         "service_tier": payload["service_tier"]},
+                        required=payload.get("experimental_query_plan") is True,
+                    )
+                    if model_records is not None:
+                        model_source = "bound_native_response"
+                except (KeyError, ValueError, TypeError):
+                    # Retain unavailable accounting; never fabricate a model step.
+                    pass
+        if model_records is None and ordinal in recoveries:
+            model_records = recoveries[ordinal].get("model_attempts")
+            if model_records is not None:
+                model_source = "bound_durable_host_ledger"
         attempts.append({"ordinal": ordinal, "phase": call.get("phase"), "status": call.get("status"),
                          "source": source if jev is not None else "unavailable", "jev": jev,
-                         "cost": jev_cost(jev), "elapsed_ms": call.get("elapsed_ms"), "host_usage": call.get("usage")})
+                         "cost": jev_cost(jev), "elapsed_ms": call.get("elapsed_ms"), "host_usage": call.get("usage"),
+                         "legacy_host_usage_scope": "final_reader", "model_attempts": model_records,
+                         "model_accounting_source": model_source})
     costs = [attempt["cost"] for attempt in attempts]
     known = [cost["known_cost_subtotal_usd"] for cost in costs if cost.get("known_cost_subtotal_usd") is not None]
     complete = bool(costs) and all(cost.get("accounting_complete") for cost in costs)
     durations = [attempt["elapsed_ms"] for attempt in attempts if isinstance(attempt["elapsed_ms"], (int, float))]
     duration_missing = len(attempts) - len(durations)
     duration_known = math.fsum(durations)
+    unavailable_models = sum(attempt.get("model_attempts") is None for attempt in attempts)
+    model_totals = usage_summary([record for attempt in attempts for record in (attempt.get("model_attempts") or [])])
+    model_totals["unavailable_native_ask_accounting"] = unavailable_models
+    model_totals["attempted_calls_known_subtotal"] = model_totals["attempted_calls"]
+    if unavailable_models:
+        model_totals["attempted_calls"] = None
+        model_totals["accounting_complete"] = False
+        for total in model_totals["token_totals"].values():
+            total["total"] = None
     return {"native_ask_attempts": len(attempts), "attempts": attempts,
             "accounting_complete": complete,
             "unknown_accounting_attempts": sum(not cost.get("accounting_complete") for cost in costs),
@@ -592,7 +670,9 @@ def cumulative_accounting(shared: LocalCodex, run_dir: Path) -> dict:
             "measured_jev_cost_usd": math.fsum(known) if complete and known else None,
             "native_ask_wall_ms": duration_known if duration_missing == 0 else None,
             "native_ask_wall_ms_known_subtotal": duration_known,
-            "native_ask_wall_ms_missing": duration_missing}
+            "native_ask_wall_ms_missing": duration_missing,
+            "native_model_turn_accounting": model_totals,
+            "native_model_accounting_scope": "Planner and final reader steps across all native ask attempts; judge turns remain in their own host ledger. Do not add legacy final-reader usage again."}
 
 
 def native_snapshot(corpus: Path, source_hashes: dict) -> dict:
@@ -646,6 +726,9 @@ def verify_native_evidence(report: dict, corpus: Path, sources: dict, text: dict
 
 def execute(args) -> dict:
     profile = profiles.resolve(args)
+    planned = getattr(args, "experimental_query_plan", False)
+    if planned:
+        profile["roles"]["query_planner"] = dict(PLANNER_PROFILE)
     profile["roles"]["index"] = {"engine": "deterministic_native", "model": None, "reasoning_effort": None, "service_tier": None}
     profile["index_effort_note"] = "Native build is deterministic; no Jev or generative indexing stage is claimed."
     if not 1 <= args.reader_concurrency <= 64 or not 1 <= args.judge_concurrency <= 64:
@@ -680,11 +763,23 @@ def execute(args) -> dict:
         "max_tool_calls": args.max_tool_calls, "jev_model_requested": args.jev_model,
         "judge_source_sha256": locks.digest(judge_source / "eval/judge.py"),
         "adapter_files": {name: locks.digest(REPO / "scripts/pageindex_baseline" / name)
-                          for name in ("bridge.py", "role_hosts.py", "profiles.py", "locks.py", "run.py", "cohorts.py")},
+                          for name in ("bridge.py", "role_hosts.py", "profiles.py", "locks.py", "run.py", "cohorts.py", "native_models.py")},
         "runner_sha256": locks.digest(Path(__file__)),
         "build": {"engine": "native LiteParse/Rust tree/tgrep index", "generative": False,
                   "jev_indexing_stage": False, "optimize_merge": args.optimize_merge},
     }
+    if planned:
+        manifest["query_strategy"] = {
+            "experimental_query_plan": True, "planner": dict(PLANNER_PROFILE),
+            "max_planner_turns_per_native_ask": 1, "max_native_model_attempts_per_ask": 2,
+            "planner_input_cap": min(args.max_input_bytes, 32768), "planner_output_cap": 4096,
+            "planner_timeout_secs": min(args.timeout, 45),
+            "max_alternate_queries": 2, "routing_concurrency": 2, "union_candidates": 24,
+            "final_relevance_question": "original question unchanged",
+            "deadline": "one timeout shared by planner, routing, rerank and final reader",
+            "model_turn_admission_upper_bound": 2 * args.max_model_calls,
+            "budget_note": "max_host_invocations caps outer processes; each native ask admits at most two model steps. Nested attempts are reported separately; this is not a provider request count.",
+        }
     with (run_dir / ".owner.lock").open("a") as owner:
         fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
         binding = reuse_manifest(run_dir / "manifest.json", manifest)
@@ -768,7 +863,8 @@ def execute(args) -> dict:
                     recovered_case.pop("error_code", None)
                     accounting_path = attempt_dir / "accounting.json"
                     if not accounting_path.exists():
-                        write_json(accounting_path, {"ordinal": receipt["ordinal"], "jev": jev_receipt(saved_report)})
+                        write_json(accounting_path, {"ordinal": receipt["ordinal"], "jev": jev_receipt(saved_report),
+                                   "model_attempts": receipt.get("model_attempts")})
                     case = recovered_case
                     checkpoint_attempt(case_path, case)
             if case["status"] in ("queued", "started", "validating"):
@@ -790,11 +886,13 @@ def execute(args) -> dict:
                             recovery_path = attempt_dir / "ledger-recovery.json"
                             recovered = locks.read_json(recovery_path) if recovery_path.exists() else [ledger_recovery(
                                 path, generation=build["generation_binding"]["generation"],
-                                query_sha256=hashlib.sha256(row["question"].encode()).hexdigest(), document=row["doc_id"]) for path in fresh]
+                                query_sha256=hashlib.sha256(row["question"].encode()).hexdigest(), document=row["doc_id"],
+                                reader_profile=profile["roles"]["chat"], planned=planned) for path in fresh]
                             if not recovery_path.exists():
                                 write_json(recovery_path, recovered)
                             write_json(accounting_path, {"ordinal": start["host_ordinal"],
-                                       "jev": recovered[0]["jev"] if len(recovered) == 1 else None})
+                                       "jev": recovered[0]["jev"] if len(recovered) == 1 else None,
+                                       "model_attempts": recovered[0].get("model_attempts") if len(recovered) == 1 else None})
                         except Exception as error:
                             write_json(accounting_path, {"ordinal": start["host_ordinal"], "jev": None, "error": str(error)})
                 case.update(status="interrupted", error="Prior reader attempt has no completed case checkpoint")
@@ -832,14 +930,16 @@ def execute(args) -> dict:
                     checkpoint_attempt(case_path, case)
                     start = locks.read_json(attempt_dir / "start.json")
                     recovered = [ledger_recovery(path, generation=build["generation_binding"]["generation"],
-                                 query_sha256=hashlib.sha256(row["question"].encode()).hexdigest(), document=row["doc_id"])
+                                 query_sha256=hashlib.sha256(row["question"].encode()).hexdigest(), document=row["doc_id"],
+                                 reader_profile=profile["roles"]["chat"], planned=planned)
                                  for path in owned_ledger_paths(corpus, receipt, start["prior_ledgers"],
                                  not_before_unix_ns=start["reservation_observed_unix_ns"])]
                     write_json(attempt_dir / "ledger-recovery.json", recovered)
                     case["native_attempt_ledgers"] = [{key: value for key, value in item.items() if key != "jev"} for item in recovered]
                     if jev_receipt(report) is None and len(recovered) == 1:
                         report = {**report, "jev": recovered[0]["jev"], "jev_receipt_source": "durable_host_ledger"}
-                    write_json(attempt_dir / "accounting.json", {"ordinal": receipt["ordinal"], "jev": jev_receipt(report)})
+                    write_json(attempt_dir / "accounting.json", {"ordinal": receipt["ordinal"], "jev": jev_receipt(report),
+                               "model_attempts": receipt.get("model_attempts", recovered[0].get("model_attempts") if len(recovered) == 1 else None)})
                     case.update(status=receipt["status"], elapsed_ms=receipt["elapsed_ms"], host_receipt=receipt,
                                 metrics=native_metrics(report, row["doc_id"], set(json.loads(row["evidence_pages"]))))
                     case["metrics"]["jev_receipt_source"] = report.get("jev_receipt_source", "final_cli_report" if jev_receipt(report) is not None else "unavailable")
@@ -964,7 +1064,9 @@ def execute(args) -> dict:
         summary.update(jev_cost_accounting_complete=cumulative["accounting_complete"],
                        measured_jev_cost_usd=cumulative["measured_jev_cost_usd"],
                        known_jev_cost_subtotal_usd=cumulative["known_jev_cost_subtotal_usd"],
-                       cost_scope="all native ask attempts, including failed/interrupted retries")
+                       cost_scope="all native ask attempts, including failed/interrupted retries",
+                       native_model_turn_accounting=cumulative["native_model_turn_accounting"],
+                       native_model_usage_scope=cumulative["native_model_accounting_scope"])
         observed_wall = [call["elapsed_ms"] for call in shared.calls
                          if type(call.get("elapsed_ms")) in (int, float) and math.isfinite(call["elapsed_ms"]) and call["elapsed_ms"] >= 0]
         missing_wall = len(shared.calls) - len(observed_wall)
@@ -1014,6 +1116,8 @@ def main() -> int:
     parser.add_argument("--build-timeout", type=int, default=300)
     parser.add_argument("--optimize-merge", action="store_true")
     parser.add_argument("--retry-failed", action="store_true", help="Retry failed/interrupted work; completed reader/judge outcomes are always reused")
+    parser.add_argument("--experimental-query-plan", action="store_true",
+                        help="Evaluate the explicit additional Luna planner and bounded multi-query initial retrieval; all nested model steps are accounted separately")
     args = parser.parse_args()
     if min(args.timeout, args.build_timeout, args.max_tool_calls, args.max_input_bytes) <= 0 or args.max_model_calls < 0:
         parser.error("Invalid execution bounds")

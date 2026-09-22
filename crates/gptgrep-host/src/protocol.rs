@@ -2,6 +2,7 @@ use crate::{
     HostConfig, HostProtocolError, HostProtocolErrorKind,
     codex_error::ParsedError,
     final_schema,
+    model_attempts::ModelAttemptObserver,
     retrieval::{self, Evidence},
 };
 use anyhow::{Result, anyhow, ensure};
@@ -128,13 +129,41 @@ pub(crate) enum Workflow<'a> {
     },
 }
 
+#[cfg(test)]
 pub(crate) async fn run<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: R,
+    writer: W,
+    cwd: &Path,
+    config: &HostConfig,
+    workflow: Workflow<'_>,
+    trace: Option<crate::trace::Trace>,
+) -> Result<Outcome> {
+    run_observed(
+        reader,
+        writer,
+        cwd,
+        config,
+        workflow,
+        trace,
+        RunOptions::default(),
+    )
+    .await
+}
+
+#[derive(Default, Clone, Copy)]
+pub(crate) struct RunOptions<'a> {
+    pub observer: Option<&'a ModelAttemptObserver>,
+    pub max_output_bytes: Option<usize>,
+}
+
+pub(crate) async fn run_observed<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     reader: R,
     writer: W,
     cwd: &Path,
     config: &HostConfig,
     mut workflow: Workflow<'_>,
     trace: Option<crate::trace::Trace>,
+    options: RunOptions<'_>,
 ) -> Result<Outcome> {
     let is_completion = matches!(&workflow, Workflow::Completion { .. });
     let mut rpc = Rpc {
@@ -213,6 +242,9 @@ pub(crate) async fn run<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
             128 * 1024,
         ),
     };
+    let max_output_bytes = options
+        .max_output_bytes
+        .map_or(max_output_bytes, |limit| limit.min(max_output_bytes));
     let instructions = if is_completion {
         instructions
     } else {
@@ -256,6 +288,15 @@ pub(crate) async fn run<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         );
     }
     let service_tier = acknowledged_service_tier(&thread, &config.service_tier)?;
+    if let Some(observer) = options.observer {
+        observer.thread(
+            &thread_id,
+            &model,
+            &provider,
+            effort.as_deref(),
+            service_tier.as_deref(),
+        )?;
+    }
     let mut warnings=vec!["Codex has no public dynamic-tools-only allowlist. Configurable integrations and environment access are disabled; any unexpected server request is denied.".into()];
     if effort.is_none() {
         warnings.push("Codex did not report effective thread reasoning effort; the requested effort is explicitly sent on turn/start.".into());
@@ -302,6 +343,7 @@ pub(crate) async fn run<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 "Dynamic tool call came from a different thread"
             );
             bind_turn(&mut turn_id, &params["turnId"])?;
+            observe_turn(options.observer, &turn_id)?;
             let call_id = identifier(&params["callId"])?;
             ensure!(
                 calls.insert(call_id.clone()),
@@ -338,16 +380,19 @@ pub(crate) async fn run<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         if message.get("id") == Some(&json!(4)) {
             ensure!(message.get("error").is_none(), "Codex rejected turn/start");
             bind_turn(&mut turn_id, &message["result"]["turn"]["id"])?;
+            observe_turn(options.observer, &turn_id)?;
             continue;
         }
         match method {
             Some("turn/started") => {
                 same_thread(&message, &thread_id)?;
                 bind_turn(&mut turn_id, &message["params"]["turn"]["id"])?;
+                observe_turn(options.observer, &turn_id)?;
             }
             Some("item/started" | "item/completed") => {
                 same_thread(&message, &thread_id)?;
                 bind_turn(&mut turn_id, &message["params"]["turnId"])?;
+                observe_turn(options.observer, &turn_id)?;
                 let item = &message["params"]["item"];
                 let kind = item["type"].as_str().unwrap_or("");
                 validate_item(item)?;
@@ -369,7 +414,11 @@ pub(crate) async fn run<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
             Some("thread/tokenUsage/updated") => {
                 same_thread(&message, &thread_id)?;
                 bind_turn(&mut turn_id, &message["params"]["turnId"])?;
+                observe_turn(options.observer, &turn_id)?;
                 usage = message["params"].get("tokenUsage").cloned();
+                if let Some(observer) = options.observer {
+                    observer.usage(usage.as_ref())?;
+                }
             }
             Some("turn/completed") => {
                 let turn = &message["params"]["turn"];
@@ -388,6 +437,7 @@ pub(crate) async fn run<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 {
                     return Err(failure(HostProtocolErrorKind::IdentityMismatch).into());
                 }
+                observe_turn(options.observer, &turn_id)?;
                 match turn["status"].as_str() {
                     Some("completed") if turn["error"].is_null() => {}
                     Some("failed") => {
@@ -439,6 +489,7 @@ pub(crate) async fn run<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 {
                     return Err(failure(HostProtocolErrorKind::IdentityMismatch).into());
                 }
+                observe_turn(options.observer, &turn_id)?;
                 if !parsed.valid || will_retry.is_none() {
                     return Err(failure(HostProtocolErrorKind::MalformedError).into());
                 }
@@ -448,6 +499,9 @@ pub(crate) async fn run<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 // The app-server owns this recovery. Continue the same turn under the
                 // outer timeout_at deadline and existing frame/message limits.
                 server_retry_notifications += 1;
+                if let Some(observer) = options.observer {
+                    observer.retries(server_retry_notifications)?;
+                }
             }
             _ => {}
         }
@@ -467,6 +521,13 @@ pub(crate) async fn run<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         usage,
         warnings,
     })
+}
+
+fn observe_turn(observer: Option<&ModelAttemptObserver>, turn_id: &Option<String>) -> Result<()> {
+    if let (Some(observer), Some(turn_id)) = (observer, turn_id) {
+        observer.turn(turn_id)?;
+    }
+    Ok(())
 }
 
 fn acknowledged_service_tier(thread: &Value, requested: &str) -> Result<Option<String>> {

@@ -1,4 +1,6 @@
-use crate::{HostConfig, ProcessOutcome, protocol, retrieval::hash, run_process, validate_config};
+use crate::{
+    HostConfig, ProcessOutcome, protocol, retrieval::hash, run_process_until, validate_config,
+};
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -69,15 +71,39 @@ pub async fn complete_json(
     schema: Value,
     config: &HostConfig,
 ) -> Result<CompletionReport> {
+    if config.query_plan.is_some() {
+        return Err(anyhow!("host_query_plan_requires_ask"));
+    }
+    complete_json_until(
+        instructions,
+        state,
+        schema,
+        config,
+        None,
+        protocol::RunOptions::default(),
+    )
+    .await
+}
+
+pub(crate) async fn complete_json_until(
+    instructions: &str,
+    state: Value,
+    schema: Value,
+    config: &HostConfig,
+    deadline: Option<tokio::time::Instant>,
+    options: protocol::RunOptions<'_>,
+) -> Result<CompletionReport> {
     validate_config(config, "complete_json")?;
     let (validator, input_bytes) = prepare(instructions, &state, &schema, config.max_input_bytes)?;
-    let completed = run_process(
+    let completed = run_process_until(
         config,
         protocol::Workflow::Completion {
             instructions,
             state: &state,
             schema: &schema,
         },
+        deadline,
+        options,
     )
     .await?;
     let ProcessOutcome {
@@ -87,6 +113,13 @@ pub async fn complete_json(
         stderr_bytes,
         stderr_truncated,
     } = completed;
+    if result.answer.len()
+        > options
+            .max_output_bytes
+            .unwrap_or(MAX_COMPLETION_OUTPUT_BYTES)
+    {
+        return Err(CompletionError::OutputLimit.into());
+    }
     let value = validate_output(&result.answer, &validator)?;
     Ok(CompletionReport {
         schema_version: "gptgrep.completion.v1".into(),

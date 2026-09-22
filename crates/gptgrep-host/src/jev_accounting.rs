@@ -1,4 +1,4 @@
-use crate::{Citation, ToolReceipt};
+use crate::{Citation, ModelAttempt, ModelUsage, QueryPlanReport, ToolReceipt};
 
 #[derive(Debug, Serialize)]
 pub(crate) struct InitializationError {
@@ -11,11 +11,14 @@ impl std::fmt::Display for InitializationError {
 }
 impl std::error::Error for InitializationError {}
 use anyhow::{Result, anyhow, ensure};
-use gptgrep_core::{Coverage, JevSearchProgress, Metrics, SearchReport};
+use gptgrep_core::{
+    Coverage, JevSearchProgress, Metrics, PlannedCoverage, PlannedSearchEvent, PlannedSearchReport,
+    SearchReport,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::File,
     io::Write,
     path::{Path, PathBuf},
@@ -23,8 +26,14 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PlannedSearchTelemetry {
+    pub coverage: Option<PlannedCoverage>,
+    pub operations: BTreeMap<String, PlannedSearchEvent>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchTelemetry {
@@ -41,6 +50,8 @@ pub struct SearchTelemetry {
     pub delivered_hits: usize,
     pub output_truncated: bool,
     pub accounting_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<PlannedSearchTelemetry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +110,11 @@ pub struct HostRetrievalError {
     pub receipts: Vec<ReceiptSummary>,
     pub cause: Option<Value>,
     pub elapsed_ms: u128,
+    pub usage_scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_plan: Option<QueryPlanReport>,
+    pub model_attempts: Vec<ModelAttempt>,
+    pub model_usage: ModelUsage,
 }
 impl std::fmt::Display for HostRetrievalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -114,6 +130,10 @@ struct State {
     path: PathBuf,
     generation: String,
     searches: Vec<SearchTelemetry>,
+    search_started: Vec<Instant>,
+    model_attempt_limit: usize,
+    model_attempts: Vec<ModelAttempt>,
+    workflow: Option<Value>,
     bytes: usize,
     events: usize,
     terminal: bool,
@@ -136,6 +156,10 @@ impl Accounting {
             path,
             generation: generation.into(),
             searches: vec![],
+            search_started: vec![],
+            model_attempt_limit: 1,
+            model_attempts: vec![],
+            workflow: None,
             bytes: 0,
             events: 0,
             terminal: false,
@@ -148,6 +172,120 @@ impl Accounting {
     }
     pub fn summary(&self) -> JevReport {
         summarize(&self.0.lock().expect("accounting mutex").searches)
+    }
+    pub fn bind_workflow(&self, question: &str, document_scope: Option<&str>) -> Result<()> {
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| anyhow!("host_jev_ledger_unavailable"))?;
+        ensure!(
+            !state.terminal && state.model_attempts.is_empty(),
+            "host_workflow_binding_closed"
+        );
+        let workflow = json!({"query_sha256":crate::retrieval::hash(question.as_bytes()),"document_scope":document_scope,"generation":state.generation});
+        ensure!(
+            state
+                .workflow
+                .as_ref()
+                .is_none_or(|prior| prior == &workflow),
+            "host_workflow_binding_changed"
+        );
+        state.workflow = Some(workflow.clone());
+        append_locked(
+            &mut state,
+            "workflow_bound",
+            None,
+            Some(json!({"workflow":workflow})),
+        )
+    }
+    pub fn set_model_attempt_limit(&self, limit: usize) -> Result<()> {
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| anyhow!("host_jev_ledger_unavailable"))?;
+        ensure!(
+            !state.terminal && state.model_attempts.is_empty() && (1..=2).contains(&limit),
+            "host_model_attempt_budget_invalid"
+        );
+        state.model_attempt_limit = limit;
+        append_locked(
+            &mut state,
+            "model_attempt_budget",
+            None,
+            Some(json!({"model_attempt_limit":limit})),
+        )
+    }
+    pub fn reserve_model_attempt(&self, attempt: ModelAttempt) -> Result<()> {
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| anyhow!("host_jev_ledger_unavailable"))?;
+        ensure!(
+            !state.terminal
+                && state.workflow.is_some()
+                && state.model_attempts.len() < state.model_attempt_limit,
+            "host_model_attempt_limit"
+        );
+        ensure!(
+            matches!(attempt.role.as_str(), "query_planner" | "final_reader")
+                && attempt.status == "reserved",
+            "host_model_attempt_invalid"
+        );
+        ensure!(
+            !state
+                .model_attempts
+                .iter()
+                .any(|prior| prior.attempt_id == attempt.attempt_id || prior.role == attempt.role),
+            "host_model_attempt_duplicate"
+        );
+        ensure!(
+            attempt.attempt_id.len() <= 128 && !attempt.attempt_id.is_empty(),
+            "host_model_attempt_invalid"
+        );
+        let detail = json!({"model_attempt":attempt});
+        state.model_attempts.push(attempt);
+        append_locked(&mut state, "model_attempt_reserved", None, Some(detail))
+    }
+    pub fn record_model_attempt(&self, attempt: &ModelAttempt) -> Result<()> {
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| anyhow!("host_jev_ledger_unavailable"))?;
+        ensure!(!state.terminal, "host_model_attempt_closed");
+        let previous = state
+            .model_attempts
+            .iter_mut()
+            .find(|prior| prior.attempt_id == attempt.attempt_id)
+            .ok_or_else(|| anyhow!("host_model_attempt_unreserved"))?;
+        ensure!(
+            previous.role == attempt.role
+                && previous.requested_model == attempt.requested_model
+                && previous.requested_reasoning_effort == attempt.requested_reasoning_effort
+                && previous.requested_service_tier == attempt.requested_service_tier
+                && previous
+                    .thread_id
+                    .as_ref()
+                    .is_none_or(|id| attempt.thread_id.as_ref() == Some(id))
+                && previous
+                    .turn_id
+                    .as_ref()
+                    .is_none_or(|id| attempt.turn_id.as_ref() == Some(id)),
+            "host_model_attempt_identity_changed"
+        );
+        *previous = attempt.clone();
+        append_locked(
+            &mut state,
+            "model_attempt_updated",
+            None,
+            Some(json!({"model_attempt":attempt})),
+        )
+    }
+    pub fn model_attempts(&self) -> Vec<ModelAttempt> {
+        self.0
+            .lock()
+            .expect("accounting mutex")
+            .model_attempts
+            .clone()
     }
     pub fn start_search(
         &self,
@@ -181,7 +319,9 @@ impl Accounting {
             delivered_hits: 0,
             output_truncated: false,
             accounting_complete: false,
+            plan: None,
         });
+        state.search_started.push(Instant::now());
         append_locked(&mut state, "search_started", Some(index), None)?;
         Ok(index)
     }
@@ -198,6 +338,92 @@ impl Accounting {
         search.generation = progress.generation.clone();
         search.accounting_complete = false;
         append_locked(&mut state, &progress.event, Some(index), None)
+    }
+    pub fn plan_event(&self, index: usize, event: &PlannedSearchEvent) -> Result<()> {
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| anyhow!("host_jev_ledger_unavailable"))?;
+        ensure!(!state.terminal, "host_jev_ledger_closed");
+        ensure!(
+            matches!(
+                event.operation_id.as_str(),
+                "q0.route" | "q1.route" | "q2.route" | "union.rerank"
+            ),
+            "host_jev_plan_operation_invalid"
+        );
+        ensure!(
+            matches!(
+                event.event.as_str(),
+                "admitted" | "before_call" | "after_reply" | "finished" | "failed" | "interrupted"
+            ) && event.metrics.jev_calls_attempted <= 1
+                && event.metrics.jev_requests <= event.metrics.jev_calls_attempted,
+            "host_jev_plan_event_invalid"
+        );
+        let elapsed_ms = state.search_started[index].elapsed().as_millis();
+        let search = &mut state.searches[index];
+        ensure!(
+            event.original_question_sha256 == search.query_sha256,
+            "host_jev_plan_question_changed"
+        );
+        let plan = search
+            .plan
+            .get_or_insert_with(PlannedSearchTelemetry::default);
+        if let Some(prior) = plan.operations.get(&event.operation_id) {
+            ensure!(
+                prior.query_sha256 == event.query_sha256
+                    && prior.metrics.jev_calls_attempted <= event.metrics.jev_calls_attempted
+                    && prior.metrics.jev_requests <= event.metrics.jev_requests,
+                "host_jev_plan_event_regressed"
+            );
+        }
+        plan.operations
+            .insert(event.operation_id.clone(), event.clone());
+        search.metrics = plan_metrics(&plan.operations, elapsed_ms);
+        search.coverage = None;
+        search.stage = event.operation_id.clone();
+        search.accounting_complete = false;
+        append_locked(
+            &mut state,
+            "plan_progress",
+            Some(index),
+            Some(json!({"operation_id":event.operation_id,"event":event.event})),
+        )
+    }
+    pub fn planned_success(
+        &self,
+        index: usize,
+        report: &PlannedSearchReport,
+    ) -> Result<SearchTelemetry> {
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| anyhow!("host_jev_ledger_unavailable"))?;
+        let search = &mut state.searches[index];
+        let plan = search
+            .plan
+            .get_or_insert_with(PlannedSearchTelemetry::default);
+        for event in &report.operations {
+            plan.operations
+                .insert(event.operation_id.clone(), event.clone());
+        }
+        let observed = plan_metrics(&plan.operations, report.metrics.elapsed_ms);
+        ensure!(
+            observed.jev_calls_attempted == report.metrics.jev_calls_attempted
+                && observed.jev_requests == report.metrics.jev_requests,
+            "host_jev_plan_accounting_mismatch"
+        );
+        plan.coverage = Some(report.coverage.clone());
+        search.metrics = observed;
+        search.coverage = None;
+        search.generation = Some(report.generation.clone());
+        search.document_scope = report.document_scope.clone();
+        search.stage = "delivery".into();
+        search.status = "awaiting_delivery".into();
+        search.accounting_complete = false;
+        let result = search.clone();
+        append_locked(&mut state, "plan_fused", Some(index), None)?;
+        Ok(result)
     }
     pub fn success(
         &self,
@@ -258,6 +484,15 @@ impl Accounting {
             search.document_scope = error.document_scope.clone();
             search.generation = error.generation.clone();
         }
+        if let Some(error) = error.downcast_ref::<gptgrep_core::PlannedSearchError>() {
+            search.stage = error.stage.clone();
+            search.document_scope = error.document_scope.clone();
+            search.generation = error.generation.clone();
+            search
+                .plan
+                .get_or_insert_with(PlannedSearchTelemetry::default)
+                .coverage = Some(error.coverage.clone());
+        }
         let result = search.clone();
         append_locked(&mut state, "search_failed", Some(index), None)?;
         Ok(result)
@@ -265,7 +500,7 @@ impl Accounting {
     pub fn receipt(&self, receipt: &ToolReceipt) -> Result<()> {
         self.append("receipt", None, Some(json!(ReceiptSummary::from(receipt))))
     }
-    pub fn delivery(&self, search: &SearchTelemetry) -> Result<()> {
+    pub fn delivery(&self, search: &SearchTelemetry) -> Result<SearchTelemetry> {
         let mut state = self
             .0
             .lock()
@@ -276,7 +511,23 @@ impl Accounting {
             .position(|value| value.search_id == search.search_id)
             .ok_or_else(|| anyhow!("host_jev_ledger_search_missing"))?;
         state.searches[index] = search.clone();
-        append_locked(&mut state, "delivery", Some(index), None)
+        let current = &mut state.searches[index];
+        if current.plan.is_some() && current.status == "awaiting_delivery" {
+            current.status = if current.delivered_hits == 0 {
+                "filtered_all"
+            } else {
+                "reranked"
+            }
+            .into();
+            current.stage = "finished".into();
+            current.accounting_complete = current.metrics.jev_calls_attempted
+                == current.metrics.jev_requests
+                && current.metrics.jev_usage.len() == current.metrics.jev_requests
+                && current.metrics.jev_usage.iter().all(usage_observed);
+        }
+        let result = current.clone();
+        append_locked(&mut state, "delivery", Some(index), None)?;
+        Ok(result)
     }
     pub fn finish(&self, status: &str) -> Result<()> {
         let mut state = self
@@ -288,9 +539,23 @@ impl Accounting {
         }
         if status != "completed" {
             for search in &mut state.searches {
-                if search.status == "running" {
+                if matches!(search.status.as_str(), "running" | "awaiting_delivery") {
                     search.status = "failed".into();
                     search.accounting_complete = false;
+                }
+            }
+            for attempt in &mut state.model_attempts {
+                if matches!(
+                    attempt.status.as_str(),
+                    "reserved" | "running" | "process_completed"
+                ) {
+                    attempt.status = if status == "interrupted" {
+                        "interrupted"
+                    } else {
+                        "failed"
+                    }
+                    .into();
+                    attempt.accounting_complete = false;
                 }
             }
         }
@@ -305,6 +570,25 @@ impl Accounting {
             .map_err(|_| anyhow!("host_jev_ledger_unavailable"))?;
         append_locked(&mut state, event, index, detail)
     }
+}
+
+fn plan_metrics(operations: &BTreeMap<String, PlannedSearchEvent>, elapsed_ms: u128) -> Metrics {
+    let mut metrics = Metrics {
+        elapsed_ms,
+        ..Metrics::default()
+    };
+    for operation in operations.values() {
+        metrics.jev_calls_attempted += operation.metrics.jev_calls_attempted;
+        metrics.jev_requests += operation.metrics.jev_requests;
+        metrics.jev_candidate_bytes += operation.metrics.jev_candidate_bytes;
+        metrics
+            .jev_models
+            .extend(operation.metrics.jev_models.iter().cloned());
+        metrics
+            .jev_usage
+            .extend(operation.metrics.jev_usage.iter().cloned());
+    }
+    metrics
 }
 
 fn usage_observed(usage: &Value) -> bool {
@@ -355,6 +639,9 @@ fn append_locked(
         "initial_status":summary.initial_status,"requests":summary.requests,
         "attempted_calls":summary.attempted_calls,"unobserved_attempts":summary.unobserved_attempts,
         "search":index.map(|index|&state.searches[index]),"receipt":detail,
+        "model_attempt_limit":state.model_attempt_limit,"model_attempts":state.model_attempts,
+        "model_usage":crate::model_attempts::summarize(&state.model_attempts),
+        "workflow":state.workflow,
     });
     let mut bytes = serde_json::to_vec(&entry)?;
     bytes.push(b'\n');

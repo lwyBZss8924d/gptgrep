@@ -1010,6 +1010,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "fs2",
+ "futures-util",
  "gptgrep-index",
  "gptgrep-jev",
  "gptgrep-pageindex",

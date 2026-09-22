@@ -8,7 +8,7 @@ No vector database, no search daemon, and no MCP server.
 
 GPTgrep returns inspectable source evidence. Default `search` uses `hybrid` and
 requires Jev routing/reranking. `ask` and `summarize` also execute this stage before
-local Codex reasoning; missing credentials or provider failures are explicit
+the final Codex reader; missing credentials or provider failures are explicit
 errors. `semantic` and `judge` also use remote Jev inference. Explicit `regex` and
 `lexical` commands are local retrieval primitives. The reasoning agent can compose
 searches, inspect trees and read bounded nodes before answering.
@@ -131,7 +131,7 @@ gptgrep summarize DOCUMENT_ID:NODE_ID --root ./documents \
   --model gpt-5.6-luna --reasoning-effort max --service-tier fast --json
 ```
 
-Before starting Codex, the host executes required Jev hybrid retrieval and
+By default, before starting the reader, the host executes required Jev hybrid retrieval and
 supplies the bounded evidence to the reasoning model. `--jev-model` selects its
 Decisions model independently of the Codex `--model`. `--document` scopes an ask;
 a summary is scoped to its selected node's document. Follow-up searches default
@@ -149,6 +149,22 @@ The host also writes a private, bounded metadata ledger under
 fails or is interrupted. Source documents stay unchanged; the Codex child has no
 access to the Jev credential.
 Citation identity checks do not independently prove semantic entailment.
+
+
+The ask-only `--experimental-query-plan` option first runs a separate no-tools
+`gpt-5.6-luna` / `max` / `fast` planner. It retains the original question and
+proposes at most two alternate retrieval phrases. Up to two routing operations
+run concurrently; exact source spans are combined within the existing candidate
+budget and Jev reranks them against the original question before the reader starts.
+The option is off by default and shares the caller's overall deadline. Planning or
+branch failure is explicit. More diverse candidates can displace original
+candidates and add latency; no quality gain is guaranteed. `model_attempts` and
+`model_usage` include the planner separately; legacy `usage` remains reader-only.
+
+```sh
+gptgrep ask 'How are offline exports recovered?' ./documents \
+  --experimental-query-plan --json
+```
 
 `host-complete --input FILE_OR_DASH` supplies the same isolated local model as a
 typed workflow primitive. Its input is `{instructions, state, schema}` and its

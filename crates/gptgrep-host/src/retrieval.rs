@@ -192,6 +192,151 @@ impl Evidence {
         Ok(())
     }
 
+    pub fn prepare_query_plan(
+        &mut self,
+        question: &str,
+    ) -> Result<crate::query_plan::PlannerInput> {
+        ensure!(self.selected_document.is_none(), "host_query_plan_ask_only");
+        self.ensure_generation()?;
+        self.ensure_jev_client()?;
+        crate::query_plan::planner_input(
+            &self.root,
+            &self.catalog,
+            &self.generation,
+            self.document.as_deref(),
+            question,
+        )
+    }
+
+    fn ensure_jev_client(&mut self) -> Result<()> {
+        if self.client.is_none() {
+            self.client = Some(JevClient::from_env(self.jev_model.as_deref()).map_err(
+                |error| {
+                    anyhow!(crate::jev_accounting::InitializationError {
+                        cause: error.to_string()
+                    })
+                },
+            )?);
+        }
+        Ok(())
+    }
+
+    pub async fn bootstrap_planned(
+        &mut self,
+        question: &str,
+        alternatives: &[String],
+    ) -> Result<()> {
+        ensure!(
+            self.initial_payload.is_none(),
+            "host_jev_initial_already_completed"
+        );
+        ensure!(self.selected_document.is_none(), "host_query_plan_ask_only");
+        self.ensure_generation()?;
+        self.ensure_jev_client()?;
+        let accounting = self
+            .accounting
+            .clone()
+            .ok_or_else(|| anyhow!("host_query_plan_accounting_required"))?;
+        let call_id = "host-initial-jev";
+        let index =
+            accounting.start_search(call_id, question, "hybrid", self.document.as_deref(), true)?;
+        let args = json!({"query":question,"alternate_queries":alternatives,"mode":"hybrid","limit":SEARCH_MAX,"strategy":"luna_queries_v1"});
+        let prior_nodes = self.known_nodes.clone();
+        let prior_issued = self.issued.clone();
+        let prior_receipts = self.receipts.len();
+        let result: Result<()> = async {
+            let options = SearchOptions {
+                mode: "hybrid".into(),
+                limit: SEARCH_MAX,
+                document: self.document.clone(),
+                model: self.jev_model.clone(),
+                ..Default::default()
+            };
+            let observer = |event: &gptgrep_core::PlannedSearchEvent| accounting.plan_event(index, event);
+            let mut found = gptgrep_core::search_planned_with_client_and_observer(
+                &self.root,
+                question,
+                alternatives,
+                &options,
+                &self.generation,
+                self.client.as_ref().expect("initialized client"),
+                &observer,
+            ).await?;
+            self.ensure_generation()?;
+            ensure!(found.generation == self.generation, "host_generation_changed");
+            ensure!(found.document_scope == self.document, "host_document_scope_changed");
+            ensure!(found.query == question, "host_query_plan_question_changed");
+            ensure!(found.coverage.indexed_files > 0, "host_jev_empty_corpus");
+            ensure!(found.coverage.reranked_candidates > 0 && found.metrics.jev_requests > 0, "host_jev_no_candidates");
+            let mut search = accounting.planned_success(index, &found)?;
+            let original_hits = found.hits.len();
+            let (value, payload) = loop {
+                let mut value = serde_json::to_value(&found)?;
+                // Full operation/provenance receipts remain in the private ledger/report.
+                // The reader receives coverage counts and only delivered source windows.
+                value.as_object_mut().expect("report object").remove("operations");
+                if let Some(coverage) = value["coverage"].as_object_mut() {
+                    coverage.remove("selected_spans");
+                }
+                value["host_delivery"] = json!({"omitted_hits":original_hits-found.hits.len()});
+                let payload = json!({"contentItems":[{"type":"inputText","text":value.to_string()}],"success":true});
+                if serde_json::to_vec(&payload)?.len() <= MAX_TOOL_BYTES - 256 {
+                    break (value, payload);
+                }
+                ensure!(!found.hits.is_empty(), "host_jev_seed_delivery_failed");
+                found.hits.pop();
+            };
+            ensure!(original_hits == 0 || !found.hits.is_empty(), "host_jev_seed_delivery_failed");
+            let mut evidence = vec![];
+            for hit in &found.hits {
+                self.known_nodes.insert(hit.node_id.clone());
+                self.issue(hit, &mut evidence)?;
+            }
+            search.delivered_hits = evidence.len();
+            search.output_truncated = found.hits.len() < original_hits;
+            search = accounting.delivery(&search)?;
+            let receipt = ToolReceipt {
+                call_id: call_id.into(),
+                tool: "gptgrep_search".into(),
+                arguments: args.clone(),
+                generation: self.generation.clone(),
+                success: true,
+                output_sha256: hash(&serde_json::to_vec(&payload)?),
+                evidence,
+                required_initial: true,
+                search: Some(search.clone()),
+            };
+            accounting.receipt(&receipt)?;
+            self.receipts.push(receipt);
+            self.last_search = Some(search);
+            self.initial_payload = Some(value);
+            Ok(())
+        }.await;
+        if let Err(error) = result {
+            self.known_nodes = prior_nodes;
+            self.issued = prior_issued;
+            self.receipts.truncate(prior_receipts);
+            self.initial_payload = None;
+            self.last_search = Some(accounting.failure(index, &error)?);
+            let payload = json!({"success":false,"error":"host_query_plan_retrieval_failed"});
+            let receipt = ToolReceipt {
+                call_id: call_id.into(),
+                tool: "gptgrep_search".into(),
+                arguments: args,
+                generation: self.generation.clone(),
+                success: false,
+                output_sha256: hash(&serde_json::to_vec(&payload)?),
+                evidence: vec![],
+                required_initial: true,
+                search: self.last_search.clone(),
+            };
+            accounting.receipt(&receipt)?;
+            self.receipts.push(receipt);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn ensure_generation(&self) -> Result<()> {
         ensure!(
             gptgrep_core::catalog(&self.root)?["generation"] == self.generation,

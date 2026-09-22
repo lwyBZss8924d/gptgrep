@@ -93,6 +93,11 @@ async fn sends_decisions_contract_and_preserves_model_and_usage() {
     assert_eq!(result.rankings[1].score, 0.5);
     assert_eq!(result.rankings[1].confidence, None);
     assert_eq!(result.usage["input_tokens"], 123);
+    assert_eq!(
+        result.provider_response_id.as_deref(),
+        Some("gen-dec-synthetic")
+    );
+    assert_eq!(result.provider.as_deref(), Some("TypeSafe"));
     let request = server.await.unwrap();
     let offset = request
         .windows(4)
@@ -168,4 +173,31 @@ async fn response_body_is_bounded_before_decoding() {
         .to_string();
     assert!(error.contains("byte limit"));
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn absent_provider_metadata_and_usage_remain_unavailable() {
+    let response = json!({"model":"typesafe/jev-fixture", "answers":{"candidate_0":{"type":"score","score":3.0}}});
+    let (endpoint, server) = serve_once("200 OK", response.to_string(), "").await;
+    let client = JevClient::with_endpoint("synthetic-test-key", None, &endpoint).unwrap();
+    let result = client
+        .rerank(
+            "query",
+            &[Candidate {
+                id: "id".into(),
+                text: "invented evidence".into(),
+            }],
+        )
+        .await
+        .unwrap();
+    assert!(result.provider_response_id.is_none());
+    assert!(result.provider.is_none());
+    assert!(result.usage.is_null());
+    server.await.unwrap();
+    let old_report: gptgrep_jev::RerankResponse = serde_json::from_value(
+        json!({"model":"typesafe/jev-fixture", "rankings":[], "usage":null}),
+    )
+    .unwrap();
+    assert!(old_report.provider_response_id.is_none());
+    assert!(old_report.provider.is_none());
 }

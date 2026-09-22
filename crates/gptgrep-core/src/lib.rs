@@ -1,8 +1,15 @@
 //! Source-bound document snapshots and vectorless retrieval orchestration.
 use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
-use gptgrep_jev::{Candidate, JevClient};
+use gptgrep_jev::{Candidate, JevClient, RerankResponse};
+
+mod planned;
 use gptgrep_pageindex::TreeNode;
+pub use planned::{
+    PlannedCoverage, PlannedSearchError, PlannedSearchEvent, PlannedSearchObserver,
+    PlannedSearchReport, PlannedSpanProvenance, PlannedViewCoverage,
+    search_planned_with_client_and_observer,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -226,6 +233,10 @@ pub struct JevSearchProgress {
     pub generation: Option<String>,
     /// Progress is nonterminal; final accounting belongs to the completed run.
     pub accounting_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_response_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 }
 
 pub type JevSearchObserver<'a> = dyn Fn(&JevSearchProgress) -> Result<()> + Send + Sync + 'a;
@@ -285,6 +296,7 @@ fn observe_jev(
     options: &SearchOptions,
     generation: &str,
     started: Instant,
+    reply: Option<&RerankResponse>,
 ) -> Result<()> {
     let Some(observer) = observer else {
         return Ok(());
@@ -299,6 +311,8 @@ fn observe_jev(
         document_scope: options.document.clone(),
         generation: Some(generation.into()),
         accounting_complete: false,
+        provider_response_id: reply.and_then(|reply| reply.provider_response_id.clone()),
+        provider: reply.and_then(|reply| reply.provider.clone()),
     };
     observer(&progress).map_err(|error| {
         let mut failure = jev_search_error(stage, error, metrics, coverage, options.document.as_deref(), Some(generation), started);
@@ -1117,14 +1131,7 @@ pub async fn search_with_client_and_observer(
     search_using_client(root, query, options, Some(client), Some(observer)).await
 }
 
-async fn search_using_client(
-    root: &Path,
-    query: &str,
-    options: &SearchOptions,
-    supplied_client: Option<&JevClient>,
-    observer: Option<&JevSearchObserver<'_>>,
-) -> Result<SearchReport> {
-    let started = Instant::now();
+fn validate_search_options(query: &str, options: &SearchOptions) -> Result<()> {
     ensure!(
         matches!(
             options.mode.as_str(),
@@ -1146,15 +1153,32 @@ async fn search_using_client(
         (1..=32).contains(&options.routing_docs),
         "routing-docs must be 1..32"
     );
-    let model_assisted = matches!(options.mode.as_str(), "hybrid" | "semantic");
     ensure!(
         options.min_score.is_finite() && (0.0..=1.0).contains(&options.min_score),
         "min-score must be a finite value in 0..1"
     );
+    Ok(())
+}
+
+struct CandidateBatch {
+    hits: Vec<Hit>,
+    coverage: Coverage,
+    warnings: Vec<String>,
+}
+
+async fn search_using_client(
+    root: &Path,
+    query: &str,
+    options: &SearchOptions,
+    supplied_client: Option<&JevClient>,
+    observer: Option<&JevSearchObserver<'_>>,
+) -> Result<SearchReport> {
+    let started = Instant::now();
+    validate_search_options(query, options)?;
+    let model_assisted = matches!(options.mode.as_str(), "hybrid" | "semantic");
     let snapshot = Snapshot::open(root)?;
     let scoped = scoped_documents(&snapshot.manifest.documents, options.document.as_deref())?;
-    let docs: HashMap<_, _> = scoped.iter().copied().map(|d| (d.id.as_str(), d)).collect();
-    let mut coverage = Coverage {
+    let coverage = Coverage {
         indexed_files: snapshot.manifest.documents.len(),
         scoped_files: scoped.len(),
         ..Default::default()
@@ -1177,6 +1201,73 @@ async fn search_using_client(
         })
     } else {
         None
+    };
+    let mut batch = collect_candidate_view(
+        &snapshot,
+        query,
+        options,
+        client.as_ref(),
+        observer,
+        &mut metrics,
+        started,
+    )
+    .await?;
+    if let Some(client) = client.as_ref() {
+        score_candidates(
+            &snapshot,
+            query,
+            options,
+            client,
+            observer,
+            &mut batch,
+            &mut metrics,
+            started,
+        )
+        .await?;
+    }
+    finish_candidate_batch(&snapshot, options, &mut batch);
+    let CandidateBatch {
+        hits,
+        coverage,
+        warnings,
+    } = batch;
+    metrics.elapsed_ms = started.elapsed().as_millis();
+    Ok(SearchReport {
+        schema_version: SCHEMA.into(),
+        query: query.into(),
+        mode: options.mode.clone(),
+        document_scope: options.document.clone(),
+        root: snapshot.manifest.root,
+        generation: snapshot.manifest.generation,
+        index_used: true,
+        source_fresh: if hits.is_empty() { None } else { Some(true) },
+        minimum_relevance_score: model_assisted.then_some(options.min_score),
+        hits,
+        coverage,
+        metrics,
+        warnings,
+    })
+}
+
+/// Construct bounded lexical/tree candidates without evidence reranking or the
+/// delivery limit. Both ordinary and planned searches use this exact stage.
+#[allow(clippy::too_many_arguments)]
+async fn collect_candidate_view(
+    snapshot: &Snapshot,
+    query: &str,
+    options: &SearchOptions,
+    client: Option<&JevClient>,
+    observer: Option<&JevSearchObserver<'_>>,
+    metrics: &mut Metrics,
+    started: Instant,
+) -> Result<CandidateBatch> {
+    let model_assisted = client.is_some();
+    let scoped = scoped_documents(&snapshot.manifest.documents, options.document.as_deref())?;
+    let docs: HashMap<_, _> = scoped.iter().copied().map(|d| (d.id.as_str(), d)).collect();
+    let mut coverage = Coverage {
+        indexed_files: snapshot.manifest.documents.len(),
+        scoped_files: scoped.len(),
+        ..Default::default()
     };
     let indexed_document = options
         .document
@@ -1362,17 +1453,18 @@ async fn search_using_client(
                 observer,
                 "document_routing",
                 "before_call",
-                &metrics,
+                metrics,
                 &coverage,
                 options,
                 &snapshot.manifest.generation,
                 started,
+                None,
             )?;
             let ranked = client.rerank(query, &routing).await.map_err(|error| {
                 jev_search_error(
                     "document_routing",
                     error,
-                    &metrics,
+                    metrics,
                     &coverage,
                     options.document.as_deref(),
                     Some(&snapshot.manifest.generation),
@@ -1380,17 +1472,18 @@ async fn search_using_client(
                 )
             })?;
             metrics.jev_requests += 1;
-            metrics.jev_models.push(ranked.model);
-            metrics.jev_usage.push(ranked.usage);
+            metrics.jev_models.push(ranked.model.clone());
+            metrics.jev_usage.push(ranked.usage.clone());
             observe_jev(
                 observer,
                 "document_routing",
                 "after_reply",
-                &metrics,
+                metrics,
                 &coverage,
                 options,
                 &snapshot.manifest.generation,
                 started,
+                Some(&ranked),
             )?;
             let mut ranks = ranked.rankings;
             ranks.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
@@ -1441,103 +1534,135 @@ async fn search_using_client(
         }
         coverage.truncated |= hits.len() > options.max_candidates;
         hits.truncate(options.max_candidates);
-        if !hits.is_empty() {
-            let candidates: Vec<_> = hits
-                .iter()
-                .enumerate()
-                .map(|(i, h)| Candidate {
-                    id: format!("c{i}"),
-                    text: format!(
-                        "Document: {}\nSection: {}\nEvidence: {}",
-                        h.path, h.title, h.text
-                    ),
-                })
-                .collect();
-            metrics.jev_candidate_bytes += candidates.iter().map(|c| c.text.len()).sum::<usize>();
-            metrics.jev_calls_attempted += 1;
-            observe_jev(
-                observer,
-                "evidence_reranking",
-                "before_call",
-                &metrics,
-                &coverage,
-                options,
-                &snapshot.manifest.generation,
-                started,
-            )?;
-            let ranked = client.rerank(query, &candidates).await.map_err(|error| {
-                jev_search_error(
-                    "evidence_reranking",
-                    error,
-                    &metrics,
-                    &coverage,
-                    options.document.as_deref(),
-                    Some(&snapshot.manifest.generation),
-                    started,
-                )
-            })?;
-            metrics.jev_requests += 1;
-            metrics.jev_models.push(ranked.model);
-            metrics.jev_usage.push(ranked.usage);
-            coverage.reranked_candidates = candidates.len();
-            observe_jev(
-                observer,
-                "evidence_reranking",
-                "after_reply",
-                &metrics,
-                &coverage,
-                options,
-                &snapshot.manifest.generation,
-                started,
-            )?;
-            let scores: HashMap<_, _> = ranked
-                .rankings
-                .into_iter()
-                .map(|r| (r.id.clone(), r))
-                .collect();
-            for (i, h) in hits.iter_mut().enumerate() {
-                let rank = scores.get(&format!("c{i}")).ok_or_else(|| {
-                    jev_search_error(
-                        "evidence_reranking",
-                        anyhow::anyhow!("Jev omitted a candidate"),
-                        &metrics,
-                        &coverage,
-                        options.document.as_deref(),
-                        Some(&snapshot.manifest.generation),
-                        started,
-                    )
-                })?;
-                h.score = rank.score;
-                h.confidence = rank.confidence;
-            }
-            let before_filter = hits.len();
-            coverage.retained_literal_anchors = hits
-                .iter()
-                .filter(|h| h.literal_anchor && h.score < options.min_score)
-                .count();
-            hits.retain(|h| h.literal_anchor || h.score >= options.min_score);
-            coverage.filtered_candidates = before_filter - hits.len();
-            hits.sort_by(|a, b| {
-                b.literal_anchor.cmp(&a.literal_anchor).then_with(|| {
-                    b.score
-                        .total_cmp(&a.score)
-                        .then(a.path.cmp(&b.path))
-                        .then(a.line_start.cmp(&b.line_start))
-                })
-            });
-        }
     }
     coverage.stale_files = known_stale_paths(&freshness, &docs);
     if !coverage.stale_files.is_empty() {
         warnings.push("Stale/deleted source documents were excluded; rerun index before relying on a negative result.".into());
     }
+    Ok(CandidateBatch {
+        hits,
+        coverage,
+        warnings,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn score_candidates(
+    snapshot: &Snapshot,
+    query: &str,
+    options: &SearchOptions,
+    client: &JevClient,
+    observer: Option<&JevSearchObserver<'_>>,
+    batch: &mut CandidateBatch,
+    metrics: &mut Metrics,
+    started: Instant,
+) -> Result<()> {
+    let CandidateBatch { hits, coverage, .. } = batch;
+    if !hits.is_empty() {
+        let candidates: Vec<_> = hits
+            .iter()
+            .enumerate()
+            .map(|(i, h)| Candidate {
+                id: format!("c{i}"),
+                text: format!(
+                    "Document: {}\nSection: {}\nEvidence: {}",
+                    h.path, h.title, h.text
+                ),
+            })
+            .collect();
+        metrics.jev_candidate_bytes += candidates.iter().map(|c| c.text.len()).sum::<usize>();
+        metrics.jev_calls_attempted += 1;
+        observe_jev(
+            observer,
+            "evidence_reranking",
+            "before_call",
+            metrics,
+            coverage,
+            options,
+            &snapshot.manifest.generation,
+            started,
+            None,
+        )?;
+        let ranked = client.rerank(query, &candidates).await.map_err(|error| {
+            jev_search_error(
+                "evidence_reranking",
+                error,
+                metrics,
+                coverage,
+                options.document.as_deref(),
+                Some(&snapshot.manifest.generation),
+                started,
+            )
+        })?;
+        metrics.jev_requests += 1;
+        metrics.jev_models.push(ranked.model.clone());
+        metrics.jev_usage.push(ranked.usage.clone());
+        coverage.reranked_candidates = candidates.len();
+        observe_jev(
+            observer,
+            "evidence_reranking",
+            "after_reply",
+            metrics,
+            coverage,
+            options,
+            &snapshot.manifest.generation,
+            started,
+            Some(&ranked),
+        )?;
+        let scores: HashMap<_, _> = ranked
+            .rankings
+            .into_iter()
+            .map(|r| (r.id.clone(), r))
+            .collect();
+        for (i, h) in hits.iter_mut().enumerate() {
+            let rank = scores.get(&format!("c{i}")).ok_or_else(|| {
+                jev_search_error(
+                    "evidence_reranking",
+                    anyhow::anyhow!("Jev omitted a candidate"),
+                    metrics,
+                    coverage,
+                    options.document.as_deref(),
+                    Some(&snapshot.manifest.generation),
+                    started,
+                )
+            })?;
+            h.score = rank.score;
+            h.confidence = rank.confidence;
+        }
+        let before_filter = hits.len();
+        coverage.retained_literal_anchors = hits
+            .iter()
+            .filter(|h| h.literal_anchor && h.score < options.min_score)
+            .count();
+        hits.retain(|h| h.literal_anchor || h.score >= options.min_score);
+        coverage.filtered_candidates = before_filter - hits.len();
+        hits.sort_by(|a, b| {
+            b.literal_anchor.cmp(&a.literal_anchor).then_with(|| {
+                b.score
+                    .total_cmp(&a.score)
+                    .then(a.path.cmp(&b.path))
+                    .then(a.line_start.cmp(&b.line_start))
+            })
+        });
+    }
+    Ok(())
+}
+
+fn finish_candidate_batch(
+    snapshot: &Snapshot,
+    options: &SearchOptions,
+    batch: &mut CandidateBatch,
+) {
+    let CandidateBatch { hits, coverage, .. } = batch;
     coverage.truncated |= hits.len() > options.limit;
     hits.truncate(options.limit);
     // Recheck selected originals after potentially slow remote inference.
     let mut final_freshness = HashMap::new();
     hits.retain(|h| {
-        let doc = docs
-            .values()
+        let doc = snapshot
+            .manifest
+            .documents
+            .iter()
             .find(|d| d.path == h.path)
             .expect("hit from manifest");
         if *final_freshness
@@ -1552,22 +1677,6 @@ async fn search_using_client(
             false
         }
     });
-    metrics.elapsed_ms = started.elapsed().as_millis();
-    Ok(SearchReport {
-        schema_version: SCHEMA.into(),
-        query: query.into(),
-        mode: options.mode.clone(),
-        document_scope: options.document.clone(),
-        root: snapshot.manifest.root,
-        generation: snapshot.manifest.generation,
-        index_used: true,
-        source_fresh: if hits.is_empty() { None } else { Some(true) },
-        minimum_relevance_score: model_assisted.then_some(options.min_score),
-        hits,
-        coverage,
-        metrics,
-        warnings,
-    })
 }
 
 /// Two linear passes preserve source/preorder while removing parents. Compute

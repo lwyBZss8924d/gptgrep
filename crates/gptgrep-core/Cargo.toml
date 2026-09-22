@@ -9,6 +9,7 @@ description = "Immutable document snapshots and evidence-grounded hybrid retriev
 [dependencies]
 anyhow = "1"
 fs2 = "0.4"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 gptgrep-index = { path = "../gptgrep-index" }
 gptgrep-jev = { path = "../gptgrep-jev" }
 gptgrep-pageindex = { path = "../gptgrep-pageindex" }
