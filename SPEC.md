@@ -76,8 +76,8 @@ benchmark repository's original local-OSS `results.json` is a separately labelle
 native reference: PageIndex Flash plus GPT-5.6 Luna/high reports 60/62 and
 $0.003607 estimated answering cost per question, excluding its shared one-off
 indexing cost. The first research-preview G5 gate requires one predeclared,
-independently confirmed complete-cohort GPTgrep configuration using GPT-5.6
-Luna or GPT-6 Luna at high, xhigh or max effort to achieve at least 61/62 and
+independently confirmed complete-cohort GPTgrep configuration using GPT-6
+Luna/Fast at high, xhigh or max effort to achieve at least 61/62 and
 strictly less than $0.003607 per question for GPTgrep answering (Codex
 reasoning plus Jev) over the same 62 tasks. Judge/evaluation cost is reported
 separately. Compute the G5 Codex dollar-equivalent cost from measured token
@@ -87,18 +87,23 @@ Fast API price-equivalent estimate separately. Neither is a ChatGPT subscription
 bill. The original PageIndex run does not declare Fast, so treating its original
 litellm estimate as Standard is a disclosed pricing-alignment inference, not
 observed provider-tier evidence. Missing answering usage or Jev cost blocks cost
-acceptance. Report GPTgrep cold indexing cost separately. The original
+acceptance for chargeable comparison attempts. Exclude only attempts with a
+bounded, observed communication/remote-service failure category from the
+experimental cost numerator; retain their count, any observed usage, and
+unknown actual billing separately. A generic legacy failure is not inferred to
+be a communication failure, and task failures stay in the 62-task quality
+denominator. Report GPTgrep cold indexing cost separately. The original
 PageIndex benchmark's `documents.json` has known indexing cost for 28 of 34
 PDFs; its $1.619953 is an incomplete subtotal, not a complete baseline index
 cost or a zero for the remaining six. Our
 qualified R8 live SDK/Codex adapter also reports 60/62 with Luna/max reader and
 retained paired tool evidence. Equal aggregate counts do not merge their answer,
 backend, effort, indexing-cost or timing provenance. The
-GPTgrep 5.6-versus-6 Luna ablation changes only the declared Codex builder and
-retrieval-worker model between its arms. For the user-selected first-release
-target, GPTgrep 6 Luna is compared with the frozen PageIndex Flash plus GPT-5.6
-Luna baseline; disclose that model difference and report the internal GPTgrep
-model ablation separately. Exploratory high/xhigh/max configurations must be
+Earlier GPTgrep 5.6-versus-6 Luna arms remain historical diagnostics; no new
+GPTgrep 5.6 runs or recoveries are required for this preview. For the
+user-selected first-release target, GPTgrep 6 Luna/Fast is compared with the
+frozen PageIndex Flash plus GPT-5.6 Luna baseline; disclose that model difference.
+Exploratory high/xhigh/max configurations must be
 labelled as such. Freeze a selected complete configuration before a fresh
 full-cohort confirmation; neither per-task best-of answers nor post-result task
 exclusions count. A cross-model whole-system gain cannot be attributed
