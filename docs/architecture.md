@@ -203,6 +203,18 @@ only normal search/read operations can issue citable evidence. Partial Jev
 failure is explicit and retains attempted-call accounting. Live quality benefit
 is not inferred from this integration alone.
 
+New enrichment plans may declare `--support-retries 0..2`. Only eligible Jev
+timeout, transport or transient HTTP failures can make at most two extra
+submissions across the whole ledger. Each uses the same prepared request bytes
+and a separate durable reservation, receipt and bounded backoff; unknown costs
+remain unknown. The default is zero, preserving older plan hashes. A terminal
+failed builder or support window can continue only with explicit
+`--resume --rebuild-failed-window CALL_ID`: completed windows and failed
+receipts remain, while the failed window's builder is a **new** model sample,
+never an identical replay of an unavailable legacy support payload. At most
+two rebuild admissions are allowed per ledger. Neither path retries a
+completed answer.
+
 
 ## Experimental query planning
 
@@ -229,6 +241,15 @@ model-attempt records retain identities, usage and unknowns on failures. Parent
 totals do not add nested totals twice; legacy `usage` covers only the final reader.
 Extra planning/routing work and candidate displacement are measured treatment
 costs. This feature makes no indexing, multi-reader voting or quality claim.
+
+`--experimental-source-continuation` is another default-off option for a
+single-document planned `ask`. It adds reader-only guidance to inspect verified
+adjacent tree/read nodes when a requested claim remains unresolved at a node
+boundary: `next_offset = null` ends that node, not the source inquiry. It does
+not grant unseen text citation authority or increase tool, time or output
+budgets. The flag and guidance digest are source-bound in the report; the
+disabled reader instructions remain byte-identical. Its quality effect needs
+a separately frozen full-cohort ablation.
 
 ## Experimental evidence roles
 
