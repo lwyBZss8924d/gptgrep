@@ -89,6 +89,7 @@ impl HostArgs {
             trace_path: self.protocol_trace,
             query_plan: None,
             navigation: None,
+            source_continuation: false,
         }
     }
 }
@@ -289,6 +290,8 @@ enum Command {
             help = "Experimental: one extra Luna query-planning turn before bounded parallel retrieval; Jev remains required"
         )]
         experimental_query_plan: bool,
+        #[arg(long, requires_all = ["experimental_query_plan", "document"], help = "Experimental: at node EOF, verify unresolved claims through scoped tree/read continuation within existing budgets")]
+        experimental_source_continuation: bool,
         #[arg(
             long,
             requires_all = ["experimental_query_plan", "document"],
@@ -389,6 +392,13 @@ fn contract() -> Value {
         "allowance":"declared additive Jev-only allowance; original call caps retained; each extra submission durably reserved and finished",
         "binding":"part of new plans; resume must retain the same value; legacy plans remain zero",
         "billing":"failed attempts and observed/unknown provider usage remain recorded; no inference of zero billing"
+    });
+    contract["commands"]["ask"]["options"]["experimental-source-continuation"] = json!({
+        "type":"boolean","default":false,"requires":["experimental-query-plan","document"],
+        "effect":"Reader guidance: node EOF is not evidence completeness; verify unresolved claims/referents using scoped verified tree/read nodes",
+        "budgets":"existing tool-call, deadline and output budgets; unresolved requirements at exhaustion yield insufficiency",
+        "citation_authority":"only issued source spans; no inferred unseen text or scope expansion",
+        "report_schema":"gptgrep.source-continuation.v1","additional_model_calls":0
     });
     contract
 }
@@ -659,6 +669,7 @@ async fn run(cli: Cli) -> Result<i32> {
             jev_model,
             document,
             experimental_query_plan,
+            experimental_source_continuation,
             navigation_overlay_sha256,
             navigation_max_jev_calls,
             navigation_max_request_bytes,
@@ -668,6 +679,7 @@ async fn run(cli: Cli) -> Result<i32> {
             let mut config = host.config();
             config.jev_model = jev_model;
             config.document = document;
+            config.source_continuation = experimental_source_continuation;
             config.navigation = navigation_overlay_sha256.map(|expected_overlay_sha256| {
                 gptgrep_host::NavigationConfig {
                     expected_overlay_sha256,
@@ -1116,6 +1128,65 @@ mod query_plan_cli_tests {
             "gpt-6-luna"
         );
         assert_eq!(schema["commands"]["enrich"]["plan_only_model_calls"], 0);
+    }
+
+    #[test]
+    fn source_continuation_requires_scoped_planned_ask_and_is_default_off() {
+        let plain = Cli::try_parse_from(["gptgrep", "ask", "invented query", "."]).unwrap();
+        assert!(matches!(
+            plain.command,
+            Some(Command::Ask {
+                experimental_source_continuation: false,
+                ..
+            })
+        ));
+        for extra in [
+            vec![],
+            vec!["--experimental-query-plan"],
+            vec!["--document", "notes.md"],
+        ] {
+            let mut args = vec![
+                "gptgrep",
+                "ask",
+                "invented query",
+                ".",
+                "--experimental-source-continuation",
+            ];
+            args.extend(extra);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        let selected = Cli::try_parse_from([
+            "gptgrep",
+            "ask",
+            "invented query",
+            ".",
+            "--experimental-source-continuation",
+            "--experimental-query-plan",
+            "--document",
+            "notes.md",
+        ])
+        .unwrap();
+        assert!(
+            matches!(selected.command, Some(Command::Ask { experimental_source_continuation: true, experimental_query_plan: true, document: Some(path), .. }) if path == "notes.md")
+        );
+        assert!(
+            Cli::try_parse_from([
+                "gptgrep",
+                "summarize",
+                "invented-node",
+                "--experimental-source-continuation"
+            ])
+            .is_err()
+        );
+        let schema = contract();
+        assert_eq!(
+            schema["commands"]["ask"]["options"]["experimental-source-continuation"]["default"],
+            false
+        );
+        assert_eq!(
+            schema["commands"]["ask"]["options"]["experimental-source-continuation"]["additional_model_calls"],
+            0
+        );
     }
 
     #[test]

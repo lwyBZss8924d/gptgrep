@@ -73,6 +73,7 @@ pub struct HostConfig {
     pub document: Option<String>,
     pub query_plan: Option<QueryPlanConfig>,
     pub navigation: Option<NavigationConfig>,
+    pub source_continuation: bool,
 }
 
 impl Default for HostConfig {
@@ -95,6 +96,7 @@ impl Default for HostConfig {
             document: None,
             query_plan: None,
             navigation: None,
+            source_continuation: false,
         }
     }
 }
@@ -127,6 +129,8 @@ pub struct HostReport {
     pub query_plan: Option<QueryPlanReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub navigation: Option<NavigationQueryReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_continuation: Option<Value>,
     #[serde(default)]
     pub model_attempts: Vec<ModelAttempt>,
     #[serde(default)]
@@ -308,6 +312,7 @@ async fn execute_with_client(
         usage_scope: "final_reader".into(),
         query_plan: query_plan_report.clone(),
         navigation: accounting.navigation(),
+        source_continuation: source_continuation_receipt(config),
         model_usage: model_attempts::summarize(&accounting.model_attempts()),
         model_attempts: accounting.model_attempts(),
         elapsed_ms:started.elapsed().as_millis(),
@@ -389,6 +394,7 @@ async fn execute_with_client(
 fn planner_runtime_config(config: &HostConfig, query_config: &QueryPlanConfig) -> HostConfig {
     let mut planner = config.clone();
     planner.navigation = None;
+    planner.source_continuation = false;
     planner.model = query_config.planner_model.clone();
     planner.service_tier = DEFAULT_SERVICE_TIER.into();
     planner.max_input_bytes = config.max_input_bytes.min(query_plan::MAX_PLAN_INPUT_BYTES);
@@ -601,7 +607,27 @@ fn validate_config(config: &HostConfig, question: &str) -> Result<()> {
             "host_navigation_requires_planned_document_ask"
         );
     }
+    if config.source_continuation {
+        ensure!(
+            config.query_plan.is_some()
+                && config
+                    .document
+                    .as_ref()
+                    .is_some_and(|path| !path.is_empty()),
+            "host_source_continuation_requires_scoped_planned_ask"
+        );
+    }
     Ok(())
+}
+
+fn source_continuation_receipt(config: &HostConfig) -> Option<Value> {
+    config.source_continuation.then(|| {
+        json!({
+            "schema_version":"gptgrep.source-continuation.v1", "enabled":true,
+            "document_scope":config.document,
+            "guidance_sha256":retrieval::hash(protocol::SOURCE_CONTINUATION_GUIDANCE.as_bytes())
+        })
+    })
 }
 
 pub(crate) fn final_schema() -> Value {

@@ -13,6 +13,19 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 
+pub(crate) const SOURCE_CONTINUATION_GUIDANCE: &str = "Source continuation policy: next_offset=null on an issued window means that node's EOF, not that the requested evidence is complete. If a requested claim, relation, or referent remains unresolved, inspect verified tree information and adjacent or related nodes within the same document scope, then read relevant source windows before finalizing. Use only node IDs exposed by the existing tools; never invent IDs, widen the document scope, infer unread text, or rely on stale source. Only issued source spans support citations; tree descriptors and navigation hints are not citable evidence. Stay within the existing tool-call, deadline, and output budgets. If a required claim remains unresolved when those budgets prevent further verification, state the unresolved limitation and return insufficient_evidence=true.";
+
+pub(crate) fn append_source_continuation(
+    instructions: &mut String,
+    enabled: bool,
+    retrieval: bool,
+) {
+    if enabled && retrieval {
+        instructions.push('\n');
+        instructions.push_str(SOURCE_CONTINUATION_GUIDANCE);
+    }
+}
+
 pub(crate) struct Outcome {
     pub thread_id: String,
     pub turn_id: String,
@@ -261,6 +274,11 @@ pub(crate) async fn run_observed<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>
         instructions.push('\n');
         instructions.push_str(guidance);
     }
+    append_source_continuation(
+        &mut instructions,
+        config.source_continuation,
+        !is_completion,
+    );
     let thread = rpc
         .request(
             3,

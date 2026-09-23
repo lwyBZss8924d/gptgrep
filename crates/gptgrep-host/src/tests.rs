@@ -3,6 +3,8 @@ use super::*;
 mod mandatory;
 #[path = "protocol_error_tests.rs"]
 mod protocol_errors;
+#[path = "source_continuation_tests.rs"]
+mod source_continuation;
 #[path = "tool_budget_tests.rs"]
 mod tool_budget;
 use crate::{protocol, retrieval::Evidence};
@@ -924,7 +926,7 @@ async fn handshake_thread(
     dynamic: bool,
     requested_tier: &str,
     effective_tier: Option<Value>,
-) {
+) -> Value {
     let init = receive(reader).await;
     assert_eq!(init["method"], "initialize");
     assert_eq!(init["params"]["capabilities"]["experimentalApi"], true);
@@ -982,6 +984,7 @@ async fn handshake_thread(
         result["serviceTier"] = tier;
     }
     send(writer, json!({"id":3,"result":result})).await;
+    thread
 }
 async fn handshake_turn(
     reader: &mut Reader,
