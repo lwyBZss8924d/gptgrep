@@ -77,10 +77,17 @@ native reference: PageIndex Flash plus GPT-5.6 Luna/high reports 60/62 and
 $0.003607 estimated answering cost per question, excluding its shared one-off
 indexing cost. The first research-preview G5 gate requires one predeclared,
 independently confirmed complete-cohort GPTgrep configuration using GPT-6
-Luna/Fast at high, xhigh or max effort to achieve at least 61/62 and
+Luna/Fast at xhigh or max effort to achieve at least 61/62 and
 strictly less than $0.003607 per question for GPTgrep answering (Codex
 reasoning plus Jev) over the same 62 tasks. Judge/evaluation cost is reported
-separately. Compute the G5 Codex dollar-equivalent cost from measured token
+separately. Future GPTgrep candidate runs use GPT-6 Luna/Fast at xhigh or max
+for the builder, planner, reader **and judge**. The original PageIndex repository
+retains only aggregate `results.json`, not per-task predictions, so its original
+60/62 cannot be rescored with the new judge without rerunning the baseline;
+disclose this cross-judge limitation. The previously adapted R8 PageIndex
+per-task predictions can be independently rejudged as a separate reference,
+without reindexing or re-answering PageIndex, but cannot replace the original
+aggregate. Compute the G5 Codex dollar-equivalent cost from measured token
 usage at the pinned **Standard** API price card, plus observed Jev cost; the
 live experiment may request Fast for throughput. Also report an actual-tier
 Fast API price-equivalent estimate separately. Neither is a ChatGPT subscription
@@ -103,7 +110,7 @@ Earlier GPTgrep 5.6-versus-6 Luna arms remain historical diagnostics; no new
 GPTgrep 5.6 runs or recoveries are required for this preview. For the
 user-selected first-release target, GPTgrep 6 Luna/Fast is compared with the
 frozen PageIndex Flash plus GPT-5.6 Luna baseline; disclose that model difference.
-Exploratory high/xhigh/max configurations must be
+Future exploratory xhigh/max configurations must be
 labelled as such. Freeze a selected complete configuration before a fresh
 full-cohort confirmation; neither per-task best-of answers nor post-result task
 exclusions count. A cross-model whole-system gain cannot be attributed
