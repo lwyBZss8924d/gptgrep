@@ -38,6 +38,8 @@ class EnrichmentExecutionTests(unittest.TestCase):
         self.args = self.fixture.args
         self.args.stage = "plan"
         self.args.model = self.args.planner_model = "gpt-6-luna"
+        self.args.judge_model = "gpt-6-luna"
+        self.args.judge_reasoning_effort = "max"
         self.args.experimental_query_plan = self.args.experimental_enrichment = True
         self.args.experimental_evidence_roles = False
         self.args.builder_model = None
@@ -410,22 +412,43 @@ class EnrichmentExecutionTests(unittest.TestCase):
         self.assertEqual(set(refs), {"original_pageindex_results", "adapted_trace_summary"})
         self.assertNotEqual(refs["original_pageindex_results"]["scope"], refs["adapted_trace_summary"]["scope"])
 
-    def test_high_and_xhigh_profiles_are_explicit_and_must_match_across_roles(self):
-        self.args.reasoning_effort = self.args.builder_reasoning_effort = "high"
+    def test_max_and_xhigh_profiles_are_explicit_and_must_match_across_roles(self):
+        self.args.reasoning_effort = self.args.builder_reasoning_effort = "max"
         planned = self.plan()
-        for role in ("builder", "query_planner", "chat"):
-            self.assertEqual(planned["profile"]["roles"][role]["reasoning_effort"], "high")
+        for role in ("builder", "query_planner", "chat", "judge"):
+            self.assertEqual(planned["profile"]["roles"][role]["model"], "gpt-6-luna")
+            self.assertEqual(planned["profile"]["roles"][role]["reasoning_effort"], "max")
+            self.assertEqual(planned["profile"]["roles"][role]["service_tier"], "fast")
         result = self.run_enriched()
         self.assertEqual(result["status"], "completed", result.get("enrichment_result"))
         request = next(builder.read_json(path) for path in (self.args.run_dir / "calls").glob("*.request.json")
                        if builder.read_json(path).get("operation") == "ask")
-        self.assertEqual(request["planner_reasoning_effort"], "high")
+        self.assertEqual(request["planner_reasoning_effort"], "max")
         self.args.run_dir = self.fixture.root / "xhigh-run"
-        self.args.reasoning_effort = self.args.builder_reasoning_effort = "xhigh"
+        self.args.reasoning_effort = self.args.builder_reasoning_effort = self.args.judge_reasoning_effort = "xhigh"
         self.assertEqual(self.plan()["profile"]["roles"]["builder"]["reasoning_effort"], "xhigh")
-        self.args.builder_reasoning_effort = "high"
+        self.args.builder_reasoning_effort = "max"
         with self.assertRaisesRegex(ValueError, "profiles_must_match"):
             self.plan()
+
+    def test_new_enriched_runs_reject_old_model_effort_or_implicit_judge(self):
+        original = vars(self.args).copy()
+        for changed in ({"model": "gpt-5.6-luna"}, {"reasoning_effort": "high"},
+                        {"judge_model": None}, {"judge_reasoning_effort": "high"}, {"service_tier": "default"}):
+            vars(self.args).clear(); vars(self.args).update(original); vars(self.args).update(changed)
+            with self.assertRaisesRegex(ValueError, "enrichment_.*(gpt6|profiles_must_match)"):
+                self.plan()
+        self.assertEqual((self.counts["index"], self.counts["enrich"], self.counts["ask"], self.counts["judge"]), (0, 0, 0, 0))
+
+    def test_judge_profile_change_requires_new_immutable_run_identity(self):
+        planned = self.plan()
+        self.assertEqual(planned["enrichment"]["model_policy"], "gpt6_fast_xhigh_or_max_all_model_roles_v1")
+        manifest = (self.args.run_dir / "manifest.json").read_bytes()
+        self.args.judge_reasoning_effort = "xhigh"
+        with self.assertRaisesRegex(ValueError, "conditions changed"):
+            self.plan()
+        self.assertEqual((self.args.run_dir / "manifest.json").read_bytes(), manifest)
+        self.assertEqual((self.counts["enrich"], self.counts["ask"], self.counts["judge"]), (0, 0, 0))
 
     def test_explicit_capacity_arguments_and_price_card_digest_are_frozen(self):
         self.args.enrich_window_bytes = 32768

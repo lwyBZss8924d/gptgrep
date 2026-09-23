@@ -113,10 +113,13 @@ def enrichment_config(args, profile):
     reader = profile["roles"]["chat"]
     builder = {"model": getattr(args, "builder_model", None) or reader["model"],
                "reasoning_effort": getattr(args, "builder_reasoning_effort", None) or reader["reasoning_effort"], "service_tier": "fast"}
-    bm.require(builder["reasoning_effort"] in ("high", "xhigh", "max"), "enrichment_builder_effort_invalid")
+    bm.require(builder["model"] == "gpt-6-luna" and builder["reasoning_effort"] in ("xhigh", "max"),
+               "enrichment_requires_gpt6_xhigh_or_max")
     bm.require(reader == builder == selected_planner_profile(args), "enrichment_builder_planner_reader_profiles_must_match")
-    bm.require(profile["roles"]["judge"] == {"model": "gpt-5.6-luna", "reasoning_effort": "high", "service_tier": "fast"}
-               and args.jev_model == "typesafe/jev-1.13", "enrichment_fixed_judge_or_jev_profile_changed")
+    judge = profile["roles"]["judge"]
+    bm.require(judge["model"] == "gpt-6-luna" and judge["reasoning_effort"] in ("xhigh", "max")
+               and judge["service_tier"] == "fast", "enrichment_requires_explicit_gpt6_fast_xhigh_or_max_judge")
+    bm.require(args.jev_model == "typesafe/jev-1.13", "enrichment_fixed_jev_profile_changed")
     values = {
         "builder": builder, "jev_model": args.jev_model,
         "max_builder_calls": getattr(args, "max_builder_calls", None),
@@ -1292,7 +1295,8 @@ def execute(args) -> dict:
                                     "prepared_binding": "enrichment/prepared.json", "reader_binding": "enrichment/ready.json",
                                     "no_reader_fallback": True, "no_failed_call_retry": True,
                                     "logical_primary_model_turn_upper_bound": enrichment["max_builder_calls"] + 3 * len(rows),
-                                    "scope": "Deterministic index, separate raw-only builder, selected-model planner/reader, fixed judge/Jev"})
+                                    "scope": "Deterministic index, separate raw-only builder, selected-model planner/reader, separately bound GPT-6 judge, fixed Jev",
+                                    "model_policy": "gpt6_fast_xhigh_or_max_all_model_roles_v1"})
         manifest["price_card"] = {"path": str(price_path), "sha256": locks.digest(price_path), "card_id": args._price_card["card_id"],
                                   "schema_version": args._price_card["schema_version"]}
         manifest["cost_comparison_policy"] = {
@@ -1303,6 +1307,7 @@ def execute(args) -> dict:
             "qa_strict_threshold_usd_equivalent": _builder_models().QA_COST_THRESHOLD,
             "full_cohort_questions": 62, "quality_min_correct": 61,
             "actual_chatgpt_billing_observed": False, "missing_metering_or_receipts": "unavailable; gate does not pass",
+            "original_baseline_judge_comparison": "Original aggregate has no retained per-task predictions to rejudge; GPT-6 judge comparison is cross-protocol. Adapted R8 rejudgments remain separate references.",
         }
         manifest["adapter_files"]["native_builder_models.py"] = locks.digest(REPO / "scripts/pageindex_baseline/native_builder_models.py")
         manifest["query_strategy"]["navigation"] = {
