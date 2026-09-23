@@ -2,7 +2,8 @@
 use crate::{
     CompletionReport, HostConfig, completion,
     enrich_accounting::{
-        self, CallKind, EnrichCallSummary, Event, Ledger, Observation, Receipt, Reservation,
+        self, CallKind, EnrichCallSummary, Event, FailureCategory, FailureInfo, Ledger,
+        Observation, Receipt, Reservation,
     },
     protocol,
     retrieval::hash,
@@ -41,6 +42,12 @@ pub struct EnrichConfig {
     /// Explicit private append-only ledger. Existing files require resume=true.
     pub ledger_path: PathBuf,
     pub resume: bool,
+    /// Explicitly rebuild the first uncommitted window after this finished failed call.
+    /// This is a new builder sample, not an identical support-request retry.
+    pub rebuild_failed_window: Option<usize>,
+    /// Whole-ledger allowance for extra same-request Jev submissions after typed
+    /// communication failures. Bound into new plans; default zero preserves legacy plans.
+    pub support_retries: usize,
     /// Optional external freeze. The computed plan must match before ledger admission.
     pub expected_plan_sha256: Option<String>,
     pub window_bytes: usize,
@@ -64,6 +71,8 @@ impl Default for EnrichConfig {
             },
             ledger_path: PathBuf::new(),
             resume: false,
+            rebuild_failed_window: None,
+            support_retries: 0,
             expected_plan_sha256: None,
             window_bytes: 8192,
             max_hints_per_window: MAX_HINTS_PER_WINDOW,
@@ -104,6 +113,10 @@ pub struct EnrichReport {
     /// A publication/storage failure may require checking the exact prepared artifact.
     pub publication_state: String,
     pub elapsed_ms: u128,
+    #[serde(default)]
+    pub recovery: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failed_call: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +142,12 @@ pub struct EnrichBinding {
     pub builder_schema_sha256: String,
     pub support_prompt_sha256: String,
     pub support_schema_sha256: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub support_retries: usize,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 pub(crate) type BuildBinding = EnrichBinding;
@@ -223,7 +242,12 @@ pub fn plan_enrichment(root: &Path, config: &EnrichConfig) -> Result<EnrichmentP
         binding,
         unit_count: units.len(),
         worst_case_builder_calls: units.len(),
-        worst_case_jev_calls: units.len(),
+        worst_case_jev_calls: units.len()
+            + if units.is_empty() {
+                0
+            } else {
+                config.support_retries
+            },
         documents,
         units,
         plan_sha256,
@@ -339,6 +363,11 @@ impl Backend for PlanningBackend {
 fn validate_config(config: &EnrichConfig) -> Result<()> {
     crate::validate_config(&config.host, "enrich")?;
     ensure!(
+        config.rebuild_failed_window.is_none() || config.resume,
+        "enrich_rebuild_requires_resume"
+    );
+    ensure!(config.support_retries <= 2, "enrich_support_retry_limit");
+    ensure!(
         config.host.query_plan.is_none()
             && config.host.document.is_none()
             && config.host.trace_path.is_none(),
@@ -393,6 +422,7 @@ fn binding(
         ))?),
         support_prompt_sha256: hash(SUPPORT_INSTRUCTIONS.as_bytes()),
         support_schema_sha256: hash(&serde_json::to_vec(&support_question("HINT_ID"))?),
+        support_retries: config.support_retries,
     })
 }
 
@@ -579,6 +609,88 @@ fn observe_jev(report: &DecisionResponse) -> Observation {
     }
 }
 
+fn failure_info(error: &anyhow::Error, kind: CallKind) -> FailureInfo {
+    let mut result = FailureInfo {
+        category: FailureCategory::Unknown,
+        http_status_code: None,
+        codex_error_info: None,
+        protocol_error_kind: None,
+        server_retry_notifications: None,
+    };
+    if error.downcast_ref::<crate::CompletionError>().is_some() {
+        result.category = FailureCategory::Validation;
+    } else if let Some(error) = error.downcast_ref::<crate::HostProtocolError>() {
+        result.http_status_code = error.http_status_code;
+        result.codex_error_info = error.codex_error_info;
+        result.protocol_error_kind = Some(error.kind);
+        result.server_retry_notifications = Some(error.server_retry_notifications);
+        result.category = if !matches!(
+            error.kind,
+            crate::HostProtocolErrorKind::TerminalError | crate::HostProtocolErrorKind::FailedTurn
+        ) || matches!(
+            error.codex_error_info,
+            Some(
+                crate::CodexErrorInfo::CyberPolicy
+                    | crate::CodexErrorInfo::MisalignmentPolicyViolation
+                    | crate::CodexErrorInfo::Unauthorized
+                    | crate::CodexErrorInfo::BadRequest
+                    | crate::CodexErrorInfo::ContextWindowExceeded
+                    | crate::CodexErrorInfo::SessionBudgetExceeded
+                    | crate::CodexErrorInfo::UsageLimitExceeded
+            )
+        ) {
+            FailureCategory::Protocol
+        } else if error.http_status_code.is_some() {
+            FailureCategory::Http
+        } else if matches!(
+            error.codex_error_info,
+            Some(
+                crate::CodexErrorInfo::ServerOverloaded
+                    | crate::CodexErrorInfo::RateLimitExceeded
+                    | crate::CodexErrorInfo::InternalServerError
+                    | crate::CodexErrorInfo::HttpConnectionFailed
+                    | crate::CodexErrorInfo::ResponseStreamConnectionFailed
+                    | crate::CodexErrorInfo::ResponseStreamDisconnected
+            )
+        ) {
+            FailureCategory::Transport
+        } else {
+            FailureCategory::Protocol
+        };
+    } else {
+        // Only owner-defined sanitized transport strings are interpreted. Arbitrary
+        // provider messages are neither copied nor used to infer a transient cause.
+        let message = error.to_string();
+        if matches!(
+            message.as_str(),
+            "host_model_attempt_timeout" | "host_deadline_exceeded" | "enrich_support_timeout"
+        ) || message
+            == "Jev request timed out; usage may be unknown and the request was not retried"
+        {
+            result.category = FailureCategory::Timeout;
+        } else if kind == CallKind::Jev {
+            if message
+                == "Jev transport failed; usage may be unknown and the request was not retried"
+            {
+                result.category = FailureCategory::Transport;
+            } else if let Some(status) = message
+                .strip_prefix("Jev provider returned HTTP ")
+                .and_then(|value| value.strip_suffix("; request was not retried"))
+                .and_then(|value| value.parse::<u16>().ok())
+                .filter(|status| (100..=599).contains(status))
+            {
+                result.category = FailureCategory::Http;
+                result.http_status_code = Some(status);
+            } else if message.starts_with("Jev response ")
+                || message.starts_with("Prepared Jev decision ")
+            {
+                result.category = FailureCategory::Validation;
+            }
+        }
+    }
+    result
+}
+
 async fn process_window(
     window: &NavigationDocumentWindow,
     preflight_bytes: usize,
@@ -607,59 +719,125 @@ async fn process_window(
         .complete(state, schema, &config.host, call_deadline)
         .await;
     let observed = completed.as_ref().ok().map(observe_completion);
+    let mut failure = completed
+        .as_ref()
+        .err()
+        .map(|error| failure_info(error, CallKind::Builder));
+    let partial_usage = completed
+        .as_ref()
+        .err()
+        .and_then(|error| error.downcast_ref::<crate::HostProtocolError>())
+        .and_then(|error| enrich_accounting::builder_usage(error.usage.as_ref()));
     let drafts = completed
         .map_err(|_| anyhow!("enrich_builder_call_failed"))
         .and_then(|report| validate_drafts(&report.value, &anchor, config.max_hints_per_window));
+    if drafts.is_err() && failure.is_none() {
+        failure = Some(FailureInfo {
+            category: FailureCategory::Validation,
+            http_status_code: None,
+            codex_error_info: None,
+            protocol_error_kind: None,
+            server_retry_notifications: None,
+        });
+    }
     ledger.append(Event::CallFinished {
         receipt: Receipt {
             call_id: builder_call_id,
             elapsed_ms: started.elapsed().as_millis().try_into()?,
             error_code: drafts.as_ref().err().map(|error| error.to_string()),
             observed,
+            failure,
+            partial_usage,
         },
     })?;
     let drafts = drafts?;
     let (jev_call_id, support) = if drafts.is_empty() {
         (None, vec![])
     } else {
-        let prepared = prepare_support(backend, window, &drafts)
-            .map_err(|_| anyhow!("enrich_support_preparation_failed"))?;
-        ensure!(
-            prepared.body_bytes() <= preflight_bytes
-                && prepared.requested_model() == ledger.binding.jev_model,
-            "enrich_support_envelope_changed"
-        );
-        ensure!(
-            tokio::time::Instant::now() < deadline,
-            "enrich_deadline_inside_window"
-        );
-        let call_id = ledger.reservations.len();
-        ledger.append(Event::CallReserved {
-            reservation: Reservation {
+        let mut retry: Option<enrich_accounting::SupportRetryAdmission> = None;
+        let (call_id, support) = loop {
+            if let Some(admission) = &retry {
+                let backoff = Duration::from_millis(admission.backoff_ms);
+                ensure!(
+                    tokio::time::Instant::now() + backoff < deadline,
+                    "enrich_support_timeout"
+                );
+                tokio::time::sleep(backoff).await;
+            }
+            let prepared = prepare_support(backend, window, &drafts)
+                .map_err(|_| anyhow!("enrich_support_preparation_failed"))?;
+            ensure!(
+                prepared.body_bytes() <= preflight_bytes
+                    && prepared.requested_model() == ledger.binding.jev_model,
+                "enrich_support_envelope_changed"
+            );
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "enrich_deadline_inside_window"
+            );
+            let call_id = ledger.reservations.len();
+            let reservation = Reservation {
                 call_id,
                 kind: CallKind::Jev,
-                anchor_id: anchor,
+                anchor_id: anchor.clone(),
                 requested_model: prepared.requested_model().into(),
                 request_sha256: prepared.body_sha256().into(),
                 request_bytes: prepared.body_bytes(),
-            },
-        })?;
-        let started = Instant::now();
-        let result = tokio::time::timeout_at(deadline, backend.submit(prepared))
-            .await
-            .map_err(|_| anyhow!("enrich_support_timeout"))
-            .and_then(|result| result.map_err(|_| anyhow!("enrich_support_call_failed")));
-        let observed = result.as_ref().ok().map(observe_jev);
-        let support = result.and_then(|response| supported(&response, drafts.len()));
-        ledger.append(Event::CallFinished {
-            receipt: Receipt {
-                call_id,
-                elapsed_ms: started.elapsed().as_millis().try_into()?,
-                error_code: support.as_ref().err().map(|error| error.to_string()),
-                observed,
-            },
-        })?;
-        (Some(call_id), support?)
+            };
+            if let Some(admission) = retry.take() {
+                ledger.reserve_support_retry(admission, reservation)?;
+            } else {
+                ledger.append(Event::CallReserved { reservation })?;
+            }
+            let started = Instant::now();
+            let result = tokio::time::timeout_at(deadline, backend.submit(prepared))
+                .await
+                .map_err(|_| anyhow!("enrich_support_timeout"))
+                .and_then(|result| result);
+            let observed = result.as_ref().ok().map(observe_jev);
+            let mut failure = result
+                .as_ref()
+                .err()
+                .map(|error| failure_info(error, CallKind::Jev));
+            let support = result
+                .map_err(|error| {
+                    if error.to_string() == "enrich_support_timeout" {
+                        error
+                    } else {
+                        anyhow!("enrich_support_call_failed")
+                    }
+                })
+                .and_then(|response| supported(&response, drafts.len()));
+            if support.is_err() && failure.is_none() {
+                failure = Some(FailureInfo {
+                    category: FailureCategory::Validation,
+                    http_status_code: None,
+                    codex_error_info: None,
+                    protocol_error_kind: None,
+                    server_retry_notifications: None,
+                });
+            }
+            ledger.append(Event::CallFinished {
+                receipt: Receipt {
+                    call_id,
+                    elapsed_ms: started.elapsed().as_millis().try_into()?,
+                    error_code: support.as_ref().err().map(|error| error.to_string()),
+                    observed,
+                    failure,
+                    partial_usage: None,
+                },
+            })?;
+            match support {
+                Ok(support) => break (call_id, support),
+                Err(error) => {
+                    retry = ledger.support_retry(call_id);
+                    if retry.is_none() {
+                        return Err(error);
+                    }
+                }
+            }
+        };
+        (Some(call_id), support)
     };
     let completed = CompletedWindow {
         document: window.document.clone(),
@@ -749,12 +927,22 @@ async fn enrich_with(
     let plan = plan_enrichment(&root, config)?;
     let source = plan.binding.source.clone();
     let paths = document_paths(&root, &source)?;
-    let mut ledger = Ledger::open(
-        &config.ledger_path,
-        plan.binding.clone(),
-        &plan.plan_sha256,
-        config.resume,
-    )?;
+    let mut ledger = if let Some(failed_call_id) = config.rebuild_failed_window {
+        Ledger::open_for_rebuild(
+            &config.ledger_path,
+            plan.binding.clone(),
+            &plan.plan_sha256,
+            failed_call_id,
+        )?
+    } else {
+        Ledger::open(
+            &config.ledger_path,
+            plan.binding.clone(),
+            &plan.plan_sha256,
+            config.resume,
+        )?
+    };
+    let mut pending_rebuild = config.rebuild_failed_window;
     let reused = ledger.windows.len();
     let mut reused_validated = 0;
     let mut documents = vec![];
@@ -787,13 +975,26 @@ async fn enrich_with(
                     offset_bytes: offset,
                 });
                 let is_new = ordinal >= reused;
+                if is_new && let Some(failed_call_id) = pending_rebuild.take() {
+                    let (window, _, _) = admitted_window(&cursor, offset, config, backend)?;
+                    let (_, _, request_sha256, request_bytes) =
+                        builder_input(&window, &anchor_id(&window), config)?;
+                    ledger.admit_rebuild(
+                        failed_call_id,
+                        &anchor_id(&window),
+                        &request_sha256,
+                        request_bytes,
+                    )?;
+                }
                 if is_new {
                     let stop = if ordinal - reused >= config.max_windows_per_run {
                         Some("window_run_limit")
                     } else if tokio::time::Instant::now() >= deadline {
                         Some("deadline_checkpoint")
-                    } else if ledger.attempt_count(CallKind::Builder) >= config.max_builder_calls
-                        || ledger.attempt_count(CallKind::Jev) >= config.max_jev_calls
+                    } else if ledger.attempt_count(CallKind::Builder)
+                        >= ledger.effective_call_limit(CallKind::Builder)
+                        || ledger.attempt_count(CallKind::Jev)
+                            >= ledger.effective_call_limit(CallKind::Jev)
                     {
                         Some("cumulative_call_limit")
                     } else if !ledger.capacity_for_window() {
@@ -969,6 +1170,8 @@ async fn enrich_with(
         publication: ledger.publication.clone(),
         publication_state: publication_state.into(),
         elapsed_ms: started.elapsed().as_millis(),
+        recovery: ledger.recovery_summary(),
+        last_failed_call: ledger.last_failed_call(),
     })
 }
 

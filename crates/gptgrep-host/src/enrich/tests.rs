@@ -11,6 +11,14 @@ enum Mode {
     Failure,
     Pending,
     JevFailure,
+    JevTransport,
+    BuilderTimeout,
+    AlternateHint,
+    JevFlaky,
+    JevUnauthorized,
+    JevValidation,
+    JevNoSupport,
+    BuilderProtocolFailure,
     EscapedHints,
 }
 
@@ -49,7 +57,10 @@ impl Mock {
     fn last_reservation(&self, expected_kind: &str) -> Value {
         let bytes = fs::read_to_string(&self.ledger).unwrap();
         let last: Value = serde_json::from_str(bytes.lines().last().unwrap()).unwrap();
-        assert_eq!(last["payload"]["event"], "call_reserved");
+        assert!(matches!(
+            last["payload"]["event"].as_str(),
+            Some("call_reserved" | "support_retry_reserved")
+        ));
         assert_eq!(last["payload"]["reservation"]["kind"], expected_kind);
         last["payload"]["reservation"].clone()
     }
@@ -83,6 +94,15 @@ impl Backend for Mock {
         if matches!(self.mode, Mode::Failure) {
             return Err(anyhow!("PRIVATE_PROVIDER_TEXT"));
         }
+        if matches!(self.mode, Mode::BuilderTimeout) {
+            return Err(anyhow!("host_model_attempt_timeout"));
+        }
+        if matches!(self.mode, Mode::BuilderProtocolFailure) {
+            return Err(crate::HostProtocolError { kind: crate::HostProtocolErrorKind::TerminalError,
+                codex_error_info: Some(crate::CodexErrorInfo::ServerOverloaded), will_retry: Some(false), http_status_code: Some(503),
+                server_retry_notifications: 1, usage: Some(json!({"total":{"inputTokens":12,"outputTokens":5,"totalTokens":17},"PRIVATE":"not-retained"})),
+                accounting_complete: false, tool_budget: None }.into());
+        }
         if let Some(path) = &self.mutate_source {
             fs::write(path, "Changed source after planning.")?;
         }
@@ -91,6 +111,9 @@ impl Backend for Mock {
             Mode::Empty => json!({"hints":[]}),
             Mode::Foreign => json!({"hints":[{"anchor_id":"foreign","hint":"A topic."}]}),
             Mode::Control => json!({"hints":[{"anchor_id":anchor,"hint":"First\nsecond"}]}),
+            Mode::AlternateHint => {
+                json!({"hints":[{"anchor_id":anchor,"hint":"An independently regenerated local navigation description."}]})
+            }
             Mode::Mixed => {
                 json!({"hints":[{"anchor_id":anchor,"hint":"Copper bead topic."},{"anchor_id":anchor,"hint":"Nearby context required."},{"anchor_id":anchor,"hint":"Unsupported silver claim."}]})
             }
@@ -139,12 +162,34 @@ impl Backend for Mock {
         if matches!(self.mode, Mode::JevFailure) {
             return Err(anyhow!("PRIVATE_JEV_TEXT"));
         }
+        if matches!(self.mode, Mode::JevTransport) {
+            return Err(anyhow!(
+                "Jev transport failed; usage may be unknown and the request was not retried"
+            ));
+        }
+        if matches!(self.mode, Mode::JevFlaky) && ordinal <= 2 {
+            return Err(anyhow!(
+                "Jev request timed out; usage may be unknown and the request was not retried"
+            ));
+        }
+        if matches!(self.mode, Mode::JevUnauthorized) {
+            return Err(anyhow!(
+                "Jev provider returned HTTP 401; request was not retried"
+            ));
+        }
+        if matches!(self.mode, Mode::JevValidation) {
+            return Err(anyhow!(
+                "Jev response is invalid JSON or contains duplicate keys"
+            ));
+        }
         let answers = (0..count)
             .map(|index| {
                 (
                     format!("hint_{index}"),
                     DecisionAnswer::Choice {
-                        choice: if matches!(self.mode, Mode::Mixed) {
+                        choice: if matches!(self.mode, Mode::JevNoSupport) {
+                            "unsupported".into()
+                        } else if matches!(self.mode, Mode::Mixed) {
                             ["supported", "needs_context", "unsupported"][index].into()
                         } else {
                             "supported".into()
@@ -627,6 +672,497 @@ async fn enrich_symlink_and_concurrent_ledger_owners_fail_before_calls() -> Resu
             .await
             .is_err()
     );
+    Ok(())
+}
+
+// Convert only an invented temporary fixture to the historical receipt schema.
+// Real frozen ledgers are never rewritten by recovery code.
+fn legacy_receipt_fixture(path: &Path) -> Result<()> {
+    let mut previous: Option<String> = None;
+    let mut output = String::new();
+    for line in fs::read_to_string(path)?.lines() {
+        let mut line: Value = serde_json::from_str(line)?;
+        if let Some(receipt) = line
+            .get_mut("payload")
+            .and_then(|payload| payload.get_mut("receipt"))
+            .and_then(Value::as_object_mut)
+        {
+            receipt.remove("failure");
+            receipt.remove("partial_usage");
+        }
+        line["previous_sha256"] = json!(previous);
+        let digest = hash(&serde_json::to_vec(
+            &json!({"sequence":line["sequence"],"previous_sha256":line["previous_sha256"],"payload":line["payload"]}),
+        )?);
+        line["sha256"] = json!(digest);
+        previous = Some(digest);
+        output.push_str(&serde_json::to_string(&line)?);
+        output.push('\n');
+    }
+    fs::write(path, output)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn enrich_explicit_legacy_rebuild_preserves_windows_prefix_and_all_attempt_costs()
+-> Result<()> {
+    for failure in [Mode::Failure, Mode::JevFailure] {
+        let (directory, mut config) =
+            fixture(&"Invented copper and blue shelf notes.\n".repeat(10)).await?;
+        config.window_bytes = 83;
+        let count = plan_enrichment(directory.path(), &config)?.unit_count;
+        config.max_builder_calls = count;
+        config.max_jev_calls = count;
+        config.expected_plan_sha256 = Some(plan_enrichment(directory.path(), &config)?.plan_sha256);
+        config.max_windows_per_run = 1;
+        let mut backend = Mock::new(Mode::Hint, &config);
+        assert_eq!(
+            enrich_with(directory.path(), &config, &backend)
+                .await?
+                .status,
+            "incomplete"
+        );
+        config.resume = true;
+        config.max_windows_per_run = MAX_WINDOWS;
+        backend.mode = failure;
+        let failed = enrich_with(directory.path(), &config, &backend).await?;
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.windows_completed, 1);
+        let failed_call = failed.last_failed_call.as_ref().unwrap()["call_id"]
+            .as_u64()
+            .unwrap() as usize;
+        legacy_receipt_fixture(&config.ledger_path)?;
+        let origin = fs::read(&config.ledger_path)?;
+        assert!(
+            enrich_with(directory.path(), &config, &backend)
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read(&config.ledger_path)?, origin);
+        config.rebuild_failed_window = Some(failed_call);
+        backend.mode = Mode::AlternateHint;
+        let complete = enrich_with(directory.path(), &config, &backend).await?;
+        assert_eq!(complete.status, "complete");
+        assert_eq!(complete.windows_completed, count);
+        assert_eq!(complete.windows_reused, 1);
+        assert!(fs::read(&config.ledger_path)?.starts_with(&origin));
+        assert_eq!(
+            complete.recovery["admissions"][0]["failed_call_id"],
+            failed_call
+        );
+        assert_eq!(
+            complete.recovery["admissions"][0]["failure_classification"],
+            "legacy_unclassified"
+        );
+        assert_eq!(
+            complete.recovery["admissions"][0]["mode"],
+            "rebuild_failed_window_new_builder_sample"
+        );
+        assert_eq!(complete.recovery["original_max_builder_calls"], count);
+        assert_eq!(complete.recovery["effective_max_builder_calls"], count + 1);
+        assert_eq!(complete.builder.attempted_calls, count + 1);
+        assert_eq!(
+            complete.jev.attempted_calls,
+            count + usize::from(matches!(failure, Mode::JevFailure))
+        );
+        if matches!(failure, Mode::Failure) {
+            assert_eq!(complete.builder.missing_usage_calls, 1);
+            assert_eq!(complete.builder.known_total_tokens, Some(count as u64 * 10));
+        } else {
+            assert_eq!(complete.jev.missing_usage_calls, 1);
+            assert_eq!(
+                complete.builder.known_total_tokens,
+                Some((count + 1) as u64 * 10)
+            );
+        }
+        assert_eq!(complete.jev.known_total_tokens, Some(count as u64 * 13));
+        assert!(
+            !complete.last_failed_call.unwrap()["classification_available"]
+                .as_bool()
+                .unwrap()
+        );
+        let before_repeat = fs::read(&config.ledger_path)?;
+        assert!(
+            enrich_with(directory.path(), &config, &backend)
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read(&config.ledger_path)?, before_repeat);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn enrich_rebuild_caps_at_two_and_never_replays_validation_or_pending_calls() -> Result<()> {
+    let (directory, mut config) = fixture("Invented small source.").await?;
+    config.max_builder_calls = 1;
+    config.max_jev_calls = 1;
+    let backend = Mock::new(Mode::JevTransport, &config);
+    let mut failed = enrich_with(directory.path(), &config, &backend).await?;
+    config.resume = true;
+    for ordinal in 1..=2 {
+        config.rebuild_failed_window = Some(
+            failed.last_failed_call.as_ref().unwrap()["call_id"]
+                .as_u64()
+                .unwrap() as usize,
+        );
+        failed = enrich_with(directory.path(), &config, &backend).await?;
+        assert_eq!(failed.status, "failed");
+        assert_eq!(
+            failed.recovery["admissions"].as_array().unwrap().len(),
+            ordinal
+        );
+    }
+    config.rebuild_failed_window = Some(
+        failed.last_failed_call.as_ref().unwrap()["call_id"]
+            .as_u64()
+            .unwrap() as usize,
+    );
+    let prior = fs::read(&config.ledger_path)?;
+    assert!(
+        enrich_with(directory.path(), &config, &backend)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("rebuild_limit")
+    );
+    assert_eq!(fs::read(&config.ledger_path)?, prior);
+    assert_eq!(backend.calls.lock().unwrap().builder, 3);
+    assert_eq!(backend.calls.lock().unwrap().jev, 3);
+    for mode in [Mode::Foreign, Mode::Pending] {
+        let (root, mut config) = fixture("Invented small source.").await?;
+        let backend = Mock::new(mode, &config);
+        let _ = tokio::time::timeout(
+            Duration::from_millis(50),
+            enrich_with(root.path(), &config, &backend),
+        )
+        .await;
+        let prior = fs::read(&config.ledger_path)?;
+        config.resume = true;
+        config.rebuild_failed_window = Some(0);
+        assert!(enrich_with(root.path(), &config, &backend).await.is_err());
+        assert_eq!(fs::read(&config.ledger_path)?, prior);
+        assert_eq!(backend.calls.lock().unwrap().builder, 1);
+    }
+    Ok(())
+}
+
+#[test]
+fn enrich_failure_taxonomy_uses_safe_owner_metadata_without_provider_text() {
+    for (message, expected, status) in [
+        (
+            "Jev request timed out; usage may be unknown and the request was not retried",
+            FailureCategory::Timeout,
+            None,
+        ),
+        (
+            "Jev transport failed; usage may be unknown and the request was not retried",
+            FailureCategory::Transport,
+            None,
+        ),
+        (
+            "Jev provider returned HTTP 503; request was not retried",
+            FailureCategory::Http,
+            Some(503),
+        ),
+        (
+            "Jev provider returned HTTP 401; request was not retried",
+            FailureCategory::Http,
+            Some(401),
+        ),
+        (
+            "Jev response is invalid JSON or contains duplicate keys",
+            FailureCategory::Validation,
+            None,
+        ),
+        (
+            "PRIVATE arbitrary provider message",
+            FailureCategory::Unknown,
+            None,
+        ),
+    ] {
+        let failure = failure_info(&anyhow!(message), CallKind::Jev);
+        assert_eq!(failure.category, expected);
+        assert_eq!(failure.http_status_code, status);
+        assert!(!serde_json::to_string(&failure).unwrap().contains("PRIVATE"));
+    }
+    assert_eq!(
+        failure_info(
+            &crate::CompletionError::InvalidOutput.into(),
+            CallKind::Builder
+        )
+        .category,
+        FailureCategory::Validation
+    );
+    assert_eq!(
+        failure_info(&anyhow!("host_model_attempt_timeout"), CallKind::Builder).category,
+        FailureCategory::Timeout
+    );
+    for kind in [
+        crate::HostProtocolErrorKind::IdentityMismatch,
+        crate::HostProtocolErrorKind::MalformedError,
+    ] {
+        let error = crate::HostProtocolError {
+            kind,
+            codex_error_info: Some(crate::CodexErrorInfo::InternalServerError),
+            will_retry: Some(false),
+            http_status_code: Some(503),
+            server_retry_notifications: 2,
+            usage: None,
+            accounting_complete: false,
+            tool_budget: None,
+        };
+        let failure = failure_info(&error.into(), CallKind::Builder);
+        assert_eq!(failure.category, FailureCategory::Protocol);
+        assert_eq!(failure.protocol_error_kind, Some(kind));
+        assert_eq!(failure.server_retry_notifications, Some(2));
+    }
+}
+
+#[tokio::test]
+async fn enrich_typed_builder_timeout_can_be_explicitly_rebuilt() -> Result<()> {
+    let (root, mut config) = fixture("Invented small source.").await?;
+    config.max_builder_calls = 1;
+    config.max_jev_calls = 1;
+    let mut backend = Mock::new(Mode::BuilderTimeout, &config);
+    let failed = enrich_with(root.path(), &config, &backend).await?;
+    assert_eq!(
+        failed.last_failed_call.as_ref().unwrap()["failure"]["category"],
+        "timeout"
+    );
+    let prefix = fs::read(&config.ledger_path)?;
+    config.resume = true;
+    config.rebuild_failed_window = Some(0);
+    backend.mode = Mode::AlternateHint;
+    let complete = enrich_with(root.path(), &config, &backend).await?;
+    assert_eq!(complete.status, "complete");
+    assert_eq!(complete.builder.attempted_calls, 2);
+    assert_eq!(complete.builder.missing_usage_calls, 1);
+    assert_eq!(
+        complete.recovery["admissions"][0]["failure_classification"],
+        "timeout"
+    );
+    assert!(fs::read(&config.ledger_path)?.starts_with(&prefix));
+    Ok(())
+}
+
+#[tokio::test]
+async fn enrich_support_retries_keep_identical_requests_and_one_builder_sample_across_resume()
+-> Result<()> {
+    let (root, mut config) =
+        fixture(&"Invented local orchard and shelf notes.\n".repeat(9)).await?;
+    config.window_bytes = 89;
+    config.support_retries = 2;
+    config.max_windows_per_run = 1;
+    let count = plan_enrichment(root.path(), &config)?.unit_count;
+    config.max_builder_calls = count;
+    config.max_jev_calls = count;
+    let plan = plan_enrichment(root.path(), &config)?;
+    assert_eq!(plan.worst_case_jev_calls, count + 2);
+    config.expected_plan_sha256 = Some(plan.plan_sha256);
+    let backend = Mock::new(Mode::JevFlaky, &config);
+    let first = enrich_with(root.path(), &config, &backend).await?;
+    assert_eq!(first.status, "incomplete");
+    assert_eq!(first.windows_completed, 1);
+    assert_eq!(first.builder.attempted_calls, 1);
+    assert_eq!(first.jev.attempted_calls, 3);
+    let admissions = first.recovery["support_retry_admissions"]
+        .as_array()
+        .unwrap();
+    assert_eq!(admissions.len(), 2);
+    assert_eq!(admissions[0]["backoff_ms"], 250);
+    assert_eq!(admissions[1]["backoff_ms"], 500);
+    let rows: Vec<Value> = fs::read_to_string(&config.ledger_path)?
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<std::result::Result<_, _>>()?;
+    let reservations: Vec<_> = rows
+        .iter()
+        .filter_map(|row| row["payload"].get("reservation"))
+        .filter(|row| row["kind"] == "jev")
+        .collect();
+    assert_eq!(reservations.len(), 3);
+    assert!(reservations.iter().all(|row| row["request_sha256"]
+        == reservations[0]["request_sha256"]
+        && row["request_bytes"] == reservations[0]["request_bytes"]));
+    let prefix = fs::read(&config.ledger_path)?;
+    config.resume = true;
+    config.max_windows_per_run = MAX_WINDOWS;
+    let complete = enrich_with(root.path(), &config, &backend).await?;
+    assert_eq!(complete.status, "complete");
+    assert_eq!(complete.windows_reused, 1);
+    assert_eq!(complete.builder.attempted_calls, count);
+    assert_eq!(complete.jev.attempted_calls, count + 2);
+    assert_eq!(complete.jev.failed_calls, 2);
+    assert_eq!(complete.jev.missing_usage_calls, 2);
+    assert_eq!(complete.jev.known_total_tokens, Some(count as u64 * 13));
+    assert_eq!(
+        complete.recovery["support_retry_admissions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(fs::read(&config.ledger_path)?.starts_with(&prefix));
+    Ok(())
+}
+
+#[tokio::test]
+async fn enrich_support_retry_exhaustion_and_exclusions_are_bounded_and_explicit() -> Result<()> {
+    for mode in [
+        Mode::JevTransport,
+        Mode::JevUnauthorized,
+        Mode::JevValidation,
+        Mode::JevFailure,
+        Mode::JevNoSupport,
+    ] {
+        let (root, mut config) = fixture("Invented local notes.").await?;
+        config.support_retries = 2;
+        config.max_jev_calls = 1;
+        config.max_builder_calls = 1;
+        let backend = Mock::new(mode, &config);
+        let result = enrich_with(root.path(), &config, &backend).await?;
+        assert_eq!(result.builder.attempted_calls, 1);
+        let expected = if matches!(mode, Mode::JevTransport) {
+            3
+        } else {
+            1
+        };
+        assert_eq!(result.jev.attempted_calls, expected);
+        assert_eq!(
+            result.recovery["support_retry_admissions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            expected - 1
+        );
+        assert_eq!(
+            result.status,
+            if matches!(mode, Mode::JevNoSupport) {
+                "complete"
+            } else {
+                "failed"
+            }
+        );
+        if matches!(mode, Mode::JevNoSupport) {
+            assert_eq!(result.coverage.unwrap().hints, 0);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn enrich_window_rebuild_after_retry_exhaustion_preserves_the_global_retry_budget()
+-> Result<()> {
+    let (root, mut config) = fixture("Invented local notes.").await?;
+    config.support_retries = 2;
+    config.max_builder_calls = 1;
+    config.max_jev_calls = 1;
+    let mut backend = Mock::new(Mode::JevTransport, &config);
+    let failed = enrich_with(root.path(), &config, &backend).await?;
+    assert_eq!(failed.status, "failed");
+    assert_eq!(failed.jev.attempted_calls, 3);
+    let prefix = fs::read(&config.ledger_path)?;
+    config.resume = true;
+    config.rebuild_failed_window = Some(3);
+    backend.mode = Mode::AlternateHint;
+    let complete = enrich_with(root.path(), &config, &backend).await?;
+    assert_eq!(complete.status, "complete");
+    assert_eq!(complete.builder.attempted_calls, 2);
+    assert_eq!(complete.jev.attempted_calls, 4);
+    assert_eq!(
+        complete.recovery["support_retry_admissions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        complete.recovery["admissions"][0]["effective_max_jev_calls"],
+        4
+    );
+    assert_eq!(complete.recovery["effective_max_jev_calls"], 4);
+    assert!(fs::read(&config.ledger_path)?.starts_with(&prefix));
+    config.rebuild_failed_window = None;
+    assert_eq!(
+        enrich_with(root.path(), &config, &backend).await?.status,
+        "complete"
+    );
+    assert_eq!(backend.calls.lock().unwrap().jev, 4);
+    Ok(())
+}
+
+#[tokio::test]
+async fn enrich_retry_backoff_cannot_extend_deadline_and_policy_cannot_change_on_resume()
+-> Result<()> {
+    let (root, mut config) = fixture("Invented local notes.").await?;
+    config.support_retries = 2;
+    let plan = plan_enrichment(root.path(), &config)?;
+    let mut ledger = Ledger::open(&config.ledger_path, plan.binding, &plan.plan_sha256, false)?;
+    let backend = Mock::new(Mode::JevTransport, &config);
+    let cursor = gptgrep_core::open_navigation_document(root.path(), "notes.txt")?;
+    let (window, bytes, _) = admitted_window(&cursor, 0, &config, &backend)?;
+    {
+        // The fake completes synchronously. A budget below the 250ms minimum
+        // backoff must therefore return in one poll, never await a retry timer.
+        // Preparation/fsync may already exhaust that budget under parallel load;
+        // either zero or one initial send is valid, but no retry may be reserved.
+        let future = process_window(
+            &window,
+            bytes,
+            &config,
+            &backend,
+            &mut ledger,
+            tokio::time::Instant::now() + Duration::from_millis(30),
+        );
+        tokio::pin!(future);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            std::future::Future::poll(future.as_mut(), &mut context),
+            std::task::Poll::Ready(Err(_))
+        ));
+    }
+    assert!(backend.calls.lock().unwrap().jev <= 1);
+    assert!(
+        ledger.recovery_summary()["support_retry_admissions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    drop(ledger);
+    config.resume = true;
+    config.support_retries = 1;
+    let prefix = fs::read(&config.ledger_path)?;
+    assert!(enrich_with(root.path(), &config, &backend).await.is_err());
+    assert_eq!(fs::read(&config.ledger_path)?, prefix);
+    Ok(())
+}
+
+#[tokio::test]
+async fn enrich_typed_failure_preserves_partial_native_usage_without_invented_identity()
+-> Result<()> {
+    let (root, mut config) = fixture("Invented local notes.").await?;
+    config.max_builder_calls = 1;
+    config.max_jev_calls = 1;
+    let mut backend = Mock::new(Mode::BuilderProtocolFailure, &config);
+    let failed = enrich_with(root.path(), &config, &backend).await?;
+    assert_eq!(failed.builder.partial_usage_calls, 1);
+    assert_eq!(failed.builder.known_total_tokens, Some(17));
+    assert_eq!(failed.builder.unobserved_calls, 1);
+    assert!(failed.last_failed_call.as_ref().unwrap()["observed"].is_null());
+    assert_eq!(
+        failed.last_failed_call.as_ref().unwrap()["failure"]["http_status_code"],
+        503
+    );
+    assert!(!fs::read_to_string(&config.ledger_path)?.contains("PRIVATE"));
+    config.resume = true;
+    config.rebuild_failed_window = Some(0);
+    backend.mode = Mode::Hint;
+    let completed = enrich_with(root.path(), &config, &backend).await?;
+    assert_eq!(completed.status, "complete");
+    assert_eq!(completed.builder.known_total_tokens, Some(27));
+    assert_eq!(completed.builder.partial_usage_calls, 1);
+    assert_eq!(completed.builder.attempted_calls, 2);
     Ok(())
 }
 

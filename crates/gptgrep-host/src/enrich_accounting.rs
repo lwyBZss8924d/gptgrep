@@ -56,6 +56,73 @@ pub(crate) struct Receipt {
     pub elapsed_ms: u64,
     pub error_code: Option<String>,
     pub observed: Option<Observation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<FailureInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_usage: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FailureCategory {
+    Transport,
+    Timeout,
+    Http,
+    Validation,
+    Protocol,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FailureInfo {
+    pub category: FailureCategory,
+    pub http_status_code: Option<u16>,
+    pub codex_error_info: Option<crate::CodexErrorInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_error_kind: Option<crate::HostProtocolErrorKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_retry_notifications: Option<usize>,
+}
+impl FailureInfo {
+    fn allows_rebuild(&self) -> bool {
+        matches!(
+            self.category,
+            FailureCategory::Transport | FailureCategory::Timeout
+        ) || (self.category == FailureCategory::Http
+            && self
+                .http_status_code
+                .is_some_and(|status| matches!(status, 408 | 429 | 500..=599)))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SupportRetryAdmission {
+    pub mode: String,
+    pub ordinal: usize,
+    pub failed_call_id: usize,
+    pub retry_call_id: usize,
+    pub backoff_ms: u64,
+    pub failure: FailureInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RebuildAdmission {
+    pub mode: String,
+    pub ordinal: usize,
+    pub failed_call_id: usize,
+    pub failed_kind: CallKind,
+    pub failure_classification: String,
+    pub retired_call_start: usize,
+    pub retired_call_end: usize,
+    pub next_builder_call_id: usize,
+    pub anchor_id: String,
+    pub builder_input_sha256: String,
+    pub builder_input_bytes: usize,
+    pub effective_max_builder_calls: usize,
+    pub effective_max_jev_calls: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +147,13 @@ pub(crate) enum Event {
     },
     Failed {
         code: String,
+    },
+    WindowRebuildAdmitted {
+        admission: RebuildAdmission,
+    },
+    SupportRetryReserved {
+        admission: SupportRetryAdmission,
+        reservation: Reservation,
     },
     PublicationPrepared {
         artifact_sha256: String,
@@ -110,6 +184,8 @@ pub struct EnrichCallSummary {
     pub known_total_tokens: Option<u64>,
     pub missing_total_tokens: usize,
     pub total_tokens_overflowed: bool,
+    #[serde(default)]
+    pub partial_usage_calls: usize,
 }
 
 pub(crate) struct Ledger {
@@ -130,6 +206,8 @@ pub(crate) struct Ledger {
     builder_calls: usize,
     jev_calls: usize,
     committed_calls: usize,
+    rebuilds: Vec<RebuildAdmission>,
+    support_retries: Vec<SupportRetryAdmission>,
 }
 
 impl Ledger {
@@ -138,6 +216,25 @@ impl Ledger {
         binding: BuildBinding,
         plan_sha256: &str,
         resume: bool,
+    ) -> Result<Self> {
+        Self::open_mode(path, binding, plan_sha256, resume, None)
+    }
+
+    pub fn open_for_rebuild(
+        path: &Path,
+        binding: BuildBinding,
+        plan_sha256: &str,
+        failed_call_id: usize,
+    ) -> Result<Self> {
+        Self::open_mode(path, binding, plan_sha256, true, Some(failed_call_id))
+    }
+
+    fn open_mode(
+        path: &Path,
+        binding: BuildBinding,
+        plan_sha256: &str,
+        resume: bool,
+        rebuild: Option<usize>,
     ) -> Result<Self> {
         ensure!(path.is_absolute(), "enrich_ledger_path_must_be_absolute");
         no_symlinks(path)?;
@@ -188,6 +285,8 @@ impl Ledger {
             builder_calls: 0,
             jev_calls: 0,
             committed_calls: 0,
+            rebuilds: vec![],
+            support_retries: vec![],
         };
         if resume {
             ensure!(
@@ -212,15 +311,19 @@ impl Ledger {
                 ledger.previous_sha256 = Some(line.sha256);
                 ledger.bytes += raw.len() as u64;
             }
-            ensure!(!ledger.failed, "enrich_failed_build_cannot_resume");
             ensure!(
                 ledger.reservations.len() == ledger.receipts.len(),
                 "enrich_pending_call_blocks_resume"
             );
-            ensure!(
-                ledger.completed_call_count() == ledger.reservations.len(),
-                "enrich_uncommitted_window_blocks_resume"
-            );
+            if let Some(failed_call_id) = rebuild {
+                ledger.rebuild_admission(failed_call_id)?;
+            } else {
+                ensure!(!ledger.failed, "enrich_failed_build_cannot_resume");
+                ensure!(
+                    ledger.completed_call_count() == ledger.reservations.len(),
+                    "enrich_uncommitted_window_blocks_resume"
+                );
+            }
         } else {
             ledger.append(Event::Bound {
                 binding,
@@ -242,9 +345,167 @@ impl Ledger {
         }
     }
 
+    pub fn effective_call_limit(&self, kind: CallKind) -> usize {
+        match kind {
+            CallKind::Builder => self.binding.max_builder_calls + self.rebuilds.len(),
+            CallKind::Jev => {
+                self.binding.max_jev_calls + self.rebuilds.len() + self.support_retries.len()
+            }
+        }
+    }
+
+    fn rebuild_admission(&self, failed_call_id: usize) -> Result<RebuildAdmission> {
+        ensure!(
+            self.publication_prepared.is_none() && self.publication.is_none(),
+            "enrich_rebuild_publication_ineligible"
+        );
+        ensure!(self.rebuilds.len() < 2, "enrich_rebuild_limit");
+        ensure!(
+            self.reservations.len() == self.receipts.len()
+                && self.reservations.len().checked_sub(1) == Some(failed_call_id),
+            "enrich_rebuild_call_mismatch"
+        );
+        let start = self.completed_call_count();
+        let tail = self
+            .reservations
+            .get(start..)
+            .ok_or_else(|| anyhow!("enrich_rebuild_window_ineligible"))?;
+        ensure!(
+            (1..=2 + self.binding.support_retries).contains(&tail.len())
+                && tail[0].kind == CallKind::Builder
+                && (tail.len() == 1
+                    || (tail[1..].iter().all(|call| call.kind == CallKind::Jev)
+                        && self.receipts[start].error_code.is_none()
+                        && (start + 1..failed_call_id).all(|id| self.support_retries.iter().any(
+                            |retry| retry.failed_call_id == id && retry.retry_call_id == id + 1
+                        )))),
+            "enrich_rebuild_window_ineligible"
+        );
+        let failed = &self.receipts[failed_call_id];
+        ensure!(
+            matches!(
+                failed.error_code.as_deref(),
+                Some(
+                    "enrich_builder_call_failed"
+                        | "enrich_support_call_failed"
+                        | "enrich_support_timeout"
+                )
+            ),
+            "enrich_rebuild_failure_ineligible"
+        );
+        ensure!(
+            failed
+                .failure
+                .as_ref()
+                .is_none_or(FailureInfo::allows_rebuild),
+            "enrich_rebuild_failure_ineligible"
+        );
+        ensure!(
+            tail.iter().all(|call| call.anchor_id == tail[0].anchor_id),
+            "enrich_rebuild_window_ineligible"
+        );
+        let ordinal = self.rebuilds.len() + 1;
+        Ok(RebuildAdmission {
+            mode: "rebuild_failed_window_new_builder_sample".into(),
+            ordinal,
+            failed_call_id,
+            failed_kind: self.reservations[failed_call_id].kind,
+            failure_classification: failed
+                .failure
+                .as_ref()
+                .map(|failure| {
+                    serde_json::to_value(&failure.category)
+                        .expect("category")
+                        .as_str()
+                        .expect("category string")
+                        .to_owned()
+                })
+                .unwrap_or_else(|| "legacy_unclassified".into()),
+            retired_call_start: start,
+            retired_call_end: self.reservations.len(),
+            next_builder_call_id: self.reservations.len(),
+            anchor_id: tail[0].anchor_id.clone(),
+            builder_input_sha256: tail[0].request_sha256.clone(),
+            builder_input_bytes: tail[0].request_bytes,
+            effective_max_builder_calls: self.binding.max_builder_calls + ordinal,
+            effective_max_jev_calls: self.binding.max_jev_calls
+                + ordinal
+                + self.support_retries.len(),
+        })
+    }
+
+    pub fn admit_rebuild(
+        &mut self,
+        failed_call_id: usize,
+        anchor_id: &str,
+        builder_input_sha256: &str,
+        builder_input_bytes: usize,
+    ) -> Result<()> {
+        let admission = self.rebuild_admission(failed_call_id)?;
+        ensure!(
+            admission.anchor_id == anchor_id
+                && admission.builder_input_sha256 == builder_input_sha256
+                && admission.builder_input_bytes == builder_input_bytes,
+            "enrich_rebuild_source_changed"
+        );
+        ensure!(self.capacity_for_window(), "enrich_rebuild_ledger_capacity");
+        self.append(Event::WindowRebuildAdmitted { admission })
+    }
+
+    pub fn recovery_summary(&self) -> Value {
+        json!({"mode":"explicit_recovery_policies","max_admissions":2,"admissions":self.rebuilds,
+            "support_retry_limit":self.binding.support_retries,"support_retry_admissions":self.support_retries,
+            "original_max_builder_calls":self.binding.max_builder_calls,"original_max_jev_calls":self.binding.max_jev_calls,
+            "effective_max_builder_calls":self.effective_call_limit(CallKind::Builder),"effective_max_jev_calls":self.effective_call_limit(CallKind::Jev)})
+    }
+
+    pub fn support_retry(&self, failed_call_id: usize) -> Option<SupportRetryAdmission> {
+        if self.support_retries.len() >= self.binding.support_retries
+            || self.binding.support_retries > 2
+            || self.reservations.len() != self.receipts.len()
+            || self.reservations.len().checked_sub(1) != Some(failed_call_id)
+            || self.reservations[failed_call_id].kind != CallKind::Jev
+            || self.receipts[failed_call_id].error_code.is_none()
+        {
+            return None;
+        }
+        let failure = self.receipts[failed_call_id].failure.as_ref()?;
+        if !failure.allows_rebuild() {
+            return None;
+        }
+        let ordinal = self.support_retries.len() + 1;
+        Some(SupportRetryAdmission {
+            mode: "same_request_support_retry".into(),
+            ordinal,
+            failed_call_id,
+            retry_call_id: self.reservations.len(),
+            backoff_ms: 250 * ordinal as u64,
+            failure: failure.clone(),
+        })
+    }
+
+    pub fn reserve_support_retry(
+        &mut self,
+        admission: SupportRetryAdmission,
+        reservation: Reservation,
+    ) -> Result<()> {
+        self.append(Event::SupportRetryReserved {
+            admission,
+            reservation,
+        })
+    }
+
+    pub fn last_failed_call(&self) -> Option<Value> {
+        self.receipts.iter().rev().find(|receipt| receipt.error_code.is_some()).map(|receipt| json!({
+            "call_id":receipt.call_id,"kind":self.reservations[receipt.call_id].kind,"error_code":receipt.error_code,
+            "failure":receipt.failure,"classification_available":receipt.failure.is_some(),"partial_usage":receipt.partial_usage,
+            "elapsed_ms":receipt.elapsed_ms,"observed":receipt.observed}))
+    }
+
     fn apply(&mut self, event: &Event) -> Result<()> {
         ensure!(
-            self.publication.is_none() && !self.failed,
+            self.publication.is_none()
+                && (!self.failed || matches!(event, Event::WindowRebuildAdmitted { .. })),
             "enrich_ledger_terminal"
         );
         match event {
@@ -268,10 +529,7 @@ impl Ledger {
                     "enrich_request_binding_invalid"
                 );
                 let count = self.attempt_count(reservation.kind);
-                let limit = match reservation.kind {
-                    CallKind::Builder => self.binding.max_builder_calls,
-                    CallKind::Jev => self.binding.max_jev_calls,
-                };
+                let limit = self.effective_call_limit(reservation.kind);
                 ensure!(count < limit, "enrich_call_budget_exhausted");
                 let expected = match reservation.kind {
                     CallKind::Builder => &self.binding.builder_model,
@@ -295,29 +553,62 @@ impl Ledger {
                 );
                 self.receipts.push(receipt.clone());
             }
+            Event::SupportRetryReserved {
+                admission,
+                reservation,
+            } => {
+                let expected = self
+                    .support_retry(admission.failed_call_id)
+                    .ok_or_else(|| anyhow!("enrich_support_retry_ineligible"))?;
+                let prior = &self.reservations[admission.failed_call_id];
+                ensure!(
+                    serde_json::to_value(admission)? == serde_json::to_value(expected)?
+                        && reservation.call_id == admission.retry_call_id
+                        && reservation.kind == CallKind::Jev
+                        && reservation.anchor_id == prior.anchor_id
+                        && reservation.requested_model == prior.requested_model
+                        && reservation.request_sha256 == prior.request_sha256
+                        && reservation.request_bytes == prior.request_bytes,
+                    "enrich_support_retry_request_changed"
+                );
+                self.support_retries.push(admission.clone());
+                self.apply(&Event::CallReserved {
+                    reservation: reservation.clone(),
+                })?;
+            }
             Event::WindowCompleted { window } => {
                 let start = self.completed_call_count();
-                let end = start + 1 + usize::from(window.jev_call_id.is_some());
+                let end = window
+                    .jev_call_id
+                    .map_or(Some(start + 1), |id| id.checked_add(1))
+                    .ok_or_else(|| anyhow!("enrich_window_call_binding_invalid"))?;
                 ensure!(
                     self.reservations.len() == end
                         && self.receipts.len() == end
                         && window.builder_call_id == start
-                        && window.jev_call_id.is_none_or(|id| id == start + 1),
+                        && window.jev_call_id.is_none_or(|id| id > start)
+                        && end <= start + 2 + self.binding.support_retries,
                     "enrich_window_call_binding_invalid"
                 );
                 for call in start..end {
                     ensure!(
                         self.reservations[call].anchor_id == window.anchor.anchor_id
-                            && self.receipts[call].error_code.is_none()
-                            && self.receipts[call].observed.is_some(),
+                            && (if call == start || call + 1 == end {
+                                self.receipts[call].error_code.is_none()
+                                    && self.receipts[call].observed.is_some()
+                            } else {
+                                self.receipts[call].error_code.is_some()
+                                    && self.support_retries.iter().any(|retry| {
+                                        retry.failed_call_id == call
+                                            && retry.retry_call_id == call + 1
+                                    })
+                            }),
                         "enrich_window_receipt_invalid"
                     );
                 }
                 ensure!(
                     self.reservations[start].kind == CallKind::Builder
-                        && window
-                            .jev_call_id
-                            .is_none_or(|id| self.reservations[id].kind == CallKind::Jev),
+                        && (start + 1..end).all(|id| self.reservations[id].kind == CallKind::Jev),
                     "enrich_window_call_kind_invalid"
                 );
                 self.windows.push(window.clone());
@@ -328,6 +619,16 @@ impl Ledger {
                 "enrich_checkpoint_incomplete_window"
             ),
             Event::Failed { .. } => self.failed = true,
+            Event::WindowRebuildAdmitted { admission } => {
+                let expected = self.rebuild_admission(admission.failed_call_id)?;
+                ensure!(
+                    serde_json::to_value(admission)? == serde_json::to_value(&expected)?,
+                    "enrich_rebuild_admission_invalid"
+                );
+                self.committed_calls = self.reservations.len();
+                self.failed = false;
+                self.rebuilds.push(admission.clone());
+            }
             Event::PublicationPrepared { artifact_sha256 } => {
                 ensure!(
                     self.reservations.len() == self.completed_call_count()
@@ -352,7 +653,12 @@ impl Ledger {
 
     pub fn capacity_for_window(&self) -> bool {
         // Reserve room for both calls, their receipts, the window and a terminal checkpoint.
-        self.bytes + (MAX_RECORD_BYTES as u64 * 7) <= self.binding.max_ledger_bytes
+        let retries = self
+            .binding
+            .support_retries
+            .saturating_sub(self.support_retries.len());
+        self.bytes + (MAX_RECORD_BYTES as u64 * (7 + 2 * retries) as u64)
+            <= self.binding.max_ledger_bytes
     }
 
     pub fn append(&mut self, payload: Event) -> Result<()> {
@@ -414,7 +720,13 @@ impl Ledger {
             if observed.is_none() {
                 result.unobserved_calls += 1;
             }
-            if observed.and_then(|value| value.usage.as_ref()).is_none() {
+            let usage = observed
+                .and_then(|value| value.usage.as_ref())
+                .or_else(|| receipt.and_then(|receipt| receipt.partial_usage.as_ref()));
+            if receipt.is_some_and(|receipt| receipt.partial_usage.is_some()) {
+                result.partial_usage_calls += 1;
+            }
+            if usage.is_none() {
                 result.missing_usage_calls += 1;
             }
             if let Some(observed) = observed {
@@ -432,13 +744,10 @@ impl Ledger {
                     continue;
                 }
             }
-            let total =
-                observed
-                    .and_then(|value| value.usage.as_ref())
-                    .and_then(|usage| match kind {
-                        CallKind::Builder => usage["total"]["totalTokens"].as_u64(),
-                        CallKind::Jev => usage["total_tokens"].as_u64(),
-                    });
+            let total = usage.and_then(|usage| match kind {
+                CallKind::Builder => usage["total"]["totalTokens"].as_u64(),
+                CallKind::Jev => usage["total_tokens"].as_u64(),
+            });
             match total {
                 Some(total) if !result.total_tokens_overflowed => {
                     result.known_total_tokens =
@@ -493,7 +802,13 @@ pub(crate) fn builder_usage(value: Option<&Value>) -> Option<Value> {
 
 pub(crate) fn jev_usage(value: &Value) -> Option<Value> {
     let mut usage = serde_json::Map::new();
-    for field in ["prompt_tokens", "completion_tokens", "total_tokens"] {
+    for field in [
+        "input_tokens",
+        "output_tokens",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+    ] {
         if let Some(number) = value[field].as_u64() {
             usage.insert(field.into(), json!(number));
         }

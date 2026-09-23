@@ -154,6 +154,20 @@ enum Command {
             help = "Resume only validated completed windows in the same ledger"
         )]
         resume: bool,
+        #[arg(
+            long,
+            requires = "resume",
+            conflicts_with = "plan_only",
+            help = "Explicitly rebuild the window of this finished failed call as a NEW builder sample; at most two admissions per ledger, each adds one builder and one Jev allowance"
+        )]
+        rebuild_failed_window: Option<usize>,
+        #[arg(
+            long,
+            default_value_t = 0,
+            help = "Declared whole-ledger extra same-body Jev submissions (0..2) after typed communication failures; separate attempts with 250/500ms backoff; immutable on resume"
+        )]
+        #[arg(value_parser = parse_support_retries)]
+        support_retries: usize,
         #[arg(long, help = "Require the zero-model plan digest before any live call")]
         expected_plan_sha256: Option<String>,
         #[arg(
@@ -328,8 +342,16 @@ enum Command {
     Schema,
 }
 
+fn parse_support_retries(value: &str) -> std::result::Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|value| *value <= 2)
+        .ok_or_else(|| "support retries must be 0..2".into())
+}
+
 fn contract() -> Value {
-    json!({
+    let mut contract = json!({
         "schema_version":"gptgrep.cli.v1", "name":"gptgrep", "version":env!("CARGO_PKG_VERSION"),
         "transport":"argv/stdout", "mcp":false, "default_output":"text", "machine_output":"--json",
         "exit_codes":{"0":"success or matches","1":"no matches","2":"error, stale evidence, or incomplete enrichment"},
@@ -351,7 +373,24 @@ fn contract() -> Value {
         "search_output":{"fields":["schema_version","query","mode","document_scope","root","generation","index_used","source_fresh","minimum_relevance_score","hits","coverage","metrics","warnings"],"hit_fields":["path","node_id","title","line_start","line_end","page_start","page_end","match_line","match_column","byte_start","byte_end","column_start","node_offset","next_offset","node_coverage","coordinate_system","text","text_truncated","score","confidence","literal_anchor","source_sha256","source_fresh","citation"]},
         "bounds":{"source_file_bytes":67108864,"jev_candidates":24,"semantic_routing_documents":32},
         "limitations":["No full PageIndex Flash parity claim", "No OCR in the initial native build", "Office conversion requires LibreOffice", "Semantic routing and evidence snippets have explicit budgets", "Generative synthesis requires explicit local Codex host mode", "Relevance floor is operational policy, not calibrated confidence; hybrid exact-token anchors are retained"]
-    })
+    });
+    contract["commands"]["enrich"]["options"] = json!({"rebuild-failed-window":{
+        "type":"integer","requires":"resume","conflicts_with":"plan-only",
+        "meaning":"Last finished failed builder/support call ID; rebuild its uncommitted raw window as a NEW builder sample and new support request",
+        "maximum_admissions_per_ledger":2,"additional_allowance_per_admission":{"builder_calls":1,"jev_calls":1},
+        "preserves":"Completed windows, original binding/caps, all prior attempts and unknown billing; append-only lineage",
+        "ineligible":"Pending calls, successful uncommitted calls, validated complete windows, changed source/profile, known validation/policy failures",
+        "legacy_failure_classification":"legacy_unclassified; elapsed time is not used to infer a cause"
+    }});
+    contract["commands"]["enrich"]["options"]["support-retries"] = json!({
+        "type":"integer","default":0,"minimum":0,"maximum":2,"scope":"extra same-request Jev submissions across the entire bound ledger",
+        "eligible":"typed timeout, transport, or HTTP 408/429/5xx only; never auth, content/validation, policy or unclassified failures",
+        "backoff_ms":[250,500],"deadline":"original invocation deadline; never reset",
+        "allowance":"declared additive Jev-only allowance; original call caps retained; each extra submission durably reserved and finished",
+        "binding":"part of new plans; resume must retain the same value; legacy plans remain zero",
+        "billing":"failed attempts and observed/unknown provider usage remain recorded; no inference of zero billing"
+    });
+    contract
 }
 
 fn llms() -> &'static str {
@@ -403,6 +442,8 @@ async fn run(cli: Cli) -> Result<i32> {
             root,
             ledger_path,
             resume,
+            rebuild_failed_window,
+            support_retries,
             expected_plan_sha256,
             plan_only,
             plan_output,
@@ -422,6 +463,8 @@ async fn run(cli: Cli) -> Result<i32> {
                 host,
                 ledger_path,
                 resume,
+                rebuild_failed_window,
+                support_retries,
                 expected_plan_sha256,
                 window_bytes,
                 max_hints_per_window,
@@ -1073,5 +1116,74 @@ mod query_plan_cli_tests {
             "gpt-6-luna"
         );
         assert_eq!(schema["commands"]["enrich"]["plan_only_model_calls"], 0);
+    }
+
+    #[test]
+    fn enrichment_rebuild_is_explicit_bounded_and_not_a_plan_only_effect() {
+        let base = [
+            "gptgrep",
+            "enrich",
+            ".",
+            "--ledger-path",
+            "/tmp/synthetic-enrich.jsonl",
+            "--max-builder-calls",
+            "3",
+            "--max-jev-calls",
+            "3",
+            "--rebuild-failed-window",
+            "4",
+        ];
+        assert!(Cli::try_parse_from(base).is_err());
+        let mut args = base.to_vec();
+        args.push("--resume");
+        assert!(matches!(
+            Cli::try_parse_from(&args).unwrap().command,
+            Some(Command::Enrich {
+                resume: true,
+                rebuild_failed_window: Some(4),
+                ..
+            })
+        ));
+        args.push("--plan-only");
+        assert!(Cli::try_parse_from(args).is_err());
+        let schema = contract();
+        assert_eq!(
+            schema["commands"]["enrich"]["options"]["rebuild-failed-window"]["maximum_admissions_per_ledger"],
+            2
+        );
+        let base = [
+            "gptgrep",
+            "enrich",
+            ".",
+            "--ledger-path",
+            "/tmp/synthetic-enrich.jsonl",
+            "--max-builder-calls",
+            "3",
+            "--max-jev-calls",
+            "3",
+            "--support-retries",
+        ];
+        let mut invalid = base.to_vec();
+        invalid.push("3");
+        assert!(Cli::try_parse_from(invalid).is_err());
+        let mut valid = base.to_vec();
+        valid.push("2");
+        valid.push("--plan-only");
+        assert!(matches!(
+            Cli::try_parse_from(valid).unwrap().command,
+            Some(Command::Enrich {
+                support_retries: 2,
+                plan_only: true,
+                ..
+            })
+        ));
+        assert_eq!(
+            schema["commands"]["enrich"]["options"]["support-retries"]["default"],
+            0
+        );
+        assert_eq!(
+            schema["commands"]["enrich"]["options"]["support-retries"]["maximum"],
+            2
+        );
     }
 }
