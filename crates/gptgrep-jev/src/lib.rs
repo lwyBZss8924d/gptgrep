@@ -300,8 +300,11 @@ impl JevClient {
     }
 
     async fn decide_body(&self, body: Vec<u8>, questions: &Value) -> Result<DecisionResponse> {
+        // Capture before sampling: suspension while checking the original/local
+        // clocks must shorten this request, never renew its remaining lifetime.
+        let captured = tokio::time::Instant::now();
         let remaining = self.execution.remaining()?;
-        let deadline = tokio::time::Instant::now() + remaining;
+        let deadline = captured + remaining;
         let digest = format!("{:x}", Sha256::digest(&body));
         let submitted = async {
             self.execution.observe_submission().await?;

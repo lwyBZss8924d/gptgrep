@@ -37,6 +37,11 @@ mod model_attempts;
 mod navigation;
 mod query_plan;
 mod retrieval;
+mod rich_text;
+pub use rich_text::{
+    PreparedRichTextHost, RichTextCitation, RichTextHostError, RichTextHostOptions,
+    RichTextHostReport, prepare_rich_text_host,
+};
 mod trace;
 pub use jev_accounting::{HostRetrievalError, JevReport, ReceiptSummary, SearchTelemetry};
 pub use model_attempts::{ModelAttempt, ModelTokenMissingCounts, ModelTokenTotals, ModelUsage};

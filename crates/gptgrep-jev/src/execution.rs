@@ -16,7 +16,7 @@ pub const MAX_SUBMISSIONS: u32 = 200;
 const MAX_LEDGER_BYTES: u64 = 128 * 1024;
 
 #[derive(Clone)]
-pub struct ExecutionContext(Arc<Inner>);
+pub struct ExecutionContext(Arc<Inner>, Option<Instant>);
 struct Inner {
     header: Header,
     deadline: Option<Instant>,
@@ -165,10 +165,13 @@ impl ExecutionContext {
         ensure!(!path.is_symlink(), "Decisions ledger must not be a symlink");
         let inner =
             Arc::try_unwrap(self.0).map_err(|_| anyhow!("Execution context is already shared"))?;
-        let context = Self(Arc::new(Inner {
-            ledger: Some(path),
-            ..inner
-        }));
+        let context = Self(
+            Arc::new(Inner {
+                ledger: Some(path),
+                ..inner
+            }),
+            self.1,
+        );
         let join_deadline = Instant::now() + context.remaining()?;
         loop {
             match context.access(|_| Ok(())) {
@@ -255,6 +258,40 @@ impl ExecutionContext {
         self.remaining().map(|_| ())
     }
 
+    /// Remaining lifetime of the same finite original run, without the HTTP
+    /// request timeout cap. No anchor, ledger attachment or admission is created.
+    /// Legacy invocation-only contexts have no finite run deadline and reject.
+    pub fn original_run_remaining(&self) -> Result<Duration> {
+        let deadline = self
+            .0
+            .header
+            .deadline_unix_ms
+            .ok_or_else(|| anyhow!("Decisions original finite deadline unavailable"))?;
+        let wall = SystemTime::UNIX_EPOCH
+            .checked_add(Duration::from_millis(deadline))
+            .and_then(|d| d.duration_since(SystemTime::now()).ok())
+            .ok_or_else(|| anyhow!("Decisions absolute deadline has expired"))?;
+        let monotonic = self
+            .0
+            .deadline
+            .map(|d| d.saturating_duration_since(Instant::now()))
+            .ok_or_else(|| anyhow!("Decisions original finite deadline unavailable"))?;
+        let shared = self
+            .0
+            .clock_anchor
+            .lock()
+            .map_err(|_| anyhow!("Decisions run clock unavailable"))?
+            .as_ref()
+            .map(RunClockAnchor::remaining)
+            .transpose()?;
+        let remaining = shared.map_or(wall.min(monotonic), |d| wall.min(monotonic).min(d));
+        ensure!(
+            !remaining.is_zero(),
+            "Decisions absolute deadline has expired"
+        );
+        Ok(remaining)
+    }
+
     pub(crate) fn compatibility() -> Self {
         Self::create(
             Header {
@@ -270,18 +307,37 @@ impl ExecutionContext {
         .expect("compatibility context is valid")
     }
     fn create(header: Header, deadline: Option<Instant>) -> Result<Self> {
-        Ok(Self(Arc::new(Inner {
-            state: Mutex::new(State {
-                header: header.clone(),
-                submission_observations: 0,
-                reservations: Vec::new(),
+        Ok(Self(
+            Arc::new(Inner {
+                state: Mutex::new(State {
+                    header: header.clone(),
+                    submission_observations: 0,
+                    reservations: Vec::new(),
+                }),
+                header,
+                deadline,
+                ledger: None,
+                clock_anchor: Mutex::new(None),
             }),
-            header,
-            deadline,
-            ledger: None,
-            clock_anchor: Mutex::new(None),
-        })))
+            None,
+        ))
     }
+    /// An immutable stricter admission/HTTP deadline sharing the original run.
+    /// Attach a ledger before creating/sharing views. This reads the existing
+    /// clocks but never captures a clock, joins a ledger, writes its header, or
+    /// replaces the shared reservations/counters. Clones retain the local cap;
+    /// applying a later cap cannot extend an earlier one. The original-run
+    /// accessor deliberately continues to report only the original lifetime.
+    pub fn with_deadline(&self, deadline: Instant) -> Result<Self> {
+        self.original_run_remaining()?;
+        let deadline = deadline
+            .min(self.0.deadline.expect("finite original context"))
+            .min(self.1.unwrap_or(deadline));
+        let view = Self(Arc::clone(&self.0), Some(deadline));
+        view.remaining()?;
+        Ok(view)
+    }
+
     pub(crate) fn remaining(&self) -> Result<Duration> {
         let wall = match self.0.header.deadline_unix_ms {
             Some(deadline) => SystemTime::UNIX_EPOCH
@@ -304,7 +360,15 @@ impl ExecutionContext {
             .map(RunClockAnchor::remaining)
             .transpose()?
             .unwrap_or(crate::REQUEST_TIMEOUT);
-        let remaining = wall.min(monotonic).min(shared).min(crate::REQUEST_TIMEOUT);
+        let local = self
+            .1
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(crate::REQUEST_TIMEOUT);
+        let remaining = wall
+            .min(monotonic)
+            .min(shared)
+            .min(local)
+            .min(crate::REQUEST_TIMEOUT);
         ensure!(
             !remaining.is_zero(),
             "Decisions absolute deadline has expired"
@@ -312,7 +376,9 @@ impl ExecutionContext {
         Ok(remaining)
     }
     pub(crate) async fn observe_submission(&self) -> Result<()> {
+        self.remaining()?;
         self.wait_access(|s| {
+            self.remaining()?;
             s.submission_observations = s.submission_observations.saturating_add(1);
             Ok(())
         })
@@ -570,6 +636,7 @@ impl Reservation {
         self.context.remaining()?;
         self.context
             .wait_access(|s| {
+                self.context.remaining()?;
                 let entry = &mut s.reservations[self.id as usize - 1];
                 ensure!(
                     entry.outcome == Outcome::Reserved,
@@ -692,6 +759,112 @@ mod tests {
         assert!(legacy.snapshot().unwrap().run_id.is_none());
         assert!(legacy.snapshot().unwrap().plan_digest.is_none());
         fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn original_remaining_is_uncapped_readonly_and_never_resets_expiry() {
+        let deadline = SystemTime::now() + Duration::from_secs(90);
+        let ctx = context(deadline, 2);
+        let snapshot = ctx.snapshot().unwrap();
+        assert!(ctx.original_run_remaining().unwrap() > Duration::from_secs(60));
+        assert!(ctx.remaining().unwrap() <= crate::REQUEST_TIMEOUT);
+        assert_eq!(ctx.snapshot().unwrap(), snapshot);
+        assert!(
+            ExecutionContext::compatibility()
+                .original_run_remaining()
+                .is_err()
+        );
+        let dir = directory();
+        let path = dir.join("original-remaining");
+        let bound = ctx.with_ledger(&path).unwrap();
+        let joined = context(deadline, 2).with_ledger(&path).unwrap();
+        let anchor = bound.ledger_clock_anchor().unwrap();
+        let journal = fs::read(&path).unwrap();
+        let header = fs::read(sidecar(&path, ".lock")).unwrap();
+        for _ in 0..3 {
+            assert!(joined.original_run_remaining().unwrap() > Duration::from_secs(60));
+        }
+        assert!(anchor == joined.ledger_clock_anchor().unwrap());
+        assert_eq!(fs::read(&path).unwrap(), journal);
+        assert_eq!(fs::read(sidecar(&path, ".lock")).unwrap(), header);
+        let mut expired = context(SystemTime::now() + Duration::from_secs(90), 2);
+        Arc::get_mut(&mut expired.0).unwrap().deadline =
+            Some(Instant::now() + Duration::from_millis(5));
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        assert!(expired.original_run_remaining().is_err());
+        assert!(expired.clone().original_run_remaining().is_err());
+        assert_eq!(expired.snapshot().unwrap().logical_reservations, 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+    async fn assert_stricter_view(persistent: bool) {
+        assert!(
+            ExecutionContext::compatibility()
+                .with_deadline(Instant::now() + Duration::from_secs(1))
+                .is_err()
+        );
+        let dir = directory();
+        let path = dir.join("deadline-view");
+        let original = context(SystemTime::now() + Duration::from_secs(60), 3);
+        let original = if persistent {
+            original.with_ledger(&path).unwrap()
+        } else {
+            original
+        };
+        let before = original.snapshot().unwrap();
+        let anchor = original.ledger_clock_anchor().unwrap();
+        let journal = persistent.then(|| fs::read(&path).unwrap());
+        let header = persistent.then(|| fs::read(sidecar(&path, ".lock")).unwrap());
+        let cap = Instant::now() + Duration::from_millis(500);
+        let view = original.with_deadline(cap).unwrap();
+        let later = view.with_deadline(cap + Duration::from_secs(30)).unwrap();
+        assert!(Arc::ptr_eq(&original.0, &view.0));
+        assert!(Arc::ptr_eq(&original.0, &later.0));
+        assert!(view.1 == Some(cap) && later.1 == Some(cap));
+        assert_eq!(view.snapshot().unwrap(), before);
+        assert!(view.ledger_clock_anchor().unwrap() == anchor);
+        assert!(view.original_run_remaining().unwrap() > Duration::from_secs(50));
+        if persistent {
+            assert_eq!(fs::read(&path).unwrap(), journal.unwrap());
+            assert_eq!(fs::read(sidecar(&path, ".lock")).unwrap(), header.unwrap());
+        }
+        view.observe_submission().await.unwrap();
+        let mut completed = view.reserve(DIGEST, "synthetic-model").await.unwrap();
+        completed.send_started().await.unwrap();
+        let mut unsent = view.reserve(DIGEST, "synthetic-model").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(view.check_deadline().is_err());
+        assert!(view.clone().check_deadline().is_err());
+        assert!(later.check_deadline().is_err());
+        assert!(
+            view.with_deadline(Instant::now() + Duration::from_secs(30))
+                .is_err()
+        );
+        assert!(view.observe_submission().await.is_err());
+        assert!(view.reserve(DIGEST, "synthetic-model").await.is_err());
+        assert!(unsent.send_started().await.is_err());
+        // Cleanup retains the original journal and can record its outcome
+        // after the local cap expires; no slot or charged count is refunded.
+        completed.terminal().await.unwrap();
+        drop(unsent);
+        let snapshot = original.snapshot().unwrap();
+        assert_eq!(snapshot.submission_observations, 1);
+        assert_eq!(snapshot.logical_reservations, 2);
+        assert_eq!(snapshot.send_start_observations, 1);
+        assert_eq!(snapshot.terminal_submissions, 1);
+        assert_eq!(snapshot.quarantined_slots, 1);
+        assert_eq!(snapshot.active_or_quarantined_slots, 1);
+        assert_eq!(view.snapshot().unwrap(), snapshot);
+        assert!(original.ledger_clock_anchor().unwrap() == anchor);
+        assert!(original.check_deadline().is_ok());
+        assert!(original.original_run_remaining().unwrap() > Duration::from_secs(50));
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn stricter_local_view_never_extends_deadline_or_refunds() {
+        assert_stricter_view(false).await;
+    }
+    #[tokio::test]
+    async fn stricter_shared_view_preserves_original_anchor_and_accounting() {
+        assert_stricter_view(true).await;
     }
     #[tokio::test]
     async fn charges_failures_never_frees_counts_and_quarantines_drop() {

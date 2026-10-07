@@ -194,6 +194,7 @@ async fn next_write_poll_observes_shared_stderr_failure() {
     let mut bytes = Vec::<u8>::new();
     let mut writer = CheckedWriter {
         writer: &mut bytes,
+        execution: None,
         transport: &budget,
         deadline: Instant::now() + Duration::from_secs(1),
     };
