@@ -23,7 +23,7 @@ pub struct OcrProfile {
 impl Default for OcrProfile {
     fn default() -> Self {
         Self {
-            model: "gpt-6.1-luna".into(),
+            model: "gpt-6-luna".into(),
             reasoning_effort: "max".into(),
             service_tier: "fast".into(),
         }
@@ -252,7 +252,7 @@ pub fn validate_ocr_task_metadata(task: &OcrTask) -> Result<()> {
         "invalid OCR task schema/page"
     );
     ensure!(
-        task.profile.model == "gpt-6.1-luna"
+        task.profile.model == "gpt-6-luna"
             && task.profile.reasoning_effort == "max"
             && task.profile.service_tier == "fast",
         "OCR profile does not match selected model/effort/tier"

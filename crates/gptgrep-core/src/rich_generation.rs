@@ -1,6 +1,13 @@
 //! Independently bound native/OCR artifacts in an immutable v2 generation.
 //! Publication consumes completed parser output; it never starts a model.
 
+mod visual;
+pub use visual::{
+    MAX_VISUAL_OUTPUT_BYTES, VerifiedRenditionFile, VerifiedVisualPayload, VisualCandidate,
+    VisualCandidateReport, VisualCandidateRequest, VisualCoverage, VisualGenerationReader,
+    VisualScope,
+};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};

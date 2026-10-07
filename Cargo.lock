@@ -1077,6 +1077,7 @@ dependencies = [
  "gptgrep-pageindex",
  "gptgrep-parse",
  "ignore 0.4.33",
+ "libc",
  "regex",
  "serde",
  "serde_json",

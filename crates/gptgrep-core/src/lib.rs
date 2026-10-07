@@ -4,7 +4,9 @@ use fs2::FileExt;
 use gptgrep_jev::{Candidate, JevClient, RerankResponse};
 
 pub mod batch;
+mod custody;
 mod evidence_roles;
+pub mod rich_batch;
 pub use evidence_roles::{
     CandidateDisposition, CandidateEligibility, DeliveredSetSufficiency, EvidenceRole,
     EvidenceRoleCandidateDecision, EvidenceRoleDiagnostics, EvidenceRoleHint, EvidenceRoleSource,
@@ -31,8 +33,11 @@ pub use planned::{
 };
 use read_cache::{CacheError, CacheKey, ReadCache, ReadMeter, ReadMetrics, ReadOrigin, ReadPin};
 pub use rich_generation::{
-    ArtifactSearchReport, ArtifactTextWindow, EvidenceRef, RICH_MANIFEST_SCHEMA, RichDocument,
-    RichGenerationReader, RichGenerationWriter, RichManifest, StoredArtifact, TextEvidenceBinding,
+    ArtifactSearchReport, ArtifactTextWindow, EvidenceRef, MAX_VISUAL_OUTPUT_BYTES,
+    RICH_MANIFEST_SCHEMA, RichDocument, RichGenerationReader, RichGenerationWriter, RichManifest,
+    StoredArtifact, TextEvidenceBinding, VerifiedRenditionFile, VerifiedVisualPayload,
+    VisualCandidate, VisualCandidateReport, VisualCandidateRequest, VisualCoverage,
+    VisualGenerationReader, VisualScope,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};

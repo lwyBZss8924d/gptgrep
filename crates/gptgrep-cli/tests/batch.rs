@@ -72,10 +72,30 @@ fn exact_minimum_output_budget_is_not_changed_by_cli_framing() {
     let mut input = request(json!([{"id":"catalog","op":"catalog","fields":["path"]}]));
     input["budget"] = json!({"max_output_bytes":5120});
     let result = invoke(corpus.path(), &serde_json::to_vec(&input).unwrap());
-    assert!(result.status.success(), "{:?}", result);
     assert!(result.stdout.len() <= 5120);
     assert_ne!(result.stdout.last(), Some(&b'\n'));
     let response: Value = serde_json::from_slice(&result.stdout).unwrap();
+    // Minimum admission reserves an item envelope, not an arbitrary result.
+    // Complete reader metrics also count against its serialized output share.
+    assert_eq!(response["items"].as_array().unwrap().len(), 1);
+    assert!(response.get("error").is_none());
+    if result.status.success() {
+        assert_eq!(response["items"][0]["status"], "ok");
+    } else {
+        assert_eq!(result.status.code(), Some(2));
+        assert_eq!(response["items"][0]["status"], "error");
+        assert!(response["items"][0].get("result").is_none());
+        assert_eq!(
+            response["items"][0]["error"]["code"],
+            "output_budget_insufficient"
+        );
+    }
+    input["budget"]["max_output_bytes"] = json!(6144);
+    let complete = invoke(corpus.path(), &serde_json::to_vec(&input).unwrap());
+    assert!(complete.status.success(), "{:?}", complete);
+    assert!(complete.stdout.len() <= 6144);
+    assert_ne!(complete.stdout.last(), Some(&b'\n'));
+    let response: Value = serde_json::from_slice(&complete.stdout).unwrap();
     assert_eq!(response["items"][0]["status"], "ok");
     input["budget"]["max_output_bytes"] = json!(5119);
     let rejected = invoke(corpus.path(), &serde_json::to_vec(&input).unwrap());

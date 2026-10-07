@@ -168,7 +168,7 @@ untrusted input to publication, which must perform its own validation.
 `OcrExecutor` is an object-safe host trait accepting an owned `OcrTask` and
 returning an owned future. The parser never launches a model. Tasks bind source,
 preparation, artifact recipe and exact image digests; local paths are omitted
-from JSON. The selected profile is `gpt-6.1-luna`, `max`, `fast`, with no fallback.
+from JSON. The selected profile is `gpt-6-luna`, `max`, `fast`, with no fallback.
 Complete results must match every required region and retain a receipt for each
 declared image's successful mediated delivery. Metadata-only validators perform
 no IO so a host can use held directory/file descriptors for path custody;

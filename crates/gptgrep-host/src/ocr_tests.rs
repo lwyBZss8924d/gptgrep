@@ -214,7 +214,7 @@ fn startup(mcp: Value) -> Vec<Value> {
     vec![
         json!({"id":1,"result":{}}),
         json!({"id":2,"result":{"config":{"mcp_servers":mcp}}}),
-        json!({"id":3,"result":{"thread":{"id":"thread-1"},"model":"gpt-6.1-luna","modelProvider":"openai","approvalPolicy":"never","sandbox":{"type":"readOnly","networkAccess":false},"reasoningEffort":"max","serviceTier":"fast"}}),
+        json!({"id":3,"result":{"thread":{"id":"thread-1"},"model":"gpt-6-luna","modelProvider":"openai","approvalPolicy":"never","sandbox":{"type":"readOnly","networkAccess":false},"reasoningEffort":"max","serviceTier":"fast"}}),
         json!({"id":4,"result":{"turn":{"id":"turn-1"}}}),
     ]
 }
@@ -276,6 +276,17 @@ async fn replay(
 #[tokio::test]
 async fn dynamic_image_is_actual_bound_content_and_exact_profile() {
     let fixture = Fixture::new();
+    gptgrep_parse::validate_ocr_task_metadata(&fixture.task).unwrap();
+    let mut previous_model = fixture.task.clone();
+    previous_model.profile.model = "gpt-6.1-luna".into();
+    rebind(&mut previous_model);
+    assert_eq!(
+        gptgrep_parse::validate_ocr_task_metadata(&previous_model)
+            .unwrap_err()
+            .to_string(),
+        "OCR profile does not match selected model/effort/tier"
+    );
+    assert!(PreparedPage::new(previous_model, fixture.dir.path()).is_err());
     let capture = Capture::default();
     let mut frames = startup(json!({}));
     frames.push(tool(1, fixture.image_args()));
@@ -289,7 +300,7 @@ async fn dynamic_image_is_actual_bound_content_and_exact_profile() {
     assert_eq!(budget.charged_admissions, 1);
     let sent = capture.frames();
     let thread = sent.iter().find(|f| f["method"] == "thread/start").unwrap();
-    assert_eq!(thread["params"]["model"], "gpt-6.1-luna");
+    assert_eq!(thread["params"]["model"], "gpt-6-luna");
     assert_eq!(thread["params"]["allowProviderModelFallback"], false);
     assert_eq!(thread["params"]["environments"], json!([]));
     assert_eq!(thread["params"]["config"]["features.view_image"], false);
@@ -570,7 +581,7 @@ for line in sys.stdin:
     elif method == 'config/read':
         send({'id': message['id'], 'result': {'config': {'mcp_servers': {}}}})
     elif method == 'thread/start':
-        send({'id': message['id'], 'result': {'thread': {'id': 'thread-1'}, 'model': 'gpt-6.1-luna', 'modelProvider': 'openai', 'approvalPolicy': 'never', 'sandbox': {'type': 'readOnly', 'networkAccess': False}, 'reasoningEffort': 'max', 'serviceTier': 'fast'}})
+        send({'id': message['id'], 'result': {'thread': {'id': 'thread-1'}, 'model': 'gpt-6-luna', 'modelProvider': 'openai', 'approvalPolicy': 'never', 'sandbox': {'type': 'readOnly', 'networkAccess': False}, 'reasoningEffort': 'max', 'serviceTier': 'fast'}})
     elif method == 'turn/start':
         pending = json.loads(message['params']['input'][0]['text'])
         send({'id': message['id'], 'result': {'turn': {'id': 'turn-1'}}})

@@ -137,6 +137,11 @@ enum Command {
         root: PathBuf,
         #[arg(long, default_value = "-")]
         input: PathBuf,
+        #[arg(
+            long,
+            help = "Use local v2 artifact operations and the rich batch schema"
+        )]
+        rich: bool,
     },
     /// Parse documents and publish a complete immutable search generation.
     #[command(alias = "init")]
@@ -407,6 +412,18 @@ fn contract() -> Value {
         "max_bytes":4096,
         "scope":"invalid declarations and input I/O errors use the batch response schema; their cap is separate from an unadmitted requested output allowance"
     });
+    contract["commands"]["batch"]["rich"] = json!({
+        "usage":"gptgrep batch --rich --root ROOT --input FILE_OR_DASH",
+        "request_schema":"gptgrep.batch.rich.request.v1",
+        "output_schema":"gptgrep.batch.rich.response.v1",
+        "operations":["inspect_documents","inspect_pages","read_artifact","search_artifacts"],
+        "generation":"CURRENT is resolved once; an exact generation and manifest SHA may be supplied",
+        "limits":{"input_bytes":1048576,"operations":64,"output_bytes":1048576,"minimum_output_bytes":"4096 + 1536 * operation_count"},
+        "inspection":"indexed_metadata_only; does not assert source freshness or grant citations",
+        "search_continuation":"generation/scope/query/options-bound cursor over a bounded max_hits window; inspect search_ceiling_reached and exhausted",
+        "read_metrics":"partial reader API bytes; excludes final-wire delivery and complete physical I/O",
+        "network":false,"model_submissions":0,"output":"always JSON without a trailing newline; exit2 for global or item failure"
+    });
     contract["commands"]["ask"]["options"]["experimental-source-continuation"] = json!({
         "type":"boolean","default":false,"requires":["experimental-query-plan","document"],
         "effect":"Reader guidance: node EOF is not evidence completeness; verify unresolved claims/referents using scoped verified tree/read nodes",
@@ -418,7 +435,7 @@ fn contract() -> Value {
 }
 
 fn llms() -> &'static str {
-    "# GPTgrep\n\nLocal vectorless retrieval helper for agents. No MCP server.\n\n1. gptgrep index ./docs --json\n1a. gptgrep enrich ./docs --ledger-path /path/to/private/enrich.jsonl --max-builder-calls 100 --max-jev-calls 100 --plan-only --json\n2. gptgrep search 'concept in natural language' ./docs --json\n3. gptgrep search 'pattern' ./docs --mode regex --json\n4. gptgrep tree manual.pdf --root ./docs --json\n5. gptgrep read DOCUMENT_ID:NODE_ID --root ./docs --json\n6. gptgrep batch --root ./docs --input operations.json --json\n\nBatch accepts gptgrep.batch.request.v1 JSON, pins one generation and preserves operation order. Local search/catalog/tree/read operations share bounded output reservations. Batch hybrid/semantic are currently rejected before provider work; inspect each item status and coverage.\n\nJev routing/reranking is required by default search, ask and summarize. OPENROUTER_API_KEY must be supplied for model-assisted runs; failures never silently downgrade to local retrieval. Explicit regex/lexical and enrich --plan-only remain offline. Enrich is an explicit Codex/Jev step that creates non-citable navigation hints after local indexing. Use --document RELATIVE_PATH to scope before candidate budgets. Hybrid/semantic and judge send bounded data to OpenRouter Jev. Inspect coverage, source_fresh, coordinate_system and text_truncated before citing evidence. The main agent performs reasoning and controls follow-up reads. New files require reindexing. --schema provides the command contract.\n"
+    "# GPTgrep\n\nLocal vectorless retrieval helper for agents. No MCP server.\n\n1. gptgrep index ./docs --json\n1a. gptgrep enrich ./docs --ledger-path /path/to/private/enrich.jsonl --max-builder-calls 100 --max-jev-calls 100 --plan-only --json\n2. gptgrep search 'concept in natural language' ./docs --json\n3. gptgrep search 'pattern' ./docs --mode regex --json\n4. gptgrep tree manual.pdf --root ./docs --json\n5. gptgrep read DOCUMENT_ID:NODE_ID --root ./docs --json\n6. gptgrep batch --root ./docs --input operations.json --json\n7. gptgrep batch --rich --root ./docs --input rich-operations.json\n\nBatch accepts gptgrep.batch.request.v1 JSON, pins one generation and preserves operation order. Local search/catalog/tree/read operations share bounded output reservations. Batch hybrid/semantic are currently rejected before provider work; inspect each item status and coverage.\n\nFor a separately published v2 generation, batch --rich accepts gptgrep.batch.rich.request.v1 with inspect_documents, inspect_pages, read_artifact and search_artifacts. Inspection returns indexed metadata only. Read/search preserve typed native/OCR evidence; cursors bind generation and operation options. Search pages cover a bounded max_hits window; inspect truncation and exhaustion. This route is local and performs zero model submissions.\n\nJev routing/reranking is required by default search, ask and summarize. OPENROUTER_API_KEY must be supplied for model-assisted runs; failures never silently downgrade to local retrieval. Explicit regex/lexical and enrich --plan-only remain offline. Enrich is an explicit Codex/Jev step that creates non-citable navigation hints after local indexing. Use --document RELATIVE_PATH to scope before candidate budgets. Hybrid/semantic and judge send bounded data to OpenRouter Jev. Inspect coverage, source_fresh, coordinate_system and text_truncated before citing evidence. The main agent performs reasoning and controls follow-up reads. New files require reindexing. --schema provides the command contract.\n"
 }
 
 fn emit(value: &Value) -> Result<()> {
@@ -447,9 +464,13 @@ async fn run(cli: Cli) -> Result<i32> {
         return Ok(0);
     };
     match command {
-        Command::Batch { root, input } => {
+        Command::Batch { root, input, rich } => {
             let mut bytes = Vec::with_capacity(8192);
-            let cap = gptgrep_core::batch::MAX_BATCH_INPUT_BYTES;
+            let cap = if rich {
+                gptgrep_core::rich_batch::MAX_RICH_BATCH_INPUT_BYTES
+            } else {
+                gptgrep_core::batch::MAX_BATCH_INPUT_BYTES
+            };
             let read_result = (|| -> io::Result<()> {
                 if input.as_os_str() == "-" {
                     io::stdin()
@@ -464,11 +485,39 @@ async fn run(cli: Cli) -> Result<i32> {
                 Ok(())
             })();
             if read_result.is_err() {
-                serde_json::to_writer(
-                    io::stdout().lock(),
-                    &gptgrep_core::batch::input_io_failure(),
-                )?;
+                if rich {
+                    serde_json::to_writer(
+                        io::stdout().lock(),
+                        &gptgrep_core::rich_batch::rich_batch_input_io_failure(),
+                    )?;
+                } else {
+                    serde_json::to_writer(
+                        io::stdout().lock(),
+                        &gptgrep_core::batch::input_io_failure(),
+                    )?;
+                }
                 return Ok(2);
+            }
+            if rich {
+                let request = match gptgrep_core::rich_batch::parse_rich_batch_request(&bytes) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        serde_json::to_writer(io::stdout().lock(), &error)?;
+                        return Ok(2);
+                    }
+                };
+                return match gptgrep_core::rich_batch::dispatch_rich_batch(&root, request) {
+                    Ok(response) => {
+                        let failed =
+                            response.coverage.failed > 0 || response.coverage.not_executed > 0;
+                        serde_json::to_writer(io::stdout().lock(), &response)?;
+                        Ok(if failed { 2 } else { 0 })
+                    }
+                    Err(error) => {
+                        serde_json::to_writer(io::stdout().lock(), &error)?;
+                        Ok(2)
+                    }
+                };
             }
             let request = match gptgrep_core::batch::parse_batch_request(&bytes) {
                 Ok(request) => request,

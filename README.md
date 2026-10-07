@@ -81,6 +81,19 @@ Node reads return `next_offset`; pass that value to `read --offset` to continue.
 Offsets count UTF-8 bytes within the node, and each window retains exact source
 coordinates. This lets agents inspect large sections without an unbounded reply.
 
+For v2 generations published through the rich core API, `gptgrep batch --rich
+--root ./documents --input rich-operations.json` accepts
+`gptgrep.batch.rich.request.v1`. Its local operations are `inspect_documents`,
+`inspect_pages`, `read_artifact` and `search_artifacts`. A batch resolves `CURRENT`
+once or uses an explicit generation and manifest SHA. Input and output are bounded
+to 1 MiB with at most 64 operations, and every item reserves output space before
+execution. Inspection returns indexed metadata; text reads and searches retain
+typed native/OCR evidence and source checks. Search cursors cover a bounded
+`max_hits` result window, so callers must inspect truncation and exhaustion.
+The response is always JSON, with exit status 2 for an item or global failure.
+Reader byte counters describe partial API reads rather than complete physical I/O.
+The ordinary `index` command currently publishes the original generation format.
+
 ## Core Jev retrieval
 
 Jev is a required part of the GPTgrep search system. Default search performs

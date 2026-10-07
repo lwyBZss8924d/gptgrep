@@ -27,7 +27,7 @@ use crate::{
     ocr_protocol,
 };
 
-pub const DEFAULT_OCR_MODEL: &str = "gpt-6.1-luna";
+pub const DEFAULT_OCR_MODEL: &str = "gpt-6-luna";
 const DESCRIPTOR_SCHEMA: &str = "gptgrep.ocr.runtime-profile.v1";
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
