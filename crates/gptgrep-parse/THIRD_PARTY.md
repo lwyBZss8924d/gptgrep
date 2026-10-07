@@ -45,7 +45,9 @@ no upstream benchmark PDF or dataset has been copied into this crate.
 The rich image adapter uses the existing exact registry dependency `image`
 `0.25.10` with only PNG/JPEG features. Its selected decoder packages are `png`
 `0.18.1` and `zune-jpeg` `0.5.15`; Cargo.lock binds their registry checksums and
-transitive dependencies. The small streaming PDF writer, container admission
+transitive dependencies. JPEG preparation and cropping are unqualified and
+reject before decode; its package remains in the dependency and notice closure.
+The small streaming PDF writer, container admission
 scan and synthetic image fixtures are original GPTgrep code. No decoder source
 is copied or changed. The inspected package manifests declare the image and PNG
 licenses as MIT OR Apache-2.0, and zune-jpeg/zune-core as MIT OR Apache-2.0 OR

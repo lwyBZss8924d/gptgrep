@@ -634,3 +634,126 @@ fn generation_and_artifact_ancestor_symlinks_are_rejected() -> Result<()> {
     assert!(reader.verify_all().is_err());
     Ok(())
 }
+
+#[test]
+fn rich_cache_warm_clone_revalidates_all_bound_bytes_and_counts_exact_windows() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let root = root.path().canonicalize()?;
+    publish(&root, &["alpha β needle\n"])?;
+    let reader = RichGenerationReader::open(&root)?;
+    let artifact = &reader.manifest.documents[0].pages[0].native_text;
+    let manifest_bytes = fs::metadata(reader.dir.join("manifest.json"))?.len();
+    let source_bytes = reader.manifest.documents[0].prepared.source_bytes;
+    let before = reader.read_metrics()?;
+    let first = reader.read_text(&artifact.id, 0, 5)?;
+    let cold = reader.read_metrics()?.since(&before)?;
+    assert_eq!(first.text, "alpha");
+    assert_eq!(cold.logical_reader_bytes, 5);
+    assert_eq!(cold.cached_logical_bytes, 0);
+    assert_eq!(cold.cache_misses, 1);
+    let expected = 2 * manifest_bytes + 2 * source_bytes + 2 * artifact.bytes;
+    assert_eq!(cold.observed_rust_read_bytes, expected);
+    assert_eq!(cold.observed_hash_bytes, expected);
+    let clone = reader.clone();
+    assert!(Arc::ptr_eq(&reader.manifest, &clone.manifest));
+    assert!(Arc::ptr_eq(&reader.index, &clone.index));
+    let before = reader.read_metrics()?;
+    let second = clone.read_text(&artifact.id, 0, 5)?;
+    let warm = reader.read_metrics()?.since(&before)?;
+    assert_eq!(serde_json::to_value(first)?, serde_json::to_value(second)?);
+    assert_eq!(warm.logical_reader_bytes, 5);
+    assert_eq!(warm.cached_logical_bytes, 5);
+    assert_eq!(warm.cache_hits, 1);
+    assert_eq!(warm.observed_rust_read_bytes, expected);
+    assert_eq!(warm.observed_hash_bytes, expected);
+    let before = reader.read_metrics()?;
+    reader.validate_text_evidence(&clone.read_text(&artifact.id, 0, 5)?.evidence)?;
+    assert_eq!(
+        reader.read_metrics()?.since(&before)?.logical_reader_bytes,
+        5
+    );
+    Ok(())
+}
+
+#[test]
+fn rich_cache_tighter_caps_fallback_and_live_pins_never_reset_capacity() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let root = root.path().canonicalize()?;
+    publish(&root, &["alpha needle\n", "bravo needle\n"])?;
+    let budget = ReaderCacheBudget {
+        max_bytes: 13,
+        max_entries: 1,
+        strict_cache_only: false,
+    };
+    let reader = RichGenerationReader::open_with_cache_budget(&root, &budget)?;
+    let pages = &reader.manifest.documents[0].pages;
+    let pin = reader.text_cached(&pages[0].native_text)?;
+    reader.clone().clear_cache()?;
+    assert_eq!(reader.cache_status()?["resident_bytes"], 0);
+    assert_eq!(reader.cache_status()?["retained_bytes"], 13);
+    let before = reader.read_metrics()?;
+    let window = reader.clone().read_text(&pages[1].native_text.id, 0, 5)?;
+    assert_eq!(window.text, "bravo");
+    let fallback = reader.read_metrics()?.since(&before)?;
+    assert_eq!(fallback.logical_reader_bytes, 5);
+    assert_eq!(fallback.uncached_logical_bytes, 5);
+    assert_eq!(fallback.cache_fallbacks, 1);
+    assert_eq!(fallback.uncached_load_bytes, 13);
+    assert_eq!(reader.cache_status()?["retained_entries"], 1);
+    drop(pin);
+    assert_eq!(
+        reader.text_cached(&pages[1].native_text)?.origin,
+        ReadOrigin::Loaded
+    );
+    let strict = RichGenerationReader::open_with_cache_budget(
+        &root,
+        &ReaderCacheBudget {
+            max_bytes: 4,
+            max_entries: 1,
+            strict_cache_only: true,
+        },
+    )?;
+    let before = strict.read_metrics()?;
+    assert!(strict.text_cached(&pages[0].native_text).is_err());
+    let failed = strict.read_metrics()?.since(&before)?;
+    // Preserved pre-load digest validation is streaming, not an owned load.
+    assert_eq!(failed.observed_rust_read_bytes, 13);
+    assert_eq!(failed.observed_hash_bytes, 13);
+    assert_eq!(failed.uncached_load_bytes, 0);
+    assert_eq!(strict.cache_status()?["retained_bytes"], 0);
+    Ok(())
+}
+
+#[test]
+fn rich_cache_warm_pin_does_not_follow_current_or_hide_mutation() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let root = root.path().canonicalize()?;
+    let pin = publish(&root, &["needle original\n"])?;
+    let reader = RichGenerationReader::open(&root)?;
+    let artifact = &reader.manifest.documents[0].pages[0].native_text;
+    reader.read_text(&artifact.id, 0, 5)?;
+    let newer = publish(&root, &["newer contents\n"])?;
+    assert_ne!(newer, pin);
+    let before = reader.read_metrics()?;
+    assert_eq!(reader.clone().read_text(&artifact.id, 0, 5)?.text, "needl");
+    assert_eq!(reader.read_metrics()?.since(&before)?.cache_hits, 1);
+    assert_eq!(reader.pin(), pin);
+    let path = reader.dir.join(&artifact.relative_path);
+    fs::write(&path, "needle tampered\n")?;
+    let before = reader.read_metrics()?;
+    assert!(reader.read_text(&artifact.id, 0, 5).is_err());
+    let failed = reader.read_metrics()?.since(&before)?;
+    assert_eq!(failed.logical_reader_bytes, 0);
+    assert_eq!(failed.cache_hits, 0); // Current bytes fail before cached delivery.
+    assert!(failed.observed_rust_read_bytes >= 16);
+    assert!(failed.observed_hash_bytes >= 16);
+    fs::write(path, "needle original\n")?;
+    fs::write(root.join("source.pdf"), "changed source")?;
+    let before = reader.read_metrics()?;
+    assert!(reader.read_text(&artifact.id, 0, 5).is_err());
+    let failed = reader.read_metrics()?.since(&before)?;
+    assert_eq!(failed.logical_reader_bytes, 0);
+    assert_eq!(failed.cache_hits, 0);
+    assert!(failed.observed_rust_read_bytes >= 14);
+    Ok(())
+}

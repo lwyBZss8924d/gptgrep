@@ -101,7 +101,7 @@ async fn bounded_png_pdf_roundtrip_preserves_geometry_pixels_and_one_conversion(
     assert!(
         matches!(&summary.conversion, FeatureState::Present(identity)
         if identity.converter == "gptgrep-bounded-image-pdf"
-        && identity.version == "image-0.25.10/rgb8-pdf-v1" && identity.invocations == 1)
+        && identity.version == "image-0.25.10/png-rgb8-pdf-v2" && identity.invocations == 1)
     );
     let FeatureState::Present(geometry) = &summary.image_geometry else {
         panic!("missing geometry")
@@ -255,49 +255,30 @@ async fn native_metadata_binds_vector_classifier_and_original_cropped_rotated_fr
 }
 
 #[tokio::test]
-async fn bounded_jpeg_pdf_roundtrip_adds_no_second_lossy_encoding() {
-    let dir = tempfile::tempdir().unwrap();
-    let encoded = jpeg_fixture();
-    let expected = image::load_from_memory_with_format(&encoded, image::ImageFormat::Jpeg)
-        .unwrap()
-        .to_rgb8();
-    let source = dir.path().join("raster.jpg");
-    std::fs::write(&source, &encoded).unwrap();
+async fn jpeg_preparation_is_unqualified_before_decoder_or_staging() {
     let budget = ResourceBudget::default();
-    let prepared = prepare_document(
-        &source,
-        &dir.path().join("staging"),
-        &PreparationOptions,
-        &budget,
-    )
-    .await
-    .unwrap();
-    assert_eq!(prepared.summary().format, "jpeg");
-    assert_eq!(
-        embedded_rgb(&std::fs::read(prepared.prepared_path()).unwrap(), 24, 16),
-        expected.as_raw()
+    let encoded = jpeg_fixture();
+    let (error, staging) = prepare_error(&encoded, "jpg", &budget).await;
+    assert!(
+        error.contains("capability_unavailable: JPEG preparation"),
+        "{error}"
     );
-    let candidate = extract_native(
-        &prepared,
-        &NativeOptions {
-            dpi: 72.0,
-            ..Default::default()
-        },
-        &budget,
-    )
-    .await
-    .unwrap();
-    let rendered = image::ImageReader::open(&candidate.pages()[0].renditions[0].path)
-        .unwrap()
-        .decode()
-        .unwrap()
-        .to_rgb8();
-    assert_eq!(rendered, expected);
-    assert_eq!(candidate.pages()[0].coverage, CoverageState::RequiredOcr);
-    assert_eq!(
-        candidate.plan().tasks[0].source_sha256,
-        crate::artifact::sha256(&encoded)
+    assert!(!staging);
+    assert_eq!(budget.staging_used(), 0);
+
+    // A complete container with shortened entropy is equally unavailable;
+    // permissive decoder pixel recovery cannot reach preparation or publication.
+    let sos = encoded.windows(2).position(|b| b == [0xff, 0xda]).unwrap();
+    let scan_len = u16::from_be_bytes([encoded[sos + 2], encoded[sos + 3]]) as usize;
+    let mut incomplete = encoded[..sos + 2 + scan_len].to_vec();
+    incomplete.extend_from_slice(&[0xff, 0xd9]);
+    let (error, staging) = prepare_error(&incomplete, "jpeg", &budget).await;
+    assert!(
+        error.contains("capability_unavailable: JPEG preparation"),
+        "{error}"
     );
+    assert!(!staging);
+    assert_eq!(budget.staging_used(), 0);
 }
 
 #[tokio::test]
@@ -398,28 +379,17 @@ async fn gray_alpha_palette_and_rgb_samples_use_the_admitted_scanline_conversion
         embedded_rgb(&std::fs::read(prepared.prepared_path()).unwrap(), 2, 1),
         &[255, 255, 255, 200, 210, 220]
     );
-    // The grayscale JPEG mode takes the same L8 expansion, without alpha.
-    let source = dir.path().join("gray.jpeg");
+    // Grayscale JPEG also remains unqualified, before sample conversion.
     let mut encoded = Vec::new();
     image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, 100)
         .write_image(&[10, 200], 2, 1, ExtendedColorType::L8)
         .unwrap();
-    let expected = image::load_from_memory_with_format(&encoded, image::ImageFormat::Jpeg)
-        .unwrap()
-        .to_rgb8();
-    std::fs::write(&source, encoded).unwrap();
-    let prepared = prepare_document(
-        &source,
-        &dir.path().join("gray-stage"),
-        &PreparationOptions,
-        &budget,
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        embedded_rgb(&std::fs::read(prepared.prepared_path()).unwrap(), 2, 1),
-        expected.as_raw()
+    let (error, staging) = prepare_error(&encoded, "jpeg", &budget).await;
+    assert!(
+        error.contains("capability_unavailable: JPEG preparation"),
+        "{error}"
     );
+    assert!(!staging);
 }
 
 #[tokio::test]
@@ -449,10 +419,7 @@ async fn bounded_color_metadata_is_explicit_and_source_format_binds_the_recipe()
         image_preparation_profile_digest("png", geometry).unwrap(),
         prepared.summary().preparation_profile_sha256
     );
-    assert_ne!(
-        image_preparation_profile_digest("jpeg", geometry).unwrap(),
-        prepared.summary().preparation_profile_sha256
-    );
+    assert!(image_preparation_profile_digest("jpeg", geometry).is_err());
     let mut forged = geometry.clone();
     forged.source_pixels_to_page.e = 1.0;
     assert!(image_preparation_profile_digest("png", &forged).is_err());
@@ -488,7 +455,10 @@ async fn image_headers_are_admitted_before_decoder_and_staging() {
         .unwrap();
     jpeg[sof + 5..sof + 9].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]);
     let (error, staging) = prepare_error(&jpeg, "jpeg", &budget).await;
-    assert!(error.contains("resource_limit: image exceeds"), "{error}");
+    assert!(
+        error.contains("capability_unavailable: JPEG preparation"),
+        "{error}"
+    );
     assert!(!staging);
 
     let encoded = vec![0u8; 1_048_577];

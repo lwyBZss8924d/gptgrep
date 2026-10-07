@@ -238,6 +238,18 @@ impl ExecutionContext {
             .then_some(self.0.header.plan_digest.as_str())
     }
 
+    /// The ledger's original monotonic anchor, for binding independent role
+    /// pools to the same run. Reading it never creates an anchor or admission.
+    /// An invocation without a shared ledger has no portable run anchor.
+    pub fn ledger_clock_anchor(&self) -> Result<Option<RunClockAnchor>> {
+        Ok(self
+            .0
+            .clock_anchor
+            .lock()
+            .map_err(|_| anyhow!("Decisions run clock unavailable"))?
+            .clone())
+    }
+
     pub(crate) fn compatibility() -> Self {
         Self::create(
             Header {
@@ -649,6 +661,7 @@ mod tests {
         let deadline = SystemTime::now() + Duration::from_secs(5);
         let ctx = context(deadline, 2);
         let before = ctx.snapshot().unwrap();
+        assert!(ctx.ledger_clock_anchor().unwrap().is_none());
         assert_eq!(ctx.run_id(), Some("invented-test-run"));
         assert_eq!(ctx.plan_digest(), Some(DIGEST));
         assert_eq!(before.run_id.as_deref(), ctx.run_id());
@@ -660,6 +673,9 @@ mod tests {
         let joined = context(deadline, 2).with_ledger(&path).unwrap();
         assert_eq!(bound.run_id(), joined.run_id());
         assert_eq!(bound.plan_digest(), joined.plan_digest());
+        let original_clock = bound.ledger_clock_anchor().unwrap().unwrap();
+        assert!(Some(original_clock.clone()) == joined.ledger_clock_anchor().unwrap());
+        original_clock.verify_deadline(deadline).unwrap();
         let snapshot = joined.snapshot().unwrap();
         assert_eq!(snapshot.run_id.as_deref(), Some("invented-test-run"));
         assert_eq!(snapshot.plan_digest.as_deref(), Some(DIGEST));

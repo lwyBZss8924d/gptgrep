@@ -1,5 +1,6 @@
 //! Bounded generation-pinned batch foundation. No model result is clipped after payment.
-use crate::{GenerationPin, GenerationReader, SearchOptions};
+use crate::read_cache::{ReadMeter, ReadOrigin};
+use crate::{GenerationPin, GenerationReader, ReaderCacheBudget, ReaderReadMetrics, SearchOptions};
 use gptgrep_jev::{ExecutionSnapshot, JevClient};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -265,6 +266,10 @@ pub struct BatchItem {
     pub coverage: BatchItemCoverage,
     /// Model counters belong to this item, never a copied shared budget.
     pub metrics: crate::Metrics,
+    /// Delta of the shared reader meter during this item's interval. Concurrent
+    /// callers of reader clones may contribute; this is not exclusive attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_metrics: Option<ReaderReadMetrics>,
 }
 impl BatchItem {
     fn failed(id: &str, quota: usize, failure: BatchError) -> Self {
@@ -276,6 +281,7 @@ impl BatchItem {
             error: Some(failure),
             coverage: Default::default(),
             metrics: Default::default(),
+            read_metrics: None,
         }
     }
     fn pending(id: &str, quota: usize) -> Self {
@@ -296,6 +302,7 @@ impl BatchItem {
             error: None,
             coverage,
             metrics: Default::default(),
+            read_metrics: None,
         }
     }
     fn encoded_bytes(&self) -> usize {
@@ -369,9 +376,11 @@ pub struct BatchMetrics {
     pub reserved_item_output_bytes: usize,
     pub model_submissions: usize,
     pub provider_usage: Vec<Value>,
-    /// The bounded text LRU and physical-read accounting are a subsequent integration.
+    /// Complete native/kernel physical traffic is not observed.
     pub physical_bytes: Option<usize>,
     pub cached_logical_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_metrics: Option<ReaderReadMetrics>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchResponse {
@@ -390,6 +399,8 @@ pub struct BatchFailure {
     pub generation: Option<GenerationPin>,
     pub execution: BatchExecution,
     pub items: Vec<BatchItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_metrics: Option<ReaderReadMetrics>,
 }
 impl std::fmt::Display for BatchFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -409,6 +420,7 @@ fn global(
         generation: pin,
         execution,
         items,
+        read_metrics: None,
     })
 }
 
@@ -521,13 +533,23 @@ pub async fn dispatch_batch(
         execution.finish(client);
         global(e, None, execution.clone(), vec![])
     })?;
+    let meter = ReadMeter::default();
     let reader = match &request.generation {
-        BatchGeneration::Current(_) => GenerationReader::open(root),
-        BatchGeneration::Exact(pin) => GenerationReader::open_pinned(root, pin),
+        BatchGeneration::Current(_) => GenerationReader::open_with_read_meter(
+            root,
+            &ReaderCacheBudget::default(),
+            meter.clone(),
+        ),
+        BatchGeneration::Exact(pin) => GenerationReader::open_pinned_with_read_meter(
+            root,
+            pin,
+            &ReaderCacheBudget::default(),
+            meter.clone(),
+        ),
     }
     .map_err(|_| {
         execution.finish(client);
-        global(
+        let mut failure = global(
             error(
                 BatchErrorCode::SharedIntegrity,
                 "Generation or shared index integrity validation failed",
@@ -535,11 +557,70 @@ pub async fn dispatch_batch(
             None,
             execution,
             vec![],
-        )
+        );
+        failure.read_metrics = meter.snapshot().ok().map(ReaderReadMetrics::from);
+        failure
     })?;
-    dispatch_batch_with_reader(&reader, request, client).await
+    dispatch_batch_metered(&reader, request, client, ReaderReadMetrics::default()).await
 }
 pub async fn dispatch_batch_with_reader(
+    reader: &GenerationReader,
+    request: BatchRequest,
+    client: Option<&JevClient>,
+) -> Result<BatchResponse, Box<BatchFailure>> {
+    let before = reader.read_metrics().map_err(|_| {
+        global(
+            error(BatchErrorCode::SharedIntegrity, "Reader meter unavailable"),
+            Some(reader.pin()),
+            BatchExecution::capture(client),
+            vec![],
+        )
+    })?;
+    dispatch_batch_metered(reader, request, client, before).await
+}
+
+async fn dispatch_batch_metered(
+    reader: &GenerationReader,
+    request: BatchRequest,
+    client: Option<&JevClient>,
+    before: ReaderReadMetrics,
+) -> Result<BatchResponse, Box<BatchFailure>> {
+    let max_output_bytes = request.budget.max_output_bytes;
+    let mut result = dispatch_batch_inner(reader, request, client).await;
+    let metrics = reader.read_metrics().and_then(|after| after.since(&before));
+    match (&mut result, metrics) {
+        (Ok(response), Ok(metrics)) => {
+            response.metrics.cached_logical_bytes =
+                usize::try_from(metrics.cached_logical_bytes).ok();
+            response.metrics.read_metrics = Some(metrics);
+            if serde_json::to_vec(response).map_or(true, |b| b.len() > max_output_bytes) {
+                let mut failure = global(
+                    error(
+                        BatchErrorCode::OutputBudgetInsufficient,
+                        "Complete batch output exceeds its reserved envelope",
+                    ),
+                    Some(response.generation.clone()),
+                    response.execution.clone(),
+                    response.items.clone(),
+                );
+                failure.read_metrics = response.metrics.read_metrics.clone();
+                result = Err(failure);
+            }
+        }
+        (Err(failure), Ok(metrics)) => failure.read_metrics = Some(metrics),
+        (_, Err(_)) => {
+            return Err(global(
+                error(BatchErrorCode::SharedIntegrity, "Reader meter unavailable"),
+                Some(reader.pin()),
+                BatchExecution::capture(client),
+                vec![],
+            ));
+        }
+    }
+    result
+}
+
+async fn dispatch_batch_inner(
     reader: &GenerationReader,
     request: BatchRequest,
     client: Option<&JevClient>,
@@ -597,25 +678,42 @@ pub async fn dispatch_batch_with_reader(
     // Reservations are fixed in input order before any operation executes. This
     // initial implementation is sequential; it does not multiply model schedulers.
     for (index, operation) in request.operations.iter().enumerate() {
+        let item_before = reader.read_metrics().map_err(|_| {
+            global(
+                error(BatchErrorCode::SharedIntegrity, "Reader meter unavailable"),
+                Some(pin.clone()),
+                execution.clone(),
+                items.clone(),
+            )
+        })?;
         if let Err(failure) = shared_integrity(reader) {
+            let _ = attach_item_reads(reader, &item_before, &mut items[index], None);
             execution.finish(client);
             return Err(global(failure, Some(pin), execution, items));
         }
-        let result = execute_operation(reader, operation, quotas[index]).await;
+        let result = execute_operation(reader, operation, quotas[index], &item_before).await;
         if let Err(failure) = shared_integrity(reader) {
+            let _ = attach_item_reads(reader, &item_before, &mut items[index], None);
             execution.finish(client);
             return Err(global(failure, Some(pin), execution, items));
         }
-        items[index] = match result {
-            Ok(item) => item,
+        let (mut item, delivery) = match result {
+            Ok(executed) => (executed.item, executed.delivery),
             Err(failure) if failure.code == BatchErrorCode::SharedIntegrity => {
+                let _ = attach_item_reads(reader, &item_before, &mut items[index], None);
                 execution.finish(client);
                 return Err(global(failure, Some(pin), execution, items));
             }
-            Err(failure) => BatchItem::failed(operation.id(), quotas[index], failure),
+            Err(failure) => (
+                BatchItem::failed(operation.id(), quotas[index], failure),
+                None,
+            ),
         };
-        if items[index].encoded_bytes() > quotas[index] {
-            items[index] = BatchItem::failed(
+        attach_item_reads(reader, &item_before, &mut item, delivery).map_err(|failure| {
+            global(failure, Some(pin.clone()), execution.clone(), items.clone())
+        })?;
+        if item.encoded_bytes() > quotas[index] {
+            item = BatchItem::failed(
                 operation.id(),
                 quotas[index],
                 error(
@@ -623,7 +721,23 @@ pub async fn dispatch_batch_with_reader(
                     "Complete operation output exceeds its reserved share",
                 ),
             );
+            attach_item_reads(reader, &item_before, &mut item, None).map_err(|failure| {
+                global(failure, Some(pin.clone()), execution.clone(), items.clone())
+            })?;
+        } else if let Some((bytes, origin)) = delivery {
+            reader
+                .read_meter
+                .record_delivery(bytes, origin)
+                .map_err(|_| {
+                    global(
+                        error(BatchErrorCode::SharedIntegrity, "Reader meter unavailable"),
+                        Some(pin.clone()),
+                        execution.clone(),
+                        items.clone(),
+                    )
+                })?;
         }
+        items[index] = item;
     }
     shared_integrity(reader).map_err(|failure| {
         execution.finish(client);
@@ -657,6 +771,7 @@ pub async fn dispatch_batch_with_reader(
             provider_usage: vec![],
             physical_bytes: None,
             cached_logical_bytes: None,
+            read_metrics: None,
         },
         items,
     };
@@ -811,12 +926,62 @@ fn coverage(
         cursor: next,
     }
 }
+struct ExecutedItem {
+    item: BatchItem,
+    delivery: Option<(usize, ReadOrigin)>,
+}
+impl From<BatchItem> for ExecutedItem {
+    fn from(item: BatchItem) -> Self {
+        Self {
+            item,
+            delivery: None,
+        }
+    }
+}
+
+fn attach_item_reads(
+    reader: &GenerationReader,
+    before: &ReaderReadMetrics,
+    item: &mut BatchItem,
+    delivery: Option<(usize, ReadOrigin)>,
+) -> Result<(), BatchError> {
+    let mut metrics = reader
+        .read_metrics()
+        .and_then(|after| after.since(before))
+        .map_err(|_| error(BatchErrorCode::SharedIntegrity, "Reader meter unavailable"))?;
+    // The shared batch envelope carries scope/coverage once. Item values are
+    // intervals of that same counter, not independent copies of its totals.
+    metrics.coverage.clear();
+    if let Some((bytes, origin)) = delivery {
+        let bytes = u64::try_from(bytes)
+            .map_err(|_| error(BatchErrorCode::SharedIntegrity, "Reader meter overflow"))?;
+        metrics.logical_reader_bytes = metrics
+            .logical_reader_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| error(BatchErrorCode::SharedIntegrity, "Reader meter overflow"))?;
+        if origin == ReadOrigin::Cache {
+            metrics.cached_logical_bytes = metrics
+                .cached_logical_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| error(BatchErrorCode::SharedIntegrity, "Reader meter overflow"))?;
+        } else if origin == ReadOrigin::Uncached {
+            metrics.uncached_logical_bytes = metrics
+                .uncached_logical_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| error(BatchErrorCode::SharedIntegrity, "Reader meter overflow"))?;
+        }
+    }
+    item.read_metrics = Some(metrics);
+    Ok(())
+}
+
 struct Enumeration<'a> {
     pointer: &'a str,
     lane: &'a str,
     scope: &'a str,
     page_size: usize,
     token: Option<&'a str>,
+    meter_before: &'a ReaderReadMetrics,
 }
 fn enumerate(
     reader: &GenerationReader,
@@ -832,6 +997,7 @@ fn enumerate(
         scope,
         page_size,
         token,
+        meter_before,
     } = enumeration;
     if !(1..=1000).contains(&page_size) {
         return Err(error(
@@ -857,12 +1023,13 @@ fn enumerate(
         *base.pointer_mut(pointer).expect("known enumeration array") =
             Value::Array(selected.clone());
         let next = (end < objects.len()).then(|| cursor(reader, lane, scope, &options, end));
-        let item = BatchItem::success(
+        let mut item = BatchItem::success(
             op.id(),
             quota,
             base.clone(),
             coverage(objects.len(), start, end, "objects", end < limit, next),
         );
+        attach_item_reads(reader, meter_before, &mut item, None)?;
         if item.encoded_bytes() > quota {
             break;
         }
@@ -887,7 +1054,8 @@ async fn execute_operation(
     reader: &GenerationReader,
     op: &BatchOperation,
     quota: usize,
-) -> Result<BatchItem, BatchError> {
+    meter_before: &ReaderReadMetrics,
+) -> Result<ExecutedItem, BatchError> {
     match op {
         BatchOperation::Catalog {
             fields,
@@ -927,8 +1095,10 @@ async fn execute_operation(
                     scope: "indexed_documents",
                     page_size: *page_size,
                     token: token.as_deref(),
+                    meter_before,
                 },
             )
+            .map(ExecutedItem::from)
         }
         BatchOperation::Tree {
             document,
@@ -1019,8 +1189,10 @@ async fn execute_operation(
                     scope: document,
                     page_size: *page_size,
                     token: token.as_deref(),
+                    meter_before,
                 },
             )
+            .map(ExecutedItem::from)
         }
         BatchOperation::ReadNode {
             node_id,
@@ -1038,23 +1210,28 @@ async fn execute_operation(
             let start = cursor_start(reader, "read_node", node_id, &options, token.as_deref())?;
             let mut bytes = *max_bytes;
             loop {
-                let hit = reader
-                    .read_node_window(node_id, bytes, start)
-                    .map_err(reader_error)?;
+                let (hit, origin) =
+                    crate::reader_node_window_unmetered_delivery(reader, node_id, bytes, start)
+                        .map_err(reader_error)?;
+                let delivered = hit.text.len();
                 let node = hit.node_coverage.expect("read node coverage");
                 let total = node.unread_before_bytes + hit.text.len() + node.unread_after_bytes;
                 let end = start + hit.text.len();
                 let next = hit
                     .next_offset
                     .map(|n| cursor(reader, "read_node", node_id, &options, n));
-                let item = BatchItem::success(
+                let mut item = BatchItem::success(
                     op.id(),
                     quota,
                     serde_json::to_value(&hit).expect("Hit DTO"),
                     coverage(total, start, end, "bytes", bytes < *max_bytes, next),
                 );
+                attach_item_reads(reader, meter_before, &mut item, Some((delivered, origin)))?;
                 if item.encoded_bytes() <= quota {
-                    return Ok(item);
+                    return Ok(ExecutedItem {
+                        item,
+                        delivery: Some((delivered, origin)),
+                    });
                 }
                 if bytes <= 4 {
                     return Err(error(
@@ -1126,13 +1303,14 @@ async fn execute_operation(
                     "Search encountered a changed or disappeared source; reindex before reading",
                 ));
             }
+            attach_item_reads(reader, meter_before, &mut item, None)?;
             if item.encoded_bytes() > quota {
                 return Err(error(
                     BatchErrorCode::OutputBudgetInsufficient,
                     "Complete deterministic search result exceeds its reserved output share",
                 ));
             }
-            Ok(item)
+            Ok(item.into())
         }
     }
 }
@@ -1174,7 +1352,14 @@ fn reader_error(error_value: anyhow::Error) -> BatchError {
             "Requested document or node is absent from the pinned generation",
         );
     }
-    if message.contains("digest mismatch")
+    if matches!(
+        error_value.downcast_ref::<crate::read_cache::CacheError>(),
+        Some(
+            crate::read_cache::CacheError::Loader(_)
+                | crate::read_cache::CacheError::DigestMismatch
+                | crate::read_cache::CacheError::LengthMismatch { .. }
+        )
+    ) || message.contains("digest mismatch")
         || message.contains("text and tree")
         || message.contains("indexed text is not UTF-8")
         || message.contains("tree does not cover")
@@ -1284,6 +1469,181 @@ mod tests {
         }
         assert!(parse_batch_request(&vec![b' '; MAX_BATCH_INPUT_BYTES + 1]).is_err());
         assert!(parse_batch_request(br#"{"schema_version":"gptgrep.batch.request.v1","operations":[{"id":"first","id":"second","op":"catalog"}]}"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn batch_reader_meter_has_one_total_and_disjoint_item_intervals() -> Result<()> {
+        let dir = fixture().await?;
+        let reader = GenerationReader::open(dir.path())?;
+        let a = reader
+            .manifest
+            .documents
+            .iter()
+            .find(|d| d.path == "a.md")
+            .unwrap();
+        let node = format!("{}:{}", a.id, a.nodes[0].id);
+        let req = request(json!([
+            {"id":"first","op":"read_node","node_id":node,"max_bytes":5},
+            {"id":"warm","op":"read_node","node_id":node,"max_bytes":5},
+            {"id":"catalog","op":"catalog"}
+        ]));
+        let before = reader.read_metrics()?;
+        let response = dispatch_batch_with_reader(&reader, req, None).await?;
+        let expected = reader.read_metrics()?.since(&before)?;
+        assert_eq!(response.metrics.read_metrics.as_ref().unwrap(), &expected);
+        assert_eq!(expected.logical_reader_bytes, 10);
+        assert_eq!(expected.cached_logical_bytes, 5);
+        assert_eq!(response.metrics.cached_logical_bytes, Some(5));
+        assert!(response.metrics.physical_bytes.is_none());
+        assert_eq!(
+            response.items[0]
+                .read_metrics
+                .as_ref()
+                .unwrap()
+                .logical_reader_bytes,
+            5
+        );
+        assert_eq!(
+            response.items[0]
+                .read_metrics
+                .as_ref()
+                .unwrap()
+                .cached_logical_bytes,
+            0
+        );
+        assert_eq!(
+            response.items[1]
+                .read_metrics
+                .as_ref()
+                .unwrap()
+                .cached_logical_bytes,
+            5
+        );
+        assert_eq!(
+            response.items[2]
+                .read_metrics
+                .as_ref()
+                .unwrap()
+                .logical_reader_bytes,
+            0
+        );
+        let item_reads: u64 = response
+            .items
+            .iter()
+            .map(|i| i.read_metrics.as_ref().unwrap().observed_rust_read_bytes)
+            .sum();
+        // Initial/final shared integrity checks belong to the batch envelope,
+        // not copied into every item's interval.
+        assert!(item_reads < expected.observed_rust_read_bytes);
+        let manifest_bytes = fs::metadata(reader.dir.join("manifest.json"))?.len();
+        assert_eq!(
+            expected.observed_rust_read_bytes - item_reads,
+            2 * manifest_bytes
+        );
+        let req = request(json!([{"id":"again","op":"read_node","node_id":node,"max_bytes":5}]));
+        let again = dispatch_batch_with_reader(&reader, req, None).await?;
+        assert_eq!(
+            again
+                .metrics
+                .read_metrics
+                .as_ref()
+                .unwrap()
+                .logical_reader_bytes,
+            5
+        );
+        assert_eq!(
+            again
+                .metrics
+                .read_metrics
+                .as_ref()
+                .unwrap()
+                .cached_logical_bytes,
+            5
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batch_quota_probes_do_not_count_discarded_windows_as_delivery() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join("a.txt"), "long evidence ".repeat(4000))?;
+        crate::index(dir.path(), 10).await?;
+        let reader = GenerationReader::open(dir.path())?;
+        let a = &reader.manifest.documents[0];
+        let node = format!("{}:{}", a.id, a.nodes[0].id);
+        let mut req =
+            request(json!([{"id":"window","op":"read_node","node_id":node,"max_bytes":65536}]));
+        req.budget.max_output_bytes = 16_384;
+        let response = dispatch_batch_with_reader(&reader, req.clone(), None).await?;
+        assert_eq!(response.items[0].status, BatchItemStatus::Ok);
+        let delivered = response.items[0].result.as_ref().unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .len() as u64;
+        let metrics = response.metrics.read_metrics.as_ref().unwrap();
+        assert!(delivered < 56_000);
+        assert_eq!(metrics.logical_reader_bytes, delivered);
+        assert_eq!(metrics.cached_logical_bytes, delivered);
+        assert!(metrics.cache_hits > 1); // Unreturned quota probes are physical work.
+        assert!(metrics.observed_rust_read_bytes > delivered);
+        assert!(serde_json::to_vec(&response)?.len() <= req.budget.max_output_bytes);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batch_reader_errors_and_open_failures_retain_actual_read_counts() -> Result<()> {
+        let dir = fixture().await?;
+        let reader = GenerationReader::open(dir.path())?;
+        let a = reader
+            .manifest
+            .documents
+            .iter()
+            .find(|d| d.path == "a.md")
+            .unwrap();
+        let node = format!("{}:{}", a.id, a.nodes[0].id);
+        reader.read_node(&node, 5)?;
+        fs::write(dir.path().join("a.md"), "changed source\n")?;
+        let req = request(json!([
+            {"id":"stale","op":"read_node","node_id":node,"max_bytes":5},
+            {"id":"later","op":"catalog"}
+        ]));
+        let response = dispatch_batch_with_reader(&reader, req, None).await?;
+        let stale = response.items[0].read_metrics.as_ref().unwrap();
+        assert_eq!(
+            response.items[0].error.as_ref().unwrap().code,
+            BatchErrorCode::SourceStale
+        );
+        assert_eq!(stale.logical_reader_bytes, 0);
+        assert!(stale.observed_rust_read_bytes >= 15);
+        fs::write(reader.dir.join("manifest.json"), "{}")?;
+        let req = request(json!([{"id":"catalog","op":"catalog"}]));
+        let failed = dispatch_batch_with_reader(&reader, req.clone(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            failed
+                .read_metrics
+                .as_ref()
+                .unwrap()
+                .observed_rust_read_bytes,
+            2
+        );
+        assert_eq!(failed.read_metrics.as_ref().unwrap().observed_hash_bytes, 2);
+        fs::write(
+            dir.path().join(crate::STATE).join("CURRENT.json"),
+            "invalid-json",
+        )?;
+        let failed = dispatch_batch(dir.path(), req, None).await.unwrap_err();
+        assert_eq!(
+            failed
+                .read_metrics
+                .as_ref()
+                .unwrap()
+                .observed_rust_read_bytes,
+            12
+        );
+        assert_eq!(failed.read_metrics.as_ref().unwrap().observed_hash_bytes, 0);
+        Ok(())
     }
 
     #[tokio::test]

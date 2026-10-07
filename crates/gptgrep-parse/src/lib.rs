@@ -11,6 +11,7 @@ use liteparse::{LiteParse, LiteParseConfig, OutputFormat, types::PdfInput};
 use std::path::{Path, PathBuf};
 
 mod artifact;
+mod crop;
 mod geometry;
 mod image_prepare;
 #[cfg(test)]
@@ -22,6 +23,7 @@ mod rich;
 mod rich_tests;
 
 pub use artifact::{ArtifactKind, ArtifactRef, FeatureState, artifact_id};
+pub use crop::{CropAdmission, CropOutput, CropRecipe, PixelCrop, crop_rendition};
 pub use geometry::{AffineTransform, BoundingBox, PageGeometry};
 pub use image_prepare::image_preparation_profile_digest;
 pub use ocr::{

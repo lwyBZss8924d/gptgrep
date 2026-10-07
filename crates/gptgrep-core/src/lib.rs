@@ -12,6 +12,7 @@ pub use evidence_roles::{
 };
 mod navigation_overlay;
 mod planned;
+mod read_cache;
 mod rich_generation;
 use gptgrep_pageindex::TreeNode;
 pub use navigation_overlay::{
@@ -28,6 +29,7 @@ pub use planned::{
     PlannedSearchObserver, PlannedSearchReport, PlannedSpanProvenance, PlannedViewCoverage,
     search_planned_with_client_and_observer, search_planned_with_policy_and_observer,
 };
+use read_cache::{CacheError, CacheKey, ReadCache, ReadMeter, ReadMetrics, ReadOrigin, ReadPin};
 pub use rich_generation::{
     ArtifactSearchReport, ArtifactTextWindow, EvidenceRef, RICH_MANIFEST_SCHEMA, RichDocument,
     RichGenerationReader, RichGenerationWriter, RichManifest, StoredArtifact, TextEvidenceBinding,
@@ -39,7 +41,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const SCHEMA: &str = "gptgrep.v1";
@@ -47,6 +49,96 @@ const STATE: &str = ".gptgrep";
 const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_TEXT_BYTES: u64 = 256 * 1024 * 1024;
+
+pub const MAX_READER_CACHE_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_READER_CACHE_ENTRIES: usize = 1024;
+
+/// Cache admission is separate from the historical text/type size limits.
+/// Default readers use a bounded uncached load when cache capacity is unavailable.
+/// Byte capacity charges immutable payloads retained by cache entries or pins;
+/// it does not bound uncached copies, manifests, native allocations or process RSS.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReaderCacheBudget {
+    pub max_bytes: usize,
+    pub max_entries: usize,
+    pub strict_cache_only: bool,
+}
+impl Default for ReaderCacheBudget {
+    fn default() -> Self {
+        Self {
+            max_bytes: 16 * 1024 * 1024,
+            max_entries: 128,
+            strict_cache_only: false,
+        }
+    }
+}
+impl ReaderCacheBudget {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.max_bytes > 0
+                && self.max_bytes <= MAX_READER_CACHE_BYTES
+                && self.max_entries > 0
+                && self.max_entries <= MAX_READER_CACHE_ENTRIES,
+            "invalid reader cache budget"
+        );
+        Ok(())
+    }
+}
+
+/// Observed byte counts, never kernel disk traffic or native index IO. Logical
+/// bytes are text windows returned by reader APIs, not final wire/provider bytes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReaderReadMetrics {
+    pub logical_reader_bytes: u64,
+    pub cached_logical_bytes: u64,
+    pub uncached_logical_bytes: u64,
+    pub observed_rust_read_bytes: u64,
+    pub observed_hash_bytes: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub cache_fallbacks: u64,
+    pub uncached_load_bytes: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub coverage: String,
+}
+impl From<ReadMetrics> for ReaderReadMetrics {
+    fn from(metrics: ReadMetrics) -> Self {
+        Self {
+            logical_reader_bytes: metrics.logical_delivered_bytes,
+            cached_logical_bytes: metrics.cached_logical_bytes,
+            uncached_logical_bytes: metrics.uncached_logical_bytes,
+            observed_rust_read_bytes: metrics.physical_read_bytes,
+            observed_hash_bytes: metrics.physical_hash_bytes,
+            cache_hits: metrics.cache_hits, cache_misses: metrics.cache_misses,
+            cache_fallbacks: metrics.cache_fallbacks, uncached_load_bytes: metrics.uncached_load_bytes,
+            coverage: "partial: Rust reader read/hash paths and node/artifact text-window delivery; excludes search/navigation logical delivery, native index/mmap, kernel disk traffic, parser and full-generation verification helpers; counters shared across reader clones".into(),
+        }
+    }
+}
+impl ReaderReadMetrics {
+    pub(crate) fn since(&self, before: &Self) -> Result<Self> {
+        macro_rules! delta {
+            ($field:ident) => {
+                self.$field
+                    .checked_sub(before.$field)
+                    .context("reader meter counter decreased")?
+            };
+        }
+        Ok(Self {
+            logical_reader_bytes: delta!(logical_reader_bytes),
+            cached_logical_bytes: delta!(cached_logical_bytes),
+            uncached_logical_bytes: delta!(uncached_logical_bytes),
+            observed_rust_read_bytes: delta!(observed_rust_read_bytes),
+            observed_hash_bytes: delta!(observed_hash_bytes),
+            cache_hits: delta!(cache_hits),
+            cache_misses: delta!(cache_misses),
+            cache_fallbacks: delta!(cache_fallbacks),
+            uncached_load_bytes: delta!(uncached_load_bytes),
+            coverage: self.coverage.clone(),
+        })
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PageSpan {
@@ -404,6 +496,152 @@ fn bounded_read(path: &Path, max: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn fill_reader_buffer(path: &Path, buffer: &mut [u8], meter: &ReadMeter) -> Result<usize> {
+    use std::io::Read;
+    let mut file = File::open(path)?;
+    ensure!(
+        file.metadata()?.len() == buffer.len() as u64,
+        "file length changed before reader load"
+    );
+    let mut filled = 0;
+    while filled < buffer.len() {
+        let count = file.read(&mut buffer[filled..])?;
+        meter.record_physical_read(count)?;
+        ensure!(count > 0, "file shortened during reader load");
+        filled += count;
+    }
+    let mut extra = [0u8; 1];
+    let count = file.read(&mut extra)?;
+    meter.record_physical_read(count)?;
+    ensure!(count == 0, "file grew during reader load");
+    Ok(filled)
+}
+
+fn bounded_read_metered(path: &Path, max: u64, meter: &ReadMeter) -> Result<Vec<u8>> {
+    let size = fs::metadata(path)?.len();
+    ensure!(
+        size <= max,
+        "file exceeds {max} byte limit: {}",
+        path.display()
+    );
+    let size = usize::try_from(size)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(size)
+        .context("reader allocation failed")?;
+    bytes.resize(size, 0);
+    fill_reader_buffer(path, &mut bytes, meter)?;
+    Ok(bytes)
+}
+
+fn digest_metered(bytes: &[u8], meter: &ReadMeter) -> Result<String> {
+    let digest = digest(bytes);
+    meter.record_physical_hash(bytes.len())?;
+    Ok(digest)
+}
+
+fn hash_reader_file(path: &Path, max: u64, meter: &ReadMeter) -> Result<(u64, String)> {
+    use std::io::Read;
+    let meta = fs::symlink_metadata(path)?;
+    ensure!(
+        meta.is_file() && !meta.file_type().is_symlink() && meta.len() <= max,
+        "reader file type/size rejected"
+    );
+    let mut file = File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut bytes = 0u64;
+    let mut buffer = [0u8; 65_536];
+    loop {
+        let admitted = usize::try_from((max - bytes).saturating_add(1).min(buffer.len() as u64))?;
+        let count = file.read(&mut buffer[..admitted])?;
+        meter.record_physical_read(count)?;
+        if count == 0 {
+            break;
+        }
+        bytes += count as u64;
+        ensure!(bytes <= max, "reader file grew beyond admission");
+        hash.update(&buffer[..count]);
+        meter.record_physical_hash(count)?;
+    }
+    Ok((bytes, format!("{:x}", hash.finalize())))
+}
+
+enum ReaderBuffer {
+    Cached(ReadPin),
+    Uncached(Vec<u8>),
+}
+struct ReaderText {
+    bytes: ReaderBuffer,
+    origin: ReadOrigin,
+}
+impl ReaderText {
+    fn into_string(self) -> Result<String> {
+        match self.bytes {
+            ReaderBuffer::Uncached(bytes) => Ok(String::from_utf8(bytes)?),
+            ReaderBuffer::Cached(pin) => {
+                let mut text = String::new();
+                text.try_reserve_exact(pin.len())
+                    .context("reader navigation text allocation failed")?;
+                text.push_str(std::str::from_utf8(&pin)?);
+                Ok(text)
+            }
+        }
+    }
+}
+impl std::ops::Deref for ReaderText {
+    type Target = str;
+    fn deref(&self) -> &str {
+        let bytes: &[u8] = match &self.bytes {
+            ReaderBuffer::Cached(pin) => pin,
+            ReaderBuffer::Uncached(bytes) => bytes,
+        };
+        std::str::from_utf8(bytes).expect("reader text validated before construction")
+    }
+}
+
+fn load_reader_text(
+    cache: &ReadCache,
+    budget: &ReaderCacheBudget,
+    meter: &ReadMeter,
+    key: &CacheKey,
+    path: &Path,
+    known_bytes: u64,
+    type_limit: u64,
+) -> Result<ReaderText> {
+    ensure!(
+        known_bytes <= type_limit,
+        "text exceeds historical reader type limit"
+    );
+    let known = usize::try_from(known_bytes)?;
+    let loaded = cache.get_or_load(key, known, meter, |buffer, meter| {
+        fill_reader_buffer(path, buffer, meter)
+    });
+    let (bytes, origin) = match loaded {
+        Ok(read) => (ReaderBuffer::Cached(read.bytes), read.origin),
+        Err(error @ (CacheError::Oversized { .. } | CacheError::CapacityRetained))
+            if !budget.strict_cache_only =>
+        {
+            meter.record_fallback()?;
+            let _ = error; // Explicit fallback is reported by the shared meter.
+            let bytes = bounded_read_metered(path, known_bytes, meter)?;
+            ensure!(bytes.len() == known, "uncached text length changed");
+            meter.record_uncached_load(bytes.len())?;
+            ensure!(
+                digest_metered(&bytes, meter)? == key.content_sha256(),
+                "uncached indexed text digest mismatch"
+            );
+            (ReaderBuffer::Uncached(bytes), ReadOrigin::Uncached)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let raw: &[u8] = match &bytes {
+        ReaderBuffer::Cached(pin) => pin,
+        ReaderBuffer::Uncached(bytes) => bytes,
+    };
+    std::str::from_utf8(raw).context("indexed text is not UTF-8")?;
+    Ok(ReaderText { bytes, origin })
+}
+
 fn source_path(root: &Path, relative: &str) -> Result<PathBuf> {
     let rel = Path::new(relative);
     ensure!(
@@ -715,17 +953,32 @@ pub struct GenerationPin {
 /// Opening resolves CURRENT once. Source freshness and candidate text digests
 /// are checked for each operation; retained generations must not be removed or
 /// edited while readers use them. No source discovery or publication occurs.
+#[derive(Clone)]
 pub struct GenerationReader {
-    manifest: Manifest,
+    manifest: Arc<Manifest>,
     dir: PathBuf,
     pin: GenerationPin,
-    index: OnceLock<std::result::Result<gptgrep_index::IndexSession, String>>,
+    index: Arc<OnceLock<std::result::Result<gptgrep_index::IndexSession, String>>>,
+    cache: ReadCache,
+    cache_budget: ReaderCacheBudget,
+    read_meter: ReadMeter,
 }
 
 type Snapshot = GenerationReader;
 
 impl GenerationReader {
     pub fn open(root: &Path) -> Result<Self> {
+        Self::open_with_cache_budget(root, &ReaderCacheBudget::default())
+    }
+    pub fn open_with_cache_budget(root: &Path, budget: &ReaderCacheBudget) -> Result<Self> {
+        Self::open_with_read_meter(root, budget, ReadMeter::default())
+    }
+    fn open_with_read_meter(
+        root: &Path,
+        budget: &ReaderCacheBudget,
+        meter: ReadMeter,
+    ) -> Result<Self> {
+        budget.validate()?;
         let root = root.canonicalize()?;
         let state = root.join(STATE);
         ensure!(
@@ -736,23 +989,44 @@ impl GenerationReader {
             "index directory cannot be a symlink"
         );
         no_symlink(&state.join("CURRENT.json"))?;
-        let pointer: Pointer =
-            serde_json::from_slice(&bounded_read(&state.join("CURRENT.json"), 4096)?)?;
+        let pointer: Pointer = serde_json::from_slice(&bounded_read_metered(
+            &state.join("CURRENT.json"),
+            4096,
+            &meter,
+        )?)?;
         ensure!(
             pointer.schema_version == SCHEMA,
             "unsupported index schema; reindex required"
         );
-        Self::open_pinned(
+        Self::open_pinned_with_read_meter(
             &root,
             &GenerationPin {
                 generation: pointer.generation,
                 manifest_sha256: pointer.manifest_sha256,
             },
+            budget,
+            meter,
         )
     }
 
     /// Open exactly a retained generation without reading CURRENT.
     pub fn open_pinned(root: &Path, pin: &GenerationPin) -> Result<Self> {
+        Self::open_pinned_with_cache_budget(root, pin, &ReaderCacheBudget::default())
+    }
+    pub fn open_pinned_with_cache_budget(
+        root: &Path,
+        pin: &GenerationPin,
+        budget: &ReaderCacheBudget,
+    ) -> Result<Self> {
+        Self::open_pinned_with_read_meter(root, pin, budget, ReadMeter::default())
+    }
+    fn open_pinned_with_read_meter(
+        root: &Path,
+        pin: &GenerationPin,
+        budget: &ReaderCacheBudget,
+        meter: ReadMeter,
+    ) -> Result<Self> {
+        budget.validate()?;
         let root = root.canonicalize()?;
         let state = root.join(STATE);
         no_symlink(&state)?;
@@ -774,9 +1048,9 @@ impl GenerationReader {
         no_symlink(&dir)?;
         no_symlink(&dir.join("manifest.json"))?;
         no_symlink(&dir.join("trigram"))?;
-        let bytes = bounded_read(&dir.join("manifest.json"), MAX_MANIFEST_BYTES)?;
+        let bytes = bounded_read_metered(&dir.join("manifest.json"), MAX_MANIFEST_BYTES, &meter)?;
         ensure!(
-            digest(&bytes) == pin.manifest_sha256,
+            digest_metered(&bytes, &meter)? == pin.manifest_sha256,
             "index manifest digest mismatch; reindex required"
         );
         let manifest: Manifest = serde_json::from_slice(&bytes)?;
@@ -795,14 +1069,32 @@ impl GenerationReader {
         );
         validate_manifest(&manifest)?;
         Ok(Self {
-            manifest,
+            manifest: Arc::new(manifest),
             dir,
             pin: pin.clone(),
-            index: OnceLock::new(),
+            index: Arc::new(OnceLock::new()),
+            cache: ReadCache::new(budget.max_bytes, budget.max_entries)?,
+            cache_budget: budget.clone(),
+            read_meter: meter,
         })
     }
     pub fn pin(&self) -> GenerationPin {
         self.pin.clone()
+    }
+    pub fn read_metrics(&self) -> Result<ReaderReadMetrics> {
+        Ok(self.read_meter.snapshot()?.into())
+    }
+    pub fn clear_cache(&self) -> Result<()> {
+        Ok(self.cache.clear()?)
+    }
+    pub fn cache_status(&self) -> Result<Value> {
+        let status = self.cache.stats()?;
+        Ok(
+            json!({"capacity_bytes":status.capacity_bytes,"capacity_entries":status.capacity_entries,
+            "retained_bytes":status.retained_bytes,"retained_entries":status.retained_entries,
+            "resident_bytes":status.resident_bytes,"resident_entries":status.resident_entries,
+            "strict_cache_only":self.cache_budget.strict_cache_only}),
+        )
     }
 
     fn validate(&self) -> Result<()> {
@@ -813,10 +1105,14 @@ impl GenerationReader {
         no_symlink(&self.dir.join("manifest.json"))?;
         no_symlink(&self.dir.join("trigram"))?;
         ensure!(
-            digest(&bounded_read(
-                &self.dir.join("manifest.json"),
-                MAX_MANIFEST_BYTES
-            )?) == self.pin.manifest_sha256,
+            digest_metered(
+                &bounded_read_metered(
+                    &self.dir.join("manifest.json"),
+                    MAX_MANIFEST_BYTES,
+                    &self.read_meter
+                )?,
+                &self.read_meter
+            )? == self.pin.manifest_sha256,
             "retained generation manifest changed; reindex required"
         );
         if let Some(Ok(index)) = self.index.get() {
@@ -877,18 +1173,31 @@ impl GenerationReader {
     }
 
     fn text(&self, doc: &Document) -> Result<String> {
+        self.text_cached(doc)?.into_string()
+    }
+    fn text_cached(&self, doc: &Document) -> Result<ReaderText> {
         no_symlink(&self.dir.join("text"))?;
         no_symlink(&self.dir.join("text").join(format!("{}.txt", doc.id)))?;
-        let bytes = bounded_read(
-            &self.dir.join("text").join(format!("{}.txt", doc.id)),
+        let path = self.dir.join("text").join(format!("{}.txt", doc.id));
+        let size = fs::metadata(&path)?.len();
+        let key = CacheKey::new(&self.pin.generation, &doc.id, &doc.text_sha256)?;
+        let text = load_reader_text(
+            &self.cache,
+            &self.cache_budget,
+            &self.read_meter,
+            &key,
+            &path,
+            size,
             MAX_TEXT_BYTES,
         )?;
-        ensure!(
-            digest(&bytes) == doc.text_sha256,
-            "indexed text digest mismatch for {}; reindex",
-            doc.path
-        );
-        let text = String::from_utf8(bytes).context("indexed text is not UTF-8")?;
+        if text.origin == ReadOrigin::Cache {
+            ensure!(
+                hash_reader_file(&path, MAX_TEXT_BYTES, &self.read_meter)?
+                    == (size, doc.text_sha256.clone()),
+                "indexed text digest mismatch for {}; reindex",
+                doc.path
+            );
+        }
         ensure!(
             (text.is_empty() && doc.pages.is_empty())
                 || doc
@@ -901,8 +1210,8 @@ impl GenerationReader {
     }
     fn fresh(&self, doc: &Document) -> bool {
         source_path(&self.manifest.root, &doc.path)
-            .and_then(|p| bounded_read(&p, MAX_SOURCE_BYTES))
-            .is_ok_and(|bytes| digest(&bytes) == doc.source_sha256)
+            .and_then(|p| hash_reader_file(&p, MAX_SOURCE_BYTES, &self.read_meter))
+            .is_ok_and(|(_, digest)| digest == doc.source_sha256)
     }
 }
 
@@ -986,6 +1295,20 @@ fn reader_read_node_window(
     max_bytes: usize,
     offset_bytes: usize,
 ) -> Result<Hit> {
+    let (hit, origin) =
+        reader_node_window_unmetered_delivery(snapshot, node_id, max_bytes, offset_bytes)?;
+    snapshot
+        .read_meter
+        .record_delivery(hit.text.len(), origin)?;
+    Ok(hit)
+}
+
+fn reader_node_window_unmetered_delivery(
+    snapshot: &GenerationReader,
+    node_id: &str,
+    max_bytes: usize,
+    offset_bytes: usize,
+) -> Result<(Hit, ReadOrigin)> {
     ensure!(
         (1..=65536).contains(&max_bytes),
         "max-bytes must be 1..65536"
@@ -1009,7 +1332,7 @@ fn reader_read_node_window(
         snapshot.fresh(doc),
         "source changed or disappeared; reindex before reading evidence"
     );
-    let view = TextView::new(snapshot.text(doc)?);
+    let view = TextView::new(snapshot.text_cached(doc)?);
     let (node_start, node_end) = view
         .node_bytes(node)
         .context("tree node range lies outside canonical text")?;
@@ -1049,7 +1372,7 @@ fn reader_read_node_window(
         "source changed or disappeared; reindex before reading evidence"
     );
     snapshot.validate()?;
-    Ok(result)
+    Ok((result, view.text.origin()))
 }
 
 fn truncate(text: &str, max: usize) -> (&str, bool) {
@@ -1063,13 +1386,45 @@ fn truncate(text: &str, max: usize) -> (&str, bool) {
     (&text[..end], true)
 }
 
+enum TextStorage {
+    Owned(String),
+    Reader(ReaderText),
+}
+impl From<String> for TextStorage {
+    fn from(text: String) -> Self {
+        Self::Owned(text)
+    }
+}
+impl From<ReaderText> for TextStorage {
+    fn from(text: ReaderText) -> Self {
+        Self::Reader(text)
+    }
+}
+impl std::ops::Deref for TextStorage {
+    type Target = str;
+    fn deref(&self) -> &str {
+        match self {
+            Self::Owned(text) => text,
+            Self::Reader(text) => text,
+        }
+    }
+}
+impl TextStorage {
+    fn origin(&self) -> ReadOrigin {
+        match self {
+            Self::Owned(_) => ReadOrigin::Loaded,
+            Self::Reader(text) => text.origin,
+        }
+    }
+}
 struct TextView {
-    text: String,
+    text: TextStorage,
     lines: Vec<(usize, usize)>,
 }
 
 impl TextView {
-    fn new(text: String) -> Self {
+    fn new(text: impl Into<TextStorage>) -> Self {
+        let text = text.into();
         let mut offset = 0;
         let mut lines = Vec::new();
         for line in text.split_inclusive('\n') {
@@ -1544,7 +1899,7 @@ async fn collect_candidate_view(
                 break;
             }
             if !texts.contains_key(&doc.id) {
-                texts.insert(doc.id.clone(), TextView::new(snapshot.text(doc)?));
+                texts.insert(doc.id.clone(), TextView::new(snapshot.text_cached(doc)?));
             }
             let text = &texts[&doc.id];
             let Some(node) = node_at(doc, m.line_number) else {
@@ -1613,7 +1968,7 @@ async fn collect_candidate_view(
                 continue;
             }
             if !texts.contains_key(&doc.id) {
-                texts.insert(doc.id.clone(), TextView::new(snapshot.text(doc)?));
+                texts.insert(doc.id.clone(), TextView::new(snapshot.text_cached(doc)?));
             }
             let headings = doc
                 .nodes
@@ -1938,6 +2293,235 @@ mod tests {
             .unwrap()
             .remove("elapsed_ms");
         Ok(value)
+    }
+
+    #[test]
+    fn reader_meter_size_admission_precedes_owned_io_and_failed_hashes_keep_counts() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("ordinary.txt");
+        fs::write(&path, "12345")?;
+        let meter = ReadMeter::default();
+        assert!(bounded_read_metered(&path, 4, &meter).is_err());
+        assert_eq!(meter.snapshot()?, ReadMetrics::default());
+        let bytes = bounded_read_metered(&path, 5, &meter)?;
+        assert_eq!(bytes, b"12345");
+        assert_eq!(meter.snapshot()?.physical_read_bytes, 5);
+        assert_eq!(meter.snapshot()?.physical_hash_bytes, 0);
+        assert_eq!(digest_metered(&bytes, &meter)?, digest(b"12345"));
+        assert_eq!(meter.snapshot()?.physical_hash_bytes, 5);
+        fs::remove_file(&path)?;
+        assert!(hash_reader_file(&path, 5, &meter).is_err());
+        assert_eq!(meter.snapshot()?.physical_read_bytes, 5);
+        assert_eq!(meter.snapshot()?.physical_hash_bytes, 5);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reader_cache_warm_clone_counts_windows_and_revalidation_reads_exactly() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = "alpha β gamma\n";
+        fs::write(dir.path().join("a.txt"), source)?;
+        index(dir.path(), 10).await?;
+        let reader = GenerationReader::open(dir.path())?;
+        let doc = &reader.manifest.documents[0];
+        let node = format!("{}:{}", doc.id, doc.nodes[0].id);
+        let manifest_bytes = fs::metadata(reader.dir.join("manifest.json"))?.len();
+        let text_bytes =
+            fs::metadata(reader.dir.join("text").join(format!("{}.txt", doc.id)))?.len();
+        let before = reader.read_metrics()?;
+        let first = reader.read_node_window(&node, 5, 0)?;
+        let cold = reader.read_metrics()?.since(&before)?;
+        assert_eq!(first.text, "alpha");
+        assert_eq!(cold.logical_reader_bytes, 5);
+        assert_eq!(cold.cached_logical_bytes, 0);
+        assert_eq!(cold.cache_misses, 1);
+        let expected = 2 * manifest_bytes + 2 * source.len() as u64 + text_bytes;
+        assert_eq!(cold.observed_rust_read_bytes, expected);
+        assert_eq!(cold.observed_hash_bytes, expected);
+        let clone = reader.clone();
+        assert!(Arc::ptr_eq(&reader.manifest, &clone.manifest));
+        assert!(Arc::ptr_eq(&reader.index, &clone.index));
+        let before = clone.read_metrics()?;
+        let second = clone.read_node_window(&node, 5, 0)?;
+        let warm = reader.read_metrics()?.since(&before)?;
+        assert_eq!(serde_json::to_value(first)?, serde_json::to_value(second)?);
+        assert_eq!(warm.logical_reader_bytes, 5);
+        assert_eq!(warm.cached_logical_bytes, 5);
+        assert_eq!(warm.cache_hits, 1);
+        // Full current-file digest validation deliberately preserves IO, even
+        // when an immutable cached payload avoids a second owned allocation.
+        assert_eq!(warm.observed_rust_read_bytes, expected);
+        assert_eq!(warm.observed_hash_bytes, expected);
+        assert_eq!(reader.cache_status()?["retained_entries"], 1);
+        assert!(warm.coverage.contains("kernel"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reader_cache_pins_keep_capacity_across_clear_clone_and_thread() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join("a.txt"), "alpha needle\n")?;
+        fs::write(dir.path().join("b.txt"), "bravo needle\n")?;
+        index(dir.path(), 10).await?;
+        let budget = ReaderCacheBudget {
+            max_bytes: 13,
+            max_entries: 1,
+            strict_cache_only: false,
+        };
+        let reader = GenerationReader::open_with_cache_budget(dir.path(), &budget)?;
+        let a = reader
+            .manifest
+            .documents
+            .iter()
+            .find(|d| d.path == "a.txt")
+            .unwrap();
+        let b = reader
+            .manifest
+            .documents
+            .iter()
+            .find(|d| d.path == "b.txt")
+            .unwrap();
+        let pin = reader.text_cached(a)?;
+        let clone = reader.clone();
+        clone.clear_cache()?;
+        assert_eq!(reader.cache_status()?["resident_entries"], 0);
+        assert_eq!(reader.cache_status()?["retained_bytes"], 13);
+        let before = reader.read_metrics()?;
+        let fallback =
+            std::thread::scope(|scope| scope.spawn(|| clone.text_cached(b)).join().unwrap())?;
+        assert_eq!(&*fallback, "bravo needle\n");
+        assert_eq!(fallback.origin, ReadOrigin::Uncached);
+        let delta = reader.read_metrics()?.since(&before)?;
+        assert_eq!(delta.cache_fallbacks, 1);
+        assert_eq!(delta.uncached_load_bytes, 13);
+        assert_eq!(delta.observed_rust_read_bytes, 13);
+        assert_eq!(delta.observed_hash_bytes, 13);
+        assert_eq!(reader.cache_status()?["retained_entries"], 1);
+        drop(pin);
+        let refill = reader.text_cached(b)?;
+        assert_eq!(refill.origin, ReadOrigin::Loaded);
+        assert_eq!(reader.cache_status()?["retained_bytes"], 13);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reader_cache_tight_caps_preserve_default_fallback_and_strict_preallocation_failure()
+    -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join("a.txt"), "alpha needle\n")?;
+        fs::write(dir.path().join("b.txt"), "bravo needle\n")?;
+        index(dir.path(), 10).await?;
+        let budget = ReaderCacheBudget {
+            max_bytes: 4,
+            max_entries: 1,
+            strict_cache_only: false,
+        };
+        let reader = GenerationReader::open_with_cache_budget(dir.path(), &budget)?;
+        let a = &reader.manifest.documents[0];
+        let node = format!("{}:{}", a.id, a.nodes[0].id);
+        let before = reader.read_metrics()?;
+        assert_eq!(reader.read_node_window(&node, 5, 0)?.text, "alpha");
+        let fallback = reader.read_metrics()?.since(&before)?;
+        assert_eq!(fallback.logical_reader_bytes, 5);
+        assert_eq!(fallback.uncached_logical_bytes, 5);
+        assert_eq!(fallback.cache_fallbacks, 1);
+        assert_eq!(fallback.uncached_load_bytes, 13);
+        assert_eq!(reader.cache_status()?["retained_bytes"], 0);
+        let strict = GenerationReader::open_with_cache_budget(
+            dir.path(),
+            &ReaderCacheBudget {
+                strict_cache_only: true,
+                ..budget
+            },
+        )?;
+        let before = strict.read_metrics()?;
+        assert!(strict.text_cached(&strict.manifest.documents[0]).is_err());
+        let failed = strict.read_metrics()?.since(&before)?;
+        assert_eq!(failed.observed_rust_read_bytes, 0);
+        assert_eq!(failed.observed_hash_bytes, 0);
+        assert_eq!(failed.cache_fallbacks, 0);
+        let strict = GenerationReader::open_with_cache_budget(
+            dir.path(),
+            &ReaderCacheBudget {
+                max_bytes: 13,
+                max_entries: 1,
+                strict_cache_only: true,
+            },
+        )?;
+        let pin = strict.text_cached(&strict.manifest.documents[0])?;
+        let before = strict.read_metrics()?;
+        assert!(
+            strict
+                .clone()
+                .text_cached(&strict.manifest.documents[1])
+                .is_err()
+        );
+        assert_eq!(
+            strict
+                .read_metrics()?
+                .since(&before)?
+                .observed_rust_read_bytes,
+            0
+        );
+        drop(pin);
+        strict.text_cached(&strict.manifest.documents[1])?;
+        assert!(
+            GenerationReader::open_with_cache_budget(
+                dir.path(),
+                &ReaderCacheBudget {
+                    max_bytes: 0,
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reader_cache_warm_pin_stays_fixed_and_failed_mutations_keep_observed_bytes()
+    -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join("a.txt"), "needle original\n")?;
+        index(dir.path(), 10).await?;
+        let reader = GenerationReader::open(dir.path())?;
+        let a = &reader.manifest.documents[0];
+        let node = format!("{}:{}", a.id, a.nodes[0].id);
+        reader.read_node(&node, 100)?;
+        fs::write(dir.path().join("b.txt"), "new generation\n")?;
+        index(dir.path(), 10).await?;
+        assert_ne!(GenerationReader::open(dir.path())?.pin(), reader.pin());
+        let before = reader.read_metrics()?;
+        assert_eq!(
+            reader.clone().read_node(&node, 100)?.text,
+            "needle original\n"
+        );
+        assert_eq!(reader.clone().pin(), reader.pin());
+        assert_eq!(reader.read_metrics()?.since(&before)?.cache_hits, 1);
+        let text_path = reader.dir.join("text").join(format!("{}.txt", a.id));
+        fs::write(&text_path, "needle tampered\n")?;
+        let before = reader.read_metrics()?;
+        assert!(reader.read_node(&node, 100).is_err());
+        let failed = reader.read_metrics()?.since(&before)?;
+        assert_eq!(failed.logical_reader_bytes, 0);
+        assert_eq!(failed.cache_hits, 1);
+        assert!(failed.observed_rust_read_bytes >= 16);
+        assert!(failed.observed_hash_bytes >= 16);
+        fs::write(&text_path, "needle original\n")?;
+        fs::write(dir.path().join("a.txt"), "source changed!\n")?;
+        let before = reader.read_metrics()?;
+        assert!(reader.read_node(&node, 100).is_err());
+        let failed = reader.read_metrics()?.since(&before)?;
+        assert_eq!(failed.logical_reader_bytes, 0);
+        assert_eq!(failed.cache_hits, 0);
+        assert!(failed.observed_rust_read_bytes >= 16);
+        fs::write(reader.dir.join("manifest.json"), "{}")?;
+        let before = reader.read_metrics()?;
+        assert!(reader.catalog().is_err());
+        let failed = reader.read_metrics()?.since(&before)?;
+        assert_eq!(failed.observed_rust_read_bytes, 2);
+        assert_eq!(failed.observed_hash_bytes, 2);
+        Ok(())
     }
 
     #[tokio::test]

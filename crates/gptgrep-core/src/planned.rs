@@ -523,8 +523,8 @@ pub async fn search_planned_with_policy_and_observer(
             query: original_question.into(),
             mode: options.mode.clone(),
             document_scope: options.document.clone(),
-            root: snapshot.manifest.root,
-            generation: snapshot.manifest.generation,
+            root: snapshot.manifest.root.clone(),
+            generation: snapshot.manifest.generation.clone(),
             index_used: true,
             source_fresh: if union.hits.is_empty() {
                 None

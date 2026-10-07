@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
@@ -17,9 +17,14 @@ use gptgrep_parse::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::read_cache::{CacheKey, ReadCache, ReadMeter, ReadOrigin};
 use crate::{
     Document, GenerationPin, MAX_MANIFEST_BYTES, MAX_SOURCE_BYTES, Manifest, PageSpan, Pointer,
     SCHEMA, STATE, bounded_read, denied, digest, no_symlink, source_path, validate_manifest,
+};
+use crate::{
+    ReaderCacheBudget, ReaderReadMetrics, ReaderText, bounded_read_metered, digest_metered,
+    hash_reader_file, load_reader_text,
 };
 
 pub const RICH_MANIFEST_SCHEMA: &str = "gptgrep.manifest.v2";
@@ -406,11 +411,15 @@ impl RichGenerationWriter {
     }
 }
 
+#[derive(Clone)]
 pub struct RichGenerationReader {
-    manifest: RichManifest,
+    manifest: Arc<RichManifest>,
     pin: GenerationPin,
     dir: PathBuf,
-    index: OnceLock<std::result::Result<gptgrep_index::IndexSession, String>>,
+    index: Arc<OnceLock<std::result::Result<gptgrep_index::IndexSession, String>>>,
+    cache: ReadCache,
+    cache_budget: ReaderCacheBudget,
+    read_meter: ReadMeter,
 }
 
 #[derive(Deserialize)]
@@ -420,27 +429,51 @@ struct RichManifestHeader<'a> {
 
 impl RichGenerationReader {
     pub fn open(root: &Path) -> Result<Self> {
+        Self::open_with_cache_budget(root, &ReaderCacheBudget::default())
+    }
+    pub fn open_with_cache_budget(root: &Path, budget: &ReaderCacheBudget) -> Result<Self> {
+        budget.validate()?;
+        let meter = ReadMeter::default();
         let root = root.canonicalize()?;
         let state = root.join(STATE);
         no_symlink(&state)?;
-        let pointer: Pointer = serde_json::from_slice(&bounded_read(
+        let pointer: Pointer = serde_json::from_slice(&bounded_read_metered(
             &owned_path(&state, Path::new("CURRENT.json"))?,
             4096,
+            &meter,
         )?)?;
         ensure!(
             pointer.schema_version == RICH_MANIFEST_SCHEMA,
             "rebuild_required: rich artifacts require manifest v2"
         );
-        Self::open_pinned(
+        Self::open_pinned_with_read_meter(
             &root,
             &GenerationPin {
                 generation: pointer.generation,
                 manifest_sha256: pointer.manifest_sha256,
             },
+            budget,
+            meter,
         )
     }
 
     pub fn open_pinned(root: &Path, pin: &GenerationPin) -> Result<Self> {
+        Self::open_pinned_with_cache_budget(root, pin, &ReaderCacheBudget::default())
+    }
+    pub fn open_pinned_with_cache_budget(
+        root: &Path,
+        pin: &GenerationPin,
+        budget: &ReaderCacheBudget,
+    ) -> Result<Self> {
+        Self::open_pinned_with_read_meter(root, pin, budget, ReadMeter::default())
+    }
+    fn open_pinned_with_read_meter(
+        root: &Path,
+        pin: &GenerationPin,
+        budget: &ReaderCacheBudget,
+        meter: ReadMeter,
+    ) -> Result<Self> {
+        budget.validate()?;
         ensure!(
             valid_digest(&pin.manifest_sha256)
                 && !pin.generation.is_empty()
@@ -455,12 +488,13 @@ impl RichGenerationReader {
             &root,
             &Path::new(STATE).join("generations").join(&pin.generation),
         )?;
-        let bytes = bounded_read(
+        let bytes = bounded_read_metered(
             &owned_path(&dir, Path::new("manifest.json"))?,
             MAX_MANIFEST_BYTES,
+            &meter,
         )?;
         ensure!(
-            digest(&bytes) == pin.manifest_sha256,
+            digest_metered(&bytes, &meter)? == pin.manifest_sha256,
             "rich manifest digest mismatch"
         );
         let header: RichManifestHeader<'_> = serde_json::from_slice(&bytes)
@@ -476,15 +510,33 @@ impl RichGenerationReader {
         );
         validate_rich_manifest(&manifest)?;
         Ok(Self {
-            manifest,
+            manifest: Arc::new(manifest),
             pin: pin.clone(),
             dir,
-            index: OnceLock::new(),
+            index: Arc::new(OnceLock::new()),
+            cache: ReadCache::new(budget.max_bytes, budget.max_entries)?,
+            cache_budget: budget.clone(),
+            read_meter: meter,
         })
     }
 
     pub fn pin(&self) -> GenerationPin {
         self.pin.clone()
+    }
+    pub fn read_metrics(&self) -> Result<ReaderReadMetrics> {
+        Ok(self.read_meter.snapshot()?.into())
+    }
+    pub fn clear_cache(&self) -> Result<()> {
+        Ok(self.cache.clear()?)
+    }
+    pub fn cache_status(&self) -> Result<serde_json::Value> {
+        let status = self.cache.stats()?;
+        Ok(
+            serde_json::json!({"capacity_bytes":status.capacity_bytes,"capacity_entries":status.capacity_entries,
+            "retained_bytes":status.retained_bytes,"retained_entries":status.retained_entries,
+            "resident_bytes":status.resident_bytes,"resident_entries":status.resident_entries,
+            "strict_cache_only":self.cache_budget.strict_cache_only}),
+        )
     }
     pub fn manifest(&self) -> Result<&RichManifest> {
         self.validate()?;
@@ -503,10 +555,14 @@ impl RichGenerationReader {
             "retained generation directory changed"
         );
         ensure!(
-            digest(&bounded_read(
-                &owned_path(&self.dir, Path::new("manifest.json"))?,
-                MAX_MANIFEST_BYTES
-            )?) == self.pin.manifest_sha256,
+            digest_metered(
+                &bounded_read_metered(
+                    &owned_path(&self.dir, Path::new("manifest.json"))?,
+                    MAX_MANIFEST_BYTES,
+                    &self.read_meter
+                )?,
+                &self.read_meter
+            )? == self.pin.manifest_sha256,
             "retained rich manifest changed"
         );
         if let Some(Ok(index)) = self.index.get() {
@@ -551,6 +607,52 @@ impl RichGenerationReader {
             })
             .context("artifact not present in pinned generation")
     }
+    fn verify_source_metered(&self, doc: &RichDocument) -> Result<()> {
+        ensure!(
+            hash_reader_file(
+                &source_path(&self.manifest.root, &doc.document.path)?,
+                MAX_SOURCE_BYTES,
+                &self.read_meter
+            )? == (
+                doc.document.source_bytes,
+                doc.document.source_sha256.clone()
+            ),
+            "source changed or disappeared: {}",
+            doc.document.path
+        );
+        Ok(())
+    }
+    fn text_cached(&self, artifact: &ArtifactRef) -> Result<ReaderText> {
+        ensure!(is_text(&artifact.kind), "artifact is not native/OCR text");
+        let path = owned_path(&self.dir, &artifact.relative_path)?;
+        let limit = artifact_limit(artifact, &self.manifest.resource_budget);
+        ensure!(
+            hash_reader_file(&path, limit, &self.read_meter)?
+                == (artifact.bytes, artifact.sha256.clone()),
+            "artifact bytes changed: {}",
+            artifact.id
+        );
+        let key = CacheKey::new(&self.pin.generation, &artifact.id, &artifact.sha256)?;
+        let text = load_reader_text(
+            &self.cache,
+            &self.cache_budget,
+            &self.read_meter,
+            &key,
+            &path,
+            artifact.bytes,
+            limit,
+        )?;
+        // Preserve the second current-file digest verification on a hit. A
+        // cold load instead checks its actual filled bytes inside the cache.
+        if text.origin == ReadOrigin::Cache {
+            ensure!(
+                hash_reader_file(&path, limit, &self.read_meter)?
+                    == (artifact.bytes, artifact.sha256.clone()),
+                "artifact changed while reading"
+            );
+        }
+        Ok(text)
+    }
 
     pub fn read_text(
         &self,
@@ -564,8 +666,8 @@ impl RichGenerationReader {
         );
         self.validate()?;
         let (doc, stored) = self.find_artifact(artifact_id)?;
-        verify_source(&self.manifest.root, doc)?;
-        let text = read_text(&self.dir, &stored.artifact)?;
+        self.verify_source_metered(doc)?;
+        let text = self.text_cached(&stored.artifact)?;
         ensure!(
             offset <= text.len() && text.is_char_boundary(offset),
             "invalid text window offset"
@@ -585,8 +687,10 @@ impl RichGenerationReader {
             next_offset: (end < text.len()).then_some(end),
         };
         encoded_size(&window, MAX_OUTPUT_BYTES as u64)?;
-        verify_source(&self.manifest.root, doc)?;
+        self.verify_source_metered(doc)?;
         self.validate()?;
+        self.read_meter
+            .record_delivery(window.text.len(), text.origin)?;
         Ok(window)
     }
 
@@ -605,8 +709,8 @@ impl RichGenerationReader {
         );
         self.validate()?;
         let (doc, stored) = self.find_artifact(&binding.artifact_id)?;
-        verify_source(&self.manifest.root, doc)?;
-        let text = read_text(&self.dir, &stored.artifact)?;
+        self.verify_source_metered(doc)?;
+        let text = self.text_cached(&stored.artifact)?;
         ensure!(
             binding.byte_start < binding.byte_end
                 && text.get(binding.byte_start..binding.byte_end).is_some(),
@@ -618,7 +722,7 @@ impl RichGenerationReader {
             serde_json::to_value(evidence)? == serde_json::to_value(expected)?,
             "evidence source/page/digest/coordinates/receipt mismatch"
         );
-        verify_source(&self.manifest.root, doc)?;
+        self.verify_source_metered(doc)?;
         self.validate()
     }
 
@@ -694,7 +798,7 @@ impl RichGenerationReader {
                 let Some((doc, _)) = texts.get(path.as_os_str()) else {
                     return Ok(false);
                 };
-                if verify_source(&self.manifest.root, doc).is_err() {
+                if self.verify_source_metered(doc).is_err() {
                     stale.insert(doc.document.path.clone());
                     return Ok(false);
                 }
@@ -706,7 +810,7 @@ impl RichGenerationReader {
             let (doc, stored) = texts
                 .get(hit.path.as_os_str())
                 .context("artifact index references unknown text identity")?;
-            let text = read_text(&self.dir, &stored.artifact)?;
+            let text = self.text_cached(&stored.artifact)?;
             let (start, end) = line_range(&text, hit.line_number)?;
             ensure!(
                 text[start..end].trim_end_matches('\r') == hit.line,
@@ -717,7 +821,7 @@ impl RichGenerationReader {
                 text: text[start..end].into(),
                 next_offset: None,
             });
-            verify_source(&self.manifest.root, doc)?;
+            self.verify_source_metered(doc)?;
         }
         self.validate()?;
         let report = ArtifactSearchReport {
@@ -869,13 +973,13 @@ fn validate_document_shape(doc: &RichDocument, budget: &ResourceBudget) -> Resul
             );
         }
         (
-            "png" | "jpeg",
+            "png",
             gptgrep_parse::FeatureState::Present(conversion),
             gptgrep_parse::FeatureState::Present(geometry),
         ) => {
             ensure!(
                 conversion.converter == "gptgrep-bounded-image-pdf"
-                    && conversion.version == "image-0.25.10/rgb8-pdf-v1"
+                    && conversion.version == "image-0.25.10/png-rgb8-pdf-v2"
                     && conversion.invocations == 1
                     && doc.pages.len() == 1,
                 "image preparation identity/count mismatch"
