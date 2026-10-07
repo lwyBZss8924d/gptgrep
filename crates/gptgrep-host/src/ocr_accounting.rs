@@ -169,6 +169,14 @@ impl OcrExecutionContext {
         self.0.header.clock.remaining()
     }
 
+    /// Return the full stored anchor adopted and validated during ledger attachment.
+    /// Local contexts have no ledger binding. This reads the immutable attachment
+    /// header without filesystem access, journal writes, captures or admissions;
+    /// it does not freshly inspect the ledger. Later admissions revalidate its header.
+    pub fn ledger_clock_anchor(&self) -> Result<Option<RunClockAnchor>> {
+        Ok(self.0.ledger.as_ref().map(|_| self.0.header.clock.clone()))
+    }
+
     pub fn snapshot(&self) -> Result<OcrBudgetSnapshot> {
         self.access(|state| {
             Ok(OcrBudgetSnapshot {
@@ -530,11 +538,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("budget.json");
         let deadline = SystemTime::now() + Duration::from_secs(3);
-        let first = context(deadline).with_ledger(&path).unwrap();
+        let local = context(deadline);
+        assert!(local.ledger_clock_anchor().unwrap().is_none());
+        let first = local.with_ledger(&path).unwrap();
+        let original = first.ledger_clock_anchor().unwrap().unwrap();
         fs::write(dir.path().join("budget.json.pending"), b"foreign bytes").unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
-        let second = context(deadline).with_ledger(&path).unwrap();
-        assert!(first.0.header.clock == second.0.header.clock);
+        let fresh = context(deadline);
+        assert!(fresh.0.header.clock != original);
+        assert_eq!(
+            fresh.0.header.clock.deadline_unix_ms(),
+            original.deadline_unix_ms()
+        );
+        let second = fresh.with_ledger(&path).unwrap();
+        let before = fs::metadata(&path).unwrap().modified().unwrap();
+        let bytes_before = fs::read(&path).unwrap();
+        assert!(second.ledger_clock_anchor().unwrap().as_ref() == Some(&original));
+        assert!(first.ledger_clock_anchor().unwrap().as_ref() == Some(&original));
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before);
+        assert_eq!(fs::read(&path).unwrap(), bytes_before);
         second
             .reserve(HASH, HASH)
             .await
