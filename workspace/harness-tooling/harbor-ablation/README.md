@@ -1,9 +1,9 @@
 # GPTgrep Harbor ablation exporter candidate
 
 This offline candidate creates Harbor 0.24.0 tasks from original synthetic inputs.
-Its eventual source owner is `workspace/harness-tooling/harbor-ablation/`.
-It does not launch Docker, Codex, OCR, Decisions, a judge, or Harbor trials. It does
-not install runtimes, read authentication, publish, or upload. Every output is
+The exporter/bridge source owner is `workspace/harness-tooling/harbor-ablation/`.
+The exporter and Python bridge do not launch Docker, Codex, OCR, Decisions, a judge,
+or Harbor trials. They do not install runtimes, read authentication, publish, or upload. Every output is
 nonexecuting and requires a new directory; overwrite and resume are refused.
 Qualification tags are prospective owner metadata, not a Harbor execution lock.
 The candidate has no trial runner or agent adapter. An external Harbor invocation
@@ -147,3 +147,110 @@ redistribution acceptance, Harbor A/B advantage, default promotion, M7 completio
 or experimental release follows from this candidate. SPEC's live PageIndex first
 release comparison gates remain in force. The earlier plans are immutable; the
 later user budget authority is recorded separately in the private amendment.
+
+
+## Raw-only prebuild source foundation
+
+The dedicated `gptgrep-harbor-prebuild` binary has two explicit frontdoors:
+
+```sh
+cargo build --offline --locked --manifest-path harness/Cargo.toml --bin gptgrep-harbor-prebuild
+gptgrep-harbor-prebuild build-native --root /app/raw/group-ID --raw-manifest /app/control/raw.json --build-controls /app/control/native.json --output-dir /app/seals/new-build
+gptgrep-harbor-prebuild seal --root /app/raw/group-ID --pin /app/control/pin.json --raw-manifest /app/control/raw.json --build-controls /app/control/native.json --output-dir /app/seals/new-seal
+```
+
+These operations accept no reader, grader, question, answer, evidence annotation,
+model, account or runtime-launch argument. The raw manifest is strict JSON with
+`schema_version="gptgrep.harbor.raw-group.v1"`, one `group_id`, and a sorted unique
+`documents` list of `{path,bytes,sha256}`. It admits at most eight explicitly listed
+PDFs, unchanged relative names and at most 64 MiB aggregate raw bytes. The corpus
+must contain exactly that raw set; `.gptgrep` is the reserved product state.
+Manifest, controls, pin, preparation staging and fresh output live outside the
+corpus. Input leaf/ancestor symlinks, traversal, control overlap and extra files
+are refused. Metadata/digests remain bound to the admitted buffers and held file
+descriptors; replacing an input path cannot change its admitted identity.
+
+Controls use `schema_version="gptgrep.harbor.native-controls.v1"`, the same
+`group_id`, `observation_wall_seconds` (1–180), `raw_group_bytes` (at most 64 MiB),
+`seal_inventory_bytes` (at most 1 GiB), `seal_inventory_files` (at most 4096),
+`native={page_window,dpi,render_pages,max_document_pages}`, the full parser
+`resource_budget`, and `hard_limits={native_wall,native_rss,total_index_publication_bytes}`.
+Page window and document page count are 1–25, DPI is positive and at most 300,
+and rendering must be enabled. Resource selections may only tighten the frozen
+parser limits. The coordinator uses one shared original ResourceBudget across
+preparation, extraction, finalization and writer import; counters are not reset
+between documents. Every hard-limit switch must be false. Unsupported requested
+hard guarantees fail before writer creation.
+
+`shared_staging_reservation_bytes_observed` is the shared invocation's conservative
+reservation counter, not measured physical disk usage. Temporary preparation
+directories are removed on successful import and on errors; the counter does
+not refund their reservations. An unpublished writer generation may remain for
+inspection after failure. Historical reservation usage is unknown for `seal`.
+
+`build-native` invokes the genuine parser preparation and immutable native
+candidate APIs. It inspects the candidate plan before finalizing with no outcomes
+and `OcrMode::Off`. Required OCR, OCR tasks or capability blockers refuse import
+and publication. It never creates successful OCR receipts or rewrites native
+coverage. Raw source checks run before/after native awaits, before import and
+before publication. This native-only round intentionally blocks visual/scanned
+sources requiring qualified OCR.
+
+The observation deadline is checked at admission and operation boundaries.
+PDFium extraction is a blocking library call, and synchronous writer publication
+builds the index before returning. The coordinator cannot enforce hard native
+CPU/RSS/wall limits, drain all library diagnostics, or prevent publication after
+a deadline that expires inside that call. A post-publication deadline or seal
+failure may leave the new CURRENT without a seal receipt. Parser/raw/shared
+staging failures before publication preserve the previous CURRENT. The seal byte
+limit admits the selected manifest before reader deserialization and bounds
+inventory verification; receipt JSON has its own limit. It is not a hard
+index-publication limit. Linux executor/cgroup/disk/process cleanup and bounded
+native diagnostics remain separate qualification requirements.
+
+`seal` requires the same admitted CURRENT bytes to name the exact supplied pin.
+This seal frontdoor is native-only: every page must be Native or BlankVerified,
+and historical OCR task/result arrays or ValidatedOcr coverage are refused.
+It uses `RichGenerationReader::verify_all`, compares every manifest document with
+the exact raw set, and verifies the complete selected generation file set:
+prepared/native/layout/tree/rendition files, artifact text and all seven pinned
+index files. The index engine revision, file-table identity and manifest digest
+come from the validated admitted index buffer. All retained input/source/artifact
+snapshots, the selected file set and the reader are checked again before output.
+A CURRENT change refuses the seal even if its retained generation remains valid.
+Unused sibling generations and write-lock history are explicitly unverified.
+Moving a generation to a different canonical root is refused; no root rewriting
+or import/relocation authority exists.
+
+A successful seal atomically creates a new directory containing `receipt.json`,
+`pin.json`, the same admitted raw manifest and build-control bytes. Existing
+outputs are never overwritten. Verification, collision, byte and observation-deadline
+failures before rename produce no fresh receipt. A parent-directory sync failure
+after successful rename leaves publication durability unknown and reports
+`publication_sync_unknown_no_retry`; the completed output may exist for owner
+inspection. The stored receipt records verified structure before publication;
+owner exit/status evidence separately records observed durability. Linux/macOS have a no-replace directory primitive;
+other platforms fail closed and remain unqualified. Receipt JSON is at most
+1 MiB. The receipt records exact raw/control/CURRENT/pin/artifact/index/coverage
+bindings, selected resource limits and available observations. Unknown builder
+binary/source identity, PDFium artifact, peak RSS and hard-executor qualification
+stay explicit. `current_frontdoor_provider_calls=0` describes this coordinator
+or seal invocation only. Historical producer/OCR request counts, usage and cost
+and historical native extraction counts/cost are unknown. Native DPI/render settings govern `build-native`; `seal` records
+the requested controls and structurally bound historical native profile without
+attesting that historical extraction executed those settings. The wrapper retains raw descriptors and digests, with zero retained
+raw payload bytes. Its admitted JSON-byte buffers have an independent 8 MiB
+content ceiling, and generation descriptors/paths have a bounded file count.
+These are separate from parser-owned working admission and exclude allocator
+capacity, typed library graphs, native buffers and global RSS. A structural seal does not authenticate historical producer
+execution or qualify native/OCR correctness. Mock fixtures are labeled MOCK and
+use synthetic DTOs with the genuine writer/reader; they make no native PDFium or
+provider calls. Source freshness is checked at operation boundaries, with sealed
+owners required; no hostile concurrent in-place mutation guarantee is asserted.
+
+The production exporter's synthetic-only gate remains in force. A genuine
+raw-only Linux builder execution with qualified binaries/native library, full
+required OCR coverage, actual resource/cost observations, independent receipt
+adoption and whole-group exporter integration is still required. These source
+frontdoors do not qualify D3/D4/D7, native tools, trials, judge parity, advantage,
+default promotion, release or Goal completion.

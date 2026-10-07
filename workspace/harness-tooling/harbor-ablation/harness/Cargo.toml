@@ -6,7 +6,16 @@ publish = false
 
 [workspace]
 
+[[bin]]
+name = "gptgrep-harbor-prebuild"
+path = "src/prebuild.rs"
+
 [dependencies]
+anyhow = "=1.0.104"
+gptgrep-core = { path = "../../../../crates/gptgrep-core" }
+gptgrep-parse = { path = "../../../../crates/gptgrep-parse" }
+tempfile = "=3.27.0"
+tokio = { version = "=1.53.1", features = ["macros", "rt", "time"] }
 clap = { version = "=4.6.7", features = ["derive"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
@@ -14,4 +23,8 @@ sha2 = "=0.10.9"
 libc = "=0.2.189"
 
 [dev-dependencies]
+image = { version = "=0.25.10", default-features = false, features = ["png"] }
 tempfile = "=3.27.0"
+
+[patch."https://github.com/run-llama/liteparse"]
+liteparse-pdfium = { path = "../../../../vendor/liteparse-pdfium" }
