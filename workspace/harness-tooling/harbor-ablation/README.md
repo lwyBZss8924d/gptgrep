@@ -1,6 +1,7 @@
 # GPTgrep Harbor ablation exporter candidate
 
-The offline exporter creates Harbor 0.24.0 tasks from original synthetic inputs.
+The offline exporter creates nonexecuting Harbor 0.24.0 tasks through separate
+synthetic and source-custodied native-v2 interfaces.
 The source owner is `workspace/harness-tooling/harbor-ablation/`. Its export and
 format-composition commands create nonexecuting packages in new directories;
 overwrite and resume are refused. These commands launch no Docker, Codex, OCR,
@@ -133,7 +134,9 @@ fixtures. They are not GPTgrep or Linux Codex capability evidence. The exporter
 checks source/projection/digest structure; it does not semantically prove that an
 arbitrary claimed derivation is a genuine GPTgrep tree/tgrep build. The production
 preprocessor must produce and independently qualify those receipts before a real
-task phase. This initial candidate deliberately refuses nonsynthetic inputs.
+task phase. The legacy v1 interface continues to refuse nonsynthetic inputs.
+The separate production interface below verifies actual generation structure and
+file custody; it keeps runtime, helper, and full multimodal qualifications on HOLD.
 
 The verifier admits only a bounded `{"answer":"..."}` artifact. It preserves the
 original answer-equivalence-only rubric boundary and 12000-character answer cap,
@@ -378,3 +381,109 @@ production derivation. Controlled umask fixtures cover the coordinator helpers
 and seal only; the unchanged parser and Writer may still fail under a restrictive
 caller umask before these helpers can complete. Native execution across arbitrary
 umasks remains unqualified. The parser retains its frozen admission budgets.
+
+
+## Source-custodied production export
+
+The exporter adds explicit commands with no task selection shortcuts:
+
+```sh
+gptgrep-harbor-ablation-exporter plan-production --corpus corpus.json --readers readers.json --options options.json --output-dir /path/to/new/plan
+gptgrep-harbor-ablation-exporter export-production-readers --corpus corpus.json --readers readers.json --options options.json --output-dir /path/to/new/readers
+gptgrep-harbor-ablation-exporter export-production-verifier --graders graders.json --reader-export /path/to/readers --output-dir /path/to/new/graders
+```
+
+`validate` dispatches by the exact export schema. Production uses
+`gptgrep.harbor.export.v2`; the existing synthetic export remains v1. Python
+`format_bridge.py compose` accepts matching reader/grader roles from either
+schema, never a cross-schema pair. Production package metadata says
+`synthetic=false`, `execution_qualified=false`.
+
+The strict input schemas are `gptgrep.harbor.production-corpus.v1`,
+`gptgrep.harbor.production-readers.v1`, `gptgrep.harbor.production-options.v1`, and
+`gptgrep.harbor.production-verifiers.v1`. A production corpus has `groups` and a
+`tool`. Each group supplies `id`, `source_root`, `runtime_root`, plus
+`sealed_receipt`, `sealed_pin`, `sealed_raw_manifest`, and `sealed_controls`.
+Every seal input is `{path, sha256}` for an explicit absolute regular file.
+The tool supplies `asset_path`, `sha256`, `version`, `source_revision`, `os`, and
+`architecture`. These declared tool attributes are bound as metadata; the
+exporter never runs the binary or proves its target platform or helper capability.
+
+The corpus admission completes before loading the reader projection. It opens
+regular files with no-follow ancestor traversal and retains their descriptors,
+checks exact raw/control/seal/current/pin digests, and invokes the public pinned
+`RichGenerationReader::verify_all`. It then derives and checks the complete
+selected generation inventory, including native text, rendition/metadata/layout
+artifacts, prepared PDFs, merged text, and all seven index files. Raw files must
+match the manifest's complete group. Unexpected raw or selected-generation files,
+symlinks, digest mismatches, duplicate raw inode aliases, and coverage requiring
+OCR fail. Historical sibling generations are outside this receipt's scope.
+This first production route admits native/verified-blank pages only; it does not
+substitute supplied OCR or promote a native-only build to the full harness.
+
+A reader projection binds the exact corpus digest and contains only
+`tasks: [{id, question, question_sha256, group_scope}]`. A scope selects whole
+admitted groups. Baseline and treatment receive exactly the same raw files and
+Codex options. Production options require the requested reader profile
+`gpt-6-luna`/`max`/`fast`, derived from the project role contract. Actual returned
+model, runtime, cost, and capability remain unqualified. Options also bind
+image and Codex binary digests, direct `codex exec` argv, task time/CPU/memory/
+network limits, repeats, seed, and nonzero `reader_uid`/`reader_gid`. A
+counterbalanced schedule remains `executed=false`; it does not launch trials.
+
+Each task preserves this context topology:
+
+```text
+environment/groups/GROUP/raw/ORIGINAL_RELATIVE_PDF_PATH
+# treatment only, beneath the same raw root:
+environment/groups/GROUP/raw/.gptgrep/CURRENT.json
+environment/groups/GROUP/raw/.gptgrep/generations/PIN/
+  manifest.json
+  text/...
+  artifact-text/...
+  artifacts/...
+  artifact-index/...
+environment/groups/GROUP/seal/{receipt,pin,raw-manifest,build-controls}.json
+environment/tool/{gptgrep,provenance.json}
+```
+
+The reader Dockerfile maps each complete `raw/` tree to its exact
+`runtime_root`, with the same requested user ownership in both arms. It does not
+rename documents, rewrite manifest roots, flatten index paths, or include a grader
+build context. `runtime_root` must equal the canonical root already bound by the
+Reader and manifest. An existing macOS-root package is nonexecuting preparation;
+Linux portability is a HOLD. Build and seal at the intended canonical Linux path
+before admitting a Linux trial. Changing the root or merely refreshing hashes is
+refused, and no generated Dockerfile is runtime qualification evidence.
+
+Verifier inputs bind the exact reader-export manifest SHA and require
+`judge_status="unavailable"`, a rubric digest, and one
+`{id, question_sha256, reference_asset: {path, sha256}}` per reader task. Each
+verifier-only reference is the original structured
+`{question, answer, answer_format}` with a non-null JSON answer. The reader route
+has no reference input. Composition binds the same manifest byte snapshots it
+parsed and writes references only in the separate `tests/` context. The original
+judge backend and physical denial of grader files to readers remain HOLD; the
+unavailable verifier uses a separate `tests/judge-status.json` qualification placeholder, preserves the original `tests/reference.json` unchanged, emits no reward, and retains the answer-equivalence rubric.
+
+Production copies hold source descriptors and use 64 KiB scratch buffers rather
+than retaining binary payloads in JSON arrays. The bounds are 64 MiB per file,
+128 MiB per complete export/package, 1 MiB per structured input, and a finite
+4096-file inventory. Composition reserves two MiB within its package cap for
+final dataset/receipt metadata. Source/path identities and inventory names are
+checked during admission, before publication, and after copying. Every new
+file is `0600` and directory `0700` before content, including under controlled
+caller masks `000` and `777`; ancestors are never chmodded. A fresh output is
+required. A failure can leave a partial new directory, which is not accepted
+without its final inventory manifest and must not be resumed or overwritten.
+These ordinary source-custody checks are not hostile filesystem attestation,
+hard native RSS/wall enforcement, authenticated builder provenance, or physical
+sandbox isolation.
+
+Generic tests build genuine v2 generations through the Writer using explicitly
+MOCK parsed DTOs, then replay Reader checks, topology, root refusal, source changes,
+reference separation, combined budgets, and typed Harbor composition. They run
+no native PDF extraction, agent, provider, Docker, or trial. Full multimodal/tree/
+regex/visual/helper delivery, actual Linux/native tools/authentication, original
+phase/resource qualification, original judge parity, utility, release, and Goal
+completion remain separate gates.

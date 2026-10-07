@@ -21,6 +21,34 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    PlanProduction {
+        #[arg(long)]
+        corpus: PathBuf,
+        #[arg(long)]
+        readers: PathBuf,
+        #[arg(long)]
+        options: PathBuf,
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
+    ExportProductionReaders {
+        #[arg(long)]
+        corpus: PathBuf,
+        #[arg(long)]
+        readers: PathBuf,
+        #[arg(long)]
+        options: PathBuf,
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
+    ExportProductionVerifier {
+        #[arg(long)]
+        graders: PathBuf,
+        #[arg(long)]
+        reader_export: PathBuf,
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
     Plan {
         #[arg(long)]
         corpus: PathBuf,
@@ -230,7 +258,7 @@ fn check_rel(value: &str) -> Result<()> {
 }
 // Walk every directory using no-follow descriptors. Neither a leaf symlink nor a
 // swapped intermediate symlink is followed by the read front door.
-fn regular_bytes(path: &Path, limit: u64) -> Result<Vec<u8>> {
+fn regular_file(path: &Path, limit: u64) -> Result<File> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -275,6 +303,10 @@ fn regular_bytes(path: &Path, limit: u64) -> Result<Vec<u8>> {
     if !metadata.is_file() || metadata.len() > limit {
         return Err("input_type_or_size_limit".into());
     }
+    Ok(file)
+}
+fn regular_bytes(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    let file = regular_file(path, limit)?;
     let mut bytes = Vec::new();
     file.take(limit + 1)
         .read_to_end(&mut bytes)
@@ -782,6 +814,29 @@ fn verifier(
 }
 fn run(command: Command) -> Result<()> {
     match command {
+        Command::PlanProduction {
+            corpus,
+            readers,
+            options,
+            output_dir,
+        } => {
+            production_export::prepare(&corpus, &readers, &options, false)?.publish(&output_dir)?;
+        }
+        Command::ExportProductionReaders {
+            corpus,
+            readers,
+            options,
+            output_dir,
+        } => {
+            production_export::prepare(&corpus, &readers, &options, true)?.publish(&output_dir)?;
+        }
+        Command::ExportProductionVerifier {
+            graders,
+            reader_export,
+            output_dir,
+        } => {
+            production_export::verifier(&graders, &reader_export)?.publish(&output_dir)?;
+        }
         Command::Plan {
             corpus,
             readers,
@@ -813,6 +868,17 @@ fn run(command: Command) -> Result<()> {
             create_output(&output_dir, &f, &m)?;
         }
         Command::Validate { export_dir } => {
+            let bytes = regular_bytes(&export_dir.join("export-manifest.json"), MAX_JSON)?;
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            if value["schema_version"] == production_export::EXPORT_SCHEMA {
+                production_export::validate(&export_dir)?;
+                println!(
+                    "{}",
+                    serde_json::json!({"valid":true,"scope":"package_integrity_only_not_source_adoption","executable":false})
+                );
+                return Ok(());
+            }
             let m = validate(&export_dir)?;
             println!(
                 "{}",
@@ -832,5 +898,6 @@ fn main() {
     }
 }
 
+mod production_export;
 #[cfg(test)]
 mod tests;

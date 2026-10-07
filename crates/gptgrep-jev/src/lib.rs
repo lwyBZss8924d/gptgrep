@@ -15,7 +15,7 @@ pub use execution::{
 pub use input::{
     DecisionInput, ImageEvidence, MAX_IMAGE_BASE64_BYTES, MAX_IMAGE_BYTES,
     MAX_IMAGE_PIXEL_BUFFER_BYTES, MAX_IMAGE_PIXELS, MAX_IMAGES, MAX_MULTIMODAL_REQUEST_BYTES,
-    MAX_TOTAL_IMAGE_PIXELS, SourceBinding, TextEvidence,
+    MAX_TOTAL_IMAGE_PIXELS, PreparedImageQualification, SourceBinding, TextEvidence,
 };
 pub use roles::{
     EvidenceRole, EvidenceRoleCandidate, EvidenceRoleResponse, MAX_ROLE_CANDIDATES,
@@ -274,18 +274,22 @@ impl JevClient {
     pub fn prepare_decision(&self, state: Value, questions: Value) -> Result<PreparedDecision> {
         self.execution.remaining()?;
         let body = self.request_body(state, &questions)?;
+        Ok(self.bind_prepared_body(body, questions))
+    }
+
+    fn bind_prepared_body(&self, body: Vec<u8>, questions: Value) -> PreparedDecision {
         let body_sha256 = Sha256::digest(&body)
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
-        Ok(PreparedDecision {
+        PreparedDecision {
             body,
             questions,
             requested_model: self.model.clone(),
             endpoint: self.endpoint.clone(),
             body_sha256,
             identity: Arc::clone(&self.identity),
-        })
+        }
     }
 
     /// Send exactly the prepared request once and validate the typed response.
