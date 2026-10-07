@@ -20,6 +20,7 @@ mod ocr_protocol;
 mod ocr_tests;
 mod process_group;
 mod protocol;
+mod transport;
 pub use completion::{
     CompletionError, CompletionReport, MAX_COMPLETION_INPUT_BYTES, MAX_COMPLETION_OUTPUT_BYTES,
     complete_json,
@@ -53,10 +54,9 @@ use std::{
     process::Stdio,
     time::{Duration, Instant},
 };
-use tokio::{
-    io::{AsyncReadExt, BufReader},
-    process::Command,
-};
+#[cfg(test)]
+use tokio::io::BufReader;
+use tokio::{io::AsyncReadExt, process::Command};
 
 pub const DEFAULT_MODEL: &str = "gpt-5.6-luna";
 pub const DEFAULT_REASONING_EFFORT: &str = "max";
@@ -429,12 +429,13 @@ async fn run_process_until(
     deadline: Option<tokio::time::Instant>,
     options: protocol::RunOptions<'_>,
 ) -> Result<ProcessOutcome> {
-    if let Some(deadline) = deadline {
-        ensure!(
-            tokio::time::Instant::now() < deadline,
-            "host_deadline_exceeded"
-        );
-    }
+    let deadline = deadline
+        .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs));
+    ensure!(
+        tokio::time::Instant::now() < deadline,
+        "host_deadline_exceeded"
+    );
+    let transport = transport::TransportBudget::new(protocol::MAX_TOTAL_BYTES);
     let trace = trace::Trace::open(config.trace_path.as_deref())?;
     let home = config
         .codex_home
@@ -450,15 +451,17 @@ async fn run_process_until(
     };
     ensure!(home.is_dir(), "Selected CODEX_HOME must be a directory");
     let mut command = process_command(&binary, cwd.path(), &home)?;
-    if let Some(deadline) = deadline {
-        ensure!(
-            tokio::time::Instant::now() < deadline,
-            "host_deadline_exceeded"
-        );
-    }
+    ensure!(
+        tokio::time::Instant::now() < deadline,
+        "host_deadline_exceeded"
+    );
     if let Some(observer) = options.observer {
         observer.running()?;
     }
+    ensure!(
+        tokio::time::Instant::now() < deadline,
+        "host_deadline_exceeded"
+    );
     let mut child = command
         .spawn()
         .map_err(|_| anyhow!("Could not start the configured Codex app-server"))?;
@@ -471,16 +474,22 @@ async fn run_process_until(
         .stdout
         .take()
         .ok_or_else(|| anyhow!("Codex stdout unavailable"))?;
-    let mut stderr = child
+    let stderr = child
         .stderr
         .take()
         .ok_or_else(|| anyhow!("Codex stderr unavailable"))?;
+    let stderr_budget = transport.clone();
     let mut stderr_task = tokio::spawn(async move {
+        let mut stderr = transport::BudgetedReader::new(stderr, stderr_budget);
         const CAP: usize = 64 * 1024;
         let mut retained = Vec::new();
         let mut total = 0u64;
         let mut buffer = [0; 4096];
-        while let Ok(count) = stderr.read(&mut buffer).await {
+        loop {
+            let count = stderr
+                .read(&mut buffer)
+                .await
+                .map_err(|_| anyhow!("host_stderr_transport_failed"))?;
             if count == 0 {
                 break;
             }
@@ -489,41 +498,44 @@ async fn run_process_until(
             retained.extend_from_slice(&buffer[..keep]);
         }
         // Raw stderr is private to this task and is never placed in a report or error.
-        (total, total > retained.len() as u64)
+        Ok::<_, anyhow::Error>((total, total > retained.len() as u64))
     });
     let started = Instant::now();
-    let session = protocol::run_observed(
-        BufReader::new(stdout),
+    let session = protocol::run_observed_budget(
+        stdout,
         stdin,
         cwd.path(),
         config,
         workflow,
         trace,
         options,
+        transport.clone(),
+        deadline,
     );
-    let deadline = deadline
-        .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs));
-    let outcome = tokio::time::timeout_at(deadline, session).await;
+    let outcome=tokio::time::timeout_at(deadline,async {
+        // There is exactly one designated failure waiter for this invocation.
+        tokio::select! { biased; _=transport.exceeded()=>transport.check_host().and_then(|()|Err(anyhow!("host_transport_unknown"))), result=session=>result }
+    }).await;
+    // Capture primary invocation classification before cleanup can change the
+    // meter or clock. Only a typed timeout is normalized as a timeout.
+    let invocation = capture_invocation_result(outcome, &transport, options.observer.is_some());
     // All exits kill and reap the owned app-server. kill_on_drop also covers caller cancellation.
     if let Err(error) = process_group.stop(&mut child).await {
         stderr_task.abort();
+        // Existing lifecycle-unknown priority remains: an unconfirmed owned
+        // cleanup can supersede the captured invocation error (RPC-S2).
         return Err(error);
     }
     let stderr_result = tokio::time::timeout(Duration::from_secs(2), &mut stderr_task).await;
-    let (stderr_bytes, stderr_truncated) = match stderr_result {
-        Ok(Ok((bytes, truncated))) => (Some(bytes), Some(truncated)),
-        _ => {
-            stderr_task.abort();
-            (None, None)
-        }
+    if !matches!(stderr_result, Ok(Ok(Ok(_)))) {
+        stderr_task.abort();
+    }
+    let drain = match stderr_result {
+        Ok(Ok(Ok(metrics))) => Ok(metrics),
+        _ => Err(anyhow!("host_stderr_cleanup_unknown")),
     };
-    let result = outcome.map_err(|_| {
-        if options.observer.is_some() {
-            anyhow!("host_model_attempt_timeout")
-        } else {
-            anyhow!("Codex host exceeded its time limit; owned app-server was terminated")
-        }
-    })??;
+    let (result, stderr_bytes, stderr_truncated) =
+        finalize_captured_invocation(invocation, &transport, drain)?;
     if let Some(observer) = options.observer {
         observer.process_completed()?;
     }
@@ -531,9 +543,44 @@ async fn run_process_until(
         result,
         home,
         elapsed_ms: started.elapsed().as_millis(),
-        stderr_bytes,
-        stderr_truncated,
+        stderr_bytes: Some(stderr_bytes),
+        stderr_truncated: Some(stderr_truncated),
     })
+}
+
+fn invocation_timeout(observed: bool) -> anyhow::Error {
+    if observed {
+        anyhow!("host_model_attempt_timeout")
+    } else {
+        anyhow!("Codex host exceeded its time limit; owned app-server was terminated")
+    }
+}
+
+fn capture_invocation_result<T>(
+    outcome: std::result::Result<Result<T>, tokio::time::error::Elapsed>,
+    transport: &transport::TransportBudget,
+    observed: bool,
+) -> Result<T> {
+    ensure!(!transport.overflowed(), "host_total_transport_limit");
+    match outcome {
+        Err(_) => Err(invocation_timeout(observed)),
+        Ok(Err(error)) if error.is::<tokio::time::error::Elapsed>() => {
+            Err(invocation_timeout(observed))
+        }
+        Ok(result) => result,
+    }
+}
+
+fn finalize_captured_invocation<T>(
+    invocation: Result<T>,
+    transport: &transport::TransportBudget,
+    drain: Result<(u64, bool)>,
+) -> Result<(T, u64, bool)> {
+    let result = invocation?;
+    // A captured success still needs the complete cleanup envelope to pass.
+    transport.check_host()?;
+    let (bytes, truncated) = drain?;
+    Ok((result, bytes, truncated))
 }
 
 fn process_command(binary: &Path, cwd: &Path, home: &Path) -> Result<Command> {
@@ -655,3 +702,5 @@ pub(crate) fn final_schema() -> Value {
 mod lifecycle_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod transport_priority_tests;

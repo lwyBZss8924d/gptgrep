@@ -2,21 +2,8 @@ use crate::ocr::{DEFAULT_OCR_MODEL, PreparedPage, hash};
 use crate::ocr_accounting::OcrAdmission;
 use anyhow::{Result, anyhow, ensure};
 use serde_json::{Value, json};
-use std::{
-    collections::BTreeSet,
-    io::Write,
-    path::Path,
-    pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
-    task::{Context, Poll},
-};
-use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf},
-    sync::Notify,
-};
+use std::{collections::BTreeSet, io::Write, path::Path};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 const TOOL: &str = "ocr_resource";
 const NAMESPACE: &str = "gptgrep_ocr";
@@ -355,105 +342,7 @@ fn output_schema(task: &gptgrep_parse::OcrTask) -> Value {
     },"required":["schema_version","task_id","task_sha256","source_sha256","prepared_sha256","page","status","regions"]})
 }
 
-#[derive(Clone)]
-pub(crate) struct TransportBudget(Arc<TransportState>);
-
-struct TransportState {
-    used: AtomicUsize,
-    limit: usize,
-    exceeded: AtomicBool,
-    wake: Notify,
-}
-
-impl TransportBudget {
-    pub fn new(limit: usize) -> Self {
-        Self(Arc::new(TransportState {
-            used: AtomicUsize::new(0),
-            limit,
-            exceeded: AtomicBool::new(false),
-            wake: Notify::new(),
-        }))
-    }
-    pub fn used(&self) -> usize {
-        self.0.used.load(Ordering::SeqCst)
-    }
-    pub fn remaining(&self) -> usize {
-        self.0.limit.saturating_sub(self.used())
-    }
-    pub fn check(&self) -> Result<()> {
-        ensure!(
-            !self.0.exceeded.load(Ordering::SeqCst),
-            "ocr_total_transport_limit"
-        );
-        Ok(())
-    }
-    fn admit(&self, bytes: usize) -> Result<()> {
-        self.check()?;
-        if self
-            .0
-            .used
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
-                used.checked_add(bytes)
-                    .filter(|total| *total <= self.0.limit)
-            })
-            .is_err()
-        {
-            self.0.exceeded.store(true, Ordering::SeqCst);
-            self.0.wake.notify_one();
-            return Err(anyhow!("ocr_total_transport_limit"));
-        }
-        self.check()
-    }
-    pub async fn exceeded(&self) {
-        loop {
-            let wake = self.0.wake.notified();
-            if self.0.exceeded.load(Ordering::SeqCst) {
-                return;
-            }
-            wake.await;
-        }
-    }
-}
-
-/// Only a fixed scratch chunk precedes admission. Unadmitted bytes never enter the
-/// protocol frame buffer or a retained stderr buffer, and no next read follows failure.
-pub(crate) struct BudgetedReader<R> {
-    reader: R,
-    transport: TransportBudget,
-}
-impl<R> BudgetedReader<R> {
-    pub fn new(reader: R, transport: TransportBudget) -> Self {
-        Self { reader, transport }
-    }
-}
-impl<R: AsyncRead + Unpin> AsyncRead for BudgetedReader<R> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        output: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        if let Err(error) = self.transport.check() {
-            return Poll::Ready(Err(std::io::Error::other(error.to_string())));
-        }
-        let mut scratch = [0u8; 4096];
-        let capacity = output.remaining().min(scratch.len());
-        if capacity == 0 {
-            return Poll::Ready(Ok(()));
-        }
-        let mut chunk = ReadBuf::new(&mut scratch[..capacity]);
-        match Pin::new(&mut self.reader).poll_read(cx, &mut chunk) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-            Poll::Ready(Ok(())) => {
-                if let Err(error) = self.transport.admit(chunk.filled().len()) {
-                    return Poll::Ready(Err(std::io::Error::other(error.to_string())));
-                }
-                output.put_slice(chunk.filled());
-                Poll::Ready(Ok(()))
-            }
-        }
-    }
-}
+pub(crate) use crate::transport::{BudgetedReader, TransportBudget};
 
 struct OcrRpc<R, W> {
     reader: R,

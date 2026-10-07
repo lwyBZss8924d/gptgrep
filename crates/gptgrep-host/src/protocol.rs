@@ -1,3 +1,4 @@
+use crate::transport::{BudgetedReader, TransportBudget};
 use crate::{
     HostConfig, HostProtocolError, HostProtocolErrorKind, ToolBudgetDiagnostics,
     codex_error::ParsedError,
@@ -7,11 +8,20 @@ use crate::{
 };
 use anyhow::{Result, anyhow, ensure};
 use serde_json::{Value, json};
+use std::sync::Arc;
 use std::{collections::BTreeSet, path::Path};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
+use tokio::{
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
+    sync::Mutex as AsyncMutex,
+    time::Instant,
+};
 
 const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
-const MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 
 pub(crate) const SOURCE_CONTINUATION_GUIDANCE: &str = "Source continuation policy: next_offset=null on an issued window means that node's EOF, not that the requested evidence is complete. If a requested claim, relation, or referent remains unresolved, inspect verified tree information and adjacent or related nodes within the same document scope, then read relevant source windows before finalizing. Use only node IDs exposed by the existing tools; never invent IDs, widen the document scope, infer unread text, or rely on stale source. Only issued source spans support citations; tree descriptors and navigation hints are not citable evidence. Stay within the existing tool-call, deadline, and output budgets. If a required claim remains unresolved when those budgets prevent further verification, state the unresolved limitation and return insufficient_evidence=true.";
 
@@ -169,7 +179,32 @@ pub(crate) struct RunOptions<'a> {
     pub max_output_bytes: Option<usize>,
 }
 
+#[cfg(test)]
 pub(crate) async fn run_observed<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: R,
+    writer: W,
+    cwd: &Path,
+    config: &HostConfig,
+    workflow: Workflow<'_>,
+    trace: Option<crate::trace::Trace>,
+    options: RunOptions<'_>,
+) -> Result<Outcome> {
+    run_observed_budget(
+        reader,
+        writer,
+        cwd,
+        config,
+        workflow,
+        trace,
+        options,
+        TransportBudget::new(MAX_TOTAL_BYTES),
+        Instant::now() + std::time::Duration::from_secs(config.timeout_secs),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: R,
     writer: W,
     cwd: &Path,
@@ -177,14 +212,18 @@ pub(crate) async fn run_observed<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>
     mut workflow: Workflow<'_>,
     trace: Option<crate::trace::Trace>,
     options: RunOptions<'_>,
+    transport: TransportBudget,
+    deadline: Instant,
 ) -> Result<Outcome> {
     let is_completion = matches!(&workflow, Workflow::Completion { .. });
     let mut rpc = Rpc {
-        reader,
-        writer,
-        total: 0,
+        reader: BufReader::new(BudgetedReader::new(reader, transport.clone())),
+        writer: Arc::new(AsyncMutex::new(writer)),
         messages: 0,
         trace,
+        transport,
+        deadline,
+        startup: Startup::default(),
     };
     rpc.request(1,"initialize",json!({"clientInfo":{"name":"gptgrep","title":"GPTgrep local retrieval host","version":env!("CARGO_PKG_VERSION")},
         "capabilities":{"experimentalApi":true}})).await?;
@@ -326,6 +365,7 @@ pub(crate) async fn run_observed<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>
             service_tier.as_deref(),
         )?;
     }
+    rpc.bind_thread(&thread_id)?;
     let mut warnings=vec!["Codex has no public dynamic-tools-only allowlist. Configurable integrations and environment access are disabled; any unexpected server request is denied.".into()];
     if effort.is_none() {
         warnings.push("Codex did not report effective thread reasoning effort; the requested effort is explicitly sent on turn/start.".into());
@@ -661,41 +701,162 @@ fn same_thread(message: &Value, id: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Default)]
+struct Startup {
+    thread_pending: bool,
+    thread: Option<String>,
+    turn_pending: bool,
+}
+
+struct WriteGuard {
+    transport: TransportBudget,
+    armed: bool,
+}
+impl Drop for WriteGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.transport.invalidate();
+        }
+    }
+}
+
+/// The complete frame was reserved once before this wrapper is constructed.
+/// Every subsequent write/flush poll observes the same invocation failure and
+/// deadline, including while stdout or stderr changes the shared meter.
+struct CheckedWriter<'a, W> {
+    writer: &'a mut W,
+    transport: &'a TransportBudget,
+    deadline: Instant,
+}
+impl<W: AsyncWrite + Unpin> CheckedWriter<'_, W> {
+    fn check(&self) -> std::io::Result<()> {
+        self.transport
+            .check_host()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        if Instant::now() >= self.deadline {
+            return Err(std::io::Error::other("host_deadline_exceeded"));
+        }
+        Ok(())
+    }
+}
+impl<W: AsyncWrite + Unpin> AsyncWrite for CheckedWriter<'_, W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if let Err(error) = self.check() {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut *self.writer).poll_write(cx, bytes)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if let Err(error) = self.check() {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut *self.writer).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if let Err(error) = self.check() {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut *self.writer).poll_shutdown(cx)
+    }
+}
+
 struct Rpc<R, W> {
     reader: R,
-    writer: W,
-    total: usize,
+    writer: Arc<AsyncMutex<W>>,
+    transport: TransportBudget,
+    deadline: Instant,
+    startup: Startup,
     messages: usize,
     trace: Option<crate::trace::Trace>,
 }
 impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Rpc<R, W> {
+    fn check(&self) -> Result<()> {
+        self.transport.check_host()?;
+        ensure!(Instant::now() < self.deadline, "host_deadline_exceeded");
+        Ok(())
+    }
+    fn bind_thread(&mut self, id: &str) -> Result<()> {
+        ensure!(
+            self.startup.thread_pending && self.startup.thread.is_none(),
+            "host_thread_already_bound"
+        );
+        self.startup.thread = Some(id.into());
+        Ok(())
+    }
     async fn send(&mut self, value: Value) -> Result<()> {
+        self.check()?;
+        if value["method"] == "thread/start" {
+            ensure!(
+                !self.startup.thread_pending && self.startup.thread.is_none(),
+                "host_thread_start_replayed"
+            );
+            self.startup.thread_pending = true;
+        } else if value["method"] == "turn/start" {
+            ensure!(
+                !self.startup.turn_pending
+                    && self.startup.thread.is_some()
+                    && self.startup.thread.as_deref() == value["params"]["threadId"].as_str(),
+                "host_turn_start_replayed"
+            );
+            self.startup.turn_pending = true;
+        }
         if let Some(trace) = &mut self.trace {
             trace.record("send", &value)?;
         }
-        let mut bytes = serde_json::to_vec(&value)?;
-        ensure!(
-            bytes.len() <= MAX_FRAME_BYTES,
-            "Outgoing Codex frame exceeded the limit"
-        );
-        bytes.push(b'\n');
-        self.writer
-            .write_all(&bytes)
+        let bytes = crate::transport::encode_frame(&value, MAX_FRAME_BYTES)?;
+        self.check()?;
+        if self.transport.admit(bytes.len()).is_err() {
+            self.transport.check_host()?;
+        }
+        // Guard exists before writer contention/write/flush. Admission is never
+        // refunded and dropping an unknown send closes this invocation's meter.
+        let mut guard = WriteGuard {
+            transport: self.transport.clone(),
+            armed: true,
+        };
+        let operation = async {
+            let mut owned_writer = self.writer.lock().await;
+            self.check()?;
+            let mut writer = CheckedWriter {
+                writer: &mut *owned_writer,
+                transport: &self.transport,
+                deadline: self.deadline,
+            };
+            writer
+                .write_all(&bytes)
+                .await
+                .map_err(|_| anyhow!("Codex input transport closed"))?;
+            writer
+                .flush()
+                .await
+                .map_err(|_| anyhow!("Codex input transport closed"))?;
+            self.check()?;
+            Ok::<(), anyhow::Error>(())
+        };
+        tokio::time::timeout_at(self.deadline, operation)
             .await
-            .map_err(|_| anyhow!("Codex input transport closed"))?;
-        self.writer
-            .flush()
-            .await
-            .map_err(|_| anyhow!("Codex input transport closed"))?;
+            .map_err(|error| anyhow::Error::new(error).context("host_send_deadline_unknown"))??;
+        guard.armed = false;
         Ok(())
     }
     async fn receive(&mut self) -> Result<Value> {
+        self.check()?;
+        let mut guard = WriteGuard {
+            transport: self.transport.clone(),
+            armed: true,
+        };
         let mut line = Vec::new();
         loop {
-            let data = self
-                .reader
-                .fill_buf()
+            self.check()?;
+            let data = tokio::time::timeout_at(self.deadline, self.reader.fill_buf())
                 .await
+                .map_err(|error| {
+                    anyhow::Error::new(error).context("host_receive_deadline_unknown")
+                })?
                 .map_err(|_| anyhow!("Codex output transport failed"))?;
             ensure!(
                 !data.is_empty(),
@@ -708,11 +869,6 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Rpc<R, W> {
             ensure!(
                 line.len() + count <= MAX_FRAME_BYTES,
                 "Codex frame exceeded the byte limit"
-            );
-            self.total = self.total.saturating_add(count);
-            ensure!(
-                self.total <= MAX_TOTAL_BYTES,
-                "Codex output exceeded the total byte limit"
             );
             line.extend_from_slice(&data[..count]);
             let complete = data[count - 1] == b'\n';
@@ -728,6 +884,8 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Rpc<R, W> {
         if let Some(trace) = &mut self.trace {
             trace.record("receive", &message)?;
         }
+        self.check()?;
+        guard.armed = false;
         Ok(message)
     }
     async fn deny(&mut self, id: Value) -> Result<()> {
@@ -754,3 +912,6 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Rpc<R, W> {
         }
     }
 }
+
+#[cfg(test)]
+mod transport_tests;
