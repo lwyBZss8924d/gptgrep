@@ -439,13 +439,72 @@ async fn inherited_mcp_and_native_items_are_rejected() {
 #[tokio::test]
 async fn runtime_failure_retry_and_closed_stream_keep_denominators() {
     let fixture = Fixture::new();
+    const SECRET: &str = "PRIVATE_OCR_ERROR_SENTINEL";
     for retry in [false, true] {
         let mut frames = startup(json!({}));
-        frames.push(json!({"method":"error","params":{"threadId":"thread-1","turnId":"turn-1","willRetry":retry}}));
-        let (result, budget) = replay(&fixture, frames, Capture::default()).await;
-        assert!(result.is_err());
+        let mut tokens = serde_json::Map::new();
+        for field in [
+            "totalTokens",
+            "inputTokens",
+            "cachedInputTokens",
+            "cacheWriteInputTokens",
+            "outputTokens",
+            "reasoningOutputTokens",
+        ] {
+            tokens.insert(field.into(), json!(u64::MAX));
+        }
+        tokens.insert("message".into(), json!(SECRET));
+        let observed = json!({"total":tokens,"last":tokens,"modelContextWindow":u64::MAX,"headers":{"Authorization":SECRET}});
+        frames.push(json!({"method":"thread/tokenUsage/updated","params":{"threadId":"thread-1","turnId":"turn-1","tokenUsage":observed}}));
+        frames.push(json!({"method":"error","params":{"threadId":"thread-1","turnId":"turn-1","willRetry":retry,"error":{"message":SECRET,"additionalDetails":{"token":SECRET},"codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":502,"headers":{"Authorization":SECRET}}}}}}));
+        let capture = Capture::default();
+        let (result, budget) = replay(&fixture, frames, capture.clone()).await;
+        let error = result.err().unwrap();
+        assert_eq!(error.to_string(), "ocr_runtime_error_completion_unknown");
+        let typed = error.downcast_ref::<crate::OcrRuntimeError>().unwrap();
+        assert_eq!(typed.code(), "ocr_runtime_error_completion_unknown");
+        assert_eq!(
+            typed.codex_error_info,
+            Some(crate::CodexErrorInfo::ResponseStreamDisconnected)
+        );
+        assert_eq!(typed.http_status_code, Some(502));
+        assert_eq!(typed.will_retry, Some(retry));
+        assert_eq!(
+            typed.usage.as_ref().unwrap()["total"]["totalTokens"],
+            json!(u64::MAX)
+        );
+        assert_eq!(
+            typed.usage.as_ref().unwrap()["last"]
+                .as_object()
+                .unwrap()
+                .len(),
+            6
+        );
+        let serialized = serde_json::to_value(typed).unwrap();
+        assert_eq!(serialized.as_object().unwrap().len(), 4);
+        assert!(serde_json::to_vec(typed).unwrap().len() <= 2048);
+        for safe in [
+            serialized.to_string(),
+            format!("{typed:?}"),
+            format!("{error:#}"),
+        ] {
+            assert!(!safe.contains(SECRET));
+            assert!(!safe.contains("thread-1"));
+            assert!(!safe.contains("turn-1"));
+            assert!(!safe.contains("Authorization"));
+            assert!(!safe.contains("additionalDetails"));
+        }
+        assert_eq!(
+            capture
+                .frames()
+                .iter()
+                .filter(|f| f["method"] == "turn/start")
+                .count(),
+            1
+        );
         assert_eq!(budget.charged_admissions, 1);
         assert_eq!(budget.quarantined_slots, 1);
+        assert_eq!(budget.terminal_admissions, 0);
     }
     let (result, budget) = replay(&fixture, startup(json!({})), Capture::default()).await;
     assert_eq!(
@@ -453,6 +512,97 @@ async fn runtime_failure_retry_and_closed_stream_keep_denominators() {
         "ocr_stream_closed_completion_unknown"
     );
     assert_eq!(budget.quarantined_slots, 1);
+}
+
+#[tokio::test]
+async fn runtime_error_malformed_and_unknown_diagnostics_remain_nullable() {
+    let fixture = Fixture::new();
+    for error_info in [
+        Value::Null,
+        json!({"message":"private","codexErrorInfo":"unknownFutureVariant"}),
+        json!({"message":"private","codexErrorInfo":"flexUnavailable"}),
+        json!({"message":"private","codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":700}}}),
+        json!({"message":false,"codexErrorInfo":{"httpConnectionFailed":{"httpStatusCode":503}}}),
+        json!({"message":"private","codexErrorInfo":"responseStreamDisconnected"}),
+    ] {
+        let mut frames = startup(json!({}));
+        frames.push(json!({"method":"thread/tokenUsage/updated","params":{"threadId":"thread-1","turnId":"turn-1","tokenUsage":{"total":{"inputTokens":-1,"outputTokens":"0","details":"private"}}}}));
+        frames.push(json!({"method":"error","params":{"threadId":"thread-1","turnId":"turn-1","willRetry":"true","error":error_info}}));
+        let (result, budget) = replay(&fixture, frames, Capture::default()).await;
+        let error = result.err().unwrap();
+        assert_eq!(error.to_string(), "ocr_runtime_error_completion_unknown");
+        let typed = error.downcast_ref::<crate::OcrRuntimeError>().unwrap();
+        assert!(typed.codex_error_info.is_none());
+        assert!(typed.http_status_code.is_none());
+        assert!(typed.will_retry.is_none());
+        assert!(typed.usage.is_none());
+        assert_eq!(budget.charged_admissions, 1);
+        assert_eq!(budget.quarantined_slots, 1);
+        assert_eq!(budget.terminal_admissions, 0);
+    }
+}
+
+#[tokio::test]
+async fn runtime_error_known_variants_preserve_only_safe_observations() {
+    let fixture = Fixture::new();
+    for (info, expected, status) in [
+        (
+            json!("unauthorized"),
+            crate::CodexErrorInfo::Unauthorized,
+            None,
+        ),
+        (
+            json!({"httpConnectionFailed":{"httpStatusCode":401}}),
+            crate::CodexErrorInfo::HttpConnectionFailed,
+            Some(401),
+        ),
+        (
+            json!({"activeTurnNotSteerable":{"turnKind":"review","extra":"private"}}),
+            crate::CodexErrorInfo::ActiveTurnNotSteerable,
+            None,
+        ),
+    ] {
+        let mut frames = startup(json!({}));
+        frames.push(json!({"method":"error","params":{"threadId":"thread-1","turnId":"turn-1","willRetry":false,"error":{"message":"private","codexErrorInfo":info}}}));
+        let (result, budget) = replay(&fixture, frames, Capture::default()).await;
+        let error = result.err().unwrap();
+        let typed = error.downcast_ref::<crate::OcrRuntimeError>().unwrap();
+        assert_eq!(typed.codex_error_info, Some(expected));
+        assert_eq!(typed.http_status_code, status);
+        assert_eq!(typed.will_retry, Some(false));
+        assert!(typed.usage.is_none());
+        assert_eq!(budget.quarantined_slots, 1);
+    }
+}
+
+#[tokio::test]
+async fn runtime_error_identity_mismatch_precedes_diagnostics() {
+    let fixture = Fixture::new();
+    for (field, expected) in [
+        ("threadId", "ocr_thread_identity_mismatch"),
+        ("turnId", "ocr_turn_identity_mismatch"),
+    ] {
+        let mut frames = startup(json!({}));
+        frames.push(json!({"method":"thread/tokenUsage/updated","params":{"threadId":"thread-1","turnId":"turn-1","tokenUsage":{"total":{"outputTokens":0}}}}));
+        let mut error = json!({"method":"error","params":{"threadId":"thread-1","turnId":"turn-1","willRetry":true,"error":{"message":"private","codexErrorInfo":"unauthorized"}}});
+        error["params"][field] = json!("forged");
+        frames.push(error);
+        let capture = Capture::default();
+        let (result, budget) = replay(&fixture, frames, capture.clone()).await;
+        let error = result.err().unwrap();
+        assert_eq!(error.to_string(), expected);
+        assert!(error.downcast_ref::<crate::OcrRuntimeError>().is_none());
+        assert_eq!(
+            capture
+                .frames()
+                .iter()
+                .filter(|f| f["method"] == "turn/start")
+                .count(),
+            1
+        );
+        assert_eq!(budget.charged_admissions, 1);
+        assert_eq!(budget.quarantined_slots, 1);
+    }
 }
 
 #[tokio::test]

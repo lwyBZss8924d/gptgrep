@@ -5,7 +5,8 @@ mod enrich;
 mod enrich_accounting;
 mod evidence_roles;
 pub use codex_error::{
-    CodexErrorInfo, HostProtocolError, HostProtocolErrorKind, ToolBudgetDiagnostics,
+    CodexErrorInfo, HostProtocolError, HostProtocolErrorKind, OcrRuntimeError,
+    ToolBudgetDiagnostics,
 };
 pub use enrich::{
     DEFAULT_ENRICH_MODEL, EnrichBinding, EnrichConfig, EnrichCursor, EnrichReport, EnrichmentPlan,

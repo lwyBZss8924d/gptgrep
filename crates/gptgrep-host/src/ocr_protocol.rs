@@ -264,7 +264,12 @@ pub(crate) async fn run<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 // The host never restarts a page or extends the deadline for runtime recovery.
                 // A frontend failure or interruption is not remote cancellation proof.
                 // Retain the submitted provider-lifetime slot even when no retry follows.
-                return Err(anyhow!("ocr_runtime_error_completion_unknown"));
+                return Err(crate::OcrRuntimeError::new(
+                    &message["params"]["error"],
+                    message["params"]["willRetry"].as_bool(),
+                    usage.as_ref(),
+                )
+                .into());
             }
             Some("configWarning" | "config/warning" | "model/rerouted") => {
                 return Err(anyhow!("ocr_runtime_configuration_not_admitted"));

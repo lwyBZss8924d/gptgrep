@@ -124,6 +124,40 @@ impl fmt::Display for HostProtocolError {
 }
 impl std::error::Error for HostProtocolError {}
 
+/// Safe diagnostics from an OCR runtime error notification.
+/// Display preserves the existing completion-unknown code. These observations
+/// do not prove a terminal provider lifetime, billed requests or complete usage.
+#[derive(Debug, Clone, Serialize)]
+pub struct OcrRuntimeError {
+    pub codex_error_info: Option<CodexErrorInfo>,
+    pub http_status_code: Option<u16>,
+    pub will_retry: Option<bool>,
+    pub usage: Option<Value>,
+}
+
+impl OcrRuntimeError {
+    pub fn code(&self) -> &'static str {
+        "ocr_runtime_error_completion_unknown"
+    }
+
+    pub(crate) fn new(error: &Value, will_retry: Option<bool>, usage: Option<&Value>) -> Self {
+        let parsed = ParsedError::parse(error);
+        Self {
+            codex_error_info: parsed.valid.then_some(parsed.info).flatten(),
+            http_status_code: parsed.valid.then_some(parsed.http_status_code).flatten(),
+            will_retry,
+            usage: usage.and_then(observed_usage),
+        }
+    }
+}
+
+impl fmt::Display for OcrRuntimeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.code())
+    }
+}
+impl std::error::Error for OcrRuntimeError {}
+
 #[derive(Default)]
 pub(crate) struct ParsedError {
     pub info: Option<CodexErrorInfo>,
