@@ -980,13 +980,18 @@ fn validate_document_shape(doc: &RichDocument, budget: &ResourceBudget) -> Resul
             );
         }
         (
-            "png",
+            format @ ("png" | "jpeg"),
             gptgrep_parse::FeatureState::Present(conversion),
             gptgrep_parse::FeatureState::Present(geometry),
         ) => {
+            let expected_version = if format == "png" {
+                "image-0.25.10/png-rgb8-pdf-v2"
+            } else {
+                "zune-jpeg-0.5.15/baseline-strict-rgb8-pdf-v1"
+            };
             ensure!(
                 conversion.converter == "gptgrep-bounded-image-pdf"
-                    && conversion.version == "image-0.25.10/png-rgb8-pdf-v2"
+                    && conversion.version == expected_version
                     && conversion.invocations == 1
                     && doc.pages.len() == 1,
                 "image preparation identity/count mismatch"

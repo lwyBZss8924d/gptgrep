@@ -1158,6 +1158,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "zune-jpeg 0.5.15",
 ]
 
 [[package]]

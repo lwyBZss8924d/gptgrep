@@ -255,28 +255,15 @@ async fn native_metadata_binds_vector_classifier_and_original_cropped_rotated_fr
 }
 
 #[tokio::test]
-async fn jpeg_preparation_is_unqualified_before_decoder_or_staging() {
-    let budget = ResourceBudget::default();
-    let encoded = jpeg_fixture();
-    let (error, staging) = prepare_error(&encoded, "jpg", &budget).await;
-    assert!(
-        error.contains("capability_unavailable: JPEG preparation"),
-        "{error}"
-    );
-    assert!(!staging);
-    assert_eq!(budget.staging_used(), 0);
-
-    // A complete container with shortened entropy is equally unavailable;
-    // permissive decoder pixel recovery cannot reach preparation or publication.
+async fn strict_jpeg_incomplete_entropy_fails_before_decoder_or_staging() {
+    let encoded = crate::image_prepare::jpeg_strict::tests::fixture(8, 8, &[0]);
     let sos = encoded.windows(2).position(|b| b == [0xff, 0xda]).unwrap();
-    let scan_len = u16::from_be_bytes([encoded[sos + 2], encoded[sos + 3]]) as usize;
-    let mut incomplete = encoded[..sos + 2 + scan_len].to_vec();
+    let length = usize::from(u16::from_be_bytes([encoded[sos + 2], encoded[sos + 3]]));
+    let mut incomplete = encoded[..sos + 2 + length].to_vec();
     incomplete.extend_from_slice(&[0xff, 0xd9]);
+    let budget = ResourceBudget::default();
     let (error, staging) = prepare_error(&incomplete, "jpeg", &budget).await;
-    assert!(
-        error.contains("capability_unavailable: JPEG preparation"),
-        "{error}"
-    );
+    assert!(error.contains("premature entropy marker"), "{error}");
     assert!(!staging);
     assert_eq!(budget.staging_used(), 0);
 }
@@ -379,17 +366,6 @@ async fn gray_alpha_palette_and_rgb_samples_use_the_admitted_scanline_conversion
         embedded_rgb(&std::fs::read(prepared.prepared_path()).unwrap(), 2, 1),
         &[255, 255, 255, 200, 210, 220]
     );
-    // Grayscale JPEG also remains unqualified, before sample conversion.
-    let mut encoded = Vec::new();
-    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, 100)
-        .write_image(&[10, 200], 2, 1, ExtendedColorType::L8)
-        .unwrap();
-    let (error, staging) = prepare_error(&encoded, "jpeg", &budget).await;
-    assert!(
-        error.contains("capability_unavailable: JPEG preparation"),
-        "{error}"
-    );
-    assert!(!staging);
 }
 
 #[tokio::test]
@@ -455,10 +431,7 @@ async fn image_headers_are_admitted_before_decoder_and_staging() {
         .unwrap();
     jpeg[sof + 5..sof + 9].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]);
     let (error, staging) = prepare_error(&jpeg, "jpeg", &budget).await;
-    assert!(
-        error.contains("capability_unavailable: JPEG preparation"),
-        "{error}"
-    );
+    assert!(error.contains("resource_limit: image exceeds"), "{error}");
     assert!(!staging);
 
     let encoded = vec![0u8; 1_048_577];
@@ -614,4 +587,142 @@ fn existing_pdf_summaries_default_image_geometry_to_absent() {
     });
     let summary: PreparedSummary = serde_json::from_value(old).unwrap();
     assert!(matches!(summary.image_geometry, FeatureState::Absent));
+}
+
+#[tokio::test]
+async fn bounded_strict_jpeg_pdf_roundtrip_preserves_known_samples_and_profile() {
+    for (values, expected) in [
+        (&[0][..], &[128, 128, 128][..]),
+        (&[-1024, 0, 1016][..], &[0, 128, 255][..]),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("constant.jpeg");
+        let encoded = crate::image_prepare::jpeg_strict::tests::fixture(13, 9, values);
+        std::fs::write(&source, &encoded).unwrap();
+        let budget = ResourceBudget::default();
+        let prepared = prepare_document(
+            &source,
+            &dir.path().join("stage"),
+            &PreparationOptions,
+            &budget,
+        )
+        .await
+        .unwrap();
+        let summary = prepared.summary();
+        assert_eq!(summary.format, "jpeg");
+        assert_eq!(summary.source_sha256, crate::artifact::sha256(&encoded));
+        assert!(
+            matches!(&summary.conversion, FeatureState::Present(identity) if identity.version == "zune-jpeg-0.5.15/baseline-strict-rgb8-pdf-v1" && identity.invocations == 1)
+        );
+        let FeatureState::Present(geometry) = &summary.image_geometry else {
+            panic!("missing image geometry")
+        };
+        assert_eq!(
+            image_preparation_profile_digest("jpeg", geometry).unwrap(),
+            summary.preparation_profile_sha256
+        );
+        let pdf = std::fs::read(prepared.prepared_path()).unwrap();
+        assert!(
+            embedded_rgb(&pdf, 13, 9)
+                .chunks_exact(3)
+                .all(|pixel| pixel == expected)
+        );
+        assert_eq!(budget.staging_used(), 13 * 9 * 3 + 16_384);
+        prepared.verify(&budget).unwrap();
+        std::fs::write(&source, b"changed").unwrap();
+        assert!(prepared.verify(&budget).is_err());
+    }
+}
+
+#[tokio::test]
+async fn strict_jpeg_buffer_output_and_invocation_limits_fail_before_entropy_or_staging() {
+    let mut encoded = crate::image_prepare::jpeg_strict::tests::fixture(13, 9, &[-1024, 0, 1016]);
+    let sos = encoded.windows(2).position(|b| b == [0xff, 0xda]).unwrap();
+    let length = usize::from(u16::from_be_bytes([encoded[sos + 2], encoded[sos + 3]]));
+    encoded.truncate(sos + 2 + length);
+    encoded.extend_from_slice(&[0xff, 0xd9]);
+    for (field, expected) in [
+        ("decoded", "image exceeds"),
+        ("working", "working admission"),
+        ("output", "PDF output admission"),
+        ("run", "shared run staging admission"),
+    ] {
+        let mut budget = ResourceBudget::default();
+        match field {
+            "decoded" => budget.image_pixel_buffer_bytes = 13 * 9 * 4 - 1,
+            "working" => {
+                budget.owned_working_bytes =
+                    encoded.len() as u64 + 13 * 9 * 3 + 16 * 3 * 16 + 3 * 13 + 1_048_576 - 1
+            }
+            "output" => budget.document_staging_bytes = 13 * 9 * 3 + 16_384 - 1,
+            "run" => budget.run_staging_bytes = 13 * 9 * 3 + 16_384 - 1,
+            _ => unreachable!(),
+        }
+        // Entropy rejection intentionally precedes reservation. Use valid
+        // entropy for the shared-counter case; it must fail before decode/output.
+        let valid = crate::image_prepare::jpeg_strict::tests::fixture(13, 9, &[-1024, 0, 1016]);
+        let input = if field == "run" { &valid } else { &encoded };
+        let (error, staging) = prepare_error(input, "jpeg", &budget).await;
+        assert!(error.contains(expected), "{field}: {error}");
+        assert!(!staging, "{field}");
+        assert_eq!(budget.staging_used(), 0);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("shared.jpg");
+    let encoded = crate::image_prepare::jpeg_strict::tests::fixture(13, 9, &[-1024, 0, 1016]);
+    std::fs::write(&source, &encoded).unwrap();
+    let mut budget = ResourceBudget::default();
+    budget.run_staging_bytes = 2 * (13 * 9 * 3 + 16_384) - 1;
+    let first = prepare_document(
+        &source,
+        &dir.path().join("one"),
+        &PreparationOptions,
+        &budget,
+    )
+    .await
+    .unwrap();
+    let error = prepare_document(
+        &source,
+        &dir.path().join("two"),
+        &PreparationOptions,
+        &budget.clone(),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("shared run staging admission"));
+    assert!(!dir.path().join("two").exists());
+    assert_eq!(budget.staging_used(), 13 * 9 * 3 + 16_384);
+    first.verify(&budget).unwrap();
+    assert!(first.verify(&ResourceBudget::default()).is_err());
+}
+
+#[tokio::test]
+async fn strict_jpeg_recipe_rejects_unsupported_source_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source.jpeg");
+    std::fs::write(
+        &source,
+        crate::image_prepare::jpeg_strict::tests::fixture(8, 8, &[0]),
+    )
+    .unwrap();
+    let prepared = prepare_document(
+        &source,
+        &dir.path().join("stage"),
+        &PreparationOptions,
+        &ResourceBudget::default(),
+    )
+    .await
+    .unwrap();
+    let FeatureState::Present(geometry) = &prepared.summary().image_geometry else {
+        panic!("missing geometry")
+    };
+    let png_profile = image_preparation_profile_digest("png", geometry).unwrap();
+    assert_ne!(png_profile, prepared.summary().preparation_profile_sha256);
+    let mut forged = geometry.clone();
+    forged.source_color_profile = FeatureState::Unsupported("not admitted".into());
+    assert!(image_preparation_profile_digest("jpeg", &forged).is_err());
+    forged = geometry.clone();
+    forged.source_orientation = FeatureState::Unsupported("not admitted".into());
+    assert!(image_preparation_profile_digest("jpeg", &forged).is_err());
+    assert!(image_preparation_profile_digest("jpg", geometry).is_err());
 }

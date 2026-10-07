@@ -3,6 +3,269 @@ use gptgrep_pageindex::{PageInput, from_pages};
 use gptgrep_parse::{AffineTransform, FeatureState, PageGeometry, RICH_PARSER};
 use serde_json::json;
 
+fn baseline_gray_jpeg() -> Result<Vec<u8>> {
+    use image::{ExtendedColorType, ImageEncoder};
+    let mut bytes = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 100).write_image(
+        &[128; 13 * 9],
+        13,
+        9,
+        ExtendedColorType::L8,
+    )?;
+    Ok(bytes)
+}
+
+async fn prepare_strict_jpeg(
+    root: &Path,
+    budget: &ResourceBudget,
+) -> Result<gptgrep_parse::PreparedDocument> {
+    fs::write(root.join("source.jpeg"), baseline_gray_jpeg()?)?;
+    gptgrep_parse::prepare_document(
+        &root.join("source.jpeg"),
+        &root.join("jpeg-staging"),
+        &gptgrep_parse::PreparationOptions,
+        budget,
+    )
+    .await
+}
+
+async fn extract_strict_jpeg(
+    prepared: &gptgrep_parse::PreparedDocument,
+    budget: &ResourceBudget,
+) -> Result<gptgrep_parse::NativeCandidate> {
+    gptgrep_parse::extract_native(
+        prepared,
+        &gptgrep_parse::NativeOptions {
+            dpi: 72.0,
+            ..Default::default()
+        },
+        budget,
+    )
+    .await
+}
+
+fn declared_offline_ocr(task: &gptgrep_parse::OcrTask) -> Result<gptgrep_parse::OcrPageResult> {
+    use gptgrep_parse::*;
+    // This mirrors the existing offline OCR DTO fixture. No model, provider,
+    // image delivery, usage, or OCR accuracy is qualified by declared receipts.
+    Ok(OcrPageResult {
+        schema_version: "gptgrep.ocr.result.v1".into(),
+        task_id: task.id.clone(),
+        task_sha256: task.task_sha256.clone(),
+        source_sha256: task.source_sha256.clone(),
+        prepared_sha256: task.prepared_sha256.clone(),
+        page: task.page,
+        status: OcrResultStatus::Complete,
+        regions: task
+            .regions
+            .iter()
+            .enumerate()
+            .map(|(i, region)| OcrRegionResult {
+                id: region.id.clone(),
+                bbox: region.bbox,
+                text: "Declared offline JPEG OCR text".into(),
+                reading_order: i as u32,
+                status: OcrRegionStatus::Complete,
+            })
+            .collect(),
+        receipt: OcrReceipt {
+            model: task.profile.model.clone(),
+            profile_sha256: ocr_profile_digest(&task.profile)?,
+            request_sha256: "1".repeat(64),
+            response_sha256: "2".repeat(64),
+            runtime_profile_sha256: "3".repeat(64),
+            image_deliveries: task
+                .images
+                .iter()
+                .enumerate()
+                .map(|(i, image)| OcrImageDelivery {
+                    artifact_id: image.artifact.id.clone(),
+                    artifact_sha256: image.artifact.sha256.clone(),
+                    tool_ordinal: i as u32 + 1,
+                    mime: image.artifact.mime.clone(),
+                    width: image.width,
+                    height: image.height,
+                    tool_response_sha256: "4".repeat(64),
+                })
+                .collect(),
+            usage: None,
+            latency_ms: None,
+        },
+    })
+}
+
+#[tokio::test]
+async fn strict_jpeg_structural_publication_keeps_native_and_offline_ocr_distinct() -> Result<()> {
+    use gptgrep_parse::*;
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    let budget = ResourceBudget::default();
+    let prepared = prepare_strict_jpeg(&root, &budget).await?;
+    assert_eq!(prepared.summary().format, "jpeg");
+    assert!(
+        matches!(&prepared.summary().conversion, FeatureState::Present(conversion)
+        if conversion.converter == "gptgrep-bounded-image-pdf"
+        && conversion.version == "zune-jpeg-0.5.15/baseline-strict-rgb8-pdf-v1"
+        && conversion.invocations == 1)
+    );
+    let FeatureState::Present(geometry) = &prepared.summary().image_geometry else {
+        panic!("JPEG geometry must be retained")
+    };
+    assert_eq!(
+        (geometry.source_width_pixels, geometry.source_height_pixels),
+        (13, 9)
+    );
+    assert_eq!(geometry.source_pixels_to_page, AffineTransform::IDENTITY);
+    assert!(matches!(geometry.source_orientation, FeatureState::Absent));
+    assert!(matches!(
+        geometry.source_color_profile,
+        FeatureState::Absent
+    ));
+    assert_eq!(
+        prepared.summary().preparation_profile_sha256,
+        image_preparation_profile_digest("jpeg", geometry)?
+    );
+    let candidate = extract_strict_jpeg(&prepared, &budget).await?;
+    assert_eq!(candidate.pages().len(), 1);
+    assert_eq!(candidate.pages()[0].coverage, CoverageState::RequiredOcr);
+    assert_eq!(candidate.pages()[0].native_text.bytes, 0);
+    assert_eq!(candidate.plan().tasks.len(), 1);
+    let result = declared_offline_ocr(&candidate.plan().tasks[0])?;
+    let parsed = finalize_document(candidate, vec![result], OcrMode::Auto, &budget)?;
+    assert_eq!(parsed.pages[0].coverage, CoverageState::ValidatedOcr);
+    let staged = budget.staging_used();
+    let mut writer = RichGenerationWriter::begin(&root, budget.clone())?;
+    writer.add_document("source.jpeg", prepared.staging_root(), parsed)?;
+    assert!(
+        budget.staging_used() > staged,
+        "retained copy shares the invocation counter"
+    );
+    let pin = writer.publish()?;
+    let reader = RichGenerationReader::open_pinned(&root, &pin)?;
+    reader.verify_all()?;
+    assert_eq!(
+        reader.manifest()?.documents[0].pages[0].native_text.bytes,
+        0
+    );
+    let hits = reader.search_artifacts("Declared", false, true, 1, None, MAX_OUTPUT_BYTES)?;
+    assert_eq!(hits.hits.len(), 1);
+    assert!(matches!(hits.hits[0].evidence, EvidenceRef::OcrText { .. }));
+    reader.validate_text_evidence(&hits.hits[0].evidence)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn strict_jpeg_without_required_ocr_preserves_prior_current() -> Result<()> {
+    use gptgrep_parse::*;
+    for mode in [OcrMode::Auto, OcrMode::Off] {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().canonicalize()?;
+        let prior = publish(&root, &["prior publication\n"])?;
+        let pointer = fs::read(root.join(STATE).join("CURRENT.json"))?;
+        let budget = ResourceBudget::default();
+        let prepared = prepare_strict_jpeg(&root, &budget).await?;
+        let candidate = extract_strict_jpeg(&prepared, &budget).await?;
+        assert_eq!(candidate.pages()[0].coverage, CoverageState::RequiredOcr);
+        // A raster-only source has no native searchable text. Auto refuses
+        // required coverage; Off refuses the no-content document earlier.
+        // No completed DTO is fabricated to bypass either refusal.
+        let error = finalize_document(candidate, vec![], mode, &budget)
+            .expect_err("raster-only JPEG cannot finalize without OCR");
+        let message = match mode {
+            OcrMode::Auto => "required OCR coverage incomplete",
+            OcrMode::Off => "no searchable text extracted",
+        };
+        assert!(error.to_string().contains(message), "{error:#}");
+        assert_eq!(fs::read(root.join(STATE).join("CURRENT.json"))?, pointer);
+        assert_eq!(RichGenerationReader::open(&root)?.pin(), prior);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn incomplete_jpeg_preparation_preserves_prior_current() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    let prior = publish(&root, &["prior publication\n"])?;
+    let pointer = fs::read(root.join(STATE).join("CURRENT.json"))?;
+    let encoded = baseline_gray_jpeg()?;
+    let sos = encoded
+        .windows(2)
+        .position(|bytes| bytes == [0xff, 0xda])
+        .unwrap();
+    let length = u16::from_be_bytes([encoded[sos + 2], encoded[sos + 3]]) as usize;
+    let mut incomplete = encoded[..sos + 2 + length].to_vec();
+    incomplete.extend_from_slice(&[0xff, 0xd9]);
+    fs::write(root.join("source.jpeg"), incomplete)?;
+    let budget = ResourceBudget::default();
+    let error = gptgrep_parse::prepare_document(
+        &root.join("source.jpeg"),
+        &root.join("jpeg-staging"),
+        &gptgrep_parse::PreparationOptions,
+        &budget,
+    )
+    .await
+    .expect_err("missing coded entropy must fail preparation");
+    assert!(error.to_string().contains("premature entropy marker"));
+    assert_eq!(budget.staging_used(), 0);
+    assert!(!root.join("jpeg-staging").exists());
+    assert_eq!(fs::read(root.join(STATE).join("CURRENT.json"))?, pointer);
+    assert_eq!(RichGenerationReader::open(&root)?.pin(), prior);
+    Ok(())
+}
+
+#[tokio::test]
+async fn strict_jpeg_source_changes_refuse_prepare_import_and_reader_evidence() -> Result<()> {
+    use gptgrep_parse::*;
+    for boundary in ["after_prepare", "after_import", "after_publish"] {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().canonicalize()?;
+        let prior = publish(&root, &["prior publication\n"])?;
+        let pointer = fs::read(root.join(STATE).join("CURRENT.json"))?;
+        let budget = ResourceBudget::default();
+        let prepared = prepare_strict_jpeg(&root, &budget).await?;
+        if boundary == "after_prepare" {
+            fs::write(root.join("source.jpeg"), b"changed original source")?;
+            assert!(extract_strict_jpeg(&prepared, &budget).await.is_err());
+            assert_eq!(fs::read(root.join(STATE).join("CURRENT.json"))?, pointer);
+            assert_eq!(RichGenerationReader::open(&root)?.pin(), prior);
+            continue;
+        }
+        let candidate = extract_strict_jpeg(&prepared, &budget).await?;
+        let result = declared_offline_ocr(&candidate.plan().tasks[0])?;
+        let parsed = finalize_document(candidate, vec![result], OcrMode::Auto, &budget)?;
+        let mut writer = RichGenerationWriter::begin(&root, budget)?;
+        writer.add_document("source.jpeg", prepared.staging_root(), parsed)?;
+        if boundary == "after_import" {
+            fs::write(root.join("source.jpeg"), b"changed original source")?;
+            assert!(writer.publish().is_err());
+            assert_eq!(fs::read(root.join(STATE).join("CURRENT.json"))?, pointer);
+            assert_eq!(RichGenerationReader::open(&root)?.pin(), prior);
+            continue;
+        }
+        let pin = writer.publish()?;
+        let pointer = fs::read(root.join(STATE).join("CURRENT.json"))?;
+        let reader = RichGenerationReader::open_pinned(&root, &pin)?;
+        let hits = reader.search_artifacts("Declared", false, true, 1, None, MAX_OUTPUT_BYTES)?;
+        let EvidenceRef::OcrText { binding, .. } = &hits.hits[0].evidence else {
+            panic!("declared OCR artifact expected")
+        };
+        assert!(
+            reader
+                .read_text(&binding.artifact_id, 0, 128)?
+                .text
+                .contains("Declared")
+        );
+        fs::write(root.join("source.jpeg"), b"changed original source")?;
+        assert!(reader.read_text(&binding.artifact_id, 0, 128).is_err());
+        let stale = reader.search_artifacts("Declared", false, true, 1, None, MAX_OUTPUT_BYTES)?;
+        assert!(stale.hits.is_empty());
+        assert_eq!(stale.stale_documents, ["source.jpeg"]);
+        assert_eq!(fs::read(root.join(STATE).join("CURRENT.json"))?, pointer);
+    }
+    Ok(())
+}
+
 // These fixtures exercise persistence and lineage with synthetic parser DTOs.
 // They do not claim native PDF parsing or OCR/model accuracy.
 fn candidate(root: &Path, texts: &[&str]) -> Result<(tempfile::TempDir, RichParsedDocument)> {

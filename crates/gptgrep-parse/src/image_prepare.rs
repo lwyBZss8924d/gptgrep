@@ -1,6 +1,9 @@
 //! Owned image-to-PDF front door. Its container subset is deliberately narrower
-//! than `image`: only a bounded static PNG subset is qualified. JPEG is
-//! unavailable until a strict entropy-completion decoder is qualified.
+//! than `image`: bounded static PNG and a strict baseline JPEG subset. JPEG
+//! entropy admission uses actual source bits before the pinned pixel decoder.
+
+#[path = "jpeg_strict.rs"]
+pub(crate) mod jpeg_strict;
 
 use std::fs::OpenOptions;
 use std::io::{Cursor, Write};
@@ -16,12 +19,14 @@ use crate::rich::{ConversionIdentity, PreparedImageGeometry};
 
 pub(crate) const CONVERTER: &str = "gptgrep-bounded-image-pdf";
 pub(crate) const CONVERTER_VERSION: &str = "image-0.25.10/png-rgb8-pdf-v2";
+const JPEG_CONVERTER_VERSION: &str = "zune-jpeg-0.5.15/baseline-strict-rgb8-pdf-v1";
 const FIXED_WORKING_BYTES: u64 = 1_048_576;
 const PDF_OVERHEAD_BYTES: u64 = 16_384;
 
 pub(crate) struct ImagePreparation {
     bytes: Vec<u8>,
     header: Header,
+    jpeg_header: Option<jpeg_strict::Header>,
     pub(crate) geometry: PreparedImageGeometry,
     pub(crate) output_upper: u64,
     pub(crate) profile_sha256: String,
@@ -51,8 +56,8 @@ impl ImagePreparation {
         budget: &ResourceBudget,
     ) -> Result<Self> {
         ensure!(
-            format == ImageFormat::Png,
-            "capability_unavailable: JPEG preparation requires a qualified strict entropy decoder"
+            matches!(format, ImageFormat::Png | ImageFormat::Jpeg),
+            "capability_unavailable: bounded image preparation requires PNG or strict baseline JPEG"
         );
         // The first owned buffer contains only encoded source bytes. File size
         // and this buffer's allowance are checked before read_bounded allocates.
@@ -62,28 +67,52 @@ impl ImagePreparation {
             "resource_limit: encoded image input admission failed"
         );
         let bytes = read_bounded(source, source_bytes, source_sha256)?;
-        let header = png_header(&bytes)?;
+        let jpeg_header = if format == ImageFormat::Jpeg {
+            Some(jpeg_strict::header(&bytes)?)
+        } else {
+            None
+        };
+        let header = if let Some(jpeg) = &jpeg_header {
+            Header {
+                width: jpeg.width,
+                height: jpeg.height,
+                format,
+                color_metadata: false,
+            }
+        } else {
+            png_header(&bytes)?
+        };
         let pixels = budget.admit_image(header.width, header.height, source_bytes)?;
         let rgba_upper = pixels.checked_mul(4).context("image byte overflow")?;
         let row_upper = u64::from(header.width) * 3;
         // PNG's explicit allocation quota is additional to its unfilter buffer
         // (not charged by png::Limits). At most twice the admitted raw frame,
         // row scratch and fixed inflate space cover that buffer's growth.
-        let decoder_upper = checked_sum(&[
-            budget.image_pixel_buffer_bytes,
-            // Filter bytes count even for one-pixel-wide rows. The Vec
-            // growth allowance is twice the frame plus one 8KiB growth.
-            (u64::from(header.width) * 4 + 1) * u64::from(header.height) * 2 + 16_384,
-            u64::from(header.width) * 32,
-        ])?;
-        // Cover encoded input, bounded decoder scratch and sample conversion.
-        let working_upper = checked_sum(&[
-            source_bytes * 4,
-            rgba_upper,
-            row_upper,
-            decoder_upper,
-            FIXED_WORKING_BYTES,
-        ])?;
+        let working_upper = if let Some(jpeg) = &jpeg_header {
+            // Direct borrowed-input decoder, one caller-owned sample frame,
+            // 1:1 component rows and fixed header/Huffman state. No upsampling
+            // or separate-component full-frame coefficient arrays are admitted.
+            checked_sum(&[
+                source_bytes,
+                pixels * u64::from(jpeg.color().bytes_per_pixel()),
+                row_upper,
+                jpeg.scratch_bytes(),
+                FIXED_WORKING_BYTES,
+            ])?
+        } else {
+            let decoder_upper = checked_sum(&[
+                budget.image_pixel_buffer_bytes,
+                (u64::from(header.width) * 4 + 1) * u64::from(header.height) * 2 + 16_384,
+                u64::from(header.width) * 32,
+            ])?;
+            checked_sum(&[
+                source_bytes * 4,
+                rgba_upper,
+                row_upper,
+                decoder_upper,
+                FIXED_WORKING_BYTES,
+            ])?
+        };
         ensure!(
             working_upper <= budget.owned_working_bytes,
             "resource_limit: image decoder/color-conversion working admission failed"
@@ -93,6 +122,12 @@ impl ImagePreparation {
             output_upper <= budget.document_staging_bytes,
             "resource_limit: prepared image PDF output admission failed"
         );
+        // Unsupported/incomplete entropy cannot reserve staging or construct
+        // the permissive pixel front door. Header and all owned buffers were
+        // admitted before this fixed-table validator runs.
+        if let Some(jpeg) = &jpeg_header {
+            jpeg.validate_entropy(&bytes)?;
+        }
         budget.reserve_staging(output_upper)?;
         let geometry = PreparedImageGeometry {
             source_width_pixels: header.width,
@@ -110,10 +145,14 @@ impl ImagePreparation {
             },
             alpha_background: "#ffffff".into(),
         };
-        let profile_sha256 = image_preparation_profile_digest("png", &geometry)?;
+        let profile_sha256 = image_preparation_profile_digest(
+            if jpeg_header.is_some() { "jpeg" } else { "png" },
+            &geometry,
+        )?;
         Ok(Self {
             bytes,
             header,
+            jpeg_header,
             geometry,
             output_upper,
             profile_sha256,
@@ -123,36 +162,51 @@ impl ImagePreparation {
     pub(crate) fn write(self, path: &Path, budget: &ResourceBudget) -> Result<ImageOutput> {
         // No decoder is created until the full simultaneous working envelope
         // and output staging have been admitted above.
-        let mut limits = Limits::default();
-        limits.max_image_width = Some(self.header.width);
-        limits.max_image_height = Some(self.header.height);
-        limits.max_alloc = Some(budget.image_pixel_buffer_bytes);
-        let mut reader = ImageReader::with_format(Cursor::new(&self.bytes), self.header.format);
-        reader.limits(limits);
-        let decoder = reader.into_decoder()?;
-        ensure!(
-            decoder.dimensions() == (self.header.width, self.header.height),
-            "image decoder/header geometry mismatch"
-        );
-        let color = decoder.color_type();
-        ensure!(
-            matches!(
-                color,
-                ColorType::L8 | ColorType::La8 | ColorType::Rgb8 | ColorType::Rgba8
-            ),
-            "capability_unavailable: bounded image decoder requires 8-bit samples"
-        );
-        let decoded_bytes = decoder.total_bytes();
-        ensure!(
-            decoded_bytes <= budget.image_pixel_buffer_bytes
-                && decoded_bytes
-                    == u64::from(self.header.width)
-                        * u64::from(self.header.height)
-                        * u64::from(color.bytes_per_pixel()),
-            "resource_limit: decoded image buffer admission failed"
-        );
-        let mut decoded = vec![0; usize::try_from(decoded_bytes)?];
-        decoder.read_image(&mut decoded)?;
+        let (color, decoded) = if let Some(jpeg) = &self.jpeg_header {
+            let color = jpeg.color();
+            let size = u64::from(self.header.width)
+                * u64::from(self.header.height)
+                * u64::from(color.bytes_per_pixel());
+            ensure!(
+                size <= budget.image_pixel_buffer_bytes,
+                "resource_limit: decoded JPEG buffer admission failed"
+            );
+            let mut decoded = vec![0; usize::try_from(size)?];
+            jpeg.decode_into(&self.bytes, &mut decoded)?;
+            (color, decoded)
+        } else {
+            let mut limits = Limits::default();
+            limits.max_image_width = Some(self.header.width);
+            limits.max_image_height = Some(self.header.height);
+            limits.max_alloc = Some(budget.image_pixel_buffer_bytes);
+            let mut reader = ImageReader::with_format(Cursor::new(&self.bytes), self.header.format);
+            reader.limits(limits);
+            let decoder = reader.into_decoder()?;
+            ensure!(
+                decoder.dimensions() == (self.header.width, self.header.height),
+                "image decoder/header geometry mismatch"
+            );
+            let color = decoder.color_type();
+            ensure!(
+                matches!(
+                    color,
+                    ColorType::L8 | ColorType::La8 | ColorType::Rgb8 | ColorType::Rgba8
+                ),
+                "capability_unavailable: bounded image decoder requires 8-bit samples"
+            );
+            let decoded_bytes = decoder.total_bytes();
+            ensure!(
+                decoded_bytes <= budget.image_pixel_buffer_bytes
+                    && decoded_bytes
+                        == u64::from(self.header.width)
+                            * u64::from(self.header.height)
+                            * u64::from(color.bytes_per_pixel()),
+                "resource_limit: decoded image buffer admission failed"
+            );
+            let mut decoded = vec![0; usize::try_from(decoded_bytes)?];
+            decoder.read_image(&mut decoded)?;
+            (color, decoded)
+        };
         let output = OpenOptions::new().create_new(true).write(true).open(path)?;
         let mut output = LimitedWriter {
             inner: output,
@@ -170,7 +224,12 @@ impl ImagePreparation {
             profile_sha256: self.profile_sha256,
             conversion: ConversionIdentity {
                 converter: CONVERTER.into(),
-                version: CONVERTER_VERSION.into(),
+                version: if self.jpeg_header.is_some() {
+                    JPEG_CONVERTER_VERSION
+                } else {
+                    CONVERTER_VERSION
+                }
+                .into(),
                 invocations: 1,
             },
         })
@@ -185,8 +244,8 @@ pub fn image_preparation_profile_digest(
     geometry: &PreparedImageGeometry,
 ) -> Result<String> {
     ensure!(
-        source_format == "png",
-        "capability_unavailable: image preparation recipe requires qualified PNG"
+        matches!(source_format, "png" | "jpeg"),
+        "capability_unavailable: image preparation recipe requires PNG or strict baseline JPEG"
     );
     ensure!(
         geometry.source_width_pixels > 0
@@ -208,6 +267,25 @@ pub fn image_preparation_profile_digest(
         ),
         "unsupported image color-profile recipe"
     );
+    if source_format == "jpeg" {
+        ensure!(
+            matches!(geometry.source_color_profile, FeatureState::Absent),
+            "unsupported strict JPEG color-profile recipe"
+        );
+        return json_sha256(
+            &(
+                "gptgrep.prepare.bounded-jpeg.v1",
+                CONVERTER,
+                JPEG_CONVERTER_VERSION,
+                source_format,
+                "owned-fixed-table-baseline-entropy-v1;SOF0-8bit-gray-or-RGB-YCbCr-1:1-all-components-single-SOS;DC0..11-prediction-1024..1023;AC0..10-bounded-runs;actual-coded-bits;all-one-pad0..7;exact-terminal-EOI;no-restarts-multiscan-metadata-transforms",
+                "zune-jpeg-0.5.15/zune-core-0.5.3;strict=true;unsafe=false;max-scans1;admitted-max-width-height;borrowed-input-decode_into;gray-Luma-or-RGB-output",
+                "RGB8-uncompressed-PDF1.4;one-pixel-one-point;raw-sample-order",
+                geometry,
+            ),
+            PDF_OVERHEAD_BYTES,
+        );
+    }
     json_sha256(
         &(
             "gptgrep.prepare.bounded-image.v2",

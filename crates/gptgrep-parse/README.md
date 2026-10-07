@@ -78,7 +78,7 @@ not use a model, remote inference, or benchmark document downloads.
 The separate `liteparse-2.15.1/rich-v1` foundation exposes
 `prepare_document`, `extract_native`, and `finalize_document`. It leaves
 `parse_path` and its OCR-disabled `layout-v1` behavior intact. Preparation
-admits PDF input and copies it once into immutable staging. Standalone PNG
+admits PDF input and copies it once into immutable staging. Standalone PNG or admitted baseline JPEG
 input uses one owned Rust conversion into a single-page prepared PDF. Office,
 other image formats and XFA/AcroForm documents fail with an explicit capability
 error until bounded conversion and packet/appearance adapters exist.
@@ -86,10 +86,18 @@ All preparation and PDFium work runs on blocking workers; PDFium objects end
 their synchronous scope before any host OCR future can be awaited.
 
 The bounded image front door admits static 8-bit noninterlaced PNG (gray,
-gray/alpha, RGB, RGBA or palette). JPEG preparation is unavailable until a
-strict entropy-completion decoder is qualified: the retained decoder can recover
-incomplete entropy with replacement pixels. JPEG fails before an input buffer,
-decoder or staging output is admitted. Animation, 16-bit or interlaced PNG,
+gray/alpha, RGB, RGBA or palette). The separate JPEG route admits only SOF0,
+8-bit gray or canonical RGB/YCbCr, 1:1 sampling, one scan containing all frame
+components, and non-transforming bounded JFIF/comment headers. Before pixel
+decoding, an owned fixed-table validator requires actual coded entropy for every
+block, bounded DC categories/predictions and AC runs, at most seven all-one pad
+bits, and exact terminal EOI. It never supplies replacement bits. The pinned
+`zune-jpeg` decoder also runs with strict mode enabled and unsafe routines
+disabled, writing into one admitted caller buffer. Strict mode alone cannot
+establish entropy completion. Progressive, restarts, subsampling, multiple
+scans/pictures, CMYK/YCCK, metadata/color/orientation transforms and other JPEG
+modes fail explicitly before the decoder or staging reservation. Animation,
+16-bit or interlaced PNG,
 compressed/unknown PNG metadata and unqualified container extensions also fail
 before an upstream decoder is constructed. The original source bytes and format
 remain bound by SHA-256. The prepared PDF contains uncompressed RGB8 samples. Alpha
@@ -100,7 +108,10 @@ rescaling is applied. Bounded PNG gamma/chromaticity metadata is recorded as an
 unsupported color-management capability. `PreparedSummary.image_geometry`
 records these dimensions, transform and capability states; existing PDF
 summaries deserialize with this field absent. The converter receipt identifies
-`gptgrep-bounded-image-pdf`, `image-0.25.10/png-rgb8-pdf-v2`, and one invocation.
+`gptgrep-bounded-image-pdf` and one invocation. PNG retains its existing
+`image-0.25.10/png-rgb8-pdf-v2` recipe; JPEG binds the distinct
+`zune-jpeg-0.5.15/baseline-strict-rgb8-pdf-v1` recipe. Earlier permissive JPEG
+recipes are not accepted by this adapter.
 `image_preparation_profile_digest` provides the pure canonical recipe binding,
 including source format, for publication validation.
 
@@ -108,7 +119,10 @@ Encoded source size is checked before its input buffer is allocated. A local
 container scan then admits dimensions, decoded output and the simultaneous
 decoder/input/RGB-row working envelope before constructing the decoder. PNG's
 explicit allocation limit is supplemented by its separately bounded unfilter
-buffer and row scratch. The PDF writer retains
+buffer and row scratch. JPEG's restricted single-scan 1:1 path admits the
+borrowed encoded input, caller sample frame, padded component MCU rows and
+fixed tables; it excludes upsampling and full-frame coefficient storage. Its
+owned working bound does not establish full process RSS. The PDF writer retains
 only one RGB row and uses `LimitedWriter`; its `3 * pixels + 16 KiB` output bound
 is checked and reserved against shared staging before decoding or opening the
 output. That conservative reservation remains charged even when actual output
@@ -193,7 +207,9 @@ Final recipe identity also binds OCR mode and the complete retained results.
 No public serialized summary contains source paths or runtime session IDs.
 Synthetic tests exercise actual PNG-to-PDFium pixel roundtrips, gray/alpha
 and palette conversion, source and prepared-file mutation, header/decode/owned
-working/output/shared-staging failure ordering, JPEG rejection and excluded modes. These tests
+working/output/shared-staging failure ordering, strict JPEG gray/RGB known
+samples, actual incomplete entropy at EOI, invalid Huffman/run/padding/terminal
+content, and excluded modes. These tests
 do not qualify all image formats, Office, orientation/color fidelity, complete
 rich metadata, process RSS, native cancellation, live OCR or release packaging.
 This foundation is not complete multimodal or full rich-metadata acceptance.

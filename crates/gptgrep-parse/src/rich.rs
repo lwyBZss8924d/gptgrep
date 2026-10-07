@@ -470,7 +470,7 @@ fn prepare_sync(
         .to_ascii_lowercase();
     ensure!(
         matches!(extension.as_str(), "pdf" | "png" | "jpeg" | "jpg"),
-        "capability_unavailable: rich preparation admits PDF and bounded PNG only; JPEG/Office/other images require a qualified bounded converter adapter"
+        "capability_unavailable: rich preparation admits PDF, bounded PNG and strict baseline JPEG; Office/other images require a qualified bounded converter adapter"
     );
     ensure!(
         fs::symlink_metadata(source)?.is_file()

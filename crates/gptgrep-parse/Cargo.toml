@@ -16,6 +16,8 @@ serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt", "fs", "time", "process", "sync"] }
 
+zune-jpeg = { version = "=0.5.15", default-features = false, features = ["std"] }
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
