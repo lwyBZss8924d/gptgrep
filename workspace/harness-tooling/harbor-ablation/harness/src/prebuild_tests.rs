@@ -166,6 +166,137 @@ async fn candidate(root: &Path, texts: &[&str]) -> Result<(tempfile::TempDir, Ri
     ))
 }
 
+#[tokio::test]
+async fn genuine_identity_prepare_imports_nested_mock_artifacts_not_outer_tempdir() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let base = dir.path().canonicalize()?;
+    let root = base.join("raw");
+    fs::create_dir(&root)?;
+    let (mock_stage, mut parsed) = candidate(&root, &["ordinary nested MOCK text\n"]).await?;
+    let outer = private_tempdir(&base, ".gptgrep-native-preparation-")?;
+    let budget = ResourceBudget::default();
+    // Genuine identity-copy preparation only. No native extraction/rendering occurs.
+    let prepared = prepare_document(
+        &root.join("source.pdf"),
+        &outer.path().canonicalize()?,
+        &PreparationOptions,
+        &budget,
+    )
+    .await?;
+    let nested = prepared_import_root(&prepared)?;
+    assert_ne!(nested, outer.path().canonicalize()?);
+    assert!(nested.starts_with(outer.path().canonicalize()?));
+    assert!(nested.join("prepared.pdf").is_file());
+    assert!(!outer.path().join("prepared.pdf").exists());
+    for artifact in &parsed.artifacts {
+        fs::copy(
+            mock_stage.path().join(&artifact.relative_path),
+            nested.join(&artifact.relative_path),
+        )?;
+    }
+    parsed.summary = prepared.summary().clone();
+    let mut wrong = RichGenerationWriter::begin(&root, budget.clone())?;
+    let failure = wrong
+        .add_document("source.pdf", &outer.path().canonicalize()?, parsed.clone())
+        .unwrap_err();
+    assert!(failure.chain().any(|error| {
+        error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    }));
+    drop(wrong);
+    let mut writer = RichGenerationWriter::begin(&root, budget)?;
+    writer.add_document("source.pdf", &nested, parsed)?;
+    let pin = writer.publish()?;
+    RichGenerationReader::open_pinned(&root, &pin)?.verify_all()?;
+    // The outer lifetime encloses preparation, artifact import and publication.
+    assert!(outer.path().exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(outer.path())?.permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(fs::metadata(&nested)?.permissions().mode() & 0o777, 0o700);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn private_modes_under_different_owned_child_umasks() -> Result<()> {
+    for mask in ["000", "777"] {
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "tests::private_modes_owned_child_fixture",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("TMPDIR", std::env::temp_dir())
+            .env("GPTGREP_SYNTHETIC_PREBUILD_UMASK", mask)
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "owned mode fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("PRIVATE_MODE_FIXTURE_CHECKED"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn private_modes_owned_child_fixture() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(value) = std::env::var("GPTGREP_SYNTHETIC_PREBUILD_UMASK") else {
+        return Ok(());
+    };
+    let mask = match value.as_str() {
+        "000" => 0,
+        "777" => 0o777,
+        _ => bail!("unrecognized_synthetic_umask"),
+    };
+    let f = Fixture::new().await?;
+    let snapshot = f.snapshot()?;
+    struct RestoreUmask(libc::mode_t);
+    impl Drop for RestoreUmask {
+        fn drop(&mut self) {
+            // SAFETY: only this explicitly marked, serial, owned subprocess changes its umask.
+            unsafe { libc::umask(self.0) };
+        }
+    }
+    // SAFETY: this branch runs only in our explicitly marked ordinary fixture child.
+    let restore = RestoreUmask(unsafe { libc::umask(mask) });
+    let stage = private_tempdir(f.output.parent().unwrap(), ".gptgrep-native-preparation-")?;
+    assert_eq!(
+        fs::metadata(stage.path())?.permissions().mode() & 0o777,
+        0o700
+    );
+    let stage_path = stage.path().to_path_buf();
+    drop(stage);
+    assert!(!stage_path.exists());
+    snapshot.publish(&f.output)?;
+    assert_eq!(fs::metadata(&f.output)?.permissions().mode() & 0o777, 0o700);
+    for name in [
+        "receipt.json",
+        "pin.json",
+        "raw-manifest.json",
+        "build-controls.json",
+    ] {
+        let file = f.output.join(name);
+        assert_eq!(fs::metadata(&file)?.permissions().mode() & 0o777, 0o600);
+        assert!(!fs::read(file)?.is_empty());
+    }
+    drop(restore);
+    println!("PRIVATE_MODE_FIXTURE_CHECKED");
+    Ok(())
+}
+
 struct Fixture {
     _dir: tempfile::TempDir,
     root: PathBuf,

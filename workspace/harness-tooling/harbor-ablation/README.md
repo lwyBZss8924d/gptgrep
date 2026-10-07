@@ -282,3 +282,99 @@ and real Linux cleanup. The separate Python fixtures use FakeEnvironment only:
 ```sh
 uv run --offline --no-project --no-sync --no-python-downloads --python /path/to/qualified/harbor-python /path/to/qualified/harbor-python -B bridge/test_native_agent.py
 ```
+
+## Original judge request foundation
+
+`gptgrep-harbor-judge-request` prepares a verifier-only request or validates a
+typed verdict artifact. It has no judge backend, model invocation, retry,
+fallback or reward output. The generated Harbor verifier remains unavailable.
+Reference answers, questions, expected formats and real answer artifacts belong
+only to the verifier. Source documents, indexes and citations are not inputs.
+
+```sh
+gptgrep-harbor-judge-request prepare \
+  --judge-source /path/to/pinned/eval/judge.py --judge-source-sha256 SOURCE_SHA256 \
+  --original-revision ORIGINAL_REVISION \
+  --reference /path/to/verifier/reference.json --reference-sha256 REFERENCE_SHA256 \
+  --answer /path/to/real/answer.json --answer-sha256 ANSWER_SHA256 \
+  --python /path/to/qualified/python --python-sha256 PYTHON_SHA256 \
+  --output-dir /path/to/fresh/verifier/request
+
+gptgrep-harbor-judge-request validate-verdict \
+  --request-root /path/to/verifier/request --request-manifest-sha256 MANIFEST_SHA256 \
+  --verdict /path/to/verifier/verdict.json --verdict-sha256 VERDICT_SHA256 \
+  --python /path/to/qualified/python --python-sha256 PYTHON_SHA256 \
+  --output-dir /path/to/fresh/verifier/validation
+```
+
+The strict reference schema is `gptgrep.judge.reference.v1` with `question`
+(string), `answer` (non-null JSON value) and `answer_format` (string). The real
+answer artifact has exactly `{"answer": "..."}`. Missing, malformed, empty or
+oversized artifacts refuse preparation; they never become an invented
+abstention or an incorrect answer. This separate reference schema does not
+upgrade existing Harbor reference packages or their unavailable verifier.
+
+The fixed formatter is embedded in the Rust binary. Only explicitly selected,
+hash-admitted Python runs, with direct `-I -S -c` arguments, a cleared
+environment and a private temporary cwd. No shell or caller-selected formatter
+code exists. Admitted source/reference/answer bytes travel over framed stdin.
+The upstream source is inert: the formatter parses AST literals for `PROMPT`,
+`SCHEMA`, `MAX_RESPONSE_CHARS`, `MODEL` and `EFFORT` without importing or executing
+that module. Requests use Python's exact split-space question normalization,
+value string formatting and character truncation. The entire real answer
+snapshot remains bound even when its response is truncated for the request.
+Original rubric values or task examples are not stored in reader product code.
+
+Source and Python executable files are at most 1 MiB each; reference, answer and
+verdict artifacts are at most 64 KiB. Framed stdin is bounded by those three
+input limits plus 24 header bytes, formatter stdout by 256 KiB and stderr by
+16 KiB. Request JSON is at most 256 KiB; manifests and validation JSON are at
+most 64 KiB. The original response limit is dynamically extracted and must be
+1–12000 characters. Supported original verdict schema is an exact object with
+required boolean `equivalent`, boolean `abstained`, string `reason`, and no
+additional properties. A reason is admitted up to 16 KiB. Input content bounds
+exclude allocator capacity, AST/library graphs, Python loader/stdlib/native
+memory and global RSS. The Python identity pin is the selected executable;
+whole-interpreter/runtime reconstruction is a separate qualification.
+
+The formatter has a ten-second observation deadline. On observed expiry or
+output overflow, the coordinator attempts termination, observes for another
+second, and reports unavailable or cleanup unknown. No hard OS/native wall,
+RSS, descendant cleanup or hostile concurrent file-mutation guarantee is
+claimed. Unknown cleanup grants no retry. Artifact owners must keep admitted
+inputs and the selected Python executable sealed; held descriptors and
+before/after digest/identity checks detect ordinary changes. Upstream modules,
+site/user modules, authentication homes and provider configuration are not
+loaded. This pure formatter child is distinct from Codex/native model or
+provider execution and never creates a RunClock or ledger.
+
+Preparation atomically publishes fresh files with mode 0600 in a directory with
+mode 0700: request, binding manifest and the same source/reference/answer byte
+snapshots. Validation reconstructs formatting with the same embedded formatter
+before admitting a verdict envelope bound to exact request/source/reference/
+answer/schema digests. It retains all upstream boolean combinations, including
+an abstention that is equivalent to the reference. Output remains structural:
+`judge_status="unavailable"`, actual judge/profile/provider/usage/cost unknown,
+and `reward_emitted=false`. It creates no `reward.txt` or `reward.json` and
+cannot authenticate a semantic/native judge result. Requested future profile
+is `gpt-6-luna`/`max`/`fast`; this is separate from actual null identity fields.
+
+Outputs require a fresh Linux/macOS namespace outside admitted inputs and are
+never overwritten. Failures before rename leave no fresh output; after-rename
+parent sync failure reports publication durability unknown, output may exist,
+and no retry is authorized. Original semantic/rubric parity, actual transport,
+cost, native profile, physical verifier gold isolation, Harbor/Linux execution,
+trials, advantage, release and Goal completion remain HOLD.
+
+
+The native coordinator imports artifacts from the prepared document's exact
+retained staging root. Its enclosing temporary directory stays alive throughout
+import. Preparation and seal temporary directories use explicit `0700`
+permissions, and seal files use explicit `0600` permissions before content is
+written. These permissions do not depend on the caller's umask. Source fixtures
+exercise genuine identity preparation and mock finalized imports; they do not
+qualify native PDF extraction, Linux cleanup, physical resource limits, or
+production derivation. Controlled umask fixtures cover the coordinator helpers
+and seal only; the unchanged parser and Writer may still fail under a restrictive
+caller umask before these helpers can complete. Native execution across arbitrary
+umasks remains unqualified. The parser retains its frozen admission budgets.

@@ -954,9 +954,7 @@ impl VerifiedSnapshot {
         self.fresh()?;
         let output = absolute(output)?;
         let parent = output.parent().context("output_parent_required")?;
-        let tmp = tempfile::Builder::new()
-            .prefix(".gptgrep-prebuild-seal-")
-            .tempdir_in(parent)?;
+        let tmp = private_tempdir(parent, ".gptgrep-prebuild-seal-")?;
         let pin_bytes = bounded_json(&PinInput {
             generation: self.receipt.pin.generation.clone(),
             manifest_sha256: self.receipt.pin.manifest_sha256.clone(),
@@ -968,14 +966,7 @@ impl VerifiedSnapshot {
             ("build-controls.json", self.inputs.controls.bytes.as_slice()),
         ] {
             let p = tmp.path().join(name);
-            let mut options = fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-            }
-            let mut file = options.open(&p)?;
+            let mut file = private_file(&p)?;
             file.write_all(data)?;
             file.sync_all()?;
         }
@@ -1044,6 +1035,57 @@ fn rename_fresh(source: &Path, dest: &Path) -> Result<()> {
 fn rename_fresh(_source: &Path, _dest: &Path) -> Result<()> {
     bail!("capability_unavailable: atomic no-replace directory publication unsupported")
 }
+#[cfg(unix)]
+fn private_tempdir(parent: &Path, prefix: &str) -> Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+    let permissions = fs::Permissions::from_mode(0o700);
+    let directory = tempfile::Builder::new()
+        .prefix(prefix)
+        .permissions(permissions.clone())
+        .tempdir_in(parent)?;
+    // Keep exact owner permissions even under a restrictive caller umask.
+    fs::set_permissions(directory.path(), permissions)?;
+    Ok(directory)
+}
+#[cfg(not(unix))]
+fn private_tempdir(_parent: &Path, _prefix: &str) -> Result<tempfile::TempDir> {
+    bail!("capability_unavailable: private POSIX directory modes unsupported")
+}
+#[cfg(unix)]
+fn private_file(path: &Path) -> Result<File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    // Set permissions on the newly opened file before any content is written.
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+#[cfg(not(unix))]
+fn private_file(_path: &Path) -> Result<File> {
+    bail!("capability_unavailable: private POSIX file modes unsupported")
+}
+fn prepared_import_root(prepared: &gptgrep_parse::PreparedDocument) -> Result<PathBuf> {
+    let path = prepared.staging_root();
+    ensure!(
+        fs::symlink_metadata(path)?.is_dir()
+            && !fs::symlink_metadata(path)?.file_type().is_symlink()
+            && path.canonicalize()? == path,
+        "prepared_import_root_must_be_canonical_nonsymlink"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // This newly prepared child is contained in our private outer TempDir.
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    bail!("capability_unavailable: private POSIX prepared directory modes unsupported");
+    Ok(path.to_path_buf())
+}
 fn native_coverage(pages: &[(u32, CoverageState)], blockers: &[String]) -> Result<()> {
     ensure!(
         !pages.is_empty()
@@ -1066,9 +1108,7 @@ async fn build_native(inputs: Inputs, output: &Path) -> Result<String> {
     let mut writer = RichGenerationWriter::begin(&inputs.root, budget.clone())?;
     for (raw, spec) in inputs.raw.iter().zip(&inputs.manifest.value.documents) {
         inputs.fresh()?;
-        let staging = tempfile::Builder::new()
-            .prefix(".gptgrep-native-preparation-")
-            .tempdir_in(&parent)?;
+        let staging = private_tempdir(&parent, ".gptgrep-native-preparation-")?;
         let prepared = gptgrep_parse::prepare_document(
             &raw.path,
             &staging.path().canonicalize()?,
@@ -1076,6 +1116,7 @@ async fn build_native(inputs: Inputs, output: &Path) -> Result<String> {
             &budget,
         )
         .await?;
+        let prepared_root = prepared_import_root(&prepared)?;
         inputs.fresh()?;
         ensure!(
             prepared.summary().source_sha256 == raw.sha256
@@ -1106,7 +1147,7 @@ async fn build_native(inputs: Inputs, output: &Path) -> Result<String> {
         );
         let parsed = gptgrep_parse::finalize_document(candidate, vec![], OcrMode::Off, &budget)?;
         inputs.fresh()?;
-        writer.add_document(&spec.path, &staging.path().canonicalize()?, parsed)?;
+        writer.add_document(&spec.path, &prepared_root, parsed)?;
     }
     inputs.fresh()?;
     // Synchronous index build/publication has no harness deadline or total-index

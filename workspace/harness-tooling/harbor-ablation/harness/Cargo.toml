@@ -32,3 +32,7 @@ liteparse-pdfium = { path = "../../../../vendor/liteparse-pdfium" }
 [[bin]]
 name = "gptgrep-codex-native-agent"
 path = "src/codex_agent.rs"
+
+[[bin]]
+name = "gptgrep-harbor-judge-request"
+path = "src/judge_request.rs"
