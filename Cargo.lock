@@ -1090,8 +1090,12 @@ name = "gptgrep-host"
 version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "fs2",
  "gptgrep-core",
  "gptgrep-jev",
+ "gptgrep-parse",
+ "image",
  "jsonschema",
  "libc",
  "serde",
@@ -1119,10 +1123,14 @@ name = "gptgrep-jev"
 version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
+ "fs2",
+ "image",
+ "libc",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokio",
 ]
 
@@ -1141,7 +1149,11 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "gptgrep-pageindex",
+ "image",
  "liteparse",
+ "serde",
+ "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
 ]

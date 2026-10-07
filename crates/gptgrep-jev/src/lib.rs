@@ -3,8 +3,20 @@
 //! No implicit retries, provider fallback, credential-file discovery, or text generation.
 //! See the crate README for the supported request contract and score normalization.
 
+mod clock;
+mod execution;
+mod input;
 mod roles;
 mod validation;
+pub use clock::RunClockAnchor;
+pub use execution::{
+    ExecutionContext, ExecutionSnapshot, MAX_CONCURRENT_REQUESTS, MAX_SUBMISSIONS,
+};
+pub use input::{
+    DecisionInput, ImageEvidence, MAX_IMAGE_BASE64_BYTES, MAX_IMAGE_BYTES,
+    MAX_IMAGE_PIXEL_BUFFER_BYTES, MAX_IMAGE_PIXELS, MAX_IMAGES, MAX_MULTIMODAL_REQUEST_BYTES,
+    MAX_TOTAL_IMAGE_PIXELS, SourceBinding, TextEvidence,
+};
 pub use roles::{
     EvidenceRole, EvidenceRoleCandidate, EvidenceRoleResponse, MAX_ROLE_CANDIDATES,
     MAX_ROLE_DEFINITION_BYTES, PreparedEvidenceRoles, evidence_role_contract,
@@ -112,9 +124,10 @@ pub struct JevClient {
     model: String,
     authorization: HeaderValue,
     identity: Arc<()>,
+    execution: ExecutionContext,
 }
 
-/// One exact validated Decisions request reserved before network admission.
+/// One exact validated Decisions request prepared before budget/network admission.
 /// Raw state, questions and credentials are never exposed through Debug or serde.
 pub struct PreparedDecision {
     body: Vec<u8>,
@@ -136,6 +149,12 @@ impl PreparedDecision {
 
     pub fn requested_model(&self) -> &str {
         &self.requested_model
+    }
+
+    pub fn question_count(&self) -> usize {
+        self.questions
+            .as_object()
+            .map_or(0, |questions| questions.len())
     }
 }
 
@@ -185,11 +204,17 @@ impl JevClient {
         let mut authorization = HeaderValue::from_str(&format!("Bearer {api_key}"))
             .map_err(|_| anyhow!("Invalid Jev API key header"))?;
         authorization.set_sensitive(true);
-        let http = Client::builder()
+        let mut http = Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .redirect(Policy::none())
             .retry(reqwest::retry::never())
-            .user_agent("gptgrep")
+            .user_agent("gptgrep");
+        if loopback {
+            // This client has one verified loopback endpoint. Internet clients retain
+            // managed proxy/routing policy; no process-wide network setting changes.
+            http = http.no_proxy();
+        }
+        let http = http
             .build()
             .map_err(|_| anyhow!("Could not initialize Jev HTTP transport"))?;
         Ok(Self {
@@ -198,7 +223,19 @@ impl JevClient {
             model: model.to_owned(),
             authorization,
             identity: Arc::new(()),
+            execution: ExecutionContext::compatibility(),
         })
+    }
+
+    /// Attach one shared experimental budget before preparing requests.
+    pub fn with_execution_context(mut self, context: ExecutionContext) -> Self {
+        self.execution = context;
+        self.identity = Arc::new(());
+        self
+    }
+
+    pub fn execution_context(&self) -> &ExecutionContext {
+        &self.execution
     }
 
     /// Evaluate a bounded set of independent typed questions.
@@ -214,6 +251,7 @@ impl JevClient {
     /// encoded request size and digest before sending it. Oversized requests
     /// fail before network I/O; callers own any explicit splitting policy.
     pub fn prepare_decision(&self, state: Value, questions: Value) -> Result<PreparedDecision> {
+        self.execution.remaining()?;
         let body = self.request_body(state, &questions)?;
         let body_sha256 = Sha256::digest(&body)
             .iter()
@@ -241,35 +279,56 @@ impl JevClient {
     }
 
     async fn decide_body(&self, body: Vec<u8>, questions: &Value) -> Result<DecisionResponse> {
-        let mut response = self
-            .http
-            .post(self.endpoint.clone())
-            .header(AUTHORIZATION, self.authorization.clone())
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body)
-            .send()
-            .await
-            .map_err(transport_error)?;
-        ensure!(
-            response.status().is_success(),
-            "Jev provider returned HTTP {}; request was not retried",
-            response.status().as_u16()
-        );
-        ensure!(
-            response
-                .content_length()
-                .is_none_or(|len| len <= MAX_RESPONSE_BYTES as u64),
-            "Jev response exceeded the byte limit"
-        );
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
+        let remaining = self.execution.remaining()?;
+        let deadline = tokio::time::Instant::now() + remaining;
+        let digest = format!("{:x}", Sha256::digest(&body));
+        let submitted = async {
+            self.execution.observe_submission().await?;
+            let mut reservation = self.execution.reserve(&digest, &self.model).await?;
             ensure!(
-                bytes.len().saturating_add(chunk.len()) <= MAX_RESPONSE_BYTES,
-                "Jev response exceeded the byte limit"
+                tokio::time::Instant::now() < deadline,
+                "Jev admission deadline expired before send; reserved submission remains charged"
             );
-            bytes.extend_from_slice(&chunk);
-        }
-        validation::response(&bytes, questions)
+            reservation.send_started().await?;
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "Jev request deadline expired before send; reserved submission remains charged"
+            );
+            let mut response = self
+                .http
+                .post(self.endpoint.clone())
+                .header(AUTHORIZATION, self.authorization.clone())
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body)
+                .send()
+                .await
+                .map_err(transport_error)?;
+            if !response.status().is_success() {
+                reservation.terminal().await?;
+                return Err(anyhow!(
+                    "Jev provider returned HTTP {}; request was not retried",
+                    response.status().as_u16()
+                ));
+            }
+            if response
+                .content_length()
+                .is_some_and(|len| len > MAX_RESPONSE_BYTES as u64)
+            {
+                return Err(anyhow!("Jev response exceeded the byte limit"));
+            }
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
+                if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+                    return Err(anyhow!("Jev response exceeded the byte limit"));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            let result = validation::response(&bytes, questions);
+            reservation.terminal().await?;
+            result
+        };
+        tokio::time::timeout_at(deadline, submitted).await
+            .map_err(|_| anyhow!("Jev admission or request deadline expired; any reserved submission remains charged and unknown; request was not retried"))?
     }
 
     /// Score each candidate on the same relevance rubric and sort deterministically.
