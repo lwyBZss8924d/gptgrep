@@ -1744,7 +1744,6 @@ dependencies = [
 [[package]]
 name = "liteparse-pdfium"
 version = "1.11.0"
-source = "git+https://github.com/run-llama/liteparse?rev=ab8879623ee45a0b7a775d12b42a9a7ae9dab16b#ab8879623ee45a0b7a775d12b42a9a7ae9dab16b"
 dependencies = [
  "liteparse-pdfium-sys",
 ]

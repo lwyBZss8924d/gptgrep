@@ -1,0 +1,7 @@
+GPTgrep includes a modified copy of the LiteParse PDFium Rust wrapper.
+Upstream: https://github.com/run-llama/liteparse
+Revision: ab8879623ee45a0b7a775d12b42a9a7ae9dab16b
+Package: liteparse-pdfium 1.11.0, Apache License 2.0 (see LICENSE).
+GPTgrep modifications expose an allocation-free annotation count and adapt the
+manifest to a standalone pinned dependency. Original source hashes and changes
+are recorded in UPSTREAM.json. Upstream reference checkouts are not modified.

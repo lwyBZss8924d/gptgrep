@@ -10,6 +10,29 @@ use gptgrep_pageindex::{
 use liteparse::{LiteParse, LiteParseConfig, OutputFormat, types::PdfInput};
 use std::path::{Path, PathBuf};
 
+mod artifact;
+mod geometry;
+mod ocr;
+mod resource;
+mod rich;
+#[cfg(test)]
+mod rich_tests;
+
+pub use artifact::{ArtifactKind, ArtifactRef, FeatureState, artifact_id};
+pub use geometry::{AffineTransform, BoundingBox, PageGeometry};
+pub use ocr::{
+    OcrExecutor, OcrImage, OcrImageDelivery, OcrPageResult, OcrProfile, OcrReceipt, OcrRegion,
+    OcrRegionResult, OcrRegionStatus, OcrResultStatus, OcrTask, OcrTaskBudget, ocr_profile_digest,
+    ocr_task_digest, validate_ocr_result, validate_ocr_result_metadata, validate_ocr_task,
+    validate_ocr_task_metadata, validate_rendition, validate_rendition_metadata,
+};
+pub use resource::ResourceBudget;
+pub use rich::{
+    ConversionIdentity, CoverageState, NativeCandidate, NativeOptions, NativePage, OcrMode,
+    OcrPlan, PreparationOptions, PreparedDocument, PreparedSummary, RICH_PARSER,
+    RichParsedDocument, SegmentMap, extract_native, finalize_document, prepare_document,
+};
+
 pub const NATIVE_PARSER: &str = "liteparse-2.15.1/layout-v1";
 pub const LITEPARSE_REVISION: &str = "ab8879623ee45a0b7a775d12b42a9a7ae9dab16b";
 /// An explicit resource limit, checked before parsing. Never silently truncate.
@@ -294,7 +317,7 @@ mod tests {
     // A tiny original fixture, generated here rather than copying a benchmark
     // document. Real PDFium parsing exercises the native dependency and page
     // citation contract; this is not a mocked parser acceptance test.
-    fn pdf_fixture(with_text: bool) -> Vec<u8> {
+    pub(super) fn pdf_fixture(with_text: bool) -> Vec<u8> {
         let content = |heading: &str, body: &str| {
             if with_text {
                 format!("BT /F1 22 Tf 72 720 Td ({heading}) Tj 0 -35 Td /F1 11 Tf ({body}) Tj ET")
@@ -319,7 +342,7 @@ mod tests {
         pdf_objects(&objects)
     }
 
-    fn pdf_objects(objects: &[String]) -> Vec<u8> {
+    pub(super) fn pdf_objects(objects: &[String]) -> Vec<u8> {
         let mut pdf = String::from("%PDF-1.4\n");
         let mut offsets = vec![0];
         for (index, object) in objects.iter().enumerate() {
