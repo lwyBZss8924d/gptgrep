@@ -94,6 +94,15 @@ The response is always JSON, with exit status 2 for an item or global failure.
 Reader byte counters describe partial API reads rather than complete physical I/O.
 The ordinary `index` command currently publishes the original generation format.
 
+The Rust core provides `DerivedVisualCache` for PNG crops obtained from a
+`VisualGenerationReader` rendition. Each derivative binds its generation, source,
+parent image, crop recipe, coordinate transforms, encoder and output digest.
+Cache hits and reads recheck the parent. Payload, metadata and working capacities
+are admitted separately; retained image pins and recipe tokens keep their capacity
+charges after eviction or `clear`. This process-local cache preserves the sealed
+generation and grants no reader image delivery or citation rights. Its bounds cover
+owned cache payloads and crop admission, not total process memory.
+
 ## Core Jev retrieval
 
 Jev is a required part of the GPTgrep search system. Default search performs

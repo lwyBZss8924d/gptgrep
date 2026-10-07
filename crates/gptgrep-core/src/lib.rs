@@ -5,8 +5,13 @@ use gptgrep_jev::{Candidate, JevClient, RerankResponse};
 
 pub mod batch;
 mod custody;
+mod derived_visual;
 mod evidence_roles;
 pub mod rich_batch;
+pub use derived_visual::{
+    DerivedCacheBudget, DerivedCacheStatus, DerivedRecipeToken, DerivedVisualCache,
+    DerivedVisualPin, DerivedVisualReceipt, VisualSource,
+};
 pub use evidence_roles::{
     CandidateDisposition, CandidateEligibility, DeliveredSetSufficiency, EvidenceRole,
     EvidenceRoleCandidateDecision, EvidenceRoleDiagnostics, EvidenceRoleHint, EvidenceRoleSource,
