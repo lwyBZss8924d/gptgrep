@@ -10,8 +10,8 @@ use gptgrep_pageindex::{
 use liteparse::{LiteParse, LiteParseConfig, OutputFormat, types::PdfInput};
 use std::path::{Path, PathBuf};
 
-pub const NATIVE_PARSER: &str = "liteparse-2.14.6/layout-v1";
-pub const LITEPARSE_REVISION: &str = "a7105d3e3cfaf001970578c6615f6e71015aa483";
+pub const NATIVE_PARSER: &str = "liteparse-2.15.1/layout-v1";
+pub const LITEPARSE_REVISION: &str = "ab8879623ee45a0b7a775d12b42a9a7ae9dab16b";
 /// An explicit resource limit, checked before parsing. Never silently truncate.
 pub const MAX_NATIVE_PAGES: u32 = 100_000;
 

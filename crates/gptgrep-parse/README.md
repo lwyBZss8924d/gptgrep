@@ -11,9 +11,9 @@ TeX and org; extensionless README, LICENSE and NOTICE are also supported. Their
 invalid UTF-8 fails explicitly, and an empty plaintext file is valid.
 
 PDF, Office, OpenDocument, presentation and image formats use the direct Rust
-LiteParse dependency, pinned to `a7105d3e3cfaf001970578c6615f6e71015aa483`
-(`2.14.6`) with default features disabled. No `lit` subprocess is used. The
-parser identifier is `liteparse-2.14.6/layout-v1`. Its canonical line numbers
+LiteParse dependency, pinned to `ab8879623ee45a0b7a775d12b42a9a7ae9dab16b`
+(`2.15.1`) with default features disabled. No `lit` subprocess is used. The
+parser identifier is `liteparse-2.15.1/layout-v1`. Its canonical line numbers
 address the stored extracted artifact, supplemented by one-based physical page
 citations. For Office/images, these pages belong to the intermediate PDF and are
 not source-file line numbers or spreadsheet cell coordinates.

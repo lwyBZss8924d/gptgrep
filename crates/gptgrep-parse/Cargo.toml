@@ -9,7 +9,7 @@ description = "Native plaintext and LiteParse document ingestion for GPTgrep"
 [dependencies]
 anyhow = "1"
 gptgrep-pageindex = { path = "../gptgrep-pageindex" }
-liteparse = { git = "https://github.com/run-llama/liteparse", rev = "a7105d3e3cfaf001970578c6615f6e71015aa483", default-features = false }
+liteparse = { git = "https://github.com/run-llama/liteparse", rev = "ab8879623ee45a0b7a775d12b42a9a7ae9dab16b", default-features = false }
 tokio = { version = "1", features = ["rt", "fs", "time", "process", "sync"] }
 
 [dev-dependencies]

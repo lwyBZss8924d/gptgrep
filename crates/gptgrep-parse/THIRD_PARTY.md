@@ -2,9 +2,9 @@
 
 Direct dependency:
 
-- Source: [run-llama/liteparse](https://github.com/run-llama/liteparse/tree/a7105d3e3cfaf001970578c6615f6e71015aa483).
-- Git revision: `a7105d3e3cfaf001970578c6615f6e71015aa483`.
-- Core version: `2.14.6`; `liteparse-pdfium` / `liteparse-pdfium-sys`: `1.11.0`.
+- Source: [run-llama/liteparse](https://github.com/run-llama/liteparse/tree/ab8879623ee45a0b7a775d12b42a9a7ae9dab16b).
+- Git revision: `ab8879623ee45a0b7a775d12b42a9a7ae9dab16b`.
+- Core version: `2.15.1`; `liteparse-pdfium` / `liteparse-pdfium-sys`: `1.11.0`.
 - License: Apache-2.0; full upstream text retained in
   [licenses/LiteParse-APACHE-2.0.txt](licenses/LiteParse-APACHE-2.0.txt).
 - Build profile: `default-features = false`; no Tesseract or ONNX OCR feature.

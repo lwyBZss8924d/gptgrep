@@ -1,7 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use gptgrep_index::{build, search, search_with_document, search_with_document_and_predicate};
+use gptgrep_index::{
+    Match, build, search, search_with_document, search_with_document_and_predicate,
+};
 use tempfile::TempDir;
 
 fn fixture(files: &[(&str, &str)]) -> (TempDir, PathBuf, PathBuf) {
@@ -316,4 +318,149 @@ fn candidate_predicate_runs_after_filtering_and_before_verification_and_caps() {
     })
     .unwrap_err();
     assert!(error.to_string().contains("candidate admission failed"));
+}
+
+#[test]
+fn indexed_regex_equals_direct_scan_for_flags_unicode_and_literals() {
+    let files = [
+        (
+            "a.txt",
+            "FOObar\nfooBAR\nFOOBAR\nfoobar\nKEY\nſea\nCAFÉ\ncafé\nＡＢＣ\nαβγ\na.b+[x]\nshort x\n",
+        ),
+        ("bom.txt", "\u{feff}# Alpha\nFOObar\nſEAbaz\nother\n"),
+        ("nested/c.txt", "KEY\nsea\nａｂｃ\nαΒΓ\nfooBAR\naXbxx\n"),
+    ];
+    let (_temp, _root, index) = fixture(&files);
+    for (pattern, insensitive, literal) in [
+        ("(?i)foobar", false, false),
+        ("(?i:foo)bar", false, false),
+        ("foo(?i:bar)", false, false),
+        ("(?i:foo)(?-i:bar)", false, false),
+        ("(?i:foo)(?-i:BAR)", false, false),
+        ("(?i:key|sea)", false, false),
+        ("(?i:sea)baz", false, false),
+        ("(?i:CAFÉ)", false, false),
+        ("(?i:ＡＢＣ)", false, false),
+        ("(?i:αβγ)", false, false),
+        ("key", true, true),
+        ("sea", true, true),
+        ("café", true, true),
+        ("ＡＢＣ", true, true),
+        ("a.b+[x]", false, true),
+        ("(?i)foobar", false, true),
+        ("^.*$", false, false),
+        ("x", false, true),
+        ("^# Alpha$", false, false),
+        (r"^\x{FEFF}# Alpha$", false, false),
+        ("\u{feff}# Alpha", false, true),
+    ] {
+        let escaped = if literal {
+            regex::escape(pattern)
+        } else {
+            pattern.into()
+        };
+        let source = if insensitive {
+            format!("(?i:{escaped})")
+        } else {
+            escaped
+        };
+        let matcher = regex::Regex::new(&source).unwrap();
+        let mut direct = Vec::new();
+        for (path, text) in &files {
+            for (line, text) in text.lines().enumerate() {
+                if matcher.is_match(text) {
+                    direct.push(Match {
+                        path: PathBuf::from(path),
+                        line_number: line + 1,
+                        line: text.into(),
+                    });
+                }
+            }
+        }
+        let indexed = search(&index, pattern, insensitive, literal, 100).unwrap();
+        assert_eq!(indexed.hits, direct, "{source}");
+        assert!(!indexed.truncated, "{source}");
+    }
+}
+
+#[test]
+fn old_engine_manifest_requires_rebuild_and_keeps_existing_artifacts() {
+    let (_temp, _root, index) = fixture(&[("a.txt", "needle\n")]);
+    let path = index.join("gptgrep-index.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    manifest["engine_revision"] = "239711cfb6e69e8780cabf912a8987162a223ff1".into();
+    let old_manifest = serde_json::to_vec(&manifest).unwrap();
+    fs::write(&path, &old_manifest).unwrap();
+    let file_table = fs::read(index.join("files.bin")).unwrap();
+    let error = search(&index, "needle", false, true, 10).unwrap_err();
+    assert!(error.to_string().contains("rebuild_required"));
+    assert_eq!(fs::read(&path).unwrap(), old_manifest);
+    assert_eq!(fs::read(index.join("files.bin")).unwrap(), file_table);
+}
+
+#[test]
+fn unsafe_paths_in_the_index_file_table_fail_before_matching() {
+    let (_temp, _root, index) = fixture(&[("safe.txt", "needle\n")]);
+    let path = index.join("files.bin");
+    let saved = fs::read(&path).unwrap();
+    let position = saved
+        .windows(b"safe.txt".len())
+        .position(|bytes| bytes == b"safe.txt")
+        .unwrap();
+    for unsafe_path in [b"../x.txt", b"/bad.txt"] {
+        let mut corrupt = saved.clone();
+        corrupt[position..position + unsafe_path.len()].copy_from_slice(unsafe_path);
+        fs::write(&path, corrupt).unwrap();
+        let error = search(&index, "needle", false, true, 10).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("normalized root-relative path"),
+            "{message}"
+        );
+    }
+    fs::write(path, saved).unwrap();
+    assert_eq!(
+        search(&index, "needle", false, true, 10)
+            .unwrap()
+            .hits
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn truncated_postings_fail_instead_of_returning_incomplete_results() {
+    let (_temp, _root, index) = fixture(&[("a.txt", "needle\n")]);
+    let path = index.join("index.bin");
+    let saved = fs::read(&path).unwrap();
+    fs::write(&path, &saved[..saved.len() - 1]).unwrap();
+    assert!(search(&index, "needle", false, true, 10).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_snapshot_files_directories_and_root_are_rejected() {
+    use std::os::unix::fs::symlink;
+
+    let (temp, root, index) = fixture(&[("nested/a.txt", "needle\n")]);
+    let outside = temp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("a.txt"), "needle\n").unwrap();
+    fs::remove_file(root.join("nested/a.txt")).unwrap();
+    symlink(outside.join("a.txt"), root.join("nested/a.txt")).unwrap();
+    let error = search(&index, "needle", false, true, 10).unwrap_err();
+    assert!(error.to_string().contains("symlink"));
+
+    fs::remove_file(root.join("nested/a.txt")).unwrap();
+    fs::remove_dir(root.join("nested")).unwrap();
+    symlink(&outside, root.join("nested")).unwrap();
+    let error = search(&index, "needle", false, true, 10).unwrap_err();
+    assert!(error.to_string().contains("symlink"));
+
+    fs::remove_file(root.join("nested")).unwrap();
+    fs::remove_dir(&root).unwrap();
+    symlink(&outside, &root).unwrap();
+    let error = search(&index, "needle", false, true, 10).unwrap_err();
+    assert!(error.to_string().contains("invalid text root"));
 }

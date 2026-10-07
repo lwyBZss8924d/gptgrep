@@ -19,7 +19,7 @@ use tgrep_core::path_index;
 use tgrep_core::query;
 use tgrep_core::reader::IndexReader;
 
-const ENGINE_REVISION: &str = "239711cfb6e69e8780cabf912a8987162a223ff1";
+const ENGINE_REVISION: &str = "1120aca41dd192ae61bdd996e9886cb354a78a27";
 const MANIFEST_NAME: &str = "gptgrep-index.json";
 const MANIFEST_VERSION: u32 = 1;
 
@@ -221,7 +221,7 @@ pub fn search_with_document_and_predicate(
         manifest.complete
             && manifest.version == MANIFEST_VERSION
             && manifest.engine_revision == ENGINE_REVISION,
-        "incomplete or incompatible GPTgrep index manifest"
+        "incomplete or incompatible GPTgrep index manifest; rebuild_required: build a new generation with the current engine"
     );
     let root = resolve_root(&index_dir, &manifest.root_relative)?;
     let reader = open_complete_index(&index_dir)?;
