@@ -28,3 +28,7 @@ tempfile = "=3.27.0"
 
 [patch."https://github.com/run-llama/liteparse"]
 liteparse-pdfium = { path = "../../../../vendor/liteparse-pdfium" }
+
+[[bin]]
+name = "gptgrep-codex-native-agent"
+path = "src/codex_agent.rs"

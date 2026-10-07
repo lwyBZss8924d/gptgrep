@@ -1,13 +1,17 @@
 # GPTgrep Harbor ablation exporter candidate
 
-This offline candidate creates Harbor 0.24.0 tasks from original synthetic inputs.
-The exporter/bridge source owner is `workspace/harness-tooling/harbor-ablation/`.
-The exporter and Python bridge do not launch Docker, Codex, OCR, Decisions, a judge,
-or Harbor trials. They do not install runtimes, read authentication, publish, or upload. Every output is
-nonexecuting and requires a new directory; overwrite and resume are refused.
-Qualification tags are prospective owner metadata, not a Harbor execution lock.
-The candidate has no trial runner or agent adapter. An external Harbor invocation
-is outside this source phase and must not use stock agent installation/auth setup.
+The offline exporter creates Harbor 0.24.0 tasks from original synthetic inputs.
+The source owner is `workspace/harness-tooling/harbor-ablation/`. Its export and
+format-composition commands create nonexecuting packages in new directories;
+overwrite and resume are refused. These commands launch no Docker, Codex, OCR,
+Decisions, judge or Harbor trials, and perform no runtime installation,
+authentication reads, publication or upload.
+
+An optional custom native agent adapter has a separate explicit execution
+frontdoor, described below. Qualification tags are prospective owner metadata,
+not a Harbor execution lock. Actual trial admission requires independently
+qualified sandbox assets and a frozen phase; stock agent installation/auth setup
+is outside this source contract.
 
 The primary comparison is the whole prebuilt search harness. The control reader
 gets raw PDFs and the same Codex configuration as the treatment. It may freely
@@ -97,7 +101,7 @@ Use an owned canonical, non-symlink scratch directory. Cargo dependencies are
 exactly pinned and locked against the existing project identity seed:
 
 ```sh
-cargo test --offline --locked --manifest-path harness/Cargo.toml
+GPTGREP_MOCK_PYTHON=/path/to/qualified/harbor-python cargo test --offline --locked --manifest-path harness/Cargo.toml -- --test-threads=1
 cargo fmt --manifest-path harness/Cargo.toml -- --check
 cargo clippy --offline --locked --manifest-path harness/Cargo.toml --all-targets -- -D warnings
 cargo build --offline --locked --manifest-path harness/Cargo.toml
@@ -254,3 +258,27 @@ required OCR coverage, actual resource/cost observations, independent receipt
 adoption and whole-group exporter integration is still required. These source
 frontdoors do not qualify D3/D4/D7, native tools, trials, judge parity, advantage,
 default promotion, release or Goal completion.
+
+
+## Optional native Harbor agent source
+
+The optional custom Harbor binding is `gptgrep_harbor_agent:FrozenCodexAgent` (Harbor 0.24.0). It subclasses BaseAgent, uses preinstalled assets and performs no installation, host auth/config copying, model-connection lookup or environment fallback. It accepts explicit `model_name="gpt-6-luna"` and strict options `launcher_path`, `control_path`, `control_sha256`, `user` (nonroot) and `transport_timeout_sec`. Unsupported Skills, MCP, configuration, resume/load and extra environment controls are rejected.
+
+The Rust entrypoint is `gptgrep-codex-native-agent --control <absolute-sandbox-path> --control-sha256 <sha256>`. Default mode admits inputs only; explicit `--run` launches one fresh standard `codex exec` child. The prompt is passed as exact stdin bytes, never interpolated into a shell command. Frozen controls select the SPEC reader profile gpt-6-luna/max/fast, raw PDF inventory, answer schema, absolute owner-supplied wall and monotonic phase deadlines with origin/clock namespace references, output namespace, exact binary/assets and an explicit nonsecret environment allowlist. The owner must derive/qualify those original deadlines before effects. This launcher does not join Jev RunClock and does not prove boot/namespace equality.
+
+Baseline input is raw PDFs only. Treatment must bind genuine v2 generation, regex/tree, visual, multimodal and Decisions-helper capability receipts; these references do not themselves establish qualification. A native-only prebuild scaffold is not the complete treatment. Both arms require independently qualified identical runtime/model/config/native tools/resources/network policy. YOLO flags act inside the external Harbor sandbox; ignore-config flags and scoped home paths are not proof of physical isolation or native entitlement.
+
+The only answer is the real `<cwd>/answer.json` (`/app/answer.json` in task images): an object containing exactly one string `answer`, at most 12,000 characters and 65,536 encoded bytes. Native final-message output does not replace a missing answer. The adapter does not grade or emit reward. It captures bounded event-kind/hashed-item/numeric-usage projections and discards raw stderr/tool text; ATIF support remains false. Requested profile is distinct from actual model/provider/effort/tier/provider-request count/cost, which remain unavailable from the basic native JSONL schema. Missing usage stays null; model attribution is not inferred from the requested name.
+
+Current validation is offline synthetic Rust children and FakeEnvironment fixtures only. Actual latest Linux binary/CLI/auth/profile capability, read-only mounts, tools, physical grader exclusion, namespace equivalence, descendant reaping, hard RSS/network/resource controls, Python lock reconstruction, production treatment provenance and paired trials remain unqualified. The new sources add no automatic trial execution or default/model promotion; all SPEC release gates remain unchanged.
+
+Cancellation and original phase validity are checked before ownership claims and immediately before spawning. All fixed output names, including the pending receipt, are admitted and rechecked before launch. These checks do not claim hard atomic OS cancellation or filesystem isolation. Terminal usage is validated and summed in a local candidate and committed together with terminal state only after the full event and projection are valid; a malformed or overflowing later field preserves prior completed observations.
+
+The native Rust fixtures require the explicit `GPTGREP_MOCK_PYTHON` interpreter
+above and run serially because they exercise shared cancellation state. They do
+not execute the native main signal-handler path or qualify parallel cancellation
+and real Linux cleanup. The separate Python fixtures use FakeEnvironment only:
+
+```sh
+uv run --offline --no-project --no-sync --no-python-downloads --python /path/to/qualified/harbor-python /path/to/qualified/harbor-python -B bridge/test_native_agent.py
+```
