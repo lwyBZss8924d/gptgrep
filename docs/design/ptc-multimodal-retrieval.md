@@ -27,17 +27,19 @@
 
 | 对象 | 基线实现 | 本设计目标／结论 |
 | --- | --- | --- |
-| tgrep-core | `239711cfb6e69e8780cabf912a8987162a223ff1`，v1.0.9 | 保留明确选择的 v1.0.11 / `7b706715ad3b620c350c73209523ba5034cd66a8` |
-| 上游最新 tgrep | 核查时 v1.1.0 已发布 | 2026-10-07 04:08 UTC 发布，commit `8ae60904506684d9422c6d3cf6f203982f25dddd`；不将 v1.0.11 写成最新，也不自动扩大升级目标 |
+| tgrep-core | `239711cfb6e69e8780cabf912a8987162a223ff1`，v1.0.9 | 采用核验时最新稳定发布 v1.1.0 / `1120aca41dd192ae61bdd996e9886cb354a78a27` |
+| tgrep 版本策略 | 允许采用最新稳定发布包 | 实施里程碑开始时核验 release/tag/package identity，再固定commit与lock用于构建和对照；不使用浮动HEAD |
 | LiteParse | `a7105d3e3cfaf001970578c6615f6e71015aa483`，2.14.6 | crates-v2.15.1 / `ab8879623ee45a0b7a775d12b42a9a7ae9dab16b` |
 | Decisions | `typesafe/jev-1.13`，文本 Candidate，OpenRouter alpha endpoint | 目标默认 `openai/gpt-6-luna-decisions`；旧模型可显式选择作文本对照 |
 | Parser | OCR 禁用；整份 native 文档无文本时失败，混合文档仍可能含未识别的扫描页 | 新增显式 `index --ocr auto` 与逐页覆盖状态；普通 index 仍无模型调用 |
 | Host | Retrieval 与无工具的文本 Completion 两种 workflow | 新增 OCR workflow 与多模态 reader；保持模型角色独立 |
 | Batch | 顶层接口每次重开 CURRENT | 需要共享 reader，不能仅在 CLI 循环现有函数 |
 
-来源：[tgrep 发布列表](https://github.com/microsoft/tgrep/releases)、[v1.0.11](https://github.com/microsoft/tgrep/releases/tag/v1.0.11)、[LiteParse 2.15.1](https://github.com/run-llama/liteparse/releases/tag/crates-v2.15.1)、[OpenRouter 模型](https://openrouter.ai/openai/gpt-6-luna-decisions)。版本身份与源码检查成立，不代表这些目标已被 GPTgrep 编译或运行。
+来源：[tgrep 发布列表](https://github.com/microsoft/tgrep/releases)、[v1.1.0](https://github.com/microsoft/tgrep/releases/tag/v1.1.0)、[LiteParse 2.15.1](https://github.com/run-llama/liteparse/releases/tag/crates-v2.15.1)、[OpenRouter 模型](https://openrouter.ai/openai/gpt-6-luna-decisions)。当前tgrep发布记录的发布时间为2026-10-07 05:09:42 UTC，release API与tag ref均指向`1120aca…`；较早的`8ae6090…`观察仅保留为历史证据。版本身份与源码检查成立，不代表这些目标已被GPTgrep编译或运行。
 
-v1.0.11 包含 v1.0.10 的 inline case-insensitive 候选过滤修复。其 fixed-string helper 的 Unicode casefold 修复位于更晚的 v1.1.0，因此继续使用 `regex::escape` → 同一 Rust regex 精确验证的路径；禁止为了 batch 改调存在风险的 literal shortcut。v1.1.0 的共享 worktree／daemon 能力作为另行评估项，当前架构仍内嵌 `tgrep-core`，不运行上游 agent 安装器、MCP 或 daemon。[v1.0.10](https://github.com/microsoft/tgrep/releases/tag/v1.0.10) · [v1.1.0](https://github.com/microsoft/tgrep/releases/tag/v1.1.0)
+v1.1.0包含inline case-insensitive修复，并修复fixed-string helper的Unicode casefold：大小写不敏感literal经escaped regex planner生成保守候选，无法规划时MatchAll扫描。GPTgrep继续用同一Rust regex做精确验证；现有escaped-regex路径可保留，native literal helper可在adapter parity证明后使用，不再将旧版风险描述成此版本缺陷。新版本的indexed path traversal校验与vendored `ignore`、平台依赖变化纳入M1测试和许可证核查。[固定query源码](https://github.com/microsoft/tgrep/blob/1120aca41dd192ae61bdd996e9886cb354a78a27/tgrep-core/src/query.rs) · [v1.1.0发布记录](https://github.com/microsoft/tgrep/releases/tag/v1.1.0)
+
+内嵌最新`tgrep-core`不等于采用上游CLI的全部运行方式。共享worktree/overlay APIs可作为后续库内复用研究；本轮仍用GPTgrep的generation所有权与reader合同，不自动启用上游daemon、MCP或agent安装器。更新版本时重新检查API、lock/许可证、路径安全和索引兼容性，冻结实验后不在运行中移动pin。
 
 ## 3. 模块与数据流
 
