@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use gptgrep_core::SearchOptions;
 use serde_json::{Value, json};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -131,6 +131,13 @@ impl EnrichHostArgs {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run bounded local operations against one retained generation; JSON output.
+    Batch {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long, default_value = "-")]
+        input: PathBuf,
+    },
     /// Parse documents and publish a complete immutable search generation.
     #[command(alias = "init")]
     Index {
@@ -359,6 +366,7 @@ fn contract() -> Value {
         "transport":"argv/stdout", "mcp":false, "default_output":"text", "machine_output":"--json",
         "exit_codes":{"0":"success or matches","1":"no matches","2":"error, stale evidence, or incomplete enrichment"},
         "commands":{
+            "batch":{"usage":"gptgrep batch --root ROOT --input FILE_OR_DASH --json","effect":"local generation-pinned search/catalog/tree/read operations","network":false,"request_schema":"gptgrep.batch.request.v1","output_schema":"gptgrep.batch.response.v1","limits":{"input_bytes":1048576,"operations":64,"output_bytes":1048576},"output_order":"input operation order","model_operations":"hybrid/semantic return output_budget_insufficient before any provider work in this foundation","continuation":"deterministic cursors bind generation, scope and projection; no model continuation","output":"always JSON; exit2 for any item or global failure"},
             "index":{"usage":"gptgrep index ROOT [--max-files 100000] [--optimize-merge] --json","effect":"write owned .gptgrep immutable generation","network":false},
             "enrich":{"usage":"gptgrep enrich ROOT --ledger-path ABSOLUTE_PATH --max-builder-calls N --max-jev-calls N [--plan-only] [--expected-plan-sha256 SHA] --json","effect":"explicit raw-only Codex/Jev navigation-overlay build after deterministic index","model_assisted":true,"plan_only_model_calls":0,"defaults":{"builder_model":"gpt-6-luna","reasoning_effort":"max","service_tier":"fast","jev_model":"typesafe/jev-1.13","window_bytes":8192,"max_hints_per_window":4},"output":"complete publishes a separate source-bound navigation overlay; incomplete/failed leaves the current index unchanged and exits 2","hint_authority":"non-citable navigation only; not full PageIndex Flash parity","resume":"same absolute ledger and bound plan; pending or failed calls are not automatically retried"},
             "search":{"usage":"gptgrep search QUERY ROOT --mode regex|lexical|hybrid|semantic --json","options":{"mode":{"type":"string","default":"hybrid","enum":["hybrid","semantic","regex","lexical"]},"document":{"type":"string","description":"Exact indexed source-relative path; scope applies before candidate limits"},"limit":{"type":"integer","default":20,"minimum":1,"maximum":1000},"context":{"type":"integer","default":0,"maximum":100},"max-candidates":{"type":"integer","default":24,"maximum":24},"routing-docs":{"type":"integer","default":32,"maximum":32},"ignore-case":{"type":"boolean"},"fixed-strings":{"type":"boolean"},"model":{"type":"string","default":"typesafe/jev-1.13"},"min-score":{"type":"number","minimum":0,"maximum":1,"default":0.5}},"network":"required Jev for default hybrid and semantic; explicit regex/lexical primitives are local","credentials":"OPENROUTER_API_KEY environment only","output_schema":"gptgrep.v1"},
@@ -393,6 +401,12 @@ fn contract() -> Value {
         "binding":"part of new plans; resume must retain the same value; legacy plans remain zero",
         "billing":"failed attempts and observed/unknown provider usage remain recorded; no inference of zero billing"
     });
+    contract["commands"]["batch"]["limits"]["minimum_output_bytes"] =
+        json!("4096 + 1024 * operation_count; includes complete response, no trailing newline");
+    contract["commands"]["batch"]["invalid_request_diagnostics"] = json!({
+        "max_bytes":4096,
+        "scope":"invalid declarations and input I/O errors use the batch response schema; their cap is separate from an unadmitted requested output allowance"
+    });
     contract["commands"]["ask"]["options"]["experimental-source-continuation"] = json!({
         "type":"boolean","default":false,"requires":["experimental-query-plan","document"],
         "effect":"Reader guidance: node EOF is not evidence completeness; verify unresolved claims/referents using scoped verified tree/read nodes",
@@ -404,7 +418,7 @@ fn contract() -> Value {
 }
 
 fn llms() -> &'static str {
-    "# GPTgrep\n\nLocal vectorless retrieval helper for agents. No MCP server.\n\n1. gptgrep index ./docs --json\n1a. gptgrep enrich ./docs --ledger-path /path/to/private/enrich.jsonl --max-builder-calls 100 --max-jev-calls 100 --plan-only --json\n2. gptgrep search 'concept in natural language' ./docs --json\n3. gptgrep search 'pattern' ./docs --mode regex --json\n4. gptgrep tree manual.pdf --root ./docs --json\n5. gptgrep read DOCUMENT_ID:NODE_ID --root ./docs --json\n\nJev routing/reranking is required by default search, ask and summarize. OPENROUTER_API_KEY must be supplied for model-assisted runs; failures never silently downgrade to local retrieval. Explicit regex/lexical and enrich --plan-only remain offline. Enrich is an explicit Codex/Jev step that creates non-citable navigation hints after local indexing. Use --document RELATIVE_PATH to scope before candidate budgets. Hybrid/semantic and judge send bounded data to OpenRouter Jev. Inspect coverage, source_fresh, coordinate_system and text_truncated before citing evidence. The main agent performs reasoning and controls follow-up reads. New files require reindexing. --schema provides the command contract.\n"
+    "# GPTgrep\n\nLocal vectorless retrieval helper for agents. No MCP server.\n\n1. gptgrep index ./docs --json\n1a. gptgrep enrich ./docs --ledger-path /path/to/private/enrich.jsonl --max-builder-calls 100 --max-jev-calls 100 --plan-only --json\n2. gptgrep search 'concept in natural language' ./docs --json\n3. gptgrep search 'pattern' ./docs --mode regex --json\n4. gptgrep tree manual.pdf --root ./docs --json\n5. gptgrep read DOCUMENT_ID:NODE_ID --root ./docs --json\n6. gptgrep batch --root ./docs --input operations.json --json\n\nBatch accepts gptgrep.batch.request.v1 JSON, pins one generation and preserves operation order. Local search/catalog/tree/read operations share bounded output reservations. Batch hybrid/semantic are currently rejected before provider work; inspect each item status and coverage.\n\nJev routing/reranking is required by default search, ask and summarize. OPENROUTER_API_KEY must be supplied for model-assisted runs; failures never silently downgrade to local retrieval. Explicit regex/lexical and enrich --plan-only remain offline. Enrich is an explicit Codex/Jev step that creates non-citable navigation hints after local indexing. Use --document RELATIVE_PATH to scope before candidate budgets. Hybrid/semantic and judge send bounded data to OpenRouter Jev. Inspect coverage, source_fresh, coordinate_system and text_truncated before citing evidence. The main agent performs reasoning and controls follow-up reads. New files require reindexing. --schema provides the command contract.\n"
 }
 
 fn emit(value: &Value) -> Result<()> {
@@ -433,6 +447,50 @@ async fn run(cli: Cli) -> Result<i32> {
         return Ok(0);
     };
     match command {
+        Command::Batch { root, input } => {
+            let mut bytes = Vec::with_capacity(8192);
+            let cap = gptgrep_core::batch::MAX_BATCH_INPUT_BYTES;
+            let read_result = (|| -> io::Result<()> {
+                if input.as_os_str() == "-" {
+                    io::stdin()
+                        .lock()
+                        .take(cap as u64 + 1)
+                        .read_to_end(&mut bytes)?;
+                } else {
+                    std::fs::File::open(&input)?
+                        .take(cap as u64 + 1)
+                        .read_to_end(&mut bytes)?;
+                }
+                Ok(())
+            })();
+            if read_result.is_err() {
+                serde_json::to_writer(
+                    io::stdout().lock(),
+                    &gptgrep_core::batch::input_io_failure(),
+                )?;
+                return Ok(2);
+            }
+            let request = match gptgrep_core::batch::parse_batch_request(&bytes) {
+                Ok(request) => request,
+                Err(error) => {
+                    serde_json::to_writer(io::stdout().lock(), &error)?;
+                    return Ok(2);
+                }
+            };
+            match gptgrep_core::batch::dispatch_batch(&root, request, None).await {
+                Ok(response) => {
+                    let failed = response.coverage.failed > 0 || response.coverage.not_executed > 0;
+                    serde_json::to_writer(io::stdout().lock(), &response)?;
+                    if failed {
+                        return Ok(2);
+                    }
+                }
+                Err(error) => {
+                    serde_json::to_writer(io::stdout().lock(), &error)?;
+                    return Ok(2);
+                }
+            }
+        }
         Command::Index {
             root,
             max_files,

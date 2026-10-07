@@ -68,6 +68,9 @@ enum Outcome {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExecutionSnapshot {
     pub scope: String,
+    /// Actual immutable explicit context binding; legacy invocation is unbound.
+    pub run_id: Option<String>,
+    pub plan_digest: Option<String>,
     pub max_submissions: u32,
     pub logical_reservations: usize,
     pub send_start_observations: usize,
@@ -190,6 +193,8 @@ impl ExecutionContext {
                     "single_invocation"
                 }
                 .into(),
+                run_id: self.run_id().map(str::to_owned),
+                plan_digest: self.plan_digest().map(str::to_owned),
                 max_submissions: state.header.max_submissions,
                 logical_reservations: state.reservations.len(),
                 send_start_observations: state
@@ -216,6 +221,21 @@ impl ExecutionContext {
                 deadline_unix_ms: state.header.deadline_unix_ms,
             })
         })
+    }
+    /// Read the actual explicit immutable binding, without budget or transport effects.
+    pub fn run_id(&self) -> Option<&str> {
+        self.0
+            .header
+            .deadline_unix_ms
+            .is_some()
+            .then_some(self.0.header.run_id.as_str())
+    }
+    pub fn plan_digest(&self) -> Option<&str> {
+        self.0
+            .header
+            .deadline_unix_ms
+            .is_some()
+            .then_some(self.0.header.plan_digest.as_str())
     }
 
     pub(crate) fn compatibility() -> Self {
@@ -623,6 +643,34 @@ mod tests {
             .tempdir()
             .unwrap()
             .keep()
+    }
+    #[test]
+    fn immutable_binding_accessors_and_snapshots_have_no_admission_effects() {
+        let deadline = SystemTime::now() + Duration::from_secs(5);
+        let ctx = context(deadline, 2);
+        let before = ctx.snapshot().unwrap();
+        assert_eq!(ctx.run_id(), Some("invented-test-run"));
+        assert_eq!(ctx.plan_digest(), Some(DIGEST));
+        assert_eq!(before.run_id.as_deref(), ctx.run_id());
+        assert_eq!(before.plan_digest.as_deref(), ctx.plan_digest());
+        assert_eq!(ctx.clone().snapshot().unwrap(), before);
+        let dir = directory();
+        let path = dir.join("binding");
+        let bound = ctx.with_ledger(&path).unwrap();
+        let joined = context(deadline, 2).with_ledger(&path).unwrap();
+        assert_eq!(bound.run_id(), joined.run_id());
+        assert_eq!(bound.plan_digest(), joined.plan_digest());
+        let snapshot = joined.snapshot().unwrap();
+        assert_eq!(snapshot.run_id.as_deref(), Some("invented-test-run"));
+        assert_eq!(snapshot.plan_digest.as_deref(), Some(DIGEST));
+        assert_eq!(snapshot.logical_reservations, 0);
+        assert_eq!(snapshot.submission_observations, 0);
+        let legacy = ExecutionContext::compatibility();
+        assert!(legacy.run_id().is_none());
+        assert!(legacy.plan_digest().is_none());
+        assert!(legacy.snapshot().unwrap().run_id.is_none());
+        assert!(legacy.snapshot().unwrap().plan_digest.is_none());
+        fs::remove_dir_all(dir).unwrap();
     }
     #[tokio::test]
     async fn charges_failures_never_frees_counts_and_quarantines_drop() {

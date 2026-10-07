@@ -3,6 +3,7 @@ use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
 use gptgrep_jev::{Candidate, JevClient, RerankResponse};
 
+pub mod batch;
 mod evidence_roles;
 pub use evidence_roles::{
     CandidateDisposition, CandidateEligibility, DeliveredSetSufficiency, EvidenceRole,
@@ -11,6 +12,7 @@ pub use evidence_roles::{
 };
 mod navigation_overlay;
 mod planned;
+mod rich_generation;
 use gptgrep_pageindex::TreeNode;
 pub use navigation_overlay::{
     BoundNavigationOverlay, MAX_NAVIGATION_HINT_BYTES, MAX_NAVIGATION_OVERLAY_BYTES,
@@ -25,6 +27,10 @@ pub use planned::{
     PlannedCoverage, PlannedScoringPolicy, PlannedSearchError, PlannedSearchEvent,
     PlannedSearchObserver, PlannedSearchReport, PlannedSpanProvenance, PlannedViewCoverage,
     search_planned_with_client_and_observer, search_planned_with_policy_and_observer,
+};
+pub use rich_generation::{
+    ArtifactSearchReport, ArtifactTextWindow, EvidenceRef, RICH_MANIFEST_SCHEMA, RichDocument,
+    RichGenerationReader, RichGenerationWriter, RichManifest, StoredArtifact, TextEvidenceBinding,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
