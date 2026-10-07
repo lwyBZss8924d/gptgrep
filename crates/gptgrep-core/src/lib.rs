@@ -8,6 +8,7 @@ mod custody;
 mod derived_visual;
 mod evidence_roles;
 pub mod rich_batch;
+mod rich_decisions;
 pub use derived_visual::{
     DerivedCacheBudget, DerivedCacheStatus, DerivedRecipeToken, DerivedVisualCache,
     DerivedVisualPin, DerivedVisualReceipt, VisualSource,
@@ -16,6 +17,11 @@ pub use evidence_roles::{
     CandidateDisposition, CandidateEligibility, DeliveredSetSufficiency, EvidenceRole,
     EvidenceRoleCandidateDecision, EvidenceRoleDiagnostics, EvidenceRoleHint, EvidenceRoleSource,
     EvidenceRoleSpan, MAX_EVIDENCE_ROLE_METADATA_BYTES,
+};
+pub use rich_decisions::{
+    PreparedRichTextSearch, RichTextAttempt, RichTextCoverage, RichTextHit, RichTextInitialPass,
+    RichTextSearchError, RichTextSearchOptions, RichTextSearchReport, RichTextUsageProjection,
+    prepare_rich_text_search,
 };
 mod navigation_overlay;
 mod planned;

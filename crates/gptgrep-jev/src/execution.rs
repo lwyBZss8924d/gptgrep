@@ -250,6 +250,11 @@ impl ExecutionContext {
             .clone())
     }
 
+    /// Check the original run deadline without admitting work or touching the ledger.
+    pub fn check_deadline(&self) -> Result<()> {
+        self.remaining().map(|_| ())
+    }
+
     pub(crate) fn compatibility() -> Self {
         Self::create(
             Header {

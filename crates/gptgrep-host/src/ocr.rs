@@ -256,20 +256,25 @@ impl OcrHostExecutor {
             }
         })
         .await;
+        // Capture transport and typed timeout state before owned cleanup can change it.
+        // A later drain failure must not erase an already observed runtime diagnostic.
+        let outcome = capture_page_outcome(outcome, &transport);
         // Every path owns, kills and reaps this invocation's process group only.
         let cleanup = group.stop(&mut child).await;
         let drained = tokio::time::timeout(Duration::from_secs(2), &mut drain).await;
         if drained.is_err() {
             drain.abort();
         }
+        // An unconfirmed owned stop retains its preexisting lifecycle-unknown priority.
         cleanup?;
-        transport.check()?;
-        drained
-            .map_err(|_| anyhow!("ocr_stderr_cleanup_completion_unknown"))?
-            .map_err(|_| anyhow!("ocr_stderr_cleanup_completion_unknown"))??;
-        admission.confirm_terminal()?;
-        let mut outcome =
-            outcome.map_err(|_| anyhow!("ocr_page_deadline_completion_unknown"))??;
+        let terminal_safeguards = (|| {
+            transport.check()?;
+            drained
+                .map_err(|_| anyhow!("ocr_stderr_cleanup_completion_unknown"))?
+                .map_err(|_| anyhow!("ocr_stderr_cleanup_completion_unknown"))??;
+            admission.confirm_terminal()
+        })();
+        let mut outcome = finish_page_outcome(outcome, terminal_safeguards)?;
         outcome.transport_bytes = transport.used();
         // The provider turn is terminal even when OCR completeness validation fails.
         let raw_sha256 = hash(outcome.answer.as_bytes());
@@ -316,6 +321,23 @@ impl OcrHostExecutor {
             server_retry_notifications: outcome.retries,
         })
     }
+}
+
+pub(super) fn capture_page_outcome<T>(
+    outcome: std::result::Result<Result<T>, tokio::time::error::Elapsed>,
+    transport: &ocr_protocol::TransportBudget,
+) -> Result<T> {
+    transport.check()?;
+    outcome.map_err(|_| anyhow!("ocr_page_deadline_completion_unknown"))?
+}
+
+pub(super) fn finish_page_outcome<T>(
+    outcome: Result<T>,
+    terminal_safeguards: Result<()>,
+) -> Result<T> {
+    let outcome = outcome?;
+    terminal_safeguards?;
+    Ok(outcome)
 }
 
 impl OcrExecutor for OcrHostExecutor {

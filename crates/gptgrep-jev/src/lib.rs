@@ -158,6 +158,27 @@ impl PreparedDecision {
     }
 }
 
+/// One immutable relevance request, bound to the preparing client.
+/// It contains source-bearing bytes and therefore has no Debug or serde API.
+pub struct PreparedRerank {
+    request: PreparedDecision,
+    ids: Vec<String>,
+}
+impl PreparedRerank {
+    pub fn body_bytes(&self) -> usize {
+        self.request.body_bytes()
+    }
+    pub fn body_sha256(&self) -> &str {
+        self.request.body_sha256()
+    }
+    pub fn requested_model(&self) -> &str {
+        self.request.requested_model()
+    }
+    pub fn question_count(&self) -> usize {
+        self.ids.len()
+    }
+}
+
 impl JevClient {
     /// Read only OPENROUTER_API_KEY from the process environment.
     pub fn from_env(model: Option<&str>) -> Result<Self> {
@@ -331,14 +352,23 @@ impl JevClient {
             .map_err(|_| anyhow!("Jev admission or request deadline expired; any reserved submission remains charged and unknown; request was not retried"))?
     }
 
-    /// Score each candidate on the same relevance rubric and sort deterministically.
-    ///
-    /// One bounded request; callers own shortlisting and any additional batching.
-    pub async fn rerank(&self, query: &str, candidates: &[Candidate]) -> Result<RerankResponse> {
+    /// Prepare the unchanged absolute relevance rubric before paid admission.
+    pub fn prepare_rerank(&self, query: &str, candidates: &[Candidate]) -> Result<PreparedRerank> {
         let (state, questions) = rerank_questions(query, candidates)?;
-        let result = self.decide(state, questions).await?;
-        let mut rankings = Vec::with_capacity(candidates.len());
-        for (index, candidate) in candidates.iter().enumerate() {
+        Ok(PreparedRerank {
+            request: self.prepare_decision(state, questions)?,
+            ids: candidates
+                .iter()
+                .map(|candidate| candidate.id.clone())
+                .collect(),
+        })
+    }
+
+    /// Submit one exact prepared relevance request without retries or fallback.
+    pub async fn submit_rerank(&self, prepared: PreparedRerank) -> Result<RerankResponse> {
+        let result = self.submit_prepared(prepared.request).await?;
+        let mut rankings = Vec::with_capacity(prepared.ids.len());
+        for (index, id) in prepared.ids.into_iter().enumerate() {
             let Some(DecisionAnswer::Score {
                 score, confidence, ..
             }) = result.answers.get(&format!("candidate_{index}"))
@@ -346,7 +376,7 @@ impl JevClient {
                 return Err(anyhow!("Jev reranking response has an invalid answer"));
             };
             rankings.push(RankedCandidate {
-                id: candidate.id.clone(),
+                id,
                 score: score / (RELEVANCE_LEVELS.len() - 1) as f64,
                 confidence: *confidence,
             });
@@ -364,6 +394,13 @@ impl JevClient {
             provider_response_id: result.id,
             provider: result.provider,
         })
+    }
+
+    /// Score each candidate on the same relevance rubric and sort deterministically.
+    /// One bounded request; callers own shortlisting and additional batching.
+    pub async fn rerank(&self, query: &str, candidates: &[Candidate]) -> Result<RerankResponse> {
+        self.submit_rerank(self.prepare_rerank(query, candidates)?)
+            .await
     }
 
     fn request_body(&self, state: Value, questions: &Value) -> Result<Vec<u8>> {
@@ -422,6 +459,75 @@ fn rerank_questions(query: &str, candidates: &[Candidate]) -> Result<(Value, Val
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn prepared_rerank_rejects_another_client_before_admission() -> Result<()> {
+        let context = ExecutionContext::new(
+            "ordinary-prepared-identity",
+            &"a".repeat(64),
+            std::time::SystemTime::now() + Duration::from_secs(60),
+            2,
+        )?;
+        let original =
+            JevClient::with_endpoint("ordinary-fixture", None, "http://127.0.0.1:9/decisions")?
+                .with_execution_context(context.clone());
+        let other =
+            JevClient::with_endpoint("ordinary-fixture", None, "http://127.0.0.1:9/decisions")?
+                .with_execution_context(context.clone());
+        let prepared = original.prepare_rerank(
+            "query",
+            &[Candidate {
+                id: "source".into(),
+                text: "ordinary source".into(),
+            }],
+        )?;
+        assert!(
+            other
+                .submit_rerank(prepared)
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("different client")
+        );
+        assert_eq!(context.snapshot()?.logical_reservations, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_rerank_preserves_original_body_and_stable_subset_bound() -> Result<()> {
+        let client = JevClient::new("ordinary-fixture", None)?;
+        let candidates: Vec<_> = (0..24)
+            .map(|i| Candidate {
+                id: format!("source-{i}"),
+                text: format!("中\r\n\tquoted \"source\" {i}"),
+            })
+            .collect();
+        let (state, questions) = rerank_questions("ordinary query", &candidates)?;
+        let direct = client.prepare_decision(state, questions)?;
+        let full = client.prepare_rerank("ordinary query", &candidates)?;
+        assert_eq!(direct.body_sha256(), full.body_sha256());
+        assert_eq!(direct.body_bytes(), full.body_bytes());
+        let mut cases = 0;
+        for mask in 0u16..256 {
+            if mask.count_ones() != 4 {
+                continue;
+            }
+            let subset: Vec<_> = candidates
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| {
+                    (i < 8 || (mask & (1 << ((i - 8) / 2))) != 0).then_some(c.clone())
+                })
+                .collect();
+            let prepared = client.prepare_rerank("ordinary query", &subset)?;
+            assert!(prepared.body_bytes() <= full.body_bytes());
+            assert_eq!(prepared.question_count(), 16);
+            cases += 1;
+        }
+        assert_eq!(cases, 70);
+        Ok(())
+    }
 
     #[test]
     fn reranking_uses_absolute_dynamic_questions() {

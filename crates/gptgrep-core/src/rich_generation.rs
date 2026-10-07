@@ -135,6 +135,24 @@ pub struct ArtifactSearchReport {
     pub stale_documents: Vec<String>,
 }
 
+#[derive(Clone)]
+pub(crate) struct RichTextLocation {
+    pub document_index: usize,
+    pub artifact_index: usize,
+    pub offset: usize,
+    pub lexical: bool,
+}
+pub(crate) struct RichTextLocations {
+    pub windows: Vec<RichTextLocation>,
+    pub routing_documents: Vec<usize>,
+    pub scoped_documents: usize,
+    pub available_artifacts: usize,
+    pub inspected_artifacts: usize,
+    pub scanned_bytes: u64,
+    pub lexical_truncated: bool,
+    pub lexical_terms_truncated: bool,
+}
+
 /// Holds the corpus writer lock until publication or drop. Failed candidates
 /// remain unpublished and retained; they do not replace CURRENT.
 pub struct RichGenerationWriter {
@@ -843,6 +861,254 @@ impl RichGenerationReader {
         };
         encoded_size(&report, max_output_bytes as u64)?;
         Ok(report)
+    }
+
+    /// Bounded positions only: evidence is reconstructed with public read_text.
+    pub(crate) fn text_window_locations(
+        &self,
+        query: &str,
+        scope: Option<&str>,
+        window_bytes: usize,
+        check_deadline: &dyn Fn() -> Result<()>,
+    ) -> Result<RichTextLocations> {
+        self.validate()?;
+        self.index_session()?.validate()?;
+        let mut docs: Vec<usize> = Vec::new();
+        let mut scoped_documents = 0usize;
+        let mut available_artifacts = 0usize;
+        for (index, doc) in self.manifest.documents.iter().enumerate() {
+            if scope.is_some_and(|path| path != doc.document.path) {
+                continue;
+            }
+            scoped_documents += 1;
+            available_artifacts = available_artifacts
+                .checked_add(
+                    doc.artifacts
+                        .iter()
+                        .filter(|a| is_text(&a.artifact.kind))
+                        .count(),
+                )
+                .context("text artifact count overflow")?;
+            let position = docs.partition_point(|other| {
+                self.manifest.documents[*other].document.path < doc.document.path
+            });
+            docs.insert(position, index);
+            docs.truncate(8);
+        }
+        ensure!(
+            scoped_documents > 0,
+            "document scope is not present in pinned generation"
+        );
+        let mut terms: Vec<String> = Vec::new();
+        let mut lexical_terms_truncated = false;
+        for term in query
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|s| !s.is_empty())
+            .map(str::to_lowercase)
+        {
+            if terms.contains(&term) {
+                continue;
+            }
+            if terms.len() == 16 {
+                lexical_terms_truncated = true;
+                break;
+            }
+            terms.push(term);
+        }
+        let matcher = if terms.is_empty() {
+            None
+        } else {
+            Some(
+                regex::RegexBuilder::new(
+                    &terms
+                        .iter()
+                        .map(|term| regex::escape(term))
+                        .collect::<Vec<_>>()
+                        .join("|"),
+                )
+                .case_insensitive(true)
+                .size_limit(262_144)
+                .build()?,
+            )
+        };
+        // Only the lowest 64 artifact keys of each bounded document are retained.
+        let mut artifacts = Vec::new();
+        for &doc_index in &docs {
+            let doc = &self.manifest.documents[doc_index];
+            let mut positions = Vec::new();
+            for (index, stored) in doc
+                .artifacts
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| is_text(&a.artifact.kind))
+            {
+                let key = (
+                    stored.artifact.page,
+                    stored.artifact.kind != ArtifactKind::NativeText,
+                    stored.artifact.id.as_str(),
+                );
+                let position = positions.partition_point(|other: &usize| {
+                    let a = &doc.artifacts[*other].artifact;
+                    (a.page, a.kind != ArtifactKind::NativeText, a.id.as_str()) < key
+                });
+                positions.insert(position, index);
+                positions.truncate(64);
+            }
+            artifacts.push(positions);
+        }
+        let mut lexical = Vec::new();
+        let mut structural: Vec<Vec<RichTextLocation>> = vec![Vec::new(); docs.len()];
+        let mut inspected_artifacts = 0usize;
+        let mut scanned_bytes = 0u64;
+        let mut lexical_truncated = false;
+        let depth = artifacts.iter().map(Vec::len).max().unwrap_or(0);
+        'scan: for offset in 0..depth {
+            for (slot, &doc_index) in docs.iter().enumerate() {
+                let Some(&artifact_index) = artifacts[slot].get(offset) else {
+                    continue;
+                };
+                if inspected_artifacts == 64 {
+                    break 'scan;
+                }
+                check_deadline()?;
+                let doc = &self.manifest.documents[doc_index];
+                let stored = &doc.artifacts[artifact_index];
+                if scanned_bytes
+                    .checked_add(stored.artifact.bytes)
+                    .is_none_or(|bytes| bytes > 64 * 1024 * 1024)
+                {
+                    break 'scan;
+                }
+                self.verify_source_metered(doc)?;
+                let text = self.text_cached(&stored.artifact)?;
+                inspected_artifacts += 1;
+                scanned_bytes += stored.artifact.bytes;
+                if !text.trim().is_empty() {
+                    let location = RichTextLocation {
+                        document_index: doc_index,
+                        artifact_index,
+                        offset: 0,
+                        lexical: false,
+                    };
+                    let choices = &mut structural[slot];
+                    if choices.len() < 2 {
+                        choices.push(location);
+                    } else {
+                        let kind = |location: &RichTextLocation| {
+                            &self.manifest.documents[location.document_index].artifacts
+                                [location.artifact_index]
+                                .artifact
+                                .kind
+                        };
+                        if kind(&choices[0]) == kind(&choices[1])
+                            && kind(&choices[0]) != &stored.artifact.kind
+                        {
+                            choices[1] = location;
+                        }
+                    }
+                    if let Some(matcher) = &matcher {
+                        for found in matcher.find_iter(&text) {
+                            if lexical.len() == 8 {
+                                lexical_truncated = true;
+                                break;
+                            }
+                            let mut start = found.start().saturating_sub(window_bytes / 4);
+                            while !text.is_char_boundary(start) {
+                                start += 1;
+                            }
+                            let location = RichTextLocation {
+                                document_index: doc_index,
+                                artifact_index,
+                                offset: start,
+                                lexical: true,
+                            };
+                            if !lexical.iter().any(|other: &RichTextLocation| {
+                                other.document_index == doc_index
+                                    && other.artifact_index == artifact_index
+                                    && other.offset == start
+                            }) {
+                                lexical.push(location);
+                            }
+                        }
+                    }
+                }
+                self.verify_source_metered(doc)?;
+                check_deadline()?;
+            }
+        }
+        let routing_documents = docs
+            .iter()
+            .copied()
+            .zip(&structural)
+            .filter_map(|(doc, windows)| (!windows.is_empty()).then_some(doc))
+            .collect();
+        let mut windows = lexical;
+        for locations in structural {
+            windows.extend(locations);
+        }
+        ensure!(windows.len() <= 24, "text locator count invariant");
+        self.validate()?;
+        Ok(RichTextLocations {
+            windows,
+            routing_documents,
+            scoped_documents,
+            available_artifacts,
+            inspected_artifacts,
+            scanned_bytes,
+            lexical_truncated,
+            lexical_terms_truncated,
+        })
+    }
+
+    /// JSON upper bound for a reference, before copying IDs/region metadata.
+    pub(crate) fn text_location_metadata_bound(
+        &self,
+        location: &RichTextLocation,
+    ) -> Result<usize> {
+        let doc = &self.manifest.documents[location.document_index];
+        let artifact = &doc.artifacts[location.artifact_index].artifact;
+        let mut bytes = 4096usize;
+        for value in [
+            &self.pin.generation,
+            &self.pin.manifest_sha256,
+            &doc.document.id,
+            &doc.document.path,
+            &doc.document.source_sha256,
+            &artifact.id,
+            &artifact.sha256,
+        ] {
+            bytes = bytes
+                .checked_add(
+                    value
+                        .len()
+                        .checked_mul(6)
+                        .context("reference metadata overflow")?,
+                )
+                .context("reference metadata overflow")?;
+        }
+        if artifact.kind == ArtifactKind::OcrText {
+            let outcome = doc
+                .ocr_results
+                .iter()
+                .find(|result| Some(result.page) == artifact.page)
+                .context("OCR receipt absent")?;
+            bytes = bytes
+                .checked_add(outcome.receipt.profile_sha256.len() * 6)
+                .context("reference metadata overflow")?;
+            for region in &outcome.regions {
+                bytes = bytes
+                    .checked_add(
+                        region
+                            .id
+                            .len()
+                            .checked_mul(6)
+                            .and_then(|n| n.checked_add(3))
+                            .context("region metadata overflow")?,
+                    )
+                    .context("region metadata overflow")?;
+            }
+        }
+        Ok(bytes)
     }
 
     fn text_evidence(

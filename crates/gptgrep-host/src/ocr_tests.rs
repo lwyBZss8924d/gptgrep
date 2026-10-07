@@ -718,8 +718,25 @@ fn mock_executor(
     use std::os::unix::fs::PermissionsExt;
     let script = fixture.dir.path().join("mock-codex");
     let code = r##"#!/usr/bin/env python3
-import json, os, pathlib, subprocess, sys, time
+import json, os, pathlib, signal, subprocess, sys, time
 MODE = '__MODE__'
+cleanup_signaled = False
+def note_cleanup(signum, frame):
+    global cleanup_signaled
+    cleanup_signaled = True
+if MODE in ('cleanup_error_flood', 'cleanup_success_flood'):
+    signal.signal(signal.SIGTERM, note_cleanup)
+def cleanup_flood():
+    while not cleanup_signaled:
+        time.sleep(0.001)
+    pathlib.Path(__file__ + '.after-term').write_text('owned cleanup TERM observed')
+    try:
+        for _ in range(80):
+            data = b'e' * (256 * 1024)
+            while data:
+                data = data[os.write(2, data):]
+    except OSError:
+        pass
 def send(value):
     print(json.dumps(value, separators=(',', ':')), flush=True)
 pending = None
@@ -738,6 +755,14 @@ for line in sys.stdin:
         artifact = pending['images'][0]['artifact']
         send({'id': 101, 'method': 'item/tool/call', 'params': {'threadId': 'thread-1', 'turnId': 'turn-1', 'callId': 'call-1', 'namespace': 'gptgrep_ocr', 'tool': 'ocr_resource', 'arguments': {'task_sha256': pending['task_sha256'], 'resource': 'image', 'artifact_id': artifact['id'], 'sha256': artifact['sha256']}}})
     elif message.get('id') == 101:
+        if MODE in ('cleanup_error_flood', 'cleanup_success_flood'):
+            pathlib.Path(__file__ + '.pid-writing').write_text(json.dumps([os.getpid()]))
+            os.replace(__file__ + '.pid-writing', __file__ + '.pid')
+        if MODE == 'cleanup_error_flood':
+            send({'method': 'thread/tokenUsage/updated', 'params': {'threadId': 'thread-1', 'turnId': 'turn-1', 'tokenUsage': {'total': {'inputTokens': 7, 'outputTokens': 0, 'private': 'not retained'}}}})
+            send({'method': 'error', 'params': {'threadId': 'thread-1', 'turnId': 'turn-1', 'willRetry': False, 'error': {'message': 'private synthetic diagnostic', 'codexErrorInfo': {'responseStreamDisconnected': {'httpStatusCode': 503}}}}})
+            cleanup_flood()
+            sys.exit(0)
         if MODE in ('hang', 'stderr_flood'):
             child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
             pathlib.Path(__file__ + '.pid-writing').write_text(json.dumps([os.getpid(), child.pid]))
@@ -753,6 +778,9 @@ for line in sys.stdin:
         status = 'partial' if MODE == 'partial' else 'complete'
         result = {'schema_version': 'gptgrep.ocr.result.v1', 'task_id': pending['task_id'], 'task_sha256': pending['task_sha256'], 'source_sha256': pending['source_sha256'], 'prepared_sha256': pending['prepared_sha256'], 'page': pending['page'], 'status': status, 'regions': [{'id': region['id'], 'bbox': region['bbox'], 'text': 'synthetic transcription', 'reading_order': index, 'status': status} for index, region in enumerate(pending['regions'])]}
         send({'method': 'turn/completed', 'params': {'threadId': 'thread-1', 'turn': {'id': 'turn-1', 'status': 'completed', 'error': None, 'items': [{'type': 'agentMessage', 'id': 'answer', 'phase': 'final_answer', 'text': json.dumps(result)}]}}})
+        if MODE == 'cleanup_success_flood':
+            cleanup_flood()
+            sys.exit(0)
 "##.replace("__MODE__", mode);
     fs::write(&script, &code).unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
@@ -853,6 +881,131 @@ async fn stderr_is_counted_and_flood_kills_group_without_releasing_provider_slot
     assert_eq!(budget.quarantined_slots, 1);
     assert_eq!(budget.terminal_admissions, 0);
     assert!(!fixture.dir.path().join("raw").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn captured_runtime_error_survives_cleanup_time_stderr_overflow() {
+    let fixture = Fixture::new();
+    let (executor, context, pid_path) = mock_executor(&fixture, "cleanup_error_flood", false);
+    let error = executor.probe_page(fixture.task.clone()).await.unwrap_err();
+    assert_eq!(error.to_string(), "ocr_runtime_error_completion_unknown");
+    let typed = error.downcast_ref::<crate::OcrRuntimeError>().unwrap();
+    assert_eq!(
+        typed.codex_error_info,
+        Some(crate::CodexErrorInfo::ResponseStreamDisconnected)
+    );
+    assert_eq!(typed.http_status_code, Some(503));
+    assert_eq!(typed.will_retry, Some(false));
+    assert_eq!(typed.usage.as_ref().unwrap()["total"]["inputTokens"], 7);
+    assert_eq!(typed.usage.as_ref().unwrap()["total"]["outputTokens"], 0);
+    assert!(!serde_json::to_string(typed).unwrap().contains("private"));
+    assert!(fixture.dir.path().join("mock-codex.after-term").exists());
+    let pids: Vec<u32> = serde_json::from_slice(&fs::read(pid_path).unwrap()).unwrap();
+    assert!(pids.into_iter().all(owned_pid_is_gone_or_zombie));
+    let budget = context.snapshot().unwrap();
+    assert_eq!(budget.charged_admissions, 1);
+    assert_eq!(budget.quarantined_slots, 1);
+    assert_eq!(budget.terminal_admissions, 0);
+    assert!(!fixture.dir.path().join("raw").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn captured_success_rejects_cleanup_time_stderr_overflow() {
+    let fixture = Fixture::new();
+    let (executor, context, pid_path) = mock_executor(&fixture, "cleanup_success_flood", false);
+    let error = executor.probe_page(fixture.task.clone()).await.unwrap_err();
+    assert_eq!(error.to_string(), "ocr_total_transport_limit");
+    assert!(fixture.dir.path().join("mock-codex.after-term").exists());
+    let pids: Vec<u32> = serde_json::from_slice(&fs::read(pid_path).unwrap()).unwrap();
+    assert!(pids.into_iter().all(owned_pid_is_gone_or_zombie));
+    let budget = context.snapshot().unwrap();
+    assert_eq!(budget.charged_admissions, 1);
+    assert_eq!(budget.quarantined_slots, 1);
+    assert_eq!(budget.terminal_admissions, 0);
+    assert!(!fixture.dir.path().join("raw").exists());
+}
+
+#[test]
+fn captured_typed_error_survives_later_meter_failure() {
+    let transport = ocr_protocol::TransportBudget::new(64);
+    let typed = crate::OcrRuntimeError::new(
+        &json!({"message":"not retained","codexErrorInfo":"unauthorized"}),
+        Some(false),
+        None,
+    );
+    let captured = crate::ocr::capture_page_outcome::<()>(Ok(Err(typed.into())), &transport);
+    assert!(transport.admit(65).is_err());
+    let error = crate::ocr::finish_page_outcome(captured, transport.check()).unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<crate::OcrRuntimeError>()
+            .unwrap()
+            .codex_error_info,
+        Some(crate::CodexErrorInfo::Unauthorized)
+    );
+}
+
+#[test]
+fn captured_typed_error_survives_later_drain_failure() {
+    let transport = ocr_protocol::TransportBudget::new(64);
+    let typed = crate::OcrRuntimeError::new(
+        &json!({"message":"not retained","codexErrorInfo":"unauthorized"}),
+        Some(false),
+        None,
+    );
+    let captured = crate::ocr::capture_page_outcome::<()>(Ok(Err(typed.into())), &transport);
+    let error = crate::ocr::finish_page_outcome(
+        captured,
+        Err(anyhow::anyhow!("ocr_stderr_cleanup_completion_unknown")),
+    )
+    .unwrap_err();
+    assert!(error.downcast_ref::<crate::OcrRuntimeError>().is_some());
+}
+
+#[tokio::test]
+async fn capture_preserves_preobserved_overflow_and_actual_outer_timeout_codes() {
+    let transport = ocr_protocol::TransportBudget::new(64);
+    assert!(transport.admit(65).is_err());
+    let error = crate::ocr::capture_page_outcome::<()>(
+        Ok(Err(anyhow::anyhow!("captured_concrete_failure"))),
+        &transport,
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "ocr_total_transport_limit");
+
+    let transport = ocr_protocol::TransportBudget::new(64);
+    let timeout =
+        tokio::time::timeout(Duration::ZERO, std::future::pending::<anyhow::Result<()>>()).await;
+    let captured = crate::ocr::capture_page_outcome(timeout, &transport);
+    let error =
+        crate::ocr::finish_page_outcome(captured, Err(anyhow::anyhow!("later_cleanup_failure")))
+            .unwrap_err();
+    assert_eq!(error.to_string(), "ocr_page_deadline_completion_unknown");
+}
+
+#[test]
+fn successful_capture_requires_final_meter_and_drain_safeguards() {
+    let transport = ocr_protocol::TransportBudget::new(64);
+    let captured = crate::ocr::capture_page_outcome(Ok(Ok(())), &transport);
+    assert!(transport.admit(65).is_err());
+    assert_eq!(
+        crate::ocr::finish_page_outcome(captured, transport.check())
+            .unwrap_err()
+            .to_string(),
+        "ocr_total_transport_limit"
+    );
+    assert_eq!(
+        crate::ocr::finish_page_outcome(
+            Ok(()),
+            Err(anyhow::anyhow!("ocr_stderr_cleanup_completion_unknown")),
+        )
+        .unwrap_err()
+        .to_string(),
+        "ocr_stderr_cleanup_completion_unknown"
+    );
+    crate::ocr::finish_page_outcome(Ok(()), Ok(())).unwrap();
 }
 
 #[cfg(unix)]
