@@ -12,11 +12,23 @@ pub use enrich::{
     EnrichmentUnit, enrich, plan_enrichment,
 };
 pub use enrich_accounting::EnrichCallSummary;
+mod ocr;
+mod ocr_accounting;
+mod ocr_protocol;
+#[cfg(test)]
+mod ocr_tests;
 mod process_group;
 mod protocol;
 pub use completion::{
     CompletionError, CompletionReport, MAX_COMPLETION_INPUT_BYTES, MAX_COMPLETION_OUTPUT_BYTES,
     complete_json,
+};
+pub use ocr::{
+    DEFAULT_OCR_MODEL, OcrHostConfig, OcrHostExecutor, OcrImageTransport, OcrProbeReport,
+    OcrRuntimeProfile,
+};
+pub use ocr_accounting::{
+    MAX_OCR_ADMISSIONS, MAX_OCR_CONCURRENCY, OcrBudgetSnapshot, OcrExecutionContext,
 };
 mod jev_accounting;
 mod model_attempts;
