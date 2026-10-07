@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
@@ -22,6 +23,15 @@ use tgrep_core::reader::IndexReader;
 const ENGINE_REVISION: &str = "1120aca41dd192ae61bdd996e9886cb354a78a27";
 const MANIFEST_NAME: &str = "gptgrep-index.json";
 const MANIFEST_VERSION: u32 = 1;
+const INDEX_ARTIFACTS: [&str; 7] = [
+    MANIFEST_NAME,
+    "meta.json",
+    "files-extra.bin",
+    "filestamps.json",
+    "files.bin",
+    "lookup.bin",
+    "index.bin",
+];
 
 /// Counts from a completely built text snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,122 +217,263 @@ pub fn search_with_document_and_predicate(
     literal: bool,
     limit: usize,
     document: Option<&Path>,
-    mut accept: impl FnMut(&Path) -> Result<bool>,
+    accept: impl FnMut(&Path) -> Result<bool>,
 ) -> Result<SearchResult> {
     ensure!(limit > 0, "search limit must be greater than zero");
-    let index_dir = index_dir
-        .canonicalize()
-        .context("resolve index directory")?;
-    let manifest: Manifest = serde_json::from_slice(
-        &fs::read(index_dir.join(MANIFEST_NAME)).context("read GPTgrep index manifest")?,
+    IndexSession::open(index_dir)?.search_with_document_and_predicate(
+        pattern,
+        case_insensitive,
+        literal,
+        limit,
+        document,
+        accept,
     )
-    .context("invalid GPTgrep index manifest")?;
-    ensure!(
-        manifest.complete
-            && manifest.version == MANIFEST_VERSION
-            && manifest.engine_revision == ENGINE_REVISION,
-        "incomplete or incompatible GPTgrep index manifest; rebuild_required: build a new generation with the current engine"
-    );
-    let root = resolve_root(&index_dir, &manifest.root_relative)?;
-    let reader = open_complete_index(&index_dir)?;
-    ensure!(
-        manifest.file_table_id == hex(&reader.file_table_id())
-            && manifest.files.len() == reader.num_files()
-            && reader
-                .all_paths()
-                .iter()
-                .all(|rel| manifest.files.contains_key(rel)),
-        "GPTgrep manifest does not match the index file table"
-    );
-    let document = document.map(normalized_document_path).transpose()?;
-    if let Some(document) = document {
+}
+
+/// A validated index and file table pinned to one immutable text generation.
+///
+/// Repeated searches reuse the open tgrep reader. Candidate text is still read
+/// and checked against its digest on every search; this session never treats a
+/// previously returned match as evidence that a changed file is valid.
+/// The owner must retain the generation and keep index files immutable.
+pub struct IndexSession {
+    dir: PathBuf,
+    root: PathBuf,
+    manifest: Manifest,
+    reader: IndexReader,
+    artifacts: Vec<(u64, String)>,
+}
+
+impl IndexSession {
+    pub fn open(index_dir: &Path) -> Result<Self> {
+        let index_dir = index_dir
+            .canonicalize()
+            .context("resolve index directory")?;
+        let manifest: Manifest = serde_json::from_slice(
+            &fs::read(index_dir.join(MANIFEST_NAME)).context("read GPTgrep index manifest")?,
+        )
+        .context("invalid GPTgrep index manifest")?;
         ensure!(
-            manifest.files.contains_key(document),
-            "unknown indexed document: {document}"
+            manifest.complete
+                && manifest.version == MANIFEST_VERSION
+                && manifest.engine_revision == ENGINE_REVISION,
+            "incomplete or incompatible GPTgrep index manifest; rebuild_required: build a new generation with the current engine"
         );
+        let artifacts = INDEX_ARTIFACTS
+            .iter()
+            .map(|name| artifact_digest(&index_dir.join(name)))
+            .collect::<Result<Vec<_>>>()?;
+        let root = resolve_root(&index_dir, &manifest.root_relative)?;
+        let reader = open_complete_index(&index_dir)?;
+        ensure!(
+            manifest.file_table_id == hex(&reader.file_table_id())
+                && manifest.files.len() == reader.num_files()
+                && reader
+                    .all_paths()
+                    .iter()
+                    .all(|rel| manifest.files.contains_key(rel)),
+            "GPTgrep manifest does not match the index file table"
+        );
+        let session = Self {
+            dir: index_dir,
+            root,
+            manifest,
+            reader,
+            artifacts,
+        };
+        session.validate()?;
+        Ok(session)
     }
 
-    let escaped = if literal {
-        regex::escape(pattern)
-    } else {
-        pattern.into()
-    };
-    // tgrep's lowercased postings cover ASCII, while regex case folding includes
-    // Unicode (e.g. K/kelvin sign and S/long-s). Let regex-syntax expand the SAME
-    // regex used below; its character classes conservatively yield MatchAll.
-    let source = if case_insensitive {
-        format!("(?i:{escaped})")
-    } else {
-        escaped
-    };
-    let matcher = Regex::new(&source).context("invalid search regex")?;
-    let plan = query::build_query_plan(&source, false).map_err(anyhow::Error::msg)?;
-    let ids = if plan.is_match_all() {
-        reader.all_file_ids()
-    } else {
-        query::execute_plan_with_masks(&plan, &|tri| reader.lookup_trigram_with_masks(tri))
-    };
-    let mut paths = ids
-        .into_iter()
-        .map(|id| {
-            reader
-                .file_path(id)
-                .context("index returned an unknown file ID")
-        })
-        .collect::<Result<Vec<_>>>()?;
-    // A literal/escaped BOM cannot occur in tgrep's decoded postings. Include
-    // these files conservatively, then verify the original UTF-8 text below.
-    paths.extend(
-        manifest
-            .files
-            .iter()
-            .filter(|(_, version)| version.has_bom)
-            .map(|(rel, _)| rel.as_str()),
-    );
-    paths.sort_unstable();
-    paths.dedup();
-    if let Some(document) = document {
-        // Filter before opening/verifying candidate files or counting matches.
-        // Unrelated matches must not consume this document's result budget.
-        paths.retain(|relative| *relative == document);
-    }
-    let mut result = SearchResult {
-        hits: Vec::new(),
-        candidate_files: paths.len(),
-        verified_files: 0,
-        truncated: false,
-    };
-    for rel in paths {
-        if !accept(Path::new(rel))? {
-            continue;
-        }
-        let version = manifest
-            .files
-            .get(rel)
-            .context("candidate missing from manifest")?;
-        let data = read_owned_file(&root, rel)?;
+    /// Recheck the retained artifacts without reopening the mapped reader.
+    /// These streaming reads count as physical reads, even on a warm OS cache.
+    /// The generation owner must prevent concurrent in-place writes to mapped
+    /// files; validation detects corruption between operations, not hostile
+    /// changes racing a memory-mapped access.
+    pub fn validate(&self) -> Result<()> {
+        let metadata = fs::symlink_metadata(&self.dir)?;
         ensure!(
-            data.len() as u64 == version.bytes && sha256(&data) == version.sha256,
-            "normalized snapshot file changed after indexing: {rel}"
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "index directory became a symlink or is not a directory"
         );
-        let text = std::str::from_utf8(&data)
-            .with_context(|| format!("normalized snapshot is not UTF-8: {rel}"))?;
-        result.verified_files += 1;
-        for (index, line) in text.lines().enumerate() {
-            if matcher.is_match(line) {
-                if result.hits.len() == limit {
-                    result.truncated = true;
-                    return Ok(result);
+        ensure!(
+            resolve_root(&self.dir, &self.manifest.root_relative)? == self.root,
+            "normalized text root changed"
+        );
+        for (name, expected) in INDEX_ARTIFACTS.iter().zip(&self.artifacts) {
+            ensure!(
+                &artifact_digest(&self.dir.join(name))? == expected,
+                "retained index artifact changed: {name}"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn search(
+        &self,
+        pattern: &str,
+        case_insensitive: bool,
+        literal: bool,
+        limit: usize,
+    ) -> Result<SearchResult> {
+        self.search_with_document(pattern, case_insensitive, literal, limit, None)
+    }
+
+    pub fn search_with_document(
+        &self,
+        pattern: &str,
+        case_insensitive: bool,
+        literal: bool,
+        limit: usize,
+        document: Option<&Path>,
+    ) -> Result<SearchResult> {
+        self.search_with_document_and_predicate(
+            pattern,
+            case_insensitive,
+            literal,
+            limit,
+            document,
+            |_| Ok(true),
+        )
+    }
+
+    pub fn search_with_document_and_predicate(
+        &self,
+        pattern: &str,
+        case_insensitive: bool,
+        literal: bool,
+        limit: usize,
+        document: Option<&Path>,
+        mut accept: impl FnMut(&Path) -> Result<bool>,
+    ) -> Result<SearchResult> {
+        ensure!(limit > 0, "search limit must be greater than zero");
+        self.validate()?;
+        let root = &self.root;
+        let manifest = &self.manifest;
+        let reader = &self.reader;
+        let document = document.map(normalized_document_path).transpose()?;
+        if let Some(document) = document {
+            ensure!(
+                manifest.files.contains_key(document),
+                "unknown indexed document: {document}"
+            );
+        }
+
+        let escaped = if literal {
+            regex::escape(pattern)
+        } else {
+            pattern.into()
+        };
+        // tgrep's lowercased postings cover ASCII, while regex case folding includes
+        // Unicode (e.g. K/kelvin sign and S/long-s). Let regex-syntax expand the SAME
+        // regex used below; its character classes conservatively yield MatchAll.
+        let source = if case_insensitive {
+            format!("(?i:{escaped})")
+        } else {
+            escaped
+        };
+        let matcher = Regex::new(&source).context("invalid search regex")?;
+        let plan = query::build_query_plan(&source, false).map_err(anyhow::Error::msg)?;
+        let ids = if plan.is_match_all() {
+            reader.all_file_ids()
+        } else {
+            query::execute_plan_with_masks(&plan, &|tri| reader.lookup_trigram_with_masks(tri))
+        };
+        let mut paths = ids
+            .into_iter()
+            .map(|id| {
+                reader
+                    .file_path(id)
+                    .context("index returned an unknown file ID")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // A literal/escaped BOM cannot occur in tgrep's decoded postings. Include
+        // these files conservatively, then verify the original UTF-8 text below.
+        paths.extend(
+            manifest
+                .files
+                .iter()
+                .filter(|(_, version)| version.has_bom)
+                .map(|(rel, _)| rel.as_str()),
+        );
+        paths.sort_unstable();
+        paths.dedup();
+        if let Some(document) = document {
+            // Filter before opening/verifying candidate files or counting matches.
+            // Unrelated matches must not consume this document's result budget.
+            paths.retain(|relative| *relative == document);
+        }
+        let mut result = SearchResult {
+            hits: Vec::new(),
+            candidate_files: paths.len(),
+            verified_files: 0,
+            truncated: false,
+        };
+        for rel in paths {
+            if !accept(Path::new(rel))? {
+                continue;
+            }
+            let version = manifest
+                .files
+                .get(rel)
+                .context("candidate missing from manifest")?;
+            let data = read_owned_file(root, rel)?;
+            ensure!(
+                data.len() as u64 == version.bytes && sha256(&data) == version.sha256,
+                "normalized snapshot file changed after indexing: {rel}"
+            );
+            let text = std::str::from_utf8(&data)
+                .with_context(|| format!("normalized snapshot is not UTF-8: {rel}"))?;
+            result.verified_files += 1;
+            for (index, line) in text.lines().enumerate() {
+                if matcher.is_match(line) {
+                    if result.hits.len() == limit {
+                        result.truncated = true;
+                        return Ok(result);
+                    }
+                    result.hits.push(Match {
+                        path: PathBuf::from(rel),
+                        line_number: index + 1,
+                        line: line.into(),
+                    });
                 }
-                result.hits.push(Match {
-                    path: PathBuf::from(rel),
-                    line_number: index + 1,
-                    line: line.into(),
-                });
             }
         }
+        Ok(result)
     }
-    Ok(result)
+}
+
+fn artifact_digest(path: &Path) -> Result<(u64, String)> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("retained index artifact missing: {}", path.display()))?;
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "retained index artifact is not an owned regular file: {}",
+        path.display()
+    );
+    let mut file = fs::File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut read = 0_u64;
+    let mut buffer = [0_u8; 16384];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        read = read
+            .checked_add(count as u64)
+            .context("index artifact length overflow")?;
+        ensure!(
+            read <= metadata.len(),
+            "index artifact grew during validation"
+        );
+        hash.update(&buffer[..count]);
+    }
+    ensure!(
+        read == metadata.len(),
+        "index artifact length changed during validation"
+    );
+    Ok((read, hex(&hash.finalize())))
 }
 
 fn normalized_document_path(document: &Path) -> Result<&str> {

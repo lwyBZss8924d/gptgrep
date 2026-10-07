@@ -33,6 +33,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const SCHEMA: &str = "gptgrep.v1";
@@ -695,13 +696,30 @@ pub async fn index_with_options(
     })
 }
 
-struct Snapshot {
-    manifest: Manifest,
-    dir: PathBuf,
+/// Exact retained generation identity. Passing a pin never follows CURRENT.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationPin {
+    pub generation: String,
+    pub manifest_sha256: String,
 }
 
-impl Snapshot {
-    fn open(root: &Path) -> Result<Self> {
+/// Reusable reader of a retained, immutable generation.
+///
+/// Opening resolves CURRENT once. Source freshness and candidate text digests
+/// are checked for each operation; retained generations must not be removed or
+/// edited while readers use them. No source discovery or publication occurs.
+pub struct GenerationReader {
+    manifest: Manifest,
+    dir: PathBuf,
+    pin: GenerationPin,
+    index: OnceLock<std::result::Result<gptgrep_index::IndexSession, String>>,
+}
+
+type Snapshot = GenerationReader;
+
+impl GenerationReader {
+    pub fn open(root: &Path) -> Result<Self> {
         let root = root.canonicalize()?;
         let state = root.join(STATE);
         ensure!(
@@ -718,29 +736,48 @@ impl Snapshot {
             pointer.schema_version == SCHEMA,
             "unsupported index schema; reindex required"
         );
+        Self::open_pinned(
+            &root,
+            &GenerationPin {
+                generation: pointer.generation,
+                manifest_sha256: pointer.manifest_sha256,
+            },
+        )
+    }
+
+    /// Open exactly a retained generation without reading CURRENT.
+    pub fn open_pinned(root: &Path, pin: &GenerationPin) -> Result<Self> {
+        let root = root.canonicalize()?;
+        let state = root.join(STATE);
+        no_symlink(&state)?;
         ensure!(
-            !pointer.generation.is_empty()
-                && pointer
+            pin.manifest_sha256.len() == 64
+                && pin.manifest_sha256.bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid manifest digest"
+        );
+        ensure!(
+            !pin.generation.is_empty()
+                && pin
                     .generation
                     .bytes()
                     .all(|x| x.is_ascii_alphanumeric() || x == b'-'),
             "invalid generation ID"
         );
-        let dir = state.join("generations").join(&pointer.generation);
+        let dir = state.join("generations").join(&pin.generation);
         no_symlink(&state.join("generations"))?;
         no_symlink(&dir)?;
         no_symlink(&dir.join("manifest.json"))?;
         no_symlink(&dir.join("trigram"))?;
         let bytes = bounded_read(&dir.join("manifest.json"), MAX_MANIFEST_BYTES)?;
         ensure!(
-            digest(&bytes) == pointer.manifest_sha256,
+            digest(&bytes) == pin.manifest_sha256,
             "index manifest digest mismatch; reindex required"
         );
         let manifest: Manifest = serde_json::from_slice(&bytes)?;
         ensure!(
             manifest.schema_version == SCHEMA
                 && manifest.root == root
-                && manifest.generation == pointer.generation,
+                && manifest.generation == pin.generation,
             "index identity mismatch; reindex at current root"
         );
         ensure!(
@@ -751,8 +788,88 @@ impl Snapshot {
             "invalid document IDs"
         );
         validate_manifest(&manifest)?;
-        Ok(Self { manifest, dir })
+        Ok(Self {
+            manifest,
+            dir,
+            pin: pin.clone(),
+            index: OnceLock::new(),
+        })
     }
+    pub fn pin(&self) -> GenerationPin {
+        self.pin.clone()
+    }
+
+    fn validate(&self) -> Result<()> {
+        let state = self.manifest.root.join(STATE);
+        no_symlink(&state)?;
+        no_symlink(&state.join("generations"))?;
+        no_symlink(&self.dir)?;
+        no_symlink(&self.dir.join("manifest.json"))?;
+        no_symlink(&self.dir.join("trigram"))?;
+        ensure!(
+            digest(&bounded_read(
+                &self.dir.join("manifest.json"),
+                MAX_MANIFEST_BYTES
+            )?) == self.pin.manifest_sha256,
+            "retained generation manifest changed; reindex required"
+        );
+        if let Some(Ok(index)) = self.index.get() {
+            index.validate()?;
+        }
+        Ok(())
+    }
+
+    fn index_session(&self) -> Result<&gptgrep_index::IndexSession> {
+        match self.index.get_or_init(|| {
+            gptgrep_index::IndexSession::open(&self.dir.join("trigram"))
+                .map_err(|error| format!("{error:#}"))
+        }) {
+            Ok(index) => Ok(index),
+            Err(error) => bail!("retained generation index is invalid: {error}"),
+        }
+    }
+
+    pub fn status(&self) -> Result<Value> {
+        reader_status(self)
+    }
+    pub fn catalog(&self) -> Result<Value> {
+        reader_catalog(self)
+    }
+    pub fn tree(&self, path: &Path) -> Result<Value> {
+        reader_tree(self, path)
+    }
+    pub fn read_node(&self, node_id: &str, max_bytes: usize) -> Result<Hit> {
+        self.read_node_window(node_id, max_bytes, 0)
+    }
+    pub fn read_node_window(
+        &self,
+        node_id: &str,
+        max_bytes: usize,
+        offset_bytes: usize,
+    ) -> Result<Hit> {
+        reader_read_node_window(self, node_id, max_bytes, offset_bytes)
+    }
+    pub async fn search(&self, query: &str, options: &SearchOptions) -> Result<SearchReport> {
+        search_reader_using_client(self, query, options, None, None).await
+    }
+    pub async fn search_with_client(
+        &self,
+        query: &str,
+        options: &SearchOptions,
+        client: &JevClient,
+    ) -> Result<SearchReport> {
+        search_reader_using_client(self, query, options, Some(client), None).await
+    }
+    pub async fn search_with_client_and_observer(
+        &self,
+        query: &str,
+        options: &SearchOptions,
+        client: &JevClient,
+        observer: &JevSearchObserver<'_>,
+    ) -> Result<SearchReport> {
+        search_reader_using_client(self, query, options, Some(client), Some(observer)).await
+    }
+
     fn text(&self, doc: &Document) -> Result<String> {
         no_symlink(&self.dir.join("text"))?;
         no_symlink(&self.dir.join("text").join(format!("{}.txt", doc.id)))?;
@@ -784,7 +901,11 @@ impl Snapshot {
 }
 
 pub fn status(root: &Path) -> Result<Value> {
-    let snapshot = Snapshot::open(root)?;
+    GenerationReader::open(root)?.status()
+}
+
+fn reader_status(snapshot: &GenerationReader) -> Result<Value> {
+    snapshot.validate()?;
     let stale: Vec<_> = snapshot
         .manifest
         .documents
@@ -801,7 +922,11 @@ pub fn status(root: &Path) -> Result<Value> {
 }
 
 pub fn tree(root: &Path, path: &Path) -> Result<Value> {
-    let snapshot = Snapshot::open(root)?;
+    GenerationReader::open(root)?.tree(path)
+}
+
+fn reader_tree(snapshot: &GenerationReader, path: &Path) -> Result<Value> {
+    snapshot.validate()?;
     let input = if path.is_absolute() {
         path.strip_prefix(&snapshot.manifest.root)?.to_path_buf()
     } else {
@@ -843,10 +968,26 @@ pub fn read_node_window(
         (1..=65536).contains(&max_bytes),
         "max-bytes must be 1..65536"
     );
+    node_id
+        .split_once(':')
+        .context("node ID must be document_id:node_id from search/tree")?;
+    GenerationReader::open(root)?.read_node_window(node_id, max_bytes, offset_bytes)
+}
+
+fn reader_read_node_window(
+    snapshot: &GenerationReader,
+    node_id: &str,
+    max_bytes: usize,
+    offset_bytes: usize,
+) -> Result<Hit> {
+    ensure!(
+        (1..=65536).contains(&max_bytes),
+        "max-bytes must be 1..65536"
+    );
     let (doc_id, local_id) = node_id
         .split_once(':')
         .context("node ID must be document_id:node_id from search/tree")?;
-    let snapshot = Snapshot::open(root)?;
+    snapshot.validate()?;
     let doc = snapshot
         .manifest
         .documents
@@ -901,6 +1042,7 @@ pub fn read_node_window(
         snapshot.fresh(doc),
         "source changed or disappeared; reindex before reading evidence"
     );
+    snapshot.validate()?;
     Ok(result)
 }
 
@@ -1207,10 +1349,22 @@ async fn search_using_client(
     supplied_client: Option<&JevClient>,
     observer: Option<&JevSearchObserver<'_>>,
 ) -> Result<SearchReport> {
+    validate_search_options(query, options)?;
+    let reader = GenerationReader::open(root)?;
+    search_reader_using_client(&reader, query, options, supplied_client, observer).await
+}
+
+async fn search_reader_using_client(
+    snapshot: &GenerationReader,
+    query: &str,
+    options: &SearchOptions,
+    supplied_client: Option<&JevClient>,
+    observer: Option<&JevSearchObserver<'_>>,
+) -> Result<SearchReport> {
     let started = Instant::now();
     validate_search_options(query, options)?;
     let model_assisted = matches!(options.mode.as_str(), "hybrid" | "semantic");
-    let snapshot = Snapshot::open(root)?;
+    snapshot.validate()?;
     let scoped = scoped_documents(&snapshot.manifest.documents, options.document.as_deref())?;
     let coverage = Coverage {
         indexed_files: snapshot.manifest.documents.len(),
@@ -1237,7 +1391,7 @@ async fn search_using_client(
         None
     };
     let mut batch = collect_candidate_view(
-        &snapshot,
+        snapshot,
         query,
         options,
         client.as_ref(),
@@ -1248,7 +1402,7 @@ async fn search_using_client(
     .await?;
     if let Some(client) = client.as_ref() {
         score_candidates(
-            &snapshot,
+            snapshot,
             query,
             options,
             client,
@@ -1259,20 +1413,21 @@ async fn search_using_client(
         )
         .await?;
     }
-    finish_candidate_batch(&snapshot, options, &mut batch);
+    finish_candidate_batch(snapshot, options, &mut batch);
     let CandidateBatch {
         hits,
         coverage,
         warnings,
     } = batch;
+    snapshot.validate()?;
     metrics.elapsed_ms = started.elapsed().as_millis();
     Ok(SearchReport {
         schema_version: SCHEMA.into(),
         query: query.into(),
         mode: options.mode.clone(),
         document_scope: options.document.clone(),
-        root: snapshot.manifest.root,
-        generation: snapshot.manifest.generation,
+        root: snapshot.manifest.root.clone(),
+        generation: snapshot.manifest.generation.clone(),
         index_used: true,
         source_fresh: if hits.is_empty() { None } else { Some(true) },
         minimum_relevance_score: model_assisted.then_some(options.min_score),
@@ -1334,30 +1489,31 @@ async fn collect_candidate_view(
         let verifier = regex::RegexBuilder::new(&verification_pattern)
             .case_insensitive(options.case_insensitive || options.mode != "regex")
             .build()?;
-        let matches = gptgrep_index::search_with_document_and_predicate(
-            &snapshot.dir.join("trigram"),
-            &pattern,
-            options.case_insensitive || options.mode != "regex",
-            options.literal && options.mode == "regex",
-            if options.mode == "regex" {
-                options.limit + 1
-            } else {
-                10_000
-            },
-            indexed_document.as_deref(),
-            |relative| {
-                let id = relative
-                    .file_stem()
-                    .and_then(|value| value.to_str())
-                    .context("invalid trigram document path")?;
-                let document = docs
-                    .get(id)
-                    .context("trigram document missing from manifest")?;
-                Ok(*freshness
-                    .entry(document.id.clone())
-                    .or_insert_with(|| snapshot.fresh(document)))
-            },
-        )?;
+        let matches = snapshot
+            .index_session()?
+            .search_with_document_and_predicate(
+                &pattern,
+                options.case_insensitive || options.mode != "regex",
+                options.literal && options.mode == "regex",
+                if options.mode == "regex" {
+                    options.limit + 1
+                } else {
+                    10_000
+                },
+                indexed_document.as_deref(),
+                |relative| {
+                    let id = relative
+                        .file_stem()
+                        .and_then(|value| value.to_str())
+                        .context("invalid trigram document path")?;
+                    let document = docs
+                        .get(id)
+                        .context("trigram document missing from manifest")?;
+                    Ok(*freshness
+                        .entry(document.id.clone())
+                        .or_insert_with(|| snapshot.fresh(document)))
+                },
+            )?;
         coverage.candidate_files = matches.candidate_files;
         coverage.verified_files = matches.verified_files;
         coverage.truncated = matches.truncated;
@@ -1745,7 +1901,11 @@ fn known_stale_paths(
 
 /// Inspect all indexed documents without loading their body text.
 pub fn catalog(root: &Path) -> Result<Value> {
-    let snapshot = Snapshot::open(root)?;
+    GenerationReader::open(root)?.catalog()
+}
+
+fn reader_catalog(snapshot: &GenerationReader) -> Result<Value> {
+    snapshot.validate()?;
     let docs: Vec<_> = snapshot.manifest.documents.iter().map(|d| json!({"id":d.id,"path":d.path,"title":d.title,
         "pages":d.pages.len(),"nodes":d.nodes.len(),"parser":d.parser,"source_sha256":d.source_sha256})).collect();
     Ok(json!({"schema_version":SCHEMA,"generation":snapshot.manifest.generation,"documents":docs}))
@@ -1763,6 +1923,260 @@ mod tests {
             mode: "regex".into(),
             ..Default::default()
         }
+    }
+
+    fn comparable_report(report: SearchReport) -> Result<Value> {
+        let mut value = serde_json::to_value(report)?;
+        value["metrics"]
+            .as_object_mut()
+            .unwrap()
+            .remove("elapsed_ms");
+        Ok(value)
+    }
+
+    #[tokio::test]
+    async fn generation_reader_reuses_index_and_matches_single_operations() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(
+            dir.path().join("a.md"),
+            "# Heading\nalpha.beta\nKEY\n中国文档\n",
+        )?;
+        fs::write(dir.path().join("b.txt"), "alphaXbeta\nKEY\n")?;
+        index(dir.path(), 10).await?;
+        let reader = GenerationReader::open(dir.path())?;
+        assert!(reader.index.get().is_none());
+        assert_eq!(reader.catalog()?, catalog(dir.path())?);
+        assert_eq!(
+            reader.tree(Path::new("a.md"))?,
+            tree(dir.path(), Path::new("a.md"))?
+        );
+        assert_eq!(reader.status()?, status(dir.path())?);
+        for (query, literal, insensitive, limit, scope) in [
+            ("alpha.beta", true, false, 10, None),
+            ("^alpha.beta$", false, false, 1, None),
+            ("key", true, true, 10, Some("a.md")),
+            ("中国", true, false, 10, None),
+            ("missing-token", true, false, 10, None),
+        ] {
+            let options = SearchOptions {
+                literal,
+                case_insensitive: insensitive,
+                limit,
+                document: scope.map(str::to_owned),
+                ..regex_options()
+            };
+            let reused = reader.search(query, &options).await?;
+            let single = search(dir.path(), query, &options).await?;
+            assert_eq!(comparable_report(reused)?, comparable_report(single)?);
+        }
+        let first_index = reader.index_session()? as *const _;
+        assert_eq!(first_index, reader.index_session()? as *const _);
+        let id = format!(
+            "{}:{}",
+            reader.manifest.documents[0].id, reader.manifest.documents[0].nodes[0].id
+        );
+        assert_eq!(
+            serde_json::to_value(reader.read_node_window(&id, 5, 0)?)?,
+            serde_json::to_value(read_node_window(dir.path(), &id, 5, 0)?)?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn generation_reader_stays_pinned_during_publication_and_retained_reopen() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join("a.txt"), "old needle\n")?;
+        index(dir.path(), 10).await?;
+        let reader = GenerationReader::open(dir.path())?;
+        let pin = reader.pin();
+        fs::write(dir.path().join("b.txt"), "new needle\n")?;
+        let options = regex_options();
+        let (published, observed) =
+            tokio::join!(index(dir.path(), 10), reader.search("needle", &options));
+        let published = published?;
+        let observed = observed?;
+        assert_ne!(published.generation, pin.generation);
+        assert_eq!(observed.generation, pin.generation);
+        assert_eq!(observed.hits.len(), 1);
+        assert_eq!(observed.hits[0].path, "a.txt");
+        assert_eq!(reader.catalog()?["documents"].as_array().unwrap().len(), 1);
+        let reopened = GenerationReader::open_pinned(dir.path(), &pin)?;
+        assert_eq!(reopened.pin(), pin);
+        assert_eq!(
+            reopened
+                .search("needle", &regex_options())
+                .await?
+                .hits
+                .len(),
+            1
+        );
+        assert_eq!(
+            search(dir.path(), "needle", &regex_options())
+                .await?
+                .hits
+                .len(),
+            2
+        );
+        fs::write(
+            dir.path().join(STATE).join("CURRENT.json"),
+            b"broken current pointer",
+        )?;
+        assert!(GenerationReader::open(dir.path()).is_err());
+        assert_eq!(
+            GenerationReader::open_pinned(dir.path(), &pin)?.catalog()?,
+            reader.catalog()?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn generation_reader_rechecks_sources_text_and_shared_manifest() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join("a.txt"), "needle original\n")?;
+        index(dir.path(), 10).await?;
+        let reader = GenerationReader::open(dir.path())?;
+        let doc = &reader.manifest.documents[0];
+        let id = format!("{}:{}", doc.id, doc.nodes[0].id);
+        reader.search("needle", &regex_options()).await?;
+        fs::write(
+            reader.dir.join("text").join(format!("{}.txt", doc.id)),
+            "needle tampered\n",
+        )?;
+        assert!(reader.search("needle", &regex_options()).await.is_err());
+        assert!(reader.read_node(&id, 100).is_err());
+        fs::write(
+            reader.dir.join("text").join(format!("{}.txt", doc.id)),
+            "needle original\n",
+        )?;
+        fs::write(dir.path().join("a.txt"), "changed source\n")?;
+        assert!(reader.read_node(&id, 100).is_err());
+        assert!(reader.tree(Path::new("a.txt")).is_err());
+        let stale = reader.search("needle", &regex_options()).await?;
+        assert!(stale.hits.is_empty());
+        assert_eq!(stale.coverage.stale_files, ["a.txt"]);
+        fs::write(reader.dir.join("manifest.json"), "{}")?;
+        assert!(reader.catalog().is_err());
+        assert!(reader.status().is_err());
+        assert!(reader.search("needle", &regex_options()).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn generation_pin_rejects_invalid_identity_and_allows_legacy_metadata_reads() -> Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join("a.txt"), "needle\n")?;
+        index(dir.path(), 10).await?;
+        let reader = GenerationReader::open(dir.path())?;
+        let pin = reader.pin();
+        for bad in [
+            GenerationPin {
+                generation: "../escape".into(),
+                ..pin.clone()
+            },
+            GenerationPin {
+                manifest_sha256: "0".repeat(64),
+                ..pin.clone()
+            },
+            GenerationPin {
+                manifest_sha256: "invalid".into(),
+                ..pin.clone()
+            },
+        ] {
+            assert!(GenerationReader::open_pinned(dir.path(), &bad).is_err());
+        }
+        let index_manifest = reader.dir.join("trigram/gptgrep-index.json");
+        let mut value: Value = serde_json::from_slice(&fs::read(&index_manifest)?)?;
+        value["engine_revision"] = json!("legacy-engine");
+        fs::write(index_manifest, serde_json::to_vec(&value)?)?;
+        assert_eq!(reader.catalog()?["documents"].as_array().unwrap().len(), 1);
+        assert!(
+            format!(
+                "{:#}",
+                reader.search("needle", &regex_options()).await.unwrap_err()
+            )
+            .contains("rebuild_required")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn generation_reader_propagates_shared_index_corruption_after_reuse() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join("a.txt"), "needle\n")?;
+        index(dir.path(), 10).await?;
+        let reader = GenerationReader::open(dir.path())?;
+        reader.search("needle", &regex_options()).await?;
+        fs::remove_file(reader.dir.join("trigram/gptgrep-index.json"))?;
+        assert!(reader.search("needle", &regex_options()).await.is_err());
+        assert!(reader.catalog().is_err());
+        assert!(reader.tree(Path::new("a.txt")).is_err());
+        assert!(reader.status().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_node_id_is_rejected_before_opening_a_missing_root() {
+        let error =
+            read_node_window(Path::new("/missing-gptgrep-root"), "bad-id", 100, 0).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("node ID must be document_id:node_id")
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_reader_is_shared_across_threads_while_new_generation_publishes()
+    -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join("a.txt"), "old needle\n")?;
+        index(dir.path(), 10).await?;
+        let reader = Arc::new(GenerationReader::open(dir.path())?);
+        let pin = reader.pin();
+        fs::write(dir.path().join("b.txt"), "new needle\n")?;
+        let barrier = Arc::new(std::sync::Barrier::new(5));
+        let mut threads = Vec::new();
+        for _ in 0..3 {
+            let reader = Arc::clone(&reader);
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || -> Result<Vec<SearchReport>> {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                barrier.wait();
+                runtime.block_on(async {
+                    let mut reports = Vec::new();
+                    for _ in 0..8 {
+                        reports.push(reader.search("needle", &regex_options()).await?);
+                    }
+                    Ok(reports)
+                })
+            }));
+        }
+        let publish_root = dir.path().to_owned();
+        let publish_barrier = Arc::clone(&barrier);
+        let publisher = std::thread::spawn(move || -> Result<IndexReport> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            publish_barrier.wait();
+            runtime.block_on(index(&publish_root, 10))
+        });
+        barrier.wait();
+        assert_ne!(publisher.join().unwrap()?.generation, pin.generation);
+        for thread in threads {
+            for report in thread.join().unwrap()? {
+                assert_eq!(report.generation, pin.generation);
+                assert_eq!(report.hits.len(), 1);
+                assert_eq!(report.hits[0].path, "a.txt");
+            }
+        }
+        assert_eq!(
+            GenerationReader::open(dir.path())?.manifest.documents.len(),
+            2
+        );
+        Ok(())
     }
 
     async fn mock_jev(

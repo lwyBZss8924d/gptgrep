@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use gptgrep_index::{
-    Match, build, search, search_with_document, search_with_document_and_predicate,
+    IndexSession, Match, build, search, search_with_document, search_with_document_and_predicate,
 };
 use tempfile::TempDir;
 
@@ -18,6 +18,161 @@ fn fixture(files: &[(&str, &str)]) -> (TempDir, PathBuf, PathBuf) {
     }
     build(&root, &index).unwrap();
     (temp, root, index)
+}
+
+#[test]
+fn reused_session_matches_single_searches_and_preserves_scope_and_admission() {
+    let (_temp, _root, index) = fixture(&[
+        ("a.txt", "alpha.beta\nKEY\n中国文档\n"),
+        ("b.txt", "alphaXbeta\nKEY\n"),
+    ]);
+    let session = IndexSession::open(&index).unwrap();
+    for (pattern, insensitive, literal, limit) in [
+        ("alpha.beta", false, true, 10),
+        ("^alpha.beta$", false, false, 1),
+        ("key", true, true, 10),
+        ("中国", false, true, 10),
+        ("missing-token", false, true, 10),
+    ] {
+        let reused = session
+            .search(pattern, insensitive, literal, limit)
+            .unwrap();
+        let single = search(&index, pattern, insensitive, literal, limit).unwrap();
+        assert_eq!(reused.hits, single.hits);
+        assert_eq!(reused.candidate_files, single.candidate_files);
+        assert_eq!(reused.verified_files, single.verified_files);
+        assert_eq!(reused.truncated, single.truncated);
+    }
+    let mut visited = Vec::new();
+    let result = session
+        .search_with_document_and_predicate(
+            "alpha",
+            false,
+            true,
+            1,
+            Some(Path::new("b.txt")),
+            |relative| {
+                visited.push(relative.to_owned());
+                Ok(true)
+            },
+        )
+        .unwrap();
+    assert_eq!(visited, [PathBuf::from("b.txt")]);
+    assert_eq!(result.hits[0].path, Path::new("b.txt"));
+    assert!(
+        session
+            .search_with_document("alpha", false, true, 1, Some(Path::new("../a.txt")))
+            .is_err()
+    );
+}
+
+#[test]
+fn reused_session_rechecks_changed_and_deleted_candidate_text() {
+    let (_temp, root, index) = fixture(&[("a.txt", "matching token\n")]);
+    let session = IndexSession::open(&index).unwrap();
+    assert_eq!(
+        session
+            .search("matching", false, true, 10)
+            .unwrap()
+            .hits
+            .len(),
+        1
+    );
+    fs::write(root.join("a.txt"), "matching edit!\n").unwrap();
+    assert!(
+        session
+            .search("matching", false, true, 10)
+            .unwrap_err()
+            .to_string()
+            .contains("changed")
+    );
+    fs::remove_file(root.join("a.txt")).unwrap();
+    assert!(
+        session
+            .search("matching", false, true, 10)
+            .unwrap_err()
+            .to_string()
+            .contains("missing")
+    );
+}
+
+#[test]
+fn reused_session_rejects_changed_and_missing_index_artifacts() {
+    for name in [
+        "gptgrep-index.json",
+        "meta.json",
+        "files-extra.bin",
+        "filestamps.json",
+        "files.bin",
+    ] {
+        let (_temp, _root, index) = fixture(&[("a.txt", "matching token\n")]);
+        let session = IndexSession::open(&index).unwrap();
+        session.search("matching", false, true, 10).unwrap();
+        let path = index.join(name);
+        let bytes = fs::read(&path).unwrap();
+        let mut corrupted = bytes.clone();
+        corrupted[0] ^= 1;
+        fs::write(&path, corrupted).unwrap();
+        assert!(
+            session.search("matching", false, true, 10).is_err(),
+            "{name}"
+        );
+        fs::write(&path, bytes).unwrap();
+        fs::remove_file(path).unwrap();
+        assert!(
+            session.search("matching", false, true, 10).is_err(),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn old_engine_session_requires_rebuild_before_reading_new_artifacts() {
+    let (_temp, _root, index) = fixture(&[("a.txt", "matching token\n")]);
+    let path = index.join("gptgrep-index.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    manifest["engine_revision"] = "legacy-engine".into();
+    fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    fs::remove_file(index.join("filestamps.json")).unwrap();
+    let error = match IndexSession::open(&index) {
+        Ok(_) => panic!("old engine must not open"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("rebuild_required"));
+}
+
+#[cfg(unix)]
+#[test]
+fn reused_session_rejects_root_and_artifact_symlinks_and_replaced_postings() {
+    use std::os::unix::fs::symlink;
+    let (temp, root, index) = fixture(&[("a.txt", "matching token\n")]);
+    let session = IndexSession::open(&index).unwrap();
+    session.search("matching", false, true, 10).unwrap();
+    let saved = temp.path().join("saved-text");
+    fs::rename(&root, &saved).unwrap();
+    symlink(&saved, &root).unwrap();
+    assert!(session.search("matching", false, true, 10).is_err());
+    fs::remove_file(&root).unwrap();
+    fs::rename(saved, &root).unwrap();
+    for name in ["gptgrep-index.json", "index.bin", "lookup.bin"] {
+        let path = index.join(name);
+        let saved = temp.path().join(format!("saved-{name}"));
+        fs::rename(&path, &saved).unwrap();
+        symlink(&saved, &path).unwrap();
+        assert!(
+            session.search("matching", false, true, 10).is_err(),
+            "{name}"
+        );
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"damaged").unwrap();
+        assert!(
+            session.search("matching", false, true, 10).is_err(),
+            "{name}"
+        );
+        fs::remove_file(&path).unwrap();
+        fs::rename(saved, path).unwrap();
+    }
 }
 
 #[test]
