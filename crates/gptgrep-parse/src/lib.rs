@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 
 mod artifact;
 mod geometry;
+mod image_prepare;
+#[cfg(test)]
+mod image_prepare_tests;
 mod ocr;
 mod resource;
 mod rich;
@@ -20,6 +23,7 @@ mod rich_tests;
 
 pub use artifact::{ArtifactKind, ArtifactRef, FeatureState, artifact_id};
 pub use geometry::{AffineTransform, BoundingBox, PageGeometry};
+pub use image_prepare::image_preparation_profile_digest;
 pub use ocr::{
     OcrExecutor, OcrImage, OcrImageDelivery, OcrPageResult, OcrProfile, OcrReceipt, OcrRegion,
     OcrRegionResult, OcrRegionStatus, OcrResultStatus, OcrTask, OcrTaskBudget, ocr_profile_digest,
@@ -29,8 +33,9 @@ pub use ocr::{
 pub use resource::ResourceBudget;
 pub use rich::{
     ConversionIdentity, CoverageState, NativeCandidate, NativeOptions, NativePage, OcrMode,
-    OcrPlan, PreparationOptions, PreparedDocument, PreparedSummary, RICH_PARSER,
-    RichParsedDocument, SegmentMap, extract_native, finalize_document, prepare_document,
+    OcrPlan, PreparationOptions, PreparedDocument, PreparedImageGeometry, PreparedSummary,
+    RICH_PARSER, RichParsedDocument, SegmentMap, extract_native, finalize_document,
+    prepare_document,
 };
 
 pub const NATIVE_PARSER: &str = "liteparse-2.15.1/layout-v1";

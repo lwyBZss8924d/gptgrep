@@ -79,10 +79,11 @@ pub(crate) struct ArtifactBinding<'a> {
     pub page: Option<u32>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(tag = "state", content = "value", rename_all = "snake_case")]
 pub enum FeatureState<T> {
     Present(T),
+    #[default]
     Absent,
     Unsupported(String),
     Failed(String),

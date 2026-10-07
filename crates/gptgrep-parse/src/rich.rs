@@ -38,6 +38,22 @@ pub struct ConversionIdentity {
     pub invocations: u32,
 }
 
+/// Raster source coordinates and normalized page coordinates both start at the
+/// top left. One source pixel occupies one PDF point; metadata never rotates or
+/// rescales pixels implicitly.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedImageGeometry {
+    pub source_width_pixels: u32,
+    pub source_height_pixels: u32,
+    pub page_width_points: f64,
+    pub page_height_points: f64,
+    pub source_pixels_to_page: AffineTransform,
+    pub source_orientation: FeatureState<String>,
+    pub source_color_profile: FeatureState<String>,
+    pub alpha_background: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreparedSummary {
@@ -49,6 +65,8 @@ pub struct PreparedSummary {
     pub parser_identity: String,
     pub preparation_profile_sha256: String,
     pub conversion: FeatureState<ConversionIdentity>,
+    #[serde(default)]
+    pub image_geometry: FeatureState<PreparedImageGeometry>,
 }
 
 /// Owns only immutable local preparation paths. Paths are excluded from public
@@ -448,10 +466,11 @@ fn prepare_sync(
     let extension = source
         .extension()
         .and_then(|ext| ext.to_str())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_ascii_lowercase();
     ensure!(
-        extension.eq_ignore_ascii_case("pdf"),
-        "capability_unavailable: rich conversion preallocation is not qualified; Office/image preparation requires a bounded converter adapter"
+        matches!(extension.as_str(), "pdf" | "png" | "jpeg" | "jpg"),
+        "capability_unavailable: rich preparation admits PDF and bounded PNG/JPEG only; Office/other images require a bounded converter adapter"
     );
     ensure!(
         fs::symlink_metadata(source)?.is_file()
@@ -459,8 +478,29 @@ fn prepare_sync(
         "prepared source must be a nonsymlink regular file"
     );
     let source_path = source.canonicalize()?;
-    let (source_bytes, source_sha256) = hash_file(&source_path, budget.document_staging_bytes)?;
-    budget.reserve_staging(source_bytes)?;
+    let is_pdf = extension == "pdf";
+    let source_limit = if is_pdf {
+        budget.document_staging_bytes
+    } else {
+        budget.image_file_bytes
+    };
+    let (source_bytes, source_sha256) = hash_file(&source_path, source_limit)?;
+    let image = if is_pdf {
+        budget.reserve_staging(source_bytes)?;
+        None
+    } else {
+        Some(crate::image_prepare::ImagePreparation::admit(
+            &source_path,
+            source_bytes,
+            &source_sha256,
+            if extension == "png" {
+                image::ImageFormat::Png
+            } else {
+                image::ImageFormat::Jpeg
+            },
+            budget,
+        )?)
+    };
     fs::create_dir_all(staging_root)?;
     ensure!(
         !fs::symlink_metadata(staging_root)?.file_type().is_symlink(),
@@ -473,47 +513,75 @@ fn prepare_sync(
     ));
     fs::create_dir(&staging_root)?;
     let prepared_path = staging_root.join("prepared.pdf");
-    let mut input = fs::File::open(&source_path)?;
-    let output = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&prepared_path)?;
-    let mut output = LimitedWriter {
-        inner: output,
-        limit: source_bytes,
-        written: 0,
-    };
-    let mut buffer = [0u8; 65_536];
-    loop {
-        let bytes = input.read(&mut buffer)?;
-        if bytes == 0 {
-            break;
+    let (
+        prepared_bytes,
+        prepared_sha256,
+        format,
+        preparation_profile_sha256,
+        conversion,
+        image_geometry,
+    ) = if let Some(image) = image {
+        let output = image.write(&prepared_path, budget)?;
+        (
+            output.bytes,
+            output.sha256,
+            if extension == "png" { "png" } else { "jpeg" },
+            output.profile_sha256,
+            FeatureState::Present(output.conversion),
+            FeatureState::Present(output.geometry),
+        )
+    } else {
+        let mut input = fs::File::open(&source_path)?;
+        let output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&prepared_path)?;
+        let mut output = LimitedWriter {
+            inner: output,
+            limit: source_bytes,
+            written: 0,
+        };
+        let mut buffer = [0u8; 65_536];
+        loop {
+            let bytes = input.read(&mut buffer)?;
+            if bytes == 0 {
+                break;
+            }
+            output.write_all(&buffer[..bytes])?;
         }
-        output.write_all(&buffer[..bytes])?;
-    }
-    output.inner.sync_all()?;
-    let (prepared_bytes, prepared_sha256) = hash_file(&prepared_path, source_bytes)?;
-    ensure!(
-        source_bytes == prepared_bytes && source_sha256 == prepared_sha256,
-        "source changed while copying immutable preparation"
-    );
+        output.inner.sync_all()?;
+        let (prepared_bytes, prepared_sha256) = hash_file(&prepared_path, source_bytes)?;
+        ensure!(
+            source_bytes == prepared_bytes && source_sha256 == prepared_sha256,
+            "source changed while copying immutable preparation"
+        );
+        (
+            prepared_bytes,
+            prepared_sha256,
+            "pdf",
+            sha256(&serde_json::to_vec(&(
+                "gptgrep.prepare.identity-pdf.v1",
+                crate::LITEPARSE_REVISION,
+            ))?),
+            FeatureState::Present(ConversionIdentity {
+                converter: "identity-pdf".into(),
+                version: crate::LITEPARSE_REVISION.into(),
+                invocations: 0,
+            }),
+            FeatureState::Absent,
+        )
+    };
     let document = PreparedDocument {
         summary: PreparedSummary {
             source_sha256,
             prepared_sha256,
             source_bytes,
             prepared_bytes,
-            format: "pdf".into(),
+            format: format.into(),
             parser_identity: RICH_PARSER.into(),
-            preparation_profile_sha256: sha256(&serde_json::to_vec(&(
-                "gptgrep.prepare.identity-pdf.v1",
-                crate::LITEPARSE_REVISION,
-            ))?),
-            conversion: FeatureState::Present(ConversionIdentity {
-                converter: "identity-pdf".into(),
-                version: crate::LITEPARSE_REVISION.into(),
-                invocations: 0,
-            }),
+            preparation_profile_sha256,
+            conversion,
+            image_geometry,
         },
         source_path,
         prepared_path,
@@ -550,6 +618,9 @@ struct NativeMetadata {
     page: Page,
     objects: Vec<serde_json::Value>,
     capabilities: std::collections::BTreeMap<String, FeatureState<String>>,
+    complexity: stages::PageComplexityStats,
+    image_rects: Vec<liteparse::types::Rect>,
+    geometry: PageGeometry,
 }
 
 fn admit_staging(used: &mut u64, bytes: u64, budget: &ResourceBudget) -> Result<()> {
@@ -597,7 +668,7 @@ fn extract_sync(
 ) -> Result<NativeCandidate> {
     prepared.verify(&budget)?;
     let native_profile_sha256 = sha256(&serde_json::to_vec(&(
-        "gptgrep.native.count-admitted.v3-annotation-count-display",
+        "gptgrep.native.count-admitted.v4-metadata-classifier-geometry-binding",
         RICH_PARSER,
         crate::LITEPARSE_REVISION,
         &prepared.summary.preparation_profile_sha256,
@@ -958,10 +1029,26 @@ fn extract_sync(
                 "text/plain; charset=utf-8",
                 budget.page_layout_bytes,
             )?;
+            // Bind the original source-only classifier inputs/output and frame
+            // in retained metadata. Admit the added held/serialized copy before
+            // cloning complexity/geometry or constructing the metadata DTO.
+            let binding_bytes = encoded_size(
+                &(&complexity, &image_rects, &geometry),
+                budget.page_layout_bytes,
+            )?;
+            ensure!(
+                object_bound + glyph_bound + annotation_bound + 16_384 + binding_bytes
+                    <= budget.page_layout_bytes,
+                "resource_limit: native metadata classifier/frame binding admission"
+            );
+            admit_native_estimate(&mut metadata_used, &mut owned_upper, binding_bytes, &budget)?;
             let metadata = NativeMetadata {
                 page: raw.clone(),
                 objects,
                 capabilities: capabilities.clone(),
+                complexity: complexity.clone(),
+                image_rects,
+                geometry: geometry.clone(),
             };
             let metadata_size = encoded_size(&metadata, budget.page_layout_bytes)?;
             admit_staging(&mut staged, metadata_size, &budget)?;

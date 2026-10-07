@@ -78,16 +78,55 @@ not use a model, remote inference, or benchmark document downloads.
 The separate `liteparse-2.15.1/rich-v1` foundation exposes
 `prepare_document`, `extract_native`, and `finalize_document`. It leaves
 `parse_path` and its OCR-disabled `layout-v1` behavior intact. Preparation
-currently admits PDF input only and copies it once into immutable staging.
-Office/image conversion and XFA/AcroForm documents fail with an explicit
-capability error until bounded conversion and packet/appearance adapters exist.
+admits PDF input and copies it once into immutable staging. Standalone PNG/JPEG
+input uses one owned Rust conversion into a single-page prepared PDF. Office,
+other image formats and XFA/AcroForm documents fail with an explicit capability
+error until bounded conversion and packet/appearance adapters exist.
 All preparation and PDFium work runs on blocking workers; PDFium objects end
 their synchronous scope before any host OCR future can be awaited.
+
+The bounded image front door admits static 8-bit noninterlaced PNG (gray,
+gray/alpha, RGB, RGBA or palette) and 8-bit baseline JPEG with one complete scan,
+one or three components, and sampling factors at most two. Animation, 16-bit or
+interlaced PNG, compressed/unknown PNG metadata, progressive or multiscan JPEG,
+JPEG orientation/color metadata and unqualified container extensions fail
+before an upstream decoder is constructed. The original source bytes and format
+remain bound by SHA-256; `.jpg` is reported as `jpeg`. The prepared PDF contains
+uncompressed RGB8 samples, so JPEG receives no additional lossy encoding. Alpha
+is composited against white with explicit integer rounding. One source pixel
+occupies one PDF point, with an identity affine between the top-left source
+pixel frame and normalized page frame. No EXIF rotation or physical-resolution
+rescaling is applied. Bounded PNG gamma/chromaticity metadata is recorded as an
+unsupported color-management capability. `PreparedSummary.image_geometry`
+records these dimensions, transform and capability states; existing PDF
+summaries deserialize with this field absent. The converter receipt identifies
+`gptgrep-bounded-image-pdf`, `image-0.25.10/rgb8-pdf-v1`, and one invocation.
+`image_preparation_profile_digest` provides the pure canonical recipe binding,
+including source format, for publication validation.
+
+Encoded source size is checked before its input buffer is allocated. A local
+container scan then admits dimensions, decoded output and the simultaneous
+decoder/input/RGB-row working envelope before constructing the decoder. PNG's
+explicit allocation limit is supplemented by its separately bounded unfilter
+buffer and row scratch; JPEG's generic allocation limit is not relied on. Its
+accepted single baseline scan avoids full-image coefficient buffers, and a
+conservative row-array allowance is charged instead. The PDF writer retains
+only one RGB row and uses `LimitedWriter`; its `3 * pixels + 16 KiB` output bound
+is checked and reserved against shared staging before decoding or opening the
+output. That conservative reservation remains charged even when actual output
+is smaller or conversion fails. Actual output hashing verifies identity after
+writing; it is not the admission check. Later native rendering uses the caller's
+explicit DPI and can fail its separate raster budget without silently resizing.
 
 Rich extraction preflights glyph, object, nested Form and path-segment counts
 before constructing owned metadata. It retains numeric native glyph data,
 raw vector paths/object matrices, normalized page geometry, native text and
 metadata artifacts, complexity signals and admitted PNG page renditions.
+Native metadata also binds the original source-only complexity output, admitted
+image rectangles and original page geometry. The native extraction recipe is
+`gptgrep.native.count-admitted.v4-metadata-classifier-geometry-binding`; completed
+public DTO consumers must validate these retained facts before accepting mutable
+coverage or page-frame fields.
 Crop, rotation and UserUnit transformations are explicit invertible affines.
 Variable-length font names, tagged structure, annotations, bookmarks and
 document metadata are represented as unsupported capabilities. Nested image
@@ -154,4 +193,9 @@ kind, page, region and content SHA-256. Native recipe identity includes the
 pinned revision, DPI and rendition encoding and excludes page-window size.
 Final recipe identity also binds OCR mode and the complete retained results.
 No public serialized summary contains source paths or runtime session IDs.
+Synthetic tests exercise actual PNG/JPEG-to-PDFium pixel roundtrips, gray/alpha
+and palette conversion, source and prepared-file mutation, header/decode/owned
+working/output/shared-staging failure ordering and excluded modes. These tests
+do not qualify all image formats, Office, orientation/color fidelity, complete
+rich metadata, process RSS, native cancellation, live OCR or release packaging.
 This foundation is not complete multimodal or full rich-metadata acceptance.
