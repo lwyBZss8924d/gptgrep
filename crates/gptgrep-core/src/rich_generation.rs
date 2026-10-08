@@ -288,6 +288,11 @@ impl RichGenerationWriter {
             "document metadata exceeds selected admission"
         );
         let id = digest(relative.as_bytes())[..24].to_owned();
+        let prepared_name = if parsed.summary.format == "plaintext" {
+            "prepared.txt"
+        } else {
+            "prepared.pdf"
+        };
         let mut record = RichDocument {
             document: Document {
                 id: id.clone(),
@@ -311,7 +316,7 @@ impl RichGenerationWriter {
                 warnings: parsed.document.warnings,
             },
             prepared: parsed.summary,
-            prepared_path: Path::new("artifacts").join(&id).join("prepared.pdf"),
+            prepared_path: Path::new("artifacts").join(&id).join(prepared_name),
             native_profile_sha256: parsed.native_profile_sha256,
             pages: parsed.pages,
             artifacts: Vec::new(),
@@ -323,7 +328,7 @@ impl RichGenerationWriter {
         fs::create_dir(self.dir.join("artifacts").join(&id))?;
         copy_verified(
             staging,
-            Path::new("prepared.pdf"),
+            Path::new(prepared_name),
             &self.dir,
             &record.prepared_path,
             record.prepared.prepared_bytes,
@@ -1298,17 +1303,66 @@ fn validate_document_shape(doc: &RichDocument, budget: &ResourceBudget) -> Resul
                 "image preparation recipe mismatch"
             );
         }
+        (
+            "plaintext",
+            gptgrep_parse::FeatureState::Present(conversion),
+            gptgrep_parse::FeatureState::Absent,
+        ) => {
+            ensure!(
+                conversion.converter == "identity-utf8"
+                    && conversion.version == gptgrep_parse::LITEPARSE_REVISION
+                    && conversion.invocations == 0
+                    && doc.document.parser == "plaintext"
+                    && doc.prepared.source_sha256 == doc.prepared.prepared_sha256
+                    && doc.prepared.source_bytes == doc.prepared.prepared_bytes
+                    && doc.prepared.preparation_profile_sha256
+                        == gptgrep_parse::plaintext_preparation_profile_digest()?
+                    && doc.native_profile_sha256
+                        == gptgrep_parse::plaintext_native_profile_digest()?,
+                "plaintext preparation recipe/source mismatch"
+            );
+        }
+        (
+            format,
+            gptgrep_parse::FeatureState::Present(conversion),
+            gptgrep_parse::FeatureState::Absent,
+        ) if gptgrep_parse::is_office_extension(format) => {
+            ensure!(
+                conversion.converter == "gptgrep-bounded-libreoffice-pdf"
+                    && conversion.version == "libreoffice-private-profile-retained-pdf-v1"
+                    && conversion.invocations == 1
+                    && doc.prepared.preparation_profile_sha256
+                        == gptgrep_parse::office_preparation_profile_digest(format)?,
+                "Office normalized-PDF conversion recipe mismatch"
+            );
+            for page in &doc.pages {
+                ensure!(
+                    matches!(page.capabilities.get("source_coordinate_system"),
+                    Some(gptgrep_parse::FeatureState::Present(value)) if value == "retained_normalized_pdf_points")
+                        && matches!(
+                            page.capabilities.get("original_office_page_cell_mapping"),
+                            Some(gptgrep_parse::FeatureState::Unsupported(_))
+                        ),
+                    "Office original page/cell mapping cannot be inferred from normalized PDF"
+                );
+            }
+        }
         _ => anyhow::bail!("source conversion or source geometry not qualified"),
     }
     ensure!(
         doc.prepared_path
-            == Path::new("artifacts")
-                .join(&doc.document.id)
-                .join("prepared.pdf"),
+            == Path::new("artifacts").join(&doc.document.id).join(
+                if doc.prepared.format == "plaintext" {
+                    "prepared.txt"
+                } else {
+                    "prepared.pdf"
+                }
+            ),
         "invalid prepared storage path"
     );
     ensure!(
-        doc.pages.len() == doc.document.pages.len() && !doc.pages.is_empty(),
+        doc.prepared.format == "plaintext"
+            || (doc.pages.len() == doc.document.pages.len() && !doc.pages.is_empty()),
         "rich page coverage mismatch"
     );
     let mut ids = BTreeSet::new();
@@ -1384,7 +1438,13 @@ fn validate_document_shape(doc: &RichDocument, budget: &ResourceBudget) -> Resul
             .context("artifact byte overflow")?;
         if let Some(page) = a.page {
             ensure!(
-                page > 0 && page as usize <= doc.pages.len(),
+                page > 0
+                    && page as usize
+                        <= if doc.prepared.format == "plaintext" {
+                            doc.document.pages.len()
+                        } else {
+                            doc.pages.len()
+                        },
                 "artifact page outside document"
             );
         }
@@ -1444,6 +1504,9 @@ fn validate_document_shape(doc: &RichDocument, budget: &ResourceBudget) -> Resul
             .all(|a| &a.artifact.profile_sha256 == final_profile),
         "final artifact recipe mismatch"
     );
+    if doc.prepared.format == "plaintext" {
+        return validate_plaintext_shape(doc);
+    }
     for (i, page) in doc.pages.iter().enumerate() {
         ensure!(
             page.number as usize == i + 1
@@ -1606,6 +1669,180 @@ fn validate_document_shape(doc: &RichDocument, budget: &ResourceBudget) -> Resul
     Ok(())
 }
 
+// Plaintext has logical source spans in Document.pages and no physical NativePage.
+// These explicit recipes extend format capability without changing existing v2
+// PDF/image contracts. Older readers reject the unknown format, never reinterpret it.
+fn validate_plaintext_shape(doc: &RichDocument) -> Result<()> {
+    let empty = doc.document.source_bytes == 0;
+    ensure!(
+        doc.pages.is_empty()
+            && doc.ocr_tasks.is_empty()
+            && doc.ocr_results.is_empty()
+            && doc.document.pages.len() == usize::from(!empty)
+            && doc.unmapped_merged_lines == 0,
+        "plaintext cannot claim physical page/OCR coverage"
+    );
+    ensure!(
+        doc.artifacts.len() == if empty { 2 } else { 4 },
+        "plaintext artifact count mismatch"
+    );
+    for a in &doc.artifacts {
+        ensure!(
+            matches!(
+                a.artifact.kind,
+                ArtifactKind::NativeText
+                    | ArtifactKind::NativeMetadata
+                    | ArtifactKind::Layout
+                    | ArtifactKind::MergedText
+            ),
+            "plaintext rendition/OCR artifact rejected"
+        );
+        if matches!(
+            a.artifact.kind,
+            ArtifactKind::NativeText | ArtifactKind::MergedText
+        ) {
+            ensure!(
+                a.artifact.sha256 == doc.document.source_sha256
+                    && a.artifact.bytes == doc.document.source_bytes,
+                "plaintext source/merged/native bytes differ"
+            );
+        }
+    }
+    ensure!(
+        doc.segments.len() == usize::from(!empty),
+        "plaintext exact source segment absent"
+    );
+    if !empty {
+        let text = doc
+            .artifacts
+            .iter()
+            .find(|a| a.artifact.kind == ArtifactKind::NativeText)
+            .context("plaintext native artifact missing")?;
+        ensure!(
+            doc.artifacts
+                .iter()
+                .filter(|a| a.artifact.kind == ArtifactKind::NativeMetadata)
+                .count()
+                == 1
+                && doc.document.pages[0].number == 1
+                && doc.document.pages[0].line_start == 1,
+            "plaintext logical source unit mismatch"
+        );
+        let seg = &doc.segments[0];
+        ensure!(
+            seg.page == 1
+                && seg.kind == ArtifactKind::NativeText
+                && seg.artifact_id == text.artifact.id
+                && seg.merged_start == 0
+                && seg.artifact_start == 0
+                && seg.merged_end == doc.document.source_bytes
+                && seg.artifact_end == doc.document.source_bytes,
+            "plaintext segment changes original byte coordinates"
+        );
+    }
+    let profile = digest(&serde_json::to_vec(&(
+        "gptgrep.finalize.source-utf8-byte-line.v1",
+        &doc.native_profile_sha256,
+    ))?);
+    ensure!(
+        doc.artifacts
+            .iter()
+            .filter(|a| matches!(
+                a.artifact.kind,
+                ArtifactKind::Layout | ArtifactKind::MergedText
+            ))
+            .all(|a| a.artifact.profile_sha256 == profile),
+        "plaintext finalization recipe mismatch"
+    );
+    Ok(())
+}
+fn verify_plaintext(
+    root: &Path,
+    dir: &Path,
+    doc: &RichDocument,
+    budget: &ResourceBudget,
+) -> Result<()> {
+    ensure!(
+        doc.prepared
+            .prepared_bytes
+            .saturating_mul(256)
+            .saturating_add(65_536)
+            <= budget.owned_working_bytes,
+        "resource_limit: plaintext validation working admission"
+    );
+    let merged = doc
+        .artifacts
+        .iter()
+        .find(|a| a.artifact.kind == ArtifactKind::MergedText)
+        .context("plaintext merged text absent")?;
+    let bytes = bounded_read(
+        &owned_path(dir, &merged.artifact.relative_path)?,
+        budget.page_layout_bytes,
+    )?;
+    ensure!(
+        digest(&bytes) == doc.document.text_sha256 && digest(&bytes) == doc.document.source_sha256,
+        "plaintext merged source differs"
+    );
+    let text = std::str::from_utf8(&bytes)?;
+    let title = Path::new(&doc.document.path)
+        .file_name()
+        .context("plaintext filename missing")?
+        .to_string_lossy();
+    ensure!(
+        doc.document.title == title && doc.document.warnings.is_empty(),
+        "plaintext document source title/warnings differ"
+    );
+    let parsed = gptgrep_pageindex::from_text(&title, text);
+    ensure!(
+        serde_json::to_value(&parsed.nodes)? == serde_json::to_value(&doc.document.nodes)?
+            && parsed
+                .pages
+                .iter()
+                .zip(&doc.document.pages)
+                .all(|(a, b)| a.number == b.number
+                    && a.line_start == b.line_start
+                    && a.line_end == b.line_end)
+            && parsed.pages.len() == doc.document.pages.len(),
+        "plaintext tree/source-line projection differs"
+    );
+    if !text.is_empty() {
+        let metadata = doc
+            .artifacts
+            .iter()
+            .find(|a| a.artifact.kind == ArtifactKind::NativeMetadata)
+            .context("plaintext metadata absent")?;
+        let bytes = bounded_read(
+            &owned_path(dir, &metadata.artifact.relative_path)?,
+            budget.page_layout_bytes,
+        )?;
+        let m: gptgrep_parse::PlaintextMetadata = serde_json::from_slice(&bytes)?;
+        ensure!(
+            m.schema == "gptgrep.plaintext-metadata.v1"
+                && m.coordinate_system
+                    == "original_utf8_bytes_and_lines; logical_source_unit_1; no_physical_pages"
+                && m.source_sha256 == doc.document.source_sha256
+                && m.utf8_bytes == doc.document.source_bytes
+                && m.lines == text.lines().count().max(1),
+            "plaintext retained metadata source binding differs"
+        );
+    }
+    let layout = doc
+        .artifacts
+        .iter()
+        .find(|a| a.artifact.kind == ArtifactKind::Layout)
+        .context("plaintext layout absent")?;
+    let encoded = bounded_read(
+        &owned_path(dir, &layout.artifact.relative_path)?,
+        budget.document_metadata_bytes,
+    )?;
+    ensure!(
+        serde_json::from_slice::<serde_json::Value>(&encoded)?
+            == serde_json::to_value((&parsed.pages, &parsed.nodes))?,
+        "plaintext retained layout differs from source"
+    );
+    verify_source(root, doc)
+}
+
 #[derive(Deserialize)]
 struct NativeCoverageMetadata {
     page: NativeCoveragePage,
@@ -1724,6 +1961,9 @@ fn verify_document(
     );
     for stored in &doc.artifacts {
         verify_artifact(dir, &stored.artifact, budget)?;
+    }
+    if doc.prepared.format == "plaintext" {
+        return verify_plaintext(root, dir, doc, budget);
     }
     for page in &doc.pages {
         ensure!(

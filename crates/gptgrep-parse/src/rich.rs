@@ -73,11 +73,11 @@ pub struct PreparedSummary {
 /// serializable summaries; this object never owns a PDFium handle.
 #[derive(Clone, Debug)]
 pub struct PreparedDocument {
-    summary: PreparedSummary,
-    source_path: PathBuf,
-    prepared_path: PathBuf,
-    staging_root: PathBuf,
-    invocation_budget: ResourceBudget,
+    pub(crate) summary: PreparedSummary,
+    pub(crate) source_path: PathBuf,
+    pub(crate) prepared_path: PathBuf,
+    pub(crate) staging_root: PathBuf,
+    pub(crate) invocation_budget: ResourceBudget,
 }
 impl PreparedDocument {
     pub fn summary(&self) -> &PreparedSummary {
@@ -185,19 +185,19 @@ pub struct OcrPlan {
 /// ```
 #[derive(Debug)]
 pub struct NativeCandidate {
-    summary: PreparedSummary,
-    pages: Vec<NativePage>,
-    artifacts: Vec<ArtifactRef>,
-    ocr_plan: OcrPlan,
-    native_profile_sha256: String,
-    prepared: PreparedDocument,
-    raw_pages: Vec<Page>,
-    document_staging_used: u64,
-    native_owned_upper: u64,
-    metadata_admitted_upper: u64,
-    execution_budget: ResourceBudget,
-    frozen_integrity_sha256: String,
-    annotation_counts: Vec<u32>,
+    pub(crate) summary: PreparedSummary,
+    pub(crate) pages: Vec<NativePage>,
+    pub(crate) artifacts: Vec<ArtifactRef>,
+    pub(crate) ocr_plan: OcrPlan,
+    pub(crate) native_profile_sha256: String,
+    pub(crate) prepared: PreparedDocument,
+    pub(crate) raw_pages: Vec<Page>,
+    pub(crate) document_staging_used: u64,
+    pub(crate) native_owned_upper: u64,
+    pub(crate) metadata_admitted_upper: u64,
+    pub(crate) execution_budget: ResourceBudget,
+    pub(crate) frozen_integrity_sha256: String,
+    pub(crate) annotation_counts: Vec<u32>,
 }
 
 impl NativeCandidate {
@@ -217,7 +217,7 @@ impl NativeCandidate {
         &self.native_profile_sha256
     }
 
-    fn integrity_digest(&self) -> Result<String> {
+    pub(crate) fn integrity_digest(&self) -> Result<String> {
         json_sha256(
             &(
                 "gptgrep.native-candidate.private.v1",
@@ -252,6 +252,9 @@ impl NativeCandidate {
             json_sha256(&self.summary, 4096)? == json_sha256(&self.prepared.summary, 4096)?,
             "native candidate summary does not match immutable preparation"
         );
+        if self.summary.format == "plaintext" {
+            return crate::rich_text::verify_candidate(self, budget);
+        }
         ensure!(
             !self.pages.is_empty()
                 && self.pages.len() == self.raw_pages.len()
@@ -468,9 +471,11 @@ fn prepare_sync(
         .and_then(|ext| ext.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
+    let is_text = crate::is_plaintext(source);
+    let is_office = crate::office::is_office_extension(&extension);
     ensure!(
-        matches!(extension.as_str(), "pdf" | "png" | "jpeg" | "jpg"),
-        "capability_unavailable: rich preparation admits PDF, bounded PNG and strict baseline JPEG; Office/other images require a qualified bounded converter adapter"
+        is_text || is_office || matches!(extension.as_str(), "pdf" | "png" | "jpeg" | "jpg"),
+        "capability_unavailable: rich preparation supports plaintext, PDF, PNG, baseline JPEG and installed LibreOffice formats"
     );
     ensure!(
         fs::symlink_metadata(source)?.is_file()
@@ -479,13 +484,13 @@ fn prepare_sync(
     );
     let source_path = source.canonicalize()?;
     let is_pdf = extension == "pdf";
-    let source_limit = if is_pdf {
+    let source_limit = if is_pdf || is_text || is_office {
         budget.document_staging_bytes
     } else {
         budget.image_file_bytes
     };
     let (source_bytes, source_sha256) = hash_file(&source_path, source_limit)?;
-    let image = if is_pdf {
+    let image = if is_pdf || is_text || is_office {
         budget.reserve_staging(source_bytes)?;
         None
     } else {
@@ -512,7 +517,11 @@ fn prepare_sync(
         PREPARATION_ID.fetch_add(1, Ordering::SeqCst)
     ));
     fs::create_dir(&staging_root)?;
-    let prepared_path = staging_root.join("prepared.pdf");
+    let prepared_path = staging_root.join(if is_text {
+        "prepared.txt"
+    } else {
+        "prepared.pdf"
+    });
     let (
         prepared_bytes,
         prepared_sha256,
@@ -520,7 +529,28 @@ fn prepare_sync(
         preparation_profile_sha256,
         conversion,
         image_geometry,
-    ) = if let Some(image) = image {
+    ) = if is_office {
+        let output = crate::office::prepare_once(
+            &source_path,
+            &staging_root,
+            &prepared_path,
+            &extension,
+            (source_bytes, &source_sha256),
+            budget,
+        )?;
+        (
+            output.0,
+            output.1,
+            extension.as_str(),
+            crate::office::office_preparation_profile_digest(&extension)?,
+            FeatureState::Present(ConversionIdentity {
+                converter: "gptgrep-bounded-libreoffice-pdf".into(),
+                version: crate::office::OFFICE_ADAPTER.into(),
+                invocations: 1,
+            }),
+            FeatureState::Absent,
+        )
+    } else if let Some(image) = image {
         let output = image.write(&prepared_path, budget)?;
         (
             output.bytes,
@@ -558,13 +588,22 @@ fn prepare_sync(
         (
             prepared_bytes,
             prepared_sha256,
-            "pdf",
-            sha256(&serde_json::to_vec(&(
-                "gptgrep.prepare.identity-pdf.v1",
-                crate::LITEPARSE_REVISION,
-            ))?),
+            if is_text { "plaintext" } else { "pdf" },
+            if is_text {
+                crate::rich_text::plaintext_preparation_profile_digest()?
+            } else {
+                sha256(&serde_json::to_vec(&(
+                    "gptgrep.prepare.identity-pdf.v1",
+                    crate::LITEPARSE_REVISION,
+                ))?)
+            },
             FeatureState::Present(ConversionIdentity {
-                converter: "identity-pdf".into(),
+                converter: if is_text {
+                    "identity-utf8"
+                } else {
+                    "identity-pdf"
+                }
+                .into(),
                 version: crate::LITEPARSE_REVISION.into(),
                 invocations: 0,
             }),
@@ -578,7 +617,7 @@ fn prepare_sync(
             source_bytes,
             prepared_bytes,
             format: format.into(),
-            parser_identity: RICH_PARSER.into(),
+            parser_identity: if is_text { "plaintext" } else { RICH_PARSER }.into(),
             preparation_profile_sha256,
             conversion,
             image_geometry,
@@ -623,7 +662,7 @@ struct NativeMetadata {
     geometry: PageGeometry,
 }
 
-fn admit_staging(used: &mut u64, bytes: u64, budget: &ResourceBudget) -> Result<()> {
+pub(crate) fn admit_staging(used: &mut u64, bytes: u64, budget: &ResourceBudget) -> Result<()> {
     let next = used
         .checked_add(bytes)
         .context("resource_limit: staging overflow")?;
@@ -661,12 +700,15 @@ fn admit_native_estimate(
     Ok(())
 }
 
-fn extract_sync(
+pub(crate) fn extract_sync(
     prepared: PreparedDocument,
     options: NativeOptions,
     budget: ResourceBudget,
 ) -> Result<NativeCandidate> {
     prepared.verify(&budget)?;
+    if prepared.summary.format == "plaintext" {
+        return crate::rich_text::extract(prepared, budget);
+    }
     let native_profile_sha256 = sha256(&serde_json::to_vec(&(
         "gptgrep.native.count-admitted.v4-metadata-classifier-geometry-binding",
         RICH_PARSER,
@@ -989,6 +1031,14 @@ fn extract_sync(
                 CoverageState::Native
             };
             let mut capabilities = std::collections::BTreeMap::new();
+            if crate::office::is_office_extension(&prepared.summary.format) {
+                capabilities.insert(
+                    "source_coordinate_system".into(),
+                    FeatureState::Present("retained_normalized_pdf_points".into()),
+                );
+                capabilities.insert("original_office_page_cell_mapping".into(), FeatureState::Unsupported("Original Office page/cell mapping is unavailable; geometry refers only to the retained normalized PDF".into()));
+            }
+
             for feature in [
                 "font_names",
                 "word_segmentation",
@@ -1343,6 +1393,10 @@ pub fn finalize_document(
 ) -> Result<RichParsedDocument> {
     budget.validate()?;
     candidate.verify_integrity(budget)?;
+    if candidate.summary.format == "plaintext" {
+        ensure!(outcomes.is_empty(), "plaintext cannot accept OCR results");
+        return crate::rich_text::finalize(candidate, mode, budget);
+    }
     let mut seen = BTreeSet::new();
     ensure!(
         outcomes.len() <= candidate.pages.len(),

@@ -17,10 +17,12 @@ mod image_prepare;
 #[cfg(test)]
 mod image_prepare_tests;
 mod ocr;
+mod office;
 mod resource;
 mod rich;
 #[cfg(test)]
 mod rich_tests;
+mod rich_text;
 
 pub use artifact::{ArtifactKind, ArtifactRef, FeatureState, artifact_id};
 pub use crop::{CropAdmission, CropOutput, CropRecipe, PixelCrop, crop_rendition};
@@ -32,12 +34,16 @@ pub use ocr::{
     ocr_task_digest, validate_ocr_result, validate_ocr_result_metadata, validate_ocr_task,
     validate_ocr_task_metadata, validate_rendition, validate_rendition_metadata,
 };
+pub use office::{is_office_extension, office_preparation_profile_digest};
 pub use resource::ResourceBudget;
 pub use rich::{
     ConversionIdentity, CoverageState, NativeCandidate, NativeOptions, NativePage, OcrMode,
     OcrPlan, PreparationOptions, PreparedDocument, PreparedImageGeometry, PreparedSummary,
     RICH_PARSER, RichParsedDocument, SegmentMap, extract_native, finalize_document,
     prepare_document,
+};
+pub use rich_text::{
+    PlaintextMetadata, plaintext_native_profile_digest, plaintext_preparation_profile_digest,
 };
 
 pub const NATIVE_PARSER: &str = "liteparse-2.15.1/layout-v1";
@@ -69,7 +75,7 @@ fn extension(path: &Path) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
-fn is_plaintext(path: &Path) -> bool {
+pub(crate) fn is_plaintext(path: &Path) -> bool {
     if let Some(ext) = extension(path) {
         return TEXT_EXTENSIONS.contains(&ext.as_str());
     }

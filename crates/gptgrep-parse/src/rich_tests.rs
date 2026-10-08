@@ -453,7 +453,7 @@ async fn char_and_raster_limits_reject_before_their_output_artifacts() {
 #[tokio::test]
 async fn unsupported_conversion_fails_before_preparation_and_staging_limit_is_shared() {
     let directory = tempfile::tempdir().unwrap();
-    let source = directory.path().join("source.docx");
+    let source = directory.path().join("source.gif");
     std::fs::write(&source, b"not an Office fixture").unwrap();
     let root = directory.path().join("staging");
     let budget = ResourceBudget::default();

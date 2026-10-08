@@ -79,9 +79,41 @@ The separate `liteparse-2.15.1/rich-v1` foundation exposes
 `prepare_document`, `extract_native`, and `finalize_document`. It leaves
 `parse_path` and its OCR-disabled `layout-v1` behavior intact. Preparation
 admits PDF input and copies it once into immutable staging. Standalone PNG or admitted baseline JPEG
-input uses one owned Rust conversion into a single-page prepared PDF. Office,
-other image formats and XFA/AcroForm documents fail with an explicit capability
-error until bounded conversion and packet/appearance adapters exist.
+input uses one owned Rust conversion into a single-page prepared PDF.
+Plaintext/Markdown use an identity UTF-8 preparation and the existing
+`pageindex::from_text` source tree: original bytes, LF/CRLF, Unicode and line
+numbers remain unchanged. `RichParsedDocument.pages` and coverage are empty
+because these documents have no physical pages; `document.pages` retains one
+logical source unit for nonempty files and zero for empty files. Native text
+references use that logical unit, with no physical geometry or renditions.
+Invalid UTF-8 and resource limits fail explicitly.
+
+Office, OpenDocument, presentation and spreadsheet formats use an existing
+LibreOffice executable, with no installation. One transaction copies the raw
+input to immutable staging, launches the converter once with a fresh private
+profile and macros disabled, and retains the normalized PDF. Extraction,
+rendering and OCR all consume that same PDF, never reconvert the raw source.
+The original raw digest and the retained PDF digest remain distinct. Geometry
+is in retained normalized PDF coordinates; original Office page/cell mappings
+are explicitly unavailable. Missing runtime, failed conversion, source changes,
+extra output files and unsupported required coverage prevent whole-generation
+publication and preserve the previous CURRENT.
+
+The converter uses direct argv, closed stdin, an environment containing only
+its private HOME/TMP/profile and PATH, 64 KiB per-pipe diagnostic counters (no
+retained output text), and a 120-second timeout. Conversion staging is reserved
+before launch and checked periodically and at completion. Successful scratch
+is deleted with its conservative shared staging reservation still charged;
+failed scratch is retained. These checks bound admission and observation, not
+hard OS disk/RSS/CPU enforcement, descendant cleanup or external link/network
+isolation. The adapter version identifies the pinned recipe, not an observed
+LibreOffice version or layout fidelity. Other image formats and XFA/AcroForm
+still fail with explicit capability errors.
+
+These additional format recipes extend the existing v2 manifest capability
+without changing PDF/PNG/JPEG fields or their validation. Older readers reject
+the unfamiliar plaintext/Office format rather than reinterpret logical spans
+as physical pages; rebuild or upgrade is required for those new formats.
 All preparation and PDFium work runs on blocking workers; PDFium objects end
 their synchronous scope before any host OCR future can be awaited.
 
@@ -210,6 +242,6 @@ and palette conversion, source and prepared-file mutation, header/decode/owned
 working/output/shared-staging failure ordering, strict JPEG gray/RGB known
 samples, actual incomplete entropy at EOI, invalid Huffman/run/padding/terminal
 content, and excluded modes. These tests
-do not qualify all image formats, Office, orientation/color fidelity, complete
+do not qualify all image formats, all Office layouts/converters, orientation/color fidelity, complete
 rich metadata, process RSS, native cancellation, live OCR or release packaging.
 This foundation is not complete multimodal or full rich-metadata acceptance.

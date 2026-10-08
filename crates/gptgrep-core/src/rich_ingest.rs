@@ -522,15 +522,6 @@ pub async fn prepare_rich_ingest(
     ensure!(per_document > 0, "rich corpus working budget exhausted");
     for relative in paths {
         let path = source_path(&root, &relative)?;
-        let ext = path
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if !matches!(ext.as_str(), "pdf" | "png" | "jpg" | "jpeg") {
-            prepared.report.blockers.push(format!("{relative}: capability_unavailable rich conversion; use legacy index for plaintext; Office/other formats require a qualified converter"));
-            continue;
-        }
         ensure!(
             fs::metadata(&path)?.len() <= super::MAX_SOURCE_BYTES,
             "source exceeds rich writer admission"

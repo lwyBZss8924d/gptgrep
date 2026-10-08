@@ -14,7 +14,7 @@ liteparse = { git = "https://github.com/run-llama/liteparse", rev = "ab8879623ee
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-tokio = { version = "1", features = ["rt", "fs", "time", "process", "sync"] }
+tokio = { version = "1", features = ["rt", "fs", "time", "process", "sync", "io-util", "macros"] }
 
 zune-jpeg = { version = "=0.5.15", default-features = false, features = ["std"] }
 

@@ -1,6 +1,7 @@
 //! Genuine native parsing with self-authored fixtures and an explicitly declared
 //! offline executor. DTO validation/publication tests do not qualify OCR accuracy.
 use super::*;
+use crate::RichGenerationReader;
 use gptgrep_parse::*;
 use std::{
     future::Future,
@@ -288,14 +289,14 @@ async fn off_and_office_blockers_precede_any_executor_call_or_publication() -> R
         root.join("unsupported.docx"),
         b"explicit unsupported format",
     )?;
-    let plan = prepare_rich_ingest(&root, options("blocked")).await?;
+    // Invalid Office input or an absent runtime is an explicit preparation
+    // failure, never a partial generation or an OCR/model admission.
     assert!(
-        plan.report()
-            .blockers
-            .iter()
-            .any(|b| b.contains("Office/other formats"))
+        prepare_rich_ingest(&root, options("blocked"))
+            .await
+            .is_err()
     );
-    assert_eq!(plan.publish(Some(&mock)).await.new_ocr_executions, 0);
+    assert_eq!(mock.calls.load(Ordering::SeqCst), 0);
     assert!(!root.join(STATE).join("CURRENT.json").exists());
     Ok(())
 }
@@ -382,6 +383,195 @@ fn runtime_descriptor_rejects_nonregular_symlinks_oversize_and_credential_names(
     for name in ["auth.json", ".env", "private.pem", "private.key"] {
         // The filename gate rejects before any credential input could be opened.
         assert!(read_rich_runtime_descriptor(&root.join(name)).is_err());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn plaintext_markdown_empty_and_source_coordinates_publish_in_one_v2_transaction()
+-> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().canonicalize()?;
+    let text = "# Heading\r\nFirst 中 value\r\n\r\n## Other\nLast";
+    fs::write(root.join("note.md"), text)?;
+    fs::write(root.join("empty.txt"), b"")?;
+    let plan = prepare_rich_ingest(&root, RichIngestOptions::default()).await?;
+    assert_eq!(plan.report().required_pages, 0);
+    let report = plan.publish(None).await;
+    assert_eq!(report.status, "published", "{report:?}");
+    let reader = RichGenerationReader::open(&root)?;
+    reader.verify_all()?;
+    let doc = &reader
+        .manifest()?
+        .documents
+        .iter()
+        .find(|d| d.document.path == "note.md")
+        .unwrap();
+    assert!(doc.pages.is_empty());
+    assert_eq!(doc.document.pages.len(), 1);
+    assert_eq!(doc.document.pages[0].line_end, text.lines().count());
+    assert!(doc.ocr_tasks.is_empty());
+    let artifact = doc
+        .artifacts
+        .iter()
+        .find(|a| a.artifact.kind == ArtifactKind::NativeText)
+        .unwrap();
+    let id = artifact.artifact.id.clone();
+    let window = reader.read_text(&id, 0, 4096)?;
+    assert_eq!(window.text, text);
+    reader.validate_text_evidence(&window.evidence)?;
+    let hits = reader.search_artifacts("中", false, true, 1, None, 1_048_576)?;
+    assert_eq!(hits.hits.len(), 1);
+    assert!(matches!(
+        hits.hits[0].evidence,
+        crate::EvidenceRef::NativeText { .. }
+    ));
+    let pointer = fs::read(root.join(STATE).join("CURRENT.json"))?;
+    fs::write(root.join("note.md"), "changed raw source")?;
+    assert!(reader.read_text(&id, 0, 4096).is_err());
+    assert_eq!(fs::read(root.join(STATE).join("CURRENT.json"))?, pointer);
+    Ok(())
+}
+#[tokio::test]
+async fn invalid_utf8_or_changed_plaintext_blocks_complete_current_publication() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().canonicalize()?;
+    fs::write(root.join("note.txt"), "baseline")?;
+    assert_eq!(
+        prepare_rich_ingest(&root, RichIngestOptions::default())
+            .await?
+            .publish(None)
+            .await
+            .status,
+        "published"
+    );
+    let pointer = fs::read(root.join(STATE).join("CURRENT.json"))?;
+    fs::write(root.join("bad.txt"), [255u8])?;
+    assert!(
+        prepare_rich_ingest(&root, RichIngestOptions::default())
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read(root.join(STATE).join("CURRENT.json"))?, pointer);
+    fs::remove_file(root.join("bad.txt"))?;
+    let plan = prepare_rich_ingest(&root, RichIngestOptions::default()).await?;
+    fs::write(root.join("note.txt"), "after preparation")?;
+    assert_eq!(plan.publish(None).await.status, "failed_unpublished");
+    assert_eq!(fs::read(root.join(STATE).join("CURRENT.json"))?, pointer);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires installed LibreOffice and PDFium; raw-only self-authored RTF"]
+async fn installed_office_conversion_once_retains_normalized_pdf_for_native_generation()
+-> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().canonicalize()?;
+    let body = "Ordinary document text demonstrates retained conversion and native extraction. ";
+    fs::write(
+        root.join("note.rtf"),
+        format!(
+            "{{\\rtf1\\ansi\\deff0 {{\\fonttbl {{\\f0 Helvetica;}}}}\\f0\\fs22 {} }}",
+            body.repeat(30)
+        ),
+    )?;
+    let raw = fs::read(root.join("note.rtf"))?;
+    let options = RichIngestOptions {
+        native: NativeOptions {
+            render_pages: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let prepared = prepare_rich_ingest(&root, options).await?;
+    assert_eq!(prepared.report().required_pages, 0);
+    let report = prepared.publish(None).await;
+    assert_eq!(report.status, "published", "{report:?}");
+    let reader = RichGenerationReader::open(&root)?;
+    reader.verify_all()?;
+    let doc = &reader.manifest()?.documents[0];
+    assert_eq!(doc.prepared.format, "rtf");
+    assert_eq!(doc.prepared.source_sha256, digest(&raw));
+    assert_ne!(doc.prepared.source_sha256, doc.prepared.prepared_sha256);
+    assert!(matches!(&doc.prepared.conversion, FeatureState::Present(c) if c.invocations == 1));
+    assert!(!doc.pages.is_empty());
+    assert!(doc.pages.iter().all(|p| matches!(
+        p.capabilities.get("original_office_page_cell_mapping"),
+        Some(FeatureState::Unsupported(_))
+    )));
+    let artifact = &doc.pages[0].native_text.id;
+    assert!(
+        reader
+            .read_text(artifact, 0, 4096)?
+            .text
+            .contains("Ordinary document text")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_plaintext_corpus_has_zero_physical_pages_and_no_fabricated_evidence() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().canonicalize()?;
+    fs::write(root.join("empty.txt"), b"")?;
+    let report = prepare_rich_ingest(&root, RichIngestOptions::default())
+        .await?
+        .publish(None)
+        .await;
+    assert_eq!(report.status, "published", "{report:?}");
+    let reader = RichGenerationReader::open(&root)?;
+    reader.verify_all()?;
+    let doc = &reader.manifest()?.documents[0];
+    assert!(doc.pages.is_empty() && doc.document.pages.is_empty() && doc.document.nodes.is_empty());
+    assert_eq!(doc.artifacts.len(), 2);
+    assert!(
+        reader
+            .search_artifacts("text", false, true, 1, None, 1_048_576)?
+            .hits
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn plaintext_completed_dto_cannot_rewrite_source_lines_or_add_physical_coverage() -> Result<()>
+{
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().canonicalize()?;
+    fs::write(root.join("note.md"), "# Title\r\nLine 中\r\n")?;
+    assert_eq!(
+        prepare_rich_ingest(&root, RichIngestOptions::default())
+            .await?
+            .publish(None)
+            .await
+            .status,
+        "published"
+    );
+    let pointer = fs::read(root.join(STATE).join("CURRENT.json"))?;
+    for mutation in 0..3 {
+        let budget = ResourceBudget::default();
+        let prepared = prepare_document(
+            &root.join("note.md"),
+            &root.join(STATE).join("fixture-staging"),
+            &PreparationOptions,
+            &budget,
+        )
+        .await?;
+        let native = extract_native(&prepared, &NativeOptions::default(), &budget).await?;
+        let mut parsed = finalize_document(native, Vec::new(), OcrMode::Off, &budget)?;
+        match mutation {
+            0 => parsed.document.pages[0].line_end += 1,
+            1 => parsed.document.text.push_str("forged text"),
+            _ => parsed.coverage.push((1, CoverageState::Native)),
+        }
+        let mut writer = RichGenerationWriter::begin(&root, budget)?;
+        assert!(
+            writer
+                .add_document("note.md", prepared.staging_root(), parsed)
+                .is_err()
+        );
+        assert!(writer.publish().is_err());
+        assert_eq!(fs::read(root.join(STATE).join("CURRENT.json"))?, pointer);
     }
     Ok(())
 }
