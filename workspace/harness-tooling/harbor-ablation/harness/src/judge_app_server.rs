@@ -102,6 +102,84 @@ fn static_failure_code(error: &anyhow::Error) -> &'static str {
         .find(|code| *code == message)
         .unwrap_or("unknown_internal_failure")
 }
+// Selected official notification literals, including refused diagnostic events.
+// Membership supplies a label only; it never admits an event or changes ordering.
+const NOTIFICATION_CATEGORIES: &[&str] = &[
+    "error",
+    "thread/started",
+    "thread/status/changed",
+    "thread/tokenUsage/updated",
+    "turn/started",
+    "turn/completed",
+    "rawResponse/completed",
+    "item/started",
+    "item/completed",
+    "item/agentMessage/delta",
+    "item/reasoning/textDelta",
+    "item/reasoning/summaryTextDelta",
+    "item/reasoning/summaryPartAdded",
+    "account/updated",
+    "account/rateLimits/updated",
+    "remoteControl/status/changed",
+    "configWarning",
+    "warning",
+    "model/rerouted",
+    "model/verification",
+    "turn/plan/updated",
+    "turn/diff/updated",
+    "serverRequest/resolved",
+];
+fn notification_category(method: Option<&str>) -> &'static str {
+    NOTIFICATION_CATEGORIES
+        .iter()
+        .copied()
+        .find(|known| Some(*known) == method)
+        .unwrap_or("unknown_notification")
+}
+fn native_error_category(info: &Value) -> &'static str {
+    const CODES: &[&str] = &[
+        "contextWindowExceeded",
+        "sessionBudgetExceeded",
+        "usageLimitExceeded",
+        "rateLimitExceeded",
+        "flexUnavailable",
+        "serverOverloaded",
+        "cyberPolicy",
+        "misalignmentPolicyViolation",
+        "tooManyDenials",
+        "internalServerError",
+        "unauthorized",
+        "badRequest",
+        "threadRollbackFailed",
+        "sandboxError",
+        "other",
+    ];
+    if let Some(code) = CODES
+        .iter()
+        .copied()
+        .find(|code| Some(*code) == info.as_str())
+    {
+        return code;
+    }
+    if let Some(o) = info.as_object().filter(|o| o.len() == 1) {
+        for code in [
+            "httpConnectionFailed",
+            "responseStreamConnectionFailed",
+            "responseStreamDisconnected",
+            "responseTooManyFailedAttempts",
+        ] {
+            if o.get(code).and_then(Value::as_object).is_some_and(|p| {
+                p.keys().all(|key| key == "httpStatusCode")
+                    && p.get("httpStatusCode").is_none_or(|value| {
+                        value.is_null() || value.as_u64().is_some_and(|n| u16::try_from(n).is_ok())
+                    })
+            }) {
+                return code;
+            }
+        }
+    }
+    "unknown_native_error"
+}
 
 struct Seed<'a> {
     nodes: &'a Cell<usize>,
@@ -435,6 +513,9 @@ struct ProtocolObservations {
     thread_usage: Option<NativeUsage>,
     raw_response_usage: Option<TokenUsage>,
     rpc_error_code: Option<i64>,
+    failing_notification_category: Option<&'static str>,
+    native_error_category: Option<&'static str>,
+    native_error_will_retry: Option<bool>,
     events_observed: usize,
     automatic_metadata_notifications: usize,
     tools_observed_and_rejected: bool,
@@ -717,6 +798,9 @@ impl<'a> Session<'a> {
                 thread_usage: None,
                 raw_response_usage: None,
                 rpc_error_code: None,
+                failing_notification_category: None,
+                native_error_category: None,
+                native_error_will_retry: None,
                 events_observed: 0,
                 automatic_metadata_notifications: 0,
                 tools_observed_and_rejected: false,
@@ -922,6 +1006,20 @@ impl<'a> Session<'a> {
         }
     }
     fn notification(&mut self, v: &Value, limits: &Limits) -> Result<()> {
+        let result = self.checked_notification(v, limits);
+        if result.is_err() {
+            self.protocol.failing_notification_category =
+                Some(notification_category(v["method"].as_str()));
+            if v["method"] == "error" {
+                self.protocol.native_error_category = Some(native_error_category(
+                    &v["params"]["error"]["codexErrorInfo"],
+                ));
+                self.protocol.native_error_will_retry = v["params"]["willRetry"].as_bool();
+            }
+        }
+        result
+    }
+    fn checked_notification(&mut self, v: &Value, limits: &Limits) -> Result<()> {
         let method = field(v, "method")?.as_str().context("app_method_shape")?;
         let p = field(v, "params")?;
         if method == "thread/status/changed" {
@@ -1333,6 +1431,9 @@ fn report(a: &Admission, origin: &'static str) -> AppReport {
             thread_usage: None,
             raw_response_usage: None,
             rpc_error_code: None,
+            failing_notification_category: None,
+            native_error_category: None,
+            native_error_will_retry: None,
             events_observed: 0,
             automatic_metadata_notifications: 0,
             tools_observed_and_rejected: false,
@@ -1360,6 +1461,9 @@ fn reserve_receipt(a: &Admission) -> Result<()> {
     worst["observations"]["stderr_bytes_observed"] = json!(usize::MAX);
     worst["protocol"]["events_observed"] = json!(usize::MAX);
     worst["protocol"]["rpc_error_code"] = json!(i64::MIN);
+    worst["protocol"]["failing_notification_category"] = json!("x".repeat(STATIC_FAILURE_CODE_CAP));
+    worst["protocol"]["native_error_category"] = json!("x".repeat(STATIC_FAILURE_CODE_CAP));
+    worst["protocol"]["native_error_will_retry"] = json!(false);
     worst["protocol"]["outbound_frames"]=json!(["initialize","initialized","thread/start","turn/start"].map(|method|json!({"method":method,"prepared_bytes":usize::MAX,"prepared_sha256":"f".repeat(64),"bytes_written":usize::MAX,"full_write_observed":false})));
     worst["protocol"]["configured_ack"] = json!({"model":"\\".repeat(ID_MAX),"model_provider":"\\".repeat(ID_MAX),"service_tier":"\\".repeat(ID_MAX)});
     let usage = json!({"totalTokens":i64::MAX,"inputTokens":i64::MAX,"cachedInputTokens":i64::MAX,"cacheWriteInputTokens":i64::MAX,"outputTokens":i64::MAX,"reasoningOutputTokens":i64::MAX});

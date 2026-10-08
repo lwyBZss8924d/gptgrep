@@ -35,6 +35,91 @@ fn automatic(method: &str, params: Value) -> Value {
     json!({"method":method,"params":params})
 }
 #[test]
+fn notification_failure_category_does_not_admit_prestarted_events_or_unknown_names() -> Result<()> {
+    let sc = schema();
+    for (method, expected) in [
+        ("error", "error"),
+        ("thread/tokenUsage/updated", "thread/tokenUsage/updated"),
+        ("item/started", "item/started"),
+        ("turn/completed", "turn/completed"),
+        ("MOCK-private-unknown-method", "unknown_notification"),
+    ] {
+        let mut s = Session::new("generic", &sc, "/mock")?;
+        s.stage = Stage::Running;
+        let error = emit(&mut s, automatic(method, json!({}))).unwrap_err();
+        assert_eq!(static_failure_code(&error), "app_turn_not_started");
+        assert_eq!(s.protocol.failing_notification_category, Some(expected));
+        assert!(!s.started && s.final_text.is_none());
+        assert!(s.protocol.thread_usage.is_none() && s.protocol.raw_response_usage.is_none());
+        assert!(!serde_json::to_string(&s.protocol)?.contains("MOCK-private"));
+    }
+    for method in NOTIFICATION_CATEGORIES {
+        assert!(method.len() <= STATIC_FAILURE_CODE_CAP);
+        assert_eq!(notification_category(Some(method)), *method);
+    }
+    assert_eq!(notification_category(None), "unknown_notification");
+    Ok(())
+}
+#[test]
+fn failed_error_notification_projects_only_closed_code_and_boolean() -> Result<()> {
+    let sc = schema();
+    for (info, expected) in [
+        (json!("unauthorized"), "unauthorized"),
+        (
+            json!({"httpConnectionFailed":{"httpStatusCode":400}}),
+            "httpConnectionFailed",
+        ),
+        (
+            json!({"responseStreamDisconnected":{"httpStatusCode":null}}),
+            "responseStreamDisconnected",
+        ),
+        (
+            json!({"responseTooManyFailedAttempts":{}}),
+            "responseTooManyFailedAttempts",
+        ),
+        (
+            json!({"responseStreamConnectionFailed":{"httpStatusCode":65535}}),
+            "responseStreamConnectionFailed",
+        ),
+        (json!("MOCK-private-unknown-code"), "unknown_native_error"),
+        (
+            json!({"httpConnectionFailed":{"httpStatusCode":65536}}),
+            "unknown_native_error",
+        ),
+        (
+            json!({"httpConnectionFailed":{"httpStatusCode":true}}),
+            "unknown_native_error",
+        ),
+        (
+            json!({"httpConnectionFailed":{"httpStatusCode":400,"MOCK-private-extra":"MOCK-private"}}),
+            "unknown_native_error",
+        ),
+        (Value::Null, "unknown_native_error"),
+    ] {
+        for retry in [
+            json!(true),
+            json!(false),
+            json!("MOCK-private-invalid-boolean"),
+        ] {
+            let mut s = Session::new("generic", &sc, "/mock")?;
+            s.stage = Stage::Running;
+            let event = automatic(
+                "error",
+                json!({"threadId":"MOCK-private-thread","turnId":"MOCK-private-turn","willRetry":retry,"error":{"message":"MOCK-private-provider-message","additionalDetails":"MOCK-private-details","codexErrorInfo":info}}),
+            );
+            let error = emit(&mut s, event).unwrap_err();
+            assert_eq!(static_failure_code(&error), "app_turn_not_started");
+            assert_eq!(s.protocol.failing_notification_category, Some("error"));
+            assert_eq!(s.protocol.native_error_category, Some(expected));
+            assert_eq!(s.protocol.native_error_will_retry, retry.as_bool());
+            let receipt = serde_json::to_string(&s.protocol)?;
+            assert!(!receipt.contains("MOCK-private") && !receipt.contains("httpStatusCode"));
+            assert!(!s.started && s.final_text.is_none());
+        }
+    }
+    Ok(())
+}
+#[test]
 fn automatic_metadata_uses_one_discard_counter_across_all_phases() -> Result<()> {
     let sc = schema();
     let mut s = Session::new("generic", &sc, "/mock")?;
@@ -825,6 +910,7 @@ if mode=='hang':time.sleep(10)
 if mode=='flood':sys.stdout.write('x'*8192);sys.stdout.flush();time.sleep(10)
 if mode=='server':send({'id':9,'method':'account/chatgptAuthTokens/refresh','params':{'secret':'mock-secret'}});time.sleep(10)
 if mode=='error':send({'id':t['id'],'error':{'code':-32001,'message':'mock-secret-home-prompt','data':{'private':'never-retain'}}});sys.exit(1)
+if mode=='prestarted':send({'id':t['id'],'result':{'turn':{'id':'native-turn','status':'inProgress'}}});send({'method':'error','params':{'threadId':'native-thread','turnId':'native-turn','willRetry':False,'error':{'message':'mock-secret-native-error','additionalDetails':'mock-secret-details','codexErrorInfo':{'httpConnectionFailed':{'httpStatusCode':400}}}}});sys.exit(1)
 send({'method':'turn/started','params':{'threadId':'native-thread','turn':{'id':'native-turn','status':'inProgress'}}})
 send({'id':t['id'],'result':{'turn':{'id':'native-turn','status':'inProgress'}}})
 i={'type':'agentMessage','id':'native-item','phase':'final_answer','text':''}
@@ -956,6 +1042,9 @@ fn actual_bidirectional_mock_child_captures_native_ids_not_served_profile() -> R
     );
     assert!(r.publication_sha256.is_some() && r.report.base.verdict.is_some());
     assert!(r.report.internal_failure_code.is_none());
+    assert!(r.report.protocol.failing_notification_category.is_none());
+    assert!(r.report.protocol.native_error_category.is_none());
+    assert!(r.report.protocol.native_error_will_retry.is_none());
     assert_eq!(
         r.report.base.observations.native_turn_id.as_deref(),
         Some("native-turn")
@@ -1001,6 +1090,39 @@ fn mock_rpc_error_retains_only_numeric_code_and_permanent_claim() -> Result<()> 
     let receipt: Value = strict(&receipt)?;
     assert_eq!(receipt["internal_failure_code"], "app_rpc_error");
     assert!(f.claims.join("mock-app.claim.json").exists());
+    Ok(())
+}
+#[test]
+fn mock_prestarted_error_retains_safe_category_without_admitting_or_retrying() -> Result<()> {
+    let f = MockFixture::new()?;
+    let r = f.run("prestarted", Duration::from_secs(3))?;
+    assert_eq!(r.report.base.status, "completion_unknown_quarantined");
+    assert_eq!(r.report.base.failure_code, Some("app_unavailable_no_retry"));
+    assert_eq!(r.report.internal_failure_code, Some("app_turn_not_started"));
+    assert_eq!(
+        r.report.protocol.failing_notification_category,
+        Some("error")
+    );
+    assert_eq!(
+        r.report.protocol.native_error_category,
+        Some("httpConnectionFailed")
+    );
+    assert_eq!(r.report.protocol.native_error_will_retry, Some(false));
+    assert!(r.report.base.verdict.is_none() && !r.report.base.reward_emitted && r.no_retry);
+    assert!(f.claims.join("mock-app.claim.json").exists());
+    let receipt = fs::read(f.output.join("app-server-observation.json"))?;
+    assert!(!String::from_utf8_lossy(&receipt).contains("mock-secret"));
+    let receipt: Value = strict(&receipt)?;
+    assert_eq!(
+        receipt["protocol"]["failing_notification_category"],
+        "error"
+    );
+    assert_eq!(
+        receipt["protocol"]["native_error_category"],
+        "httpConnectionFailed"
+    );
+    assert_eq!(receipt["protocol"]["native_error_will_retry"], false);
+    assert!(f.run("prestarted", Duration::from_secs(3)).is_err());
     Ok(())
 }
 #[test]
