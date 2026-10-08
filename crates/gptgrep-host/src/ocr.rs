@@ -809,7 +809,6 @@ fn ocr_command(binary: &Path, cwd: &Path, home: &Path, descriptor: &Path) -> Res
 
 pub(crate) fn ocr_policy() -> Value {
     let mut policy = crate::protocol::base_config();
-    policy["features.stable_environment_tools"] = json!(false);
     policy["features.request_permissions_tool"] = json!(false);
     policy["model_reasoning_effort"] = json!("max");
     policy["service_tier"] = json!("fast");

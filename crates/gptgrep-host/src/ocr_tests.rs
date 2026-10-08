@@ -1274,3 +1274,67 @@ async fn emitted_protocol_shapes_match_selected_runtime_schema() {
         );
     }
 }
+
+#[test]
+fn official_runtime_policy_omits_obsolete_flag_and_preserves_restrictions() {
+    // Frozen from the unmodified 3f1461 product helper, excluding only its
+    // observed unsupported override. This catches collateral policy changes.
+    let expected = json!({
+        "agents.enabled": false,
+        "analytics.enabled": false,
+        "cloud.skills.enabled": false,
+        "features.apps": false,
+        "features.artifact": false,
+        "features.browser_use": false,
+        "features.browser_use_external": false,
+        "features.code_mode.direct_only_tool_namespaces": [
+            "gptgrep"
+        ],
+        "features.code_mode.enabled": false,
+        "features.code_mode_host.disable_in_process_fallback": false,
+        "features.code_mode_host.enabled": false,
+        "features.code_mode_only": false,
+        "features.code_mode_prewarm": false,
+        "features.computer_use": false,
+        "features.current_time_reminder": false,
+        "features.deferred_executor": false,
+        "features.fast_mode": true,
+        "features.goals": false,
+        "features.hooks": false,
+        "features.image_generation": false,
+        "features.in_app_browser": false,
+        "features.memories": false,
+        "features.multi_agent_v2": false,
+        "features.plugins": false,
+        "features.realtime_conversation": false,
+        "features.request_permissions_tool": false,
+        "features.send_message_to_user_async": false,
+        "features.shell_tool": false,
+        "features.sleep_tool": false,
+        "features.token_budget": false,
+        "features.tool_suggest": false,
+        "features.view_image": false,
+        "model_reasoning_effort": "max",
+        "notify": [],
+        "orchestrator.mcp.enabled": false,
+        "project_doc_max_bytes": 0,
+        "service_tier": "fast",
+        "tools.experimental_request_user_input.enabled": false,
+        "tools.update_plan.enabled": false,
+        "web_search": "disabled"
+    });
+    let policy = crate::ocr::ocr_policy();
+    assert!(policy.get("features.stable_environment_tools").is_none());
+    assert_eq!(policy, expected);
+    assert_eq!(policy["model_reasoning_effort"], "max");
+    assert_eq!(policy["service_tier"], "fast");
+    assert_eq!(policy["features.shell_tool"], false);
+    assert_eq!(policy["features.view_image"], false);
+    assert_eq!(policy["features.request_permissions_tool"], false);
+    assert_eq!(policy["web_search"], "disabled");
+    assert_eq!(policy["orchestrator.mcp.enabled"], false);
+    assert_eq!(
+        policy["features.code_mode.direct_only_tool_namespaces"],
+        json!(["gptgrep"])
+    );
+}
