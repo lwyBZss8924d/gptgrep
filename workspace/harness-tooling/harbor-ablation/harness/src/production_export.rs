@@ -1401,8 +1401,8 @@ fn reader_dockerfile(
     arm: &str,
 ) -> Result<Vec<u8>> {
     let mut docker = format!(
-        "FROM {}\nWORKDIR /app\nCOPY --chown={}:{} reader-input.json codex-config.json /app/\n",
-        o.reader_image, o.reader_uid, o.reader_gid
+        "FROM {}\nWORKDIR /app\nRUN chown {}:{} /app && chmod 0755 /app\nCOPY --chown={}:{} reader-input.json codex-config.json /app/\n",
+        o.reader_image, o.reader_uid, o.reader_gid, o.reader_uid, o.reader_gid
     );
     if o.runtime_debian_packages.is_some() {
         docker.push_str(RUNTIME_DOCKER);

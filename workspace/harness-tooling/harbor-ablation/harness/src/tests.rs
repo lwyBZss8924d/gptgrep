@@ -693,12 +693,31 @@ mod production {
         assert_eq!(
             fs::read_to_string(first.join("control/task-a/environment/Dockerfile"))?,
             format!(
-                "FROM example/reader@sha256:{}\nWORKDIR /app\nCOPY --chown=1000:1000 reader-input.json codex-config.json /app/\nCOPY --chown=1000:1000 groups/group-a/raw/ {}/\nUSER 1000:1000\n",
+                "FROM example/reader@sha256:{}\nWORKDIR /app\nRUN chown 1000:1000 /app && chmod 0755 /app\nCOPY --chown=1000:1000 reader-input.json codex-config.json /app/\nCOPY --chown=1000:1000 groups/group-a/raw/ {}/\nUSER 1000:1000\n",
                 "a".repeat(64),
                 f.raw.display()
             )
         );
         assert!(!second.join("frozen-runtime-debian-inputs.json").exists());
+        Ok(())
+    }
+    #[tokio::test]
+    async fn reader_answer_directory_is_symmetric_for_numeric_user() -> Result<()> {
+        let f = ProductionFixture::new().await?;
+        let mut options: Value = serde_json::from_slice(&fs::read(&f.options)?)?;
+        options["reader_uid"] = json!(501);
+        options["reader_gid"] = json!(20);
+        save(&f.options, &options)?;
+        let output = f.base.join("answer-directory-readers");
+        f.export(&output);
+        for arm in ["control", "gptgrep"] {
+            let docker =
+                fs::read_to_string(output.join(format!("{arm}/task-a/environment/Dockerfile")))?;
+            assert!(docker.contains("WORKDIR /app\nRUN chown 501:20 /app && chmod 0755 /app\n"));
+            assert!(docker.ends_with("USER 501:20\n"));
+            assert_eq!(docker.matches("RUN chown 501:20 /app").count(), 1);
+            assert!(docker.find("RUN chown").unwrap() < docker.find("COPY").unwrap());
+        }
         Ok(())
     }
     #[tokio::test]
