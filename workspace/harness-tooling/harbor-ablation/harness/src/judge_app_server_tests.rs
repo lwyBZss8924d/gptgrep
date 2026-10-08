@@ -54,6 +54,103 @@ fn automatic_metadata_uses_one_discard_counter_across_all_phases() -> Result<()>
     Ok(())
 }
 #[test]
+fn notification_envelope_accepts_only_optional_i64_timestamp() -> Result<()> {
+    let sc = schema();
+    for timestamp in [None, Some(i64::MIN), Some(0), Some(i64::MAX)] {
+        for stage in [
+            Stage::SendInit,
+            Stage::Init,
+            Stage::SendThread,
+            Stage::Thread,
+            Stage::ThreadStarted,
+            Stage::SendTurn,
+            Stage::Turn,
+            Stage::Running,
+            Stage::Complete,
+        ] {
+            let mut s = Session::new("generic", &sc, "/mock")?;
+            s.stage = stage;
+            let mut event = automatic(
+                "remoteControl/status/changed",
+                json!({"installationId":"private-discarded","serverName":"private-discarded","status":"disabled","environmentId":null}),
+            );
+            if let Some(timestamp) = timestamp {
+                event["emittedAtMs"] = json!(timestamp);
+            }
+            emit(&mut s, event)?;
+            assert_eq!(s.metadata.notifications, 1);
+            assert_eq!(s.protocol.automatic_metadata_notifications, 1);
+            assert_eq!(s.protocol.outbound_frames.len(), 1);
+            assert!(s.early.is_empty());
+            assert!(s.thread_id.is_none() && s.turn_id.is_none());
+            assert!(s.protocol.thread_usage.is_none() && s.protocol.raw_response_usage.is_none());
+            let receipt = serde_json::to_string(&s.protocol)?;
+            assert!(!receipt.contains("emittedAtMs") && !receipt.contains("private-discarded"));
+        }
+    }
+    Ok(())
+}
+#[test]
+fn notification_envelope_rejects_invalid_timestamps_before_metadata() -> Result<()> {
+    let sc = schema();
+    for timestamp in [
+        Value::Null,
+        json!(true),
+        json!(false),
+        json!("1"),
+        json!(1.0),
+        json!(i64::MAX as u64 + 1),
+        serde_json::from_str("-9223372036854775809")?,
+    ] {
+        let mut s = Session::new("generic", &sc, "/mock")?;
+        let mut event = automatic("account/updated", json!({"authMode":"chatgpt"}));
+        event["emittedAtMs"] = timestamp;
+        assert!(emit(&mut s, event).is_err());
+        assert_eq!(s.metadata.notifications, 0);
+        assert!(s.early.is_empty());
+    }
+    for raw in [
+        br#"{"method":"account/updated","params":{"authMode":"chatgpt"},"emittedAtMs":0,"emittedAtMs":1}"#.as_slice(),
+        br#"{"method":"account/updated","params":{"authMode":"chatgpt"},"emittedAtMs":0,"emitted\u0041tMs":1}"#,
+    ] {
+        let mut s = Session::new("generic", &sc, "/mock")?;
+        assert!(s.line(raw, &limits()).is_err());
+        assert_eq!(s.metadata.notifications, 0);
+    }
+    Ok(())
+}
+#[test]
+fn notification_timestamp_does_not_admit_other_fields_or_configuration_warnings() -> Result<()> {
+    let sc = schema();
+    for (key, value) in [
+        ("extra", json!(false)),
+        ("jsonrpc", json!("2.0")),
+        ("id", Value::Null),
+    ] {
+        let mut s = Session::new("generic", &sc, "/mock")?;
+        let mut event = automatic("account/updated", json!({"authMode":"chatgpt"}));
+        event["emittedAtMs"] = json!(0);
+        event[key] = value;
+        assert!(emit(&mut s, event).is_err());
+        assert_eq!(s.metadata.notifications, 0);
+    }
+    let mut s = Session::new("generic", &sc, "/mock")?;
+    let mut warning = automatic(
+        "configWarning",
+        json!({"summary":"generic warning","details":null}),
+    );
+    warning["emittedAtMs"] = json!(0);
+    assert_eq!(
+        emit(&mut s, warning).unwrap_err().to_string(),
+        "app_notification_order"
+    );
+    assert_eq!(s.metadata.notifications, 0);
+    let mut s = Session::new("generic", &sc, "/mock")?;
+    sent(&mut s);
+    assert!(emit(&mut s, json!({"id":1,"result":{},"emittedAtMs":0})).is_err());
+    Ok(())
+}
+#[test]
 fn automatic_metadata_invalid_shapes_requests_and_other_methods_stay_refused() -> Result<()> {
     let sc = schema();
     for event in [

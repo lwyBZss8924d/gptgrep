@@ -697,7 +697,15 @@ impl<'a> Session<'a> {
                 self.protocol.tools_observed_and_rejected = true;
                 bail!("app_server_request_rejected");
             }
-            ensure!(o.len() == 2 && o.contains_key("params"), "app_rpc_envelope");
+            // Official notifications optionally add emittedAtMs: i64; discard its value.
+            ensure!(
+                o.contains_key("params")
+                    && o.keys()
+                        .all(|key| { matches!(key.as_str(), "method" | "params" | "emittedAtMs") })
+                    && o.get("emittedAtMs")
+                        .is_none_or(|value| value.as_i64().is_some()),
+                "app_rpc_envelope"
+            );
             if self.metadata.observe(&v)? {
                 self.protocol.automatic_metadata_notifications = self.metadata.notifications;
                 return Ok(());
