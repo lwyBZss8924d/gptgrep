@@ -16,6 +16,7 @@ from verify_answer import admit_answer, equivalence_reward
 EXPORTER = None
 SCRATCH = None
 PRODUCTION_FIXTURE = None
+READER_EXPORT_FIXTURE = None
 
 
 class PackagingTests(unittest.TestCase):
@@ -521,6 +522,51 @@ class ProductionPackagingTests(unittest.TestCase):
         self.assertFalse(self.package.exists())
 
 
+class ProductionDockerOwnershipTests(unittest.TestCase):
+    def test_expected_numeric_answer_directory_ownership_is_symmetric(self):
+        options = {"reader_image": "python@sha256:" + "a" * 64,
+                   "reader_uid": 501, "reader_gid": 20}
+        groups = {"group-a": {"runtime_root": "/app/groups/group-a/raw"}}
+        for arm in ("control", "gptgrep"):
+            docker = bridge.production_reader_dockerfile(options, groups, ["group-a"], arm)
+            self.assertIn(b"WORKDIR /app\nRUN chown 501:20 /app && chmod 0755 /app\n", docker)
+            self.assertTrue(docker.endswith(b"USER 501:20\n"))
+
+    def test_retained_generated_reader_export_is_admitted_without_grader(self):
+        if READER_EXPORT_FIXTURE is None:
+            self.skipTest("explicit source-only generated reader export not supplied")
+        manifest, files, manifest_sha = bridge.read_export(Path(READER_EXPORT_FIXTURE), "reader")
+        self.assertEqual(manifest["role"], "reader")
+        self.assertEqual(manifest_sha, bridge.digest(
+            (Path(READER_EXPORT_FIXTURE) / "export-manifest.json").read_bytes()))
+        self.assertTrue(files)
+
+    def test_refreshed_inventory_cannot_omit_or_change_answer_directory_ownership(self):
+        if READER_EXPORT_FIXTURE is None:
+            self.skipTest("explicit source-only generated reader export not supplied")
+        source = Path(READER_EXPORT_FIXTURE)
+        options = bridge.production_json((source / "frozen-options.json").read_bytes())
+        line = f"RUN chown {options['reader_uid']}:{options['reader_gid']} /app && chmod 0755 /app\n".encode()
+        manifest = bridge.production_json((source / "export-manifest.json").read_bytes())
+        for arm in ("control", "gptgrep"):
+            for replacement in (b"", line.replace(b"0755", b"0777")):
+                with self.subTest(arm=arm, omitted=not replacement):
+                    with tempfile.TemporaryDirectory(dir=SCRATCH) as directory:
+                        readers = Path(directory) / "readers"
+                        shutil.copytree(source, readers)
+                        name = f"{arm}/{manifest['task_bindings'][0]['id']}/environment/Dockerfile"
+                        docker = readers / name
+                        original = docker.read_bytes()
+                        self.assertEqual(original.count(line), 1)
+                        docker.write_bytes(original.replace(line, replacement))
+                        refreshed = bridge.production_json((readers / "export-manifest.json").read_bytes())
+                        refreshed["files"][name] = bridge.digest(docker.read_bytes())
+                        (readers / "export-manifest.json").write_text(json.dumps(refreshed))
+                        with self.assertRaisesRegex(ValueError, "production_reader_docker_binding"):
+                            bridge.read_export(readers, "reader")
+                        self.assertFalse((Path(directory) / "package").exists())
+
+
 class ToolObservationTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=SCRATCH)
@@ -594,6 +640,8 @@ if __name__ == "__main__":
     parser=argparse.ArgumentParser()
     parser.add_argument("--exporter",required=True);parser.add_argument("--scratch",required=True)
     parser.add_argument("--production-fixture")
+    parser.add_argument("--reader-export-fixture")
     args=parser.parse_args();EXPORTER=str(Path(args.exporter).resolve());SCRATCH=str(Path(args.scratch).resolve())
     PRODUCTION_FIXTURE = args.production_fixture
+    READER_EXPORT_FIXTURE = args.reader_export_fixture
     unittest.main(argv=[sys.argv[0]],verbosity=2)

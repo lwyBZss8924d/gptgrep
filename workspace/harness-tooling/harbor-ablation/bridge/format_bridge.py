@@ -283,7 +283,9 @@ def production_reader_dockerfile(options, groups, scope, arm):
     uid, gid = options["reader_uid"], options["reader_gid"]
     if type(uid) is not int or type(gid) is not int or not 1 <= uid <= 4294967295 or not 1 <= gid <= 4294967295:
         raise ValueError("production_reader_user")
-    docker = f"FROM {image}\nWORKDIR /app\nCOPY --chown={uid}:{gid} reader-input.json codex-config.json /app/\n"
+    docker = (f"FROM {image}\nWORKDIR /app\n"
+              f"RUN chown {uid}:{gid} /app && chmod 0755 /app\n"
+              f"COPY --chown={uid}:{gid} reader-input.json codex-config.json /app/\n")
     if options.get("runtime_debian_packages") is not None:
         docker += RUNTIME_DOCKER
     for group_id in scope:
