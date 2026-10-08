@@ -130,8 +130,12 @@ the lexical lane and are marked `literal_anchor`; the model score is not rewritt
 This avoids allowing an uncertain semantic judgment to erase a proven grep match.
 No-answer cases, literal queries and natural-language questions are separate evals.
 
-Jev uses `/api/alpha/decisions`, a 20-second request deadline, no automatic retry,
-no redirects or provider fallback, at most 64 questions and a 64 KiB payload.
+Decisions uses `/api/alpha/decisions`, a 20-second request deadline, no automatic
+retry, no redirects or provider fallback, and at most 64 questions. Text requests
+and the escaped text/questions envelope retain a 64 KiB limit. Typed Luna image
+requests have an 8 MiB complete-body limit, with at most four PNG/JPEG images,
+1 MiB of compressed bytes and 8 million pixels per image, and 24 million pixels
+in total. Base64 and JSON framing count toward the complete-body limit.
 Malformed, missing, duplicate and mismatched responses fail explicitly. Returned
 model and available usage/cost are retained; unavailable metrics remain null.
 

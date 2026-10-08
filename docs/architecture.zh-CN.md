@@ -40,7 +40,12 @@ flowchart TD
 | `gptgrep-cli` | 原生命令行参数、JSON、schema 与 grep 结果展示 | 本地命令无需额外运行时 |
 | `packages/cli` | 可选的 incur 展示与接口发现包装层 | Node 和已发布的 incur 0.5.1 |
 
-宿主配置的默认值为本项目选定的 `model = "gpt-5.6-luna"` 和
+Decisions 默认使用 `openai/gpt-6-luna-decisions`，支持有明确上限的扁平 typed
+PNG/JPEG 输入，并严格校验返回的模型标识。`typesafe/jev-1.13` 保留为显式选择的
+纯文本选项。routing、reranking 与宿主后续调用共享一个 `ExecutionContext`；
+可选地加入已有账本，但不会重设原始时钟或已消耗的额度。原生 Codex 的模型选择独立配置。
+
+宿主配置的默认值为本项目选定的 `model = "gpt-6-luna"` 和
 `model_reasoning_effort = "max"`，以及 `service_tier = "fast"`。这些设置仅用于本地辅助模型，不会改变开发智能体的模型。
 运行时的 `CODEX_HOME` 用于选择已有的账户隔离环境。
 程序不读取或复制认证文件、不修改全局配置，也不执行交互式登录。
@@ -106,8 +111,11 @@ Choice 分数用于比较可用选项，因此不被用作绝对相关性。
 模型分数不会被改写。这样可避免不确定的语义判断抹去已经验证的 grep 匹配。
 无答案案例、字面量查询和自然语言问题分别进行评估。
 
-Jev 使用 `/api/alpha/decisions`，请求时限为 20 秒；不自动重试、不跟随重定向，也不回退到其他提供方。
-每次请求最多包含 64 个问题，载荷上限为 64 KiB。
+Decisions 使用 `/api/alpha/decisions`，请求时限为 20 秒；不自动重试、不跟随重定向，也不回退到其他提供方。
+每次请求最多包含 64 个问题。文本请求以及转义后的文本／问题封装保持 64 KiB 上限。
+Typed Luna 图片请求的完整请求体上限为 8 MiB，最多包含 4 张 PNG/JPEG；
+每张压缩文件不超过 1 MiB、像素不超过 800 万，合计不超过 2400 万像素。
+Base64 与 JSON 封装均计入完整请求体上限。
 格式错误、缺失、重复或不匹配的响应都会明确失败。
 实际返回的模型及可获得的用量／费用会被保留；不可获得的指标保持为 null。
 
