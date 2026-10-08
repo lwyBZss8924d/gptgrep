@@ -10,6 +10,7 @@ mod evidence_roles;
 pub mod rich_batch;
 pub use gptgrep_index::{IndexContentLimits, IndexContentReport};
 mod rich_decisions;
+mod rich_multimodal;
 pub use derived_visual::{
     DerivedCacheBudget, DerivedCacheStatus, DerivedRecipeToken, DerivedVisualCache,
     DerivedVisualPin, DerivedVisualReceipt, VisualSource,
@@ -23,6 +24,12 @@ pub use rich_decisions::{
     PreparedRichTextSearch, RichTextAttempt, RichTextCoverage, RichTextHit, RichTextInitialPass,
     RichTextSearchError, RichTextSearchOptions, RichTextSearchReport, RichTextUsageProjection,
     prepare_rich_text_search,
+};
+pub use rich_multimodal::{
+    PreparedRichMultimodalSearch, RichMultimodalAttempt, RichMultimodalContent,
+    RichMultimodalCoverage, RichMultimodalHit, RichMultimodalInitialPass,
+    RichMultimodalSearchError, RichMultimodalSearchOptions, RichMultimodalSearchReport,
+    prepare_rich_multimodal_search,
 };
 mod navigation_overlay;
 mod planned;

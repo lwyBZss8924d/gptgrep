@@ -9,7 +9,10 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
 };
-async fn candidate(root: &Path, texts: &[&str]) -> Result<(tempfile::TempDir, RichParsedDocument)> {
+pub(crate) async fn candidate(
+    root: &Path,
+    texts: &[&str],
+) -> Result<(tempfile::TempDir, RichParsedDocument)> {
     let staging = tempfile::tempdir()?;
     let staging_path = staging.path().canonicalize()?;
     let source = format!(
@@ -150,7 +153,7 @@ async fn publish(root: &Path, texts: &[&str]) -> Result<GenerationPin> {
     writer.publish()
 }
 
-fn context(limit: u32) -> Result<ExecutionContext> {
+pub(crate) fn context(limit: u32) -> Result<ExecutionContext> {
     ExecutionContext::new(
         "ordinary-rich-rpc-fixture",
         &"a".repeat(64),
@@ -236,14 +239,14 @@ async fn mock_with_score_and_delay(
     });
     Ok((endpoint, task))
 }
-async fn mock(
+pub(crate) async fn mock(
     count: usize,
     action: Arc<dyn Fn(usize) -> Result<()> + Send + Sync>,
     fail_second: bool,
 ) -> Result<(String, tokio::task::JoinHandle<Result<Vec<Value>>>)> {
     mock_with_score(count, action, fail_second, 3.0).await
 }
-fn client(endpoint: &str, context: ExecutionContext) -> Result<JevClient> {
+pub(crate) fn client(endpoint: &str, context: ExecutionContext) -> Result<JevClient> {
     Ok(
         JevClient::with_endpoint("ordinary-fixture-not-a-secret", None, endpoint)?
             .with_execution_context(context),

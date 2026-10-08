@@ -37,7 +37,13 @@ mod model_attempts;
 mod navigation;
 mod query_plan;
 mod retrieval;
+mod rich_multimodal;
 mod rich_text;
+pub use rich_multimodal::{
+    PreparedRichMultimodalHost, RichMultimodalCitation, RichMultimodalHostError,
+    RichMultimodalHostOptions, RichMultimodalHostReport, RichVisualCitation,
+    VisualDeliveryIdentity, prepare_rich_multimodal_host,
+};
 pub use rich_text::{
     PreparedRichTextHost, RichTextCitation, RichTextHostError, RichTextHostOptions,
     RichTextHostReport, prepare_rich_text_host,

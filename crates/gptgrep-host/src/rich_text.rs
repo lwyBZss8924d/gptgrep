@@ -331,15 +331,17 @@ impl PreparedRichTextHost {
 }
 
 pub(crate) struct RichEvidence {
-    initial: Option<RichTextInitialPass>,
+    pub(crate) initial: Option<RichTextInitialPass>,
+    pub(crate) multimodal: Option<gptgrep_core::RichMultimodalInitialPass>,
+    pub(crate) visual_resources: Option<gptgrep_parse::ResourceBudget>,
     pub(crate) reader: RichGenerationReader,
     pub(crate) client: JevClient,
     pub(crate) delivery: Option<protocol::RichDeliveryHandle>,
-    max_citations: usize,
-    deadline: tokio::time::Instant,
-    before: ReaderReadMetrics,
-    calls: usize,
-    document: Option<String>,
+    pub(crate) max_citations: usize,
+    pub(crate) deadline: tokio::time::Instant,
+    pub(crate) before: ReaderReadMetrics,
+    pub(crate) calls: usize,
+    pub(crate) document: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -392,6 +394,8 @@ impl RichEvidence {
         };
         Ok(Self {
             initial: Some(initial),
+            multimodal: None,
+            visual_resources: None,
             reader,
             client,
             delivery: None,
@@ -408,13 +412,25 @@ impl RichEvidence {
             tokio::time::Instant::now() < self.deadline,
             "host_deadline_exceeded"
         );
-        self.initial
-            .as_ref()
-            .expect("one genuine initial pass")
-            .validate()
+        if let Some(initial) = &self.initial {
+            initial.validate()
+        } else {
+            self.multimodal
+                .as_ref()
+                .expect("one genuine initial pass")
+                .validate()
+        }
     }
     pub(crate) fn state(&self, question: &str) -> Result<Value> {
         self.validate()?;
+        if let Some(initial) = &self.multimodal {
+            let seed: Vec<_> = initial.report().hits.iter().take(SEED_HITS).collect();
+            let value = json!({"question":question,"generation":self.reader.pin(),"initial_retrieval":seed,
+                "coverage":initial.report().coverage,"citation_status":"model_exposure_only_explicit_delivery_required"});
+            measure(&value, 196608)?;
+            self.validate()?;
+            return Ok(value);
+        }
         let initial = self
             .initial
             .as_ref()
@@ -552,9 +568,15 @@ impl RichEvidence {
                 RichBatchOperation::InspectPages {
                     id: "metadata".into(),
                     document: request.document,
-                    fields: ["coverage", "native_text", "ocr_text"]
-                        .map(str::to_owned)
-                        .to_vec(),
+                    fields: if self.multimodal.is_some() {
+                        ["coverage", "native_text", "ocr_text", "renditions"]
+                            .map(str::to_owned)
+                            .to_vec()
+                    } else {
+                        ["coverage", "native_text", "ocr_text"]
+                            .map(str::to_owned)
+                            .to_vec()
+                    },
                     page_size: request.page_size,
                     cursor: request.cursor,
                 }
@@ -921,7 +943,7 @@ pub(crate) fn final_schema(maximum: usize) -> Value {
         "required":["issued_id","offset","length","quote"]}}},"required":["answer","citations","insufficient_evidence"]})
 }
 
-fn metadata_bound(reader: &RichGenerationReader, id: &str) -> Result<usize> {
+pub(crate) fn metadata_bound(reader: &RichGenerationReader, id: &str) -> Result<usize> {
     let manifest = reader.manifest()?;
     let (doc, stored) = manifest
         .documents
@@ -992,9 +1014,12 @@ pub(crate) fn hash(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
-fn meter_delta(after: &ReaderReadMetrics, before: &ReaderReadMetrics) -> Result<ReaderReadMetrics> {
+pub(crate) fn meter_delta(
+    after: &ReaderReadMetrics,
+    before: &ReaderReadMetrics,
+) -> Result<ReaderReadMetrics> {
     ensure!(
         after.coverage == before.coverage,
         "host_rich_meter_scope_changed"

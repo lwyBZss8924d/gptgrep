@@ -250,7 +250,7 @@ impl Write for JsonCounter {
         Ok(())
     }
 }
-fn measure(value: &impl Serialize, limit: usize) -> Result<usize> {
+pub(crate) fn measure(value: &impl Serialize, limit: usize) -> Result<usize> {
     let mut counter = JsonCounter { bytes: 0, limit };
     serde_json::to_writer(&mut counter, value)?;
     Ok(counter.bytes)
@@ -265,12 +265,12 @@ impl Write for HashWriter {
         Ok(())
     }
 }
-fn hash_json(value: &impl Serialize) -> Result<String> {
+pub(crate) fn hash_json(value: &impl Serialize) -> Result<String> {
     let mut writer = HashWriter(Sha256::new());
     serde_json::to_writer(&mut writer, value)?;
     Ok(format!("{:x}", writer.0.finalize()))
 }
-fn binding(window: &ArtifactTextWindow) -> &crate::TextEvidenceBinding {
+pub(crate) fn binding(window: &ArtifactTextWindow) -> &crate::TextEvidenceBinding {
     match &window.evidence {
         EvidenceRef::NativeText { binding } | EvidenceRef::OcrText { binding, .. } => binding,
         EvidenceRef::VisualRegion { .. } => unreachable!("reader text window is native/OCR only"),

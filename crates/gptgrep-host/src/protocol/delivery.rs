@@ -12,6 +12,10 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
+pub(super) mod visual;
+pub(crate) use visual::VisualCitationRequest;
+pub use visual::{DeliveredVisualCitation, VisualDeliveryIdentity};
+pub(super) use visual::{RenderRequest, VisualSettings};
 
 pub(super) const MAX_TEXT: usize = 2048;
 pub(super) const MAX_METADATA: usize = 16384;
@@ -93,6 +97,10 @@ pub(super) struct Registry {
     max_entries: usize,
     entries: BTreeMap<String, Arc<Entry>>,
     unknown: Vec<Arc<Entry>>,
+    visual: Option<VisualSettings>,
+    visual_reserved: usize,
+    visual_entries: BTreeMap<String, Arc<visual::VisualEntry>>,
+    visual_unknown: Vec<Arc<visual::VisualEntry>>,
 }
 #[derive(Clone)]
 pub(crate) struct Handle(Arc<Mutex<Registry>>);
@@ -119,6 +127,10 @@ impl Handle {
             max_entries,
             entries: BTreeMap::new(),
             unknown: Vec::new(),
+            visual: None,
+            visual_reserved: 0,
+            visual_entries: BTreeMap::new(),
+            visual_unknown: Vec::new(),
         }))))
     }
     pub(super) fn admit(
@@ -160,7 +172,11 @@ impl Handle {
         );
         let arguments = frame["params"]["arguments"].take();
         crate::rich_text::measure(&arguments, 4096)?;
-        crate::rich_text::validate_arguments(&tool, &arguments)?;
+        if tool == "gptgrep_render" && self.visual_enabled() {
+            RenderRequest::parse(&arguments)?;
+        } else {
+            crate::rich_text::validate_arguments(&tool, &arguments)?;
+        }
         let mut state = self
             .0
             .lock()
@@ -268,18 +284,12 @@ impl Handle {
         Ok(())
     }
     pub(crate) fn retained_bytes(&self) -> usize {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retained_entries
-            * ENTRY_CHARGE
+        let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        state.retained_entries * ENTRY_CHARGE + state.visual_reserved * visual::ENTRY_CHARGE
     }
     pub(crate) fn unknown_entries(&self) -> usize {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .unknown
-            .len()
+        let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        state.unknown.len() + state.visual_unknown.len()
     }
     pub(crate) fn resolve(
         &self,
