@@ -85,7 +85,7 @@ pub struct RerankResponse {
     pub provider: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum DecisionAnswer {
     Noul {
