@@ -344,9 +344,11 @@ fn distribution<'a>(
     Ok(())
 }
 
-/// Inspect raw container tokens so arbitrary_precision's synthetic number maps cannot
-/// be confused with real objects. Object keys are decoded before duplicate checking.
-fn unique_json(bytes: &[u8]) -> serde_json::Result<Value> {
+/// Decode JSON while rejecting duplicate decoded object keys at every depth.
+///
+/// Nesting is limited to 128 levels. Callers must bound the input byte length.
+/// Raw container tokens distinguish real objects from arbitrary-precision numbers.
+pub fn unique_json(bytes: &[u8]) -> serde_json::Result<Value> {
     let raw: &RawValue = serde_json::from_slice(bytes)?;
     unique_value(raw, 0)
 }

@@ -242,6 +242,16 @@ async fn replay(
     anyhow::Result<ocr_protocol::OcrOutcome>,
     crate::OcrBudgetSnapshot,
 ) {
+    replay_bytes(fixture, transcript(messages), capture).await
+}
+async fn replay_bytes(
+    fixture: &Fixture,
+    bytes: Vec<u8>,
+    capture: Capture,
+) -> (
+    anyhow::Result<ocr_protocol::OcrOutcome>,
+    crate::OcrBudgetSnapshot,
+) {
     let context = OcrExecutionContext::new(
         "offline-mock",
         HASH,
@@ -254,7 +264,7 @@ async fn replay(
         .await
         .unwrap();
     let result = ocr_protocol::run(
-        BufReader::new(Cursor::new(transcript(messages))),
+        BufReader::new(Cursor::new(bytes)),
         capture,
         Path::new("."),
         fixture.page(),
@@ -591,7 +601,8 @@ async fn runtime_failure_retry_and_closed_stream_keep_denominators() {
             6
         );
         let serialized = serde_json::to_value(typed).unwrap();
-        assert_eq!(serialized.as_object().unwrap().len(), 4);
+        assert_eq!(serialized.as_object().unwrap().len(), 5);
+        assert_eq!(typed.server_retry_notifications, 0);
         assert!(serde_json::to_vec(typed).unwrap().len() <= 2048);
         for safe in [
             serialized.to_string(),
@@ -622,6 +633,325 @@ async fn runtime_failure_retry_and_closed_stream_keep_denominators() {
         "ocr_stream_closed_completion_unknown"
     );
     assert_eq!(budget.quarantined_slots, 1);
+}
+
+fn intermediate_error(info: Value, retry: Value) -> Value {
+    json!({"method":"error","params":{"threadId":"thread-1","turnId":"turn-1","willRetry":retry,"error":{"message":"PRIVATE_RETRY_ERROR_SENTINEL","additionalDetails":"PRIVATE_RETRY_DETAILS_SENTINEL","codexErrorInfo":info}}})
+}
+
+#[tokio::test]
+async fn raw_duplicate_error_fields_fail_before_recovery_or_image_delivery() {
+    // Value-based fixtures cannot express duplicate keys: exercise actual wire bytes.
+    for fields in [
+        r#""willRetry":false,"willRetry":true,"error":{"message":"failed","codexErrorInfo":{"responseStreamDisconnected":{}}}"#,
+        r#""willRetry":false,"will\u0052etry":true,"error":{"message":"failed","codexErrorInfo":{"responseStreamDisconnected":{}}}"#,
+        r#""willRetry":true,"error":{"message":"failed","codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":700,"httpStatusCode":503}}}"#,
+        r#""willRetry":true,"error":{"message":"failed","codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":700,"httpStatus\u0043ode":503}}}"#,
+        r#""willRetry":true,"error":{"message":"failed","codexErrorInfo":"internalServerError","codexErrorInfo":{"responseStreamDisconnected":{}}}"#,
+    ] {
+        let fixture = Fixture::new();
+        let capture = Capture::default();
+        let mut bytes = transcript(startup(json!({})));
+        bytes.extend_from_slice(
+            format!(
+                "{{\"method\":\"error\",\"params\":{{\"threadId\":\"thread-1\",\"turnId\":\"turn-1\",{fields}}}}}\n"
+            )
+            .as_bytes(),
+        );
+        bytes.extend(transcript(vec![
+            tool(1, fixture.image_args()),
+            completed("{}".into()),
+        ]));
+        let (result, budget) = replay_bytes(&fixture, bytes, capture.clone()).await;
+        assert_eq!(
+            result.err().unwrap().to_string(),
+            "ocr_invalid_protocol_json"
+        );
+        let sent = capture.frames();
+        assert_eq!(sent.len(), 5); // Startup only; no recovery RPC or image response.
+        assert_eq!(
+            sent.iter().filter(|f| f["method"] == "turn/start").count(),
+            1
+        );
+        assert_eq!(budget.charged_admissions, 1);
+        assert_eq!(budget.quarantined_slots, 1);
+        assert_eq!(budget.terminal_admissions, 0);
+    }
+}
+
+#[tokio::test]
+async fn intermediate_transport_notifications_recover_without_another_turn_or_reservation() {
+    for (variant, count) in [
+        ("responseStreamDisconnected", 1),
+        ("responseStreamConnectionFailed", 1),
+        ("httpConnectionFailed", 5),
+    ] {
+        let fixture = Fixture::new();
+        let capture = Capture::default();
+        let mut frames = startup(json!({}));
+        for _ in 0..count {
+            frames.push(intermediate_error(
+                json!({variant:{"httpStatusCode":null}}),
+                json!(true),
+            ));
+        }
+        frames.push(tool(1, fixture.image_args()));
+        frames.push(completed("{}".into()));
+        let (result, budget) = replay(&fixture, frames, capture.clone()).await;
+        let result = result.unwrap();
+        result.page.verify_delivery().unwrap();
+        assert_eq!(result.retries, count);
+        assert_eq!(result.tool_calls, 1);
+        assert!(result.usage.is_none());
+        let sent = capture.frames();
+        assert_eq!(
+            sent.iter().filter(|f| f["method"] == "turn/start").count(),
+            1
+        );
+        assert_eq!(sent.iter().filter(|f| f["method"].is_string()).count(), 5);
+        assert_eq!(sent.len(), 6); // four requests, initialized, one genuine image response
+        assert_eq!(budget.charged_admissions, 1);
+        assert_eq!(budget.terminal_admissions, 1);
+        assert_eq!(budget.quarantined_slots, 0);
+    }
+}
+
+#[tokio::test]
+async fn intermediate_then_terminal_error_preserves_count_and_safe_diagnostics() {
+    let fixture = Fixture::new();
+    let mut frames = startup(json!({}));
+    frames.push(intermediate_error(
+        json!({"responseStreamDisconnected":{}}),
+        json!(true),
+    ));
+    frames.push(intermediate_error(
+        json!({"responseStreamConnectionFailed":{"httpStatusCode":503}}),
+        json!(false),
+    ));
+    let (result, budget) = replay(&fixture, frames, Capture::default()).await;
+    let error = result.err().unwrap();
+    let typed = error.downcast_ref::<crate::OcrRuntimeError>().unwrap();
+    assert_eq!(typed.server_retry_notifications, 1);
+    assert_eq!(
+        typed.codex_error_info,
+        Some(crate::CodexErrorInfo::ResponseStreamConnectionFailed)
+    );
+    assert_eq!(typed.http_status_code, Some(503));
+    assert_eq!(typed.will_retry, Some(false));
+    assert!(typed.usage.is_none());
+    let safe = serde_json::to_string(typed).unwrap();
+    assert!(!safe.contains("PRIVATE_RETRY"));
+    assert_eq!(budget.charged_admissions, 1);
+    assert_eq!(budget.quarantined_slots, 1);
+    assert_eq!(budget.terminal_admissions, 0);
+}
+
+#[tokio::test]
+async fn sixth_intermediate_notification_fails_before_later_image_delivery() {
+    let fixture = Fixture::new();
+    let capture = Capture::default();
+    let mut frames = startup(json!({}));
+    for _ in 0..6 {
+        frames.push(intermediate_error(
+            json!({"responseStreamDisconnected":{}}),
+            json!(true),
+        ));
+    }
+    frames.push(tool(1, fixture.image_args()));
+    frames.push(completed("{}".into()));
+    let (result, budget) = replay(&fixture, frames, capture.clone()).await;
+    let error = result.err().unwrap();
+    let typed = error.downcast_ref::<crate::OcrRuntimeError>().unwrap();
+    assert_eq!(typed.server_retry_notifications, 6);
+    assert_eq!(typed.will_retry, Some(true));
+    assert!(capture.frames().iter().all(|f| f.get("result").is_none()));
+    assert_eq!(capture.frames().len(), 5);
+    assert_eq!(budget.charged_admissions, 1);
+    assert_eq!(budget.quarantined_slots, 1);
+    assert_eq!(budget.terminal_admissions, 0);
+}
+
+#[tokio::test]
+async fn intermediate_unknown_or_malformed_error_never_recovers() {
+    let fixture = Fixture::new();
+    let base = intermediate_error(json!({"responseStreamDisconnected":{}}), json!(true));
+    let mut cases = Vec::new();
+    for info in [
+        Value::Null,
+        json!("unauthorized"),
+        json!("unknownFutureVariant"),
+        json!({"responseTooManyFailedAttempts":{}}),
+    ] {
+        let mut f = base.clone();
+        f["params"]["error"]["codexErrorInfo"] = info;
+        cases.push(f);
+    }
+    for retry in [Value::Null, json!("true"), json!(false)] {
+        let mut f = base.clone();
+        f["params"]["willRetry"] = retry;
+        cases.push(f);
+    }
+    for (name, value) in [
+        ("message", json!(false)),
+        ("additionalDetails", json!({"secret":"not retained"})),
+        ("misalignment", json!({"errorType":"private"})),
+        ("unknown", json!("private")),
+    ] {
+        let mut f = base.clone();
+        f["params"]["error"][name] = value;
+        cases.push(f);
+    }
+    let mut extra = base.clone();
+    extra["params"]["error"]["codexErrorInfo"]["responseStreamDisconnected"]["headers"] =
+        json!({"private":"not retained"});
+    cases.push(extra);
+    let mut invalid_status = base.clone();
+    invalid_status["params"]["error"]["codexErrorInfo"]["responseStreamDisconnected"]["httpStatusCode"] =
+        json!(700);
+    cases.push(invalid_status);
+    for f in cases {
+        let capture = Capture::default();
+        let mut frames = startup(json!({}));
+        frames.push(f);
+        frames.push(completed("{}".into()));
+        let (result, budget) = replay(&fixture, frames, capture.clone()).await;
+        let error = result.err().unwrap();
+        let typed = error.downcast_ref::<crate::OcrRuntimeError>().unwrap();
+        assert_eq!(typed.server_retry_notifications, 0);
+        assert_eq!(capture.frames().len(), 5);
+        assert_eq!(budget.charged_admissions, 1);
+        assert_eq!(budget.quarantined_slots, 1);
+    }
+}
+
+#[tokio::test]
+async fn intermediate_error_never_weakens_identity_or_tool_budget() {
+    let fixture = Fixture::new();
+    for field in ["threadId", "turnId"] {
+        let mut frames = startup(json!({}));
+        let mut error = intermediate_error(json!({"responseStreamDisconnected":{}}), json!(true));
+        error["params"][field] = json!("forged");
+        frames.push(error);
+        frames.push(completed("{}".into()));
+        let (result, budget) = replay(&fixture, frames, Capture::default()).await;
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .downcast_ref::<crate::OcrRuntimeError>()
+                .is_none()
+        );
+        assert_eq!(budget.quarantined_slots, 1);
+    }
+    let capture = Capture::default();
+    let mut frames = startup(json!({}));
+    frames.push(tool(1, fixture.image_args()));
+    frames.push(intermediate_error(
+        json!({"responseStreamDisconnected":{}}),
+        json!(true),
+    ));
+    for n in 2..=9 {
+        frames.push(tool(n, fixture.image_args()));
+    }
+    let (result, budget) = replay(&fixture, frames, capture.clone()).await;
+    assert_eq!(
+        result.err().unwrap().to_string(),
+        "ocr_tool_budget_exhausted"
+    );
+    assert_eq!(
+        capture
+            .frames()
+            .iter()
+            .filter(|f| f["result"]["contentItems"].is_array())
+            .count(),
+        8
+    );
+    assert_eq!(
+        capture
+            .frames()
+            .iter()
+            .filter(|f| f["method"] == "turn/start")
+            .count(),
+        1
+    );
+    assert_eq!(budget.charged_admissions, 1);
+    assert_eq!(budget.quarantined_slots, 1);
+}
+
+#[tokio::test]
+async fn intermediate_notification_does_not_renew_original_outer_deadline() {
+    struct PendingAfterFrames(Cursor<Vec<u8>>);
+    impl tokio::io::AsyncRead for PendingAfterFrames {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let start = self.0.position() as usize;
+            if start == self.0.get_ref().len() {
+                return Poll::Pending;
+            }
+            let end = (start + buf.remaining()).min(self.0.get_ref().len());
+            buf.put_slice(&self.0.get_ref()[start..end]);
+            self.0.set_position(end as u64);
+            Poll::Ready(Ok(()))
+        }
+    }
+    let fixture = Fixture::new();
+    let context = OcrExecutionContext::new(
+        "offline-original-deadline",
+        HASH,
+        SystemTime::now() + Duration::from_secs(5),
+        24,
+    )
+    .unwrap();
+    let mut admission = context
+        .reserve(&fixture.task.task_sha256, HASH)
+        .await
+        .unwrap();
+    let mut frames = startup(json!({}));
+    frames.push(intermediate_error(
+        json!({"responseStreamDisconnected":{}}),
+        json!(true),
+    ));
+    let capture = Capture::default();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(20);
+    let transport =
+        ocr_protocol::TransportBudget::new(fixture.task.budget.transport_bytes as usize);
+    let result = tokio::time::timeout_at(
+        deadline,
+        ocr_protocol::run(
+            PendingAfterFrames(Cursor::new(transcript(frames))),
+            capture.clone(),
+            Path::new("."),
+            fixture.page(),
+            HASH,
+            &mut admission,
+            ocr_protocol::OcrRunBudget {
+                deadline,
+                transport: transport.clone(),
+            },
+        ),
+    )
+    .await;
+    let error = crate::ocr::capture_page_outcome(result, &transport)
+        .err()
+        .unwrap();
+    assert_eq!(error.to_string(), "ocr_page_deadline_completion_unknown");
+    assert_eq!(capture.frames().len(), 5);
+    assert_eq!(
+        capture
+            .frames()
+            .iter()
+            .filter(|f| f["method"] == "turn/start")
+            .count(),
+        1
+    );
+    drop(admission);
+    let budget = context.snapshot().unwrap();
+    assert_eq!(budget.charged_admissions, 1);
+    assert_eq!(budget.quarantined_slots, 1);
+    assert_eq!(budget.terminal_admissions, 0);
 }
 
 #[tokio::test]

@@ -26,6 +26,7 @@ pub use roles::{
     EvidenceRole, EvidenceRoleCandidate, EvidenceRoleResponse, MAX_ROLE_CANDIDATES,
     MAX_ROLE_DEFINITION_BYTES, PreparedEvidenceRoles, evidence_role_contract,
 };
+pub use validation::unique_json as parse_unique_json;
 
 use anyhow::{Result, anyhow, ensure};
 use reqwest::{

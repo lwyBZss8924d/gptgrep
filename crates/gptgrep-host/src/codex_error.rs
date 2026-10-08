@@ -133,6 +133,9 @@ pub struct OcrRuntimeError {
     pub http_status_code: Option<u16>,
     pub will_retry: Option<bool>,
     pub usage: Option<Value>,
+    /// Validated intermediate server notifications observed on this same turn.
+    /// This is not a physical provider attempt or billed request count.
+    pub server_retry_notifications: usize,
 }
 
 impl OcrRuntimeError {
@@ -147,7 +150,13 @@ impl OcrRuntimeError {
             http_status_code: parsed.valid.then_some(parsed.http_status_code).flatten(),
             will_retry,
             usage: usage.and_then(observed_usage),
+            server_retry_notifications: 0,
         }
+    }
+
+    pub(crate) fn with_server_retry_notifications(mut self, count: usize) -> Self {
+        self.server_retry_notifications = count;
+        self
     }
 }
 
@@ -165,6 +174,44 @@ pub(crate) struct ParsedError {
     pub valid: bool,
 }
 impl ParsedError {
+    /// Narrow native recovery observation, without retaining provider strings.
+    /// An announced retry may continue receiving this turn; it grants no new RPC.
+    pub(crate) fn retryable_transport(error: &Value) -> bool {
+        let parsed = Self::parse(error);
+        if !parsed.valid
+            || !matches!(
+                parsed.info,
+                Some(
+                    CodexErrorInfo::HttpConnectionFailed
+                        | CodexErrorInfo::ResponseStreamConnectionFailed
+                        | CodexErrorInfo::ResponseStreamDisconnected
+                )
+            )
+        {
+            return false;
+        }
+        let object = error.as_object().expect("parsed error object");
+        if !object.keys().all(|key| {
+            matches!(
+                key.as_str(),
+                "message" | "codexErrorInfo" | "additionalDetails" | "misalignment"
+            )
+        }) || !matches!(
+            object.get("additionalDetails"),
+            None | Some(Value::Null | Value::String(_))
+        ) || !matches!(object.get("misalignment"), None | Some(Value::Null))
+        {
+            return false;
+        }
+        // Transport variants have one object whose only optional field is HTTP status.
+        // parse() validates its observed numeric range; absent status remains unknown.
+        error["codexErrorInfo"]
+            .as_object()
+            .and_then(|info| info.values().next())
+            .and_then(Value::as_object)
+            .is_some_and(|details| details.keys().all(|key| key == "httpStatusCode"))
+    }
+
     pub fn parse(error: &Value) -> Self {
         let mut result = Self {
             valid: error.is_object() && error["message"].is_string(),
