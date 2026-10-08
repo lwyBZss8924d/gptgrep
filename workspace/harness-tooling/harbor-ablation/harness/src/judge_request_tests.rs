@@ -6,16 +6,16 @@ const PYTHON_ENV: &str = "GPTGREP_JUDGE_TEST_PYTHON";
 const PYTHON_SHA_ENV: &str = "GPTGREP_JUDGE_TEST_PYTHON_SHA256";
 const REVISION: &str = "1111111111111111111111111111111111111111";
 const SOURCE: &str = "raise RuntimeError('source must not execute')\nPROMPT = 'Q={question}|A={answer}|F={answer_format}|R={response}'\nSCHEMA = {'type':'object','properties':{'equivalent':{'type':'boolean'},'abstained':{'type':'boolean'},'reason':{'type':'string'}},'required':['equivalent','abstained','reason'],'additionalProperties':False}\nMAX_RESPONSE_CHARS = 12000\nMODEL = 'source-history'\nEFFORT = 'source-effort'\n";
-struct Fixture {
+pub(super) struct Fixture {
     _temp: tempfile::TempDir,
-    root: PathBuf,
-    source: PathBuf,
-    reference: PathBuf,
-    answer: PathBuf,
-    output: PathBuf,
+    pub(super) root: PathBuf,
+    pub(super) source: PathBuf,
+    pub(super) reference: PathBuf,
+    pub(super) answer: PathBuf,
+    pub(super) output: PathBuf,
 }
 impl Fixture {
-    fn new() -> Result<Self> {
+    pub(super) fn new() -> Result<Self> {
         let temp = tempfile::tempdir()?;
         let root = temp.path().canonicalize()?;
         let source = root.join("inert-source.py");
@@ -38,10 +38,10 @@ impl Fixture {
             output,
         })
     }
-    fn load(&self, path: &Path, cap: usize) -> Result<Snapshot> {
+    pub(super) fn load(&self, path: &Path, cap: usize) -> Result<Snapshot> {
         Snapshot::load(path, &digest(&fs::read(path)?), cap)
     }
-    fn python(&self) -> Result<Snapshot> {
+    pub(super) fn python(&self) -> Result<Snapshot> {
         let path = PathBuf::from(
             std::env::var(PYTHON_ENV).context("explicit qualified test Python required")?,
         );
@@ -52,7 +52,7 @@ impl Fixture {
             SOURCE_MAX,
         )
     }
-    fn prepare(&self) -> Result<String> {
+    pub(super) fn prepare(&self) -> Result<String> {
         prepare(
             self.load(&self.source, SOURCE_MAX)?,
             self.load(&self.reference, ARTIFACT_MAX)?,
@@ -330,5 +330,19 @@ fn exact_schema_and_serialized_output_admission_have_no_defaults() -> Result<()>
         )
         .is_err()
     );
+    Ok(())
+}
+
+#[test]
+fn native_structural_custody_has_no_formatter_or_output_effects_and_rechecks() -> Result<()> {
+    let f = Fixture::new()?;
+    let sha = f.prepare()?;
+    let admitted = PreparedRequest::load(&f.output, &sha, f.python()?)?;
+    assert!(admitted.fresh().is_ok());
+    assert_eq!(admitted.decoded.actual, None);
+    assert!(!admitted.decoded.reward_emitted);
+    fs::write(f.output.join("answer.json"), b"changed")?;
+    assert!(admitted.fresh().is_err());
+    assert!(!f.root.join("native-output").exists());
     Ok(())
 }

@@ -487,3 +487,86 @@ no native PDF extraction, agent, provider, Docker, or trial. Full multimodal/tre
 regex/visual/helper delivery, actual Linux/native tools/authentication, original
 phase/resource qualification, original judge parity, utility, release, and Goal
 completion remain separate gates.
+
+
+### Native judge runner source foundation
+
+The verifier-only judge request tool adds a structural preflight front door:
+
+```sh
+gptgrep-harbor-judge-request execute-native \
+  --control verifier-control.json --control-sha256 CONTROL_SHA256
+```
+
+The `gptgrep.judge.native-control.v1` control binds a prepared request root and
+manifest, the exact qualified Python executable, a native executable's digest
+and known byte length, source/recipe digests, explicit environment and state/log
+paths, a once-only invocation ID, a fresh output path, and tighter capture limits.
+Phase-origin and execution-policy digests are references; they grant no execution
+permission. Preflight holds and rechecks the declared input files and streams the
+binary hash. It creates no claim, output, formatter child, native process, home,
+clock, or ledger. The explicitly selected control snapshot is read to decode its
+fields. Before opening nested request-root, Python, or binary inputs, preflight
+rejects their lexical namespace overlap with configured HOME, CODEX_HOME, sqlite
+and log roots. `environment.home` names the selected isolated actor HOME, not the
+entire ordinary physical user workspace; source/runtime executables may remain
+in that workspace outside the configured actor namespaces. Shared TMPDIR is
+allowed. It reads only selected control/source
+inputs and performs no native config, authentication or state discovery. Private
+input, tool, home/account authorization and actual runtime qualification remain
+HOLD; this lexical guard establishes none of them and authorizes no home/account
+change. This preflight checks structure
+and bindings; it does not reconstruct the original formatter or establish judge
+parity.
+
+Adding `--run` currently fails with `native_execution_policy_unavailable` before
+any child or durable claim. There is no caller-selected command, permit boolean,
+formatter, fallback, retry, or default verifier promotion. Original phase/clock,
+tool, home, runtime and response-identity qualification need separate admission.
+The generated Harbor verifier remains unavailable and emits no reward.
+
+The private runner has no production permit constructor. Only test code can admit
+self-authored isolated mock children. Under that test permit, it reconstructs the
+request with the fixed embedded formatter before consuming an exclusive, durable
+claim. It then uses a fixed direct argv recipe, a cleared explicit environment,
+nonblocking pipes and one immutable observation deadline. It accepts one complete
+bounded thread/turn/final-message/terminal sequence and requires final-file bytes
+to equal the stream message, a retained file identity, and the exact two-boolean
+and string verdict. File/input identities and digests are rechecked before atomic
+publication. Files are `0600`, directories `0700`, and an existing output is never
+replaced. A claim is never deleted or refunded; failure, deadline, cleanup or
+publication uncertainty cannot authorize another attempt. A late detected source,
+control, binary or claim-root custody failure after receipt serialization clears
+the typed verdict, marks the observation unavailable/quarantined, and publishes
+no output. Already observed transport IDs, projected usage and raw-final hash
+remain scoped observations, with the consumed claim retained and no retry.
+Publication status is separate from execution observations; a post-rename sync failure can leave output
+and remains unknown with no retry.
+
+Control bytes are at most 64 KiB. The binary is admitted by known length at most
+1 GiB and hashed through a 4 KiB scratch buffer. Capture limits are at most 1 MiB
+stdout, 64 KiB stderr, 64 KiB per event, 4096 events, 64 KiB final bytes and 64 KiB
+receipt. The scalar-only failure receipt allowance is checked before effects;
+a typed reason that does not fit clears the verdict and preserves a bounded
+unqualified failure observation. Raw stderr is counted and hashed, never retained.
+Caller limits may tighten these bounds only if the failure receipt still fits.
+The original source formatter retains its dynamically read response-character cap
+of at most 12000, Python normalization and truncation semantics.
+
+Requested `gpt-6-luna`/`max`/`fast` stays distinct from observed identity. Standard
+exec JSON exposes no native turn ID or served profile, and its projected numeric
+usage can default to zeros when usage was absent. Native turn/model/provider/
+effort/tier/response identity, actual usage/cost/provider calls therefore remain
+null and usage presence remains unknown. Mock thread/item IDs are labelled as
+transport fixture observations. Even a well-formed complete sequence and typed
+verdict is structural and unqualified, with no numeric reward.
+
+The source-supported recipe does not prove tools are disabled, user state cannot
+be written, flags are live-supported, or the requested profile was served.
+macOS mock startup added the platform environment key `__CF_USER_TEXT_ENCODING`;
+no value or inherited provider credential was read. Named owned-buffer/capture
+limits and bounded leader cleanup do not prove total RSS, aggregate disk/inode
+reservation, hostile path-to-exec custody, descendant/remote lifetime termination,
+or a hard OS deadline. These limits, actual native/backend/original-judge semantic
+qualification, Linux/Harbor trials, utility, release and full acceptance remain
+HOLD.

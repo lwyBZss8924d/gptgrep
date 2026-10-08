@@ -1,4 +1,4 @@
-//! Verifier-only request preparation and structural verdict admission. No judge backend.
+//! Verifier-only preparation, structural admission and gated native source foundation.
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -28,13 +28,24 @@ const FORMATTER_WALL: Duration = Duration::from_secs(10);
 const QUALIFICATION: &str = "source_structure_only_original_judge_unqualified";
 
 #[derive(Parser)]
-#[command(about = "Verifier-only original judge requests; no backend, reward or live judging")]
+#[command(
+    about = "Verifier-only original judge requests; native execution policy unavailable; no rewards"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Operation,
 }
 #[derive(Subcommand)]
 enum Operation {
+    /// Admit a native source plan only. --run fails closed before effects.
+    ExecuteNative {
+        #[arg(long)]
+        control: PathBuf,
+        #[arg(long)]
+        control_sha256: String,
+        #[arg(long, default_value_t = false)]
+        run: bool,
+    },
     Prepare {
         #[arg(long)]
         judge_source: PathBuf,
@@ -451,6 +462,20 @@ fn format(
     answer: &Snapshot,
     parent: &Path,
 ) -> Result<Formatted> {
+    format_until(python, source, reference, answer, parent, None)
+}
+fn format_until(
+    python: &Snapshot,
+    source: &Snapshot,
+    reference: &Snapshot,
+    answer: &Snapshot,
+    parent: &Path,
+    admitted_deadline: Option<Instant>,
+) -> Result<Formatted> {
+    ensure!(
+        admitted_deadline.is_none_or(|d| Instant::now() < d),
+        "formatter_limit_or_deadline_unavailable"
+    );
     python.fresh()?;
     source.fresh()?;
     reference.fresh()?;
@@ -467,6 +492,13 @@ fn format(
         framed.extend_from_slice(input);
     }
     let cwd = private_tempdir(parent, ".judge-formatter-")?;
+    let deadline = admitted_deadline.map_or(Instant::now() + FORMATTER_WALL, |d| {
+        d.min(Instant::now() + FORMATTER_WALL)
+    });
+    ensure!(
+        Instant::now() < deadline,
+        "formatter_limit_or_deadline_unavailable"
+    );
     let mut child = Command::new(&python.path)
         .args(["-I", "-S", "-c", FORMATTER])
         .env_clear()
@@ -477,7 +509,6 @@ fn format(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let started = Instant::now();
     let overflow = Arc::new(AtomicBool::new(false));
     let stdout = capture(
         child.stdout.take().context("formatter_stdout")?,
@@ -500,7 +531,7 @@ fn format(
         if let Some(status) = child.try_wait()? {
             break status;
         }
-        if overflow.load(Ordering::SeqCst) || started.elapsed() >= FORMATTER_WALL {
+        if overflow.load(Ordering::SeqCst) || Instant::now() >= deadline {
             let _ = child.kill();
             let cleanup = Instant::now();
             loop {
@@ -517,18 +548,22 @@ fn format(
         thread::sleep(Duration::from_millis(10));
     };
     ensure!(
+        Instant::now() < deadline,
+        "formatter_limit_or_deadline_unavailable"
+    );
+    ensure!(
         status.success() && !overflow.load(Ordering::SeqCst),
         "formatter_failed_unavailable"
     );
-    let remaining = FORMATTER_WALL.saturating_sub(started.elapsed());
+    let remaining = deadline.saturating_duration_since(Instant::now());
     sent_rx
         .recv_timeout(remaining)
         .context("formatter_stdin_cleanup_unknown")??;
     let bytes = stdout
-        .recv_timeout(FORMATTER_WALL.saturating_sub(started.elapsed()))
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
         .context("formatter_stdout_cleanup_unknown")??;
     let diagnostics = stderr
-        .recv_timeout(FORMATTER_WALL.saturating_sub(started.elapsed()))
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
         .context("formatter_stderr_cleanup_unknown")??;
     ensure!(
         diagnostics.is_empty() && !overflow.load(Ordering::SeqCst),
@@ -562,6 +597,10 @@ fn format(
             && !value.upstream_effort.is_empty()
             && value.upstream_effort.len() <= 512,
         "formatter_response_binding"
+    );
+    ensure!(
+        Instant::now() < deadline,
+        "formatter_limit_or_deadline_unavailable"
     );
     Ok(value)
 }
@@ -618,15 +657,16 @@ fn fresh_output(path: &Path, inputs: &[&Path]) -> Result<PathBuf> {
         "capability_unavailable: atomic fresh output requires Linux/macOS"
     );
     let path = absolute(path)?;
-    ensure!(fs::symlink_metadata(&path).is_err(), "output_must_be_fresh");
-    let parent = path.parent().context("output_parent")?;
-    open_held(parent, true)?;
+    // Reject lexical input/home overlap before inspecting an output path or parent.
     ensure!(
         !inputs
             .iter()
             .any(|p| p.starts_with(&path) || path.starts_with(p)),
         "output_input_overlap"
     );
+    ensure!(fs::symlink_metadata(&path).is_err(), "output_must_be_fresh");
+    let parent = path.parent().context("output_parent")?;
+    open_held(parent, true)?;
     Ok(path)
 }
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -655,6 +695,15 @@ fn rename_fresh(_: &Path, _: &Path) -> Result<()> {
     bail!("capability_unavailable: atomic fresh output")
 }
 fn publish(output: &Path, files: &[(&str, &[u8])], snapshots: &[&Snapshot]) -> Result<String> {
+    publish_checked(output, files, snapshots, || Ok(()))
+}
+fn publish_checked(
+    output: &Path,
+    files: &[(&str, &[u8])],
+    snapshots: &[&Snapshot],
+    check: impl Fn() -> Result<()>,
+) -> Result<String> {
+    check()?;
     let input_paths = snapshots
         .iter()
         .map(|s| s.path.as_path())
@@ -691,6 +740,7 @@ fn publish(output: &Path, files: &[(&str, &[u8])], snapshots: &[&Snapshot]) -> R
         snapshot.fresh()?;
     }
     fresh_output(&output, &input_paths)?;
+    check()?;
     rename_fresh(temp.path(), &output)?;
     let _ = temp.keep();
     open_held(parent, true)
@@ -775,6 +825,155 @@ fn load_binding(root: &Path, name: &str, binding: &Binding, cap: usize) -> Resul
     );
     Ok(snapshot)
 }
+/// Immutable retained source custody. Loading has no formatter/native/output effects.
+/// Structural preflight is not Python formatter parity or execution authority.
+struct PreparedRequest {
+    root: PathBuf,
+    held_root: File,
+    root_id: (u64, u64),
+    manifest: Snapshot,
+    source: Snapshot,
+    reference: Snapshot,
+    answer: Snapshot,
+    saved: Snapshot,
+    python: Snapshot,
+    decoded: Request,
+}
+impl PreparedRequest {
+    fn load(root: &Path, manifest_sha: &str, python: Snapshot) -> Result<Self> {
+        let root = absolute(root)?;
+        let held_root = open_held(&root, true)?;
+        let root_id = identity(&held_root)?;
+        let manifest = Snapshot::load(
+            &root.join("request-manifest.json"),
+            manifest_sha,
+            ARTIFACT_MAX,
+        )?;
+        let m: Manifest = strict(&manifest.bytes)?;
+        ensure!(
+            m.schema_version == "gptgrep.judge.request-manifest.v1"
+                && m.role == "verifier_only"
+                && m.judge_status == "unavailable"
+                && m.qualification == QUALIFICATION
+                && hex(&m.original_revision, 40)
+                && m.formatter_sha256 == digest(FORMATTER.as_bytes())
+                && m.python_sha256 == python.sha256
+                && m.actual_judge_model.is_none()
+                && m.actual_provider_calls.is_none()
+                && m.actual_usage.is_none()
+                && m.actual_cost.is_none()
+                && !m.reward_emitted,
+            "request_manifest_contract"
+        );
+        let source = load_binding(&root, "judge-source.py", &m.judge_source, SOURCE_MAX)?;
+        let reference = load_binding(&root, "reference.json", &m.reference, ARTIFACT_MAX)?;
+        let answer = load_binding(&root, "answer.json", &m.answer, ARTIFACT_MAX)?;
+        let saved = load_binding(&root, "request.json", &m.request, REQUEST_MAX)?;
+        inputs_valid(&reference, &answer)?;
+        let decoded: Request = strict(&saved.bytes)?;
+        schema_valid(&decoded.formatted.verdict_schema)?;
+        let parsed_answer: Answer = strict(&answer.bytes)?;
+        let f = &decoded.formatted;
+        ensure!(
+            decoded.schema_version == "gptgrep.judge.request.v1"
+                && decoded.judge_status == "unavailable"
+                && decoded.qualification == QUALIFICATION
+                && decoded.requested
+                    == Requested {
+                        model: "gpt-6-luna".into(),
+                        reasoning_effort: "max".into(),
+                        service_tier: "fast".into()
+                    }
+                && decoded.actual.is_none()
+                && !decoded.reward_emitted
+                && f.schema_version == "gptgrep.judge.formatted.v1"
+                && f.judge_source_sha256 == source.sha256
+                && f.reference_sha256 == reference.sha256
+                && f.answer_sha256 == answer.sha256
+                && f.prompt_sha256 == digest(f.prompt.as_bytes())
+                && f.verdict_schema_sha256 == digest(&serde_json::to_vec(&f.verdict_schema)?)
+                && hex(&f.prompt_template_sha256, 64)
+                && !f.prompt.trim().is_empty()
+                && f.prompt.len() <= REQUEST_MAX
+                && (1..=12000).contains(&f.max_response_characters)
+                && f.original_response_characters == parsed_answer.answer.chars().count()
+                && f.used_response_characters
+                    == f.original_response_characters
+                        .min(f.max_response_characters)
+                && f.response_truncated
+                    == (f.used_response_characters < f.original_response_characters)
+                && !f.upstream_model.is_empty()
+                && f.upstream_model.len() <= 512
+                && !f.upstream_effort.is_empty()
+                && f.upstream_effort.len() <= 512,
+            "request_format_or_qualification_mismatch"
+        );
+        let value = Self {
+            root,
+            held_root,
+            root_id,
+            manifest,
+            source,
+            reference,
+            answer,
+            saved,
+            python,
+            decoded,
+        };
+        let snapshots = value.snapshots();
+        for (index, a) in snapshots.iter().enumerate() {
+            ensure!(
+                snapshots.iter().skip(index + 1).all(|b| a.id != b.id),
+                "input_alias"
+            );
+        }
+        value.fresh()?;
+        Ok(value)
+    }
+    fn reconstruct(&self, parent: &Path, deadline: Instant) -> Result<()> {
+        self.fresh()?;
+        let formed = format_until(
+            &self.python,
+            &self.source,
+            &self.reference,
+            &self.answer,
+            parent,
+            Some(deadline),
+        )?;
+        ensure!(
+            self.decoded == request(formed),
+            "request_format_or_qualification_mismatch"
+        );
+        self.fresh()?;
+        ensure!(
+            Instant::now() < deadline,
+            "formatter_limit_or_deadline_unavailable"
+        );
+        Ok(())
+    }
+    fn snapshots(&self) -> [&Snapshot; 6] {
+        [
+            &self.manifest,
+            &self.source,
+            &self.reference,
+            &self.answer,
+            &self.saved,
+            &self.python,
+        ]
+    }
+    fn fresh(&self) -> Result<()> {
+        ensure!(
+            identity(&self.held_root)? == self.root_id
+                && identity(&open_held(&self.root, true)?)? == self.root_id,
+            "request_root_changed"
+        );
+        for snapshot in self.snapshots() {
+            snapshot.fresh()?;
+        }
+        Ok(())
+    }
+}
+
 fn validate_verdict(
     root: &Path,
     manifest_sha: &str,
@@ -782,35 +981,19 @@ fn validate_verdict(
     python: Snapshot,
     output: &Path,
 ) -> Result<String> {
-    let root = absolute(root)?;
-    let held_root = open_held(&root, true)?;
-    let root_id = identity(&held_root)?;
-    let manifest = Snapshot::load(
-        &root.join("request-manifest.json"),
-        manifest_sha,
-        ARTIFACT_MAX,
-    )?;
-    let m: Manifest = strict(&manifest.bytes)?;
-    ensure!(
-        m.schema_version == "gptgrep.judge.request-manifest.v1"
-            && m.role == "verifier_only"
-            && m.judge_status == "unavailable"
-            && m.qualification == QUALIFICATION
-            && hex(&m.original_revision, 40)
-            && m.formatter_sha256 == digest(FORMATTER.as_bytes())
-            && m.python_sha256 == python.sha256
-            && m.actual_judge_model.is_none()
-            && m.actual_provider_calls.is_none()
-            && m.actual_usage.is_none()
-            && m.actual_cost.is_none()
-            && !m.reward_emitted,
-        "request_manifest_contract"
-    );
-    let source = load_binding(&root, "judge-source.py", &m.judge_source, SOURCE_MAX)?;
-    let reference = load_binding(&root, "reference.json", &m.reference, ARTIFACT_MAX)?;
-    let answer = load_binding(&root, "answer.json", &m.answer, ARTIFACT_MAX)?;
-    let saved = load_binding(&root, "request.json", &m.request, REQUEST_MAX)?;
-    inputs_valid(&reference, &answer)?;
+    let prepared = PreparedRequest::load(root, manifest_sha, python)?;
+    let PreparedRequest {
+        root,
+        held_root: _held_root,
+        root_id,
+        manifest,
+        source,
+        reference,
+        answer,
+        saved,
+        python,
+        decoded: actual,
+    } = prepared;
     let output = fresh_output(output, &[&root, &verdict.path, &python.path])?;
     let formed = format(
         &python,
@@ -820,7 +1003,6 @@ fn validate_verdict(
         output.parent().context("output_parent")?,
     )?;
     let expected = request(formed);
-    let actual: Request = strict(&saved.bytes)?;
     ensure!(
         actual == expected,
         "request_format_or_qualification_mismatch"
@@ -859,6 +1041,11 @@ fn validate_verdict(
 }
 fn run(operation: Operation) -> Result<String> {
     match operation {
+        Operation::ExecuteNative {
+            control,
+            control_sha256,
+            run,
+        } => judge_backend::dispatch(&control, &control_sha256, run),
         Operation::Prepare {
             judge_source,
             judge_source_sha256,
@@ -898,6 +1085,18 @@ fn run(operation: Operation) -> Result<String> {
 fn failure_code(error: &anyhow::Error) -> &'static str {
     for (message, code) in [
         (
+            "native_execution_policy_unavailable",
+            "native_execution_policy_unavailable",
+        ),
+        (
+            "native_invocation_consumed",
+            "native_invocation_consumed_no_retry",
+        ),
+        (
+            "native_completion_unknown_no_retry",
+            "native_completion_unknown_no_retry",
+        ),
+        (
             "publication_sync_unknown_no_retry_output_may_exist",
             "publication_sync_unknown_no_retry_output_may_exist",
         ),
@@ -929,7 +1128,10 @@ fn failure_code(error: &anyhow::Error) -> &'static str {
     "judge_request_or_verdict_unavailable"
 }
 fn main() {
-    match run(Cli::parse().command) {
+    let operation = Cli::parse().command;
+    let native = matches!(&operation, Operation::ExecuteNative { .. });
+    match run(operation) {
+        Ok(response) if native => println!("{response}"),
         Ok(sha) => println!(
             "{}",
             serde_json::json!({"artifact_sha256":sha,"judge_status":"unavailable","qualification":QUALIFICATION,"reward_emitted":false})
@@ -943,6 +1145,9 @@ fn main() {
         }
     }
 }
+#[path = "judge_backend.rs"]
+mod judge_backend;
+
 #[cfg(test)]
 #[path = "judge_request_tests.rs"]
 mod tests;
