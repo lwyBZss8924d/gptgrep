@@ -1,6 +1,6 @@
 use crate::{
-    DecisionAnswer, DecisionResponse, MAX_PROVIDER_METADATA_BYTES, MAX_QUESTIONS,
-    MAX_RESPONSE_BYTES,
+    DecisionAnswer, DecisionFailure, DecisionResponse, FailedResponseUsage,
+    MAX_PROVIDER_METADATA_BYTES, MAX_QUESTIONS, MAX_RESPONSE_BYTES,
 };
 use anyhow::{Result, anyhow, ensure};
 use serde::{
@@ -88,9 +88,15 @@ pub(crate) fn response(bytes: &[u8], questions: &Value) -> Result<DecisionRespon
         bytes.len() <= MAX_RESPONSE_BYTES,
         "Jev response exceeded the byte limit"
     );
-    let unique: UniqueValue = serde_json::from_slice(bytes)
-        .map_err(|_| anyhow!("Jev response is invalid JSON or contains duplicate keys"))?;
-    let response: DecisionResponse = serde_json::from_value(unique.0)
+    let unique: UniqueValue =
+        serde_json::from_slice(bytes).map_err(|_| DecisionFailure::invalid_json())?;
+    let usage = FailedResponseUsage::from_response(&unique.0);
+    validate_response(unique.0, questions)
+        .map_err(|error| DecisionFailure::validation(&error, usage).into())
+}
+
+fn validate_response(value: Value, questions: &Value) -> Result<DecisionResponse> {
+    let response: DecisionResponse = serde_json::from_value(value)
         .map_err(|_| anyhow!("Jev response does not match the Decisions schema"))?;
     ensure!(
         !response.model.trim().is_empty()

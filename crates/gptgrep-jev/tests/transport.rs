@@ -1,6 +1,10 @@
-use gptgrep_jev::{Candidate, JevClient, MAX_RESPONSE_BYTES};
+use gptgrep_jev::{
+    Candidate, DecisionFailure, DecisionFailureKind, ExecutionContext, JevClient,
+    MAX_RESPONSE_BYTES, UsagePresence,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::time::{Duration, SystemTime};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -122,6 +126,138 @@ async fn prepared_decision_binds_exact_bytes_model_and_endpoint() {
     assert_eq!(body["provider"]["allow_fallbacks"], false);
 }
 
+fn diagnostic_question() -> Value {
+    json!({"support":{"type":"choice","instructions":"Does the supplied passage support the claim?",
+        "criteria":{"supported":"Supported","unsupported":"Unsupported"}}})
+}
+
+#[tokio::test]
+async fn failed_typed_response_preserves_http_and_numeric_usage_without_payload() {
+    let response = json!({"model":"vendor-build", "answers":{"support":{"type":"unsupported-secret-sentinel"}},
+        "usage":{"input_tokens":17,"output_tokens":null,"cost":0.0000123,"private":"secret-sentinel"},
+        "private":"secret-sentinel"}).to_string();
+    let expected_bytes = response.len();
+    let (endpoint, server) = serve_once("200 OK", response, "").await;
+    let context = ExecutionContext::new(
+        "schema-failure",
+        &"a".repeat(64),
+        SystemTime::now() + Duration::from_secs(30),
+        1,
+    )
+    .unwrap();
+    let client = JevClient::with_endpoint("synthetic-test-key", None, &endpoint)
+        .unwrap()
+        .with_execution_context(context.clone());
+    let error = client
+        .decide(json!("ordinary passage"), diagnostic_question())
+        .await
+        .unwrap_err();
+    let failure = error.downcast_ref::<DecisionFailure>().unwrap();
+    let observed = failure.diagnostic();
+    assert_eq!(observed.kind, DecisionFailureKind::ResponseSchema);
+    assert_eq!(observed.http_status, Some(200));
+    assert_eq!(observed.response_bytes, Some(expected_bytes));
+    assert_eq!(observed.validation_code, Some("schema"));
+    let usage = observed.reported_usage.as_ref().unwrap();
+    assert_eq!(usage.input_tokens.presence, UsagePresence::Reported);
+    assert_eq!(usage.input_tokens.value, Some(17));
+    assert_eq!(usage.output_tokens.presence, UsagePresence::Null);
+    assert_eq!(usage.output_tokens.value, None);
+    assert_eq!(usage.cost.value, Some(0.0000123));
+    for rendered in [
+        format!("{failure}"),
+        format!("{failure:?}"),
+        serde_json::to_string(observed).unwrap(),
+        format!("{error:#}"),
+    ] {
+        assert!(!rendered.contains("secret-sentinel"));
+        assert!(!rendered.contains("ordinary passage"));
+        assert!(!rendered.contains("synthetic-test-key"));
+        assert!(!rendered.contains(&endpoint));
+    }
+    assert!(std::error::Error::source(failure).is_none());
+    server.await.unwrap();
+    let snapshot = context.snapshot().unwrap();
+    assert_eq!(snapshot.logical_reservations, 1);
+    assert_eq!(snapshot.send_start_observations, 1);
+    assert_eq!(snapshot.terminal_submissions, 1);
+    assert_eq!(snapshot.active_or_quarantined_slots, 0);
+}
+
+#[tokio::test]
+async fn duplicate_json_cannot_supply_failure_usage_or_become_a_schema_failure() {
+    let response =
+        r#"{"model":"vendor-build","answers":{},"usage":{"cost":0},"usage":{"cost":999}}"#;
+    let (endpoint, server) = serve_once("200 OK", response.into(), "").await;
+    let client = JevClient::with_endpoint("synthetic-test-key", None, &endpoint).unwrap();
+    let error = client
+        .decide(json!("ordinary passage"), diagnostic_question())
+        .await
+        .unwrap_err();
+    let observed = error
+        .downcast_ref::<DecisionFailure>()
+        .unwrap()
+        .diagnostic();
+    assert_eq!(observed.kind, DecisionFailureKind::InvalidJson);
+    assert_eq!(observed.http_status, Some(200));
+    assert!(observed.reported_usage.is_none());
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn invalid_usage_values_are_marked_invalid_and_never_retained() {
+    let response = json!({"model":"vendor-build","answers":{"support":{"type":"choice","choice":"supported"}},
+        "usage":{"input_tokens":"secret-sentinel","output_tokens":-1,"cost":"secret-sentinel"}});
+    let (endpoint, server) = serve_once("200 OK", response.to_string(), "").await;
+    let client = JevClient::with_endpoint("synthetic-test-key", None, &endpoint).unwrap();
+    let error = client
+        .decide(json!("ordinary passage"), diagnostic_question())
+        .await
+        .unwrap_err();
+    let observed = error
+        .downcast_ref::<DecisionFailure>()
+        .unwrap()
+        .diagnostic();
+    assert_eq!(observed.kind, DecisionFailureKind::ResponseValidation);
+    assert_eq!(observed.validation_code, Some("token_usage"));
+    let usage = observed.reported_usage.as_ref().unwrap();
+    assert_eq!(usage.input_tokens.presence, UsagePresence::Invalid);
+    assert_eq!(usage.output_tokens.presence, UsagePresence::Invalid);
+    assert_eq!(usage.cost.presence, UsagePresence::Invalid);
+    assert!(
+        usage.input_tokens.value.is_none()
+            && usage.output_tokens.value.is_none()
+            && usage.cost.value.is_none()
+    );
+    assert!(
+        !serde_json::to_string(observed)
+            .unwrap()
+            .contains("secret-sentinel")
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn mathematical_rejection_retains_its_specific_validation_code() {
+    let response = json!({"model":"vendor-build","answers":{"support":{"type":"choice","choice":"supported",
+        "probabilities":{"supported":0.1,"unsupported":0.9}}},"usage":{"cost":null}});
+    let (endpoint, server) = serve_once("200 OK", response.to_string(), "").await;
+    let client = JevClient::with_endpoint("synthetic-test-key", None, &endpoint).unwrap();
+    let error = client
+        .decide(json!("ordinary passage"), diagnostic_question())
+        .await
+        .unwrap_err();
+    let observed = error
+        .downcast_ref::<DecisionFailure>()
+        .unwrap()
+        .diagnostic();
+    assert_eq!(observed.validation_code, Some("choice_distribution"));
+    let usage = observed.reported_usage.as_ref().unwrap();
+    assert_eq!(usage.input_tokens.presence, UsagePresence::Absent);
+    assert_eq!(usage.cost.presence, UsagePresence::Null);
+    server.await.unwrap();
+}
+
 #[tokio::test]
 async fn sends_decisions_contract_and_preserves_model_and_usage() {
     let response = json!({
@@ -190,11 +326,18 @@ async fn status_failure_is_redacted_and_not_retried() {
             }),
         )
         .await
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("HTTP 503"));
-    assert!(error.contains("not retried"));
-    assert!(!error.contains("secret-sentinel"));
+        .unwrap_err();
+    let failure = error
+        .downcast_ref::<DecisionFailure>()
+        .unwrap()
+        .diagnostic();
+    assert_eq!(failure.kind, DecisionFailureKind::HttpStatus);
+    assert_eq!(failure.http_status, Some(503));
+    assert!(failure.reported_usage.is_none());
+    let rendered = error.to_string();
+    assert!(rendered.contains("HTTP 503"));
+    assert!(rendered.contains("not retried"));
+    assert!(!rendered.contains("secret-sentinel"));
     server.await.unwrap();
 }
 
@@ -234,10 +377,56 @@ async fn response_body_is_bounded_before_decoding() {
             }),
         )
         .await
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("byte limit"));
+        .unwrap_err();
+    let observed = error
+        .downcast_ref::<DecisionFailure>()
+        .unwrap()
+        .diagnostic();
+    assert_eq!(observed.kind, DecisionFailureKind::ResponseSize);
+    assert_eq!(observed.http_status, Some(200));
+    assert_eq!(observed.response_bytes, None);
+    assert!(observed.reported_usage.is_none());
+    assert!(error.to_string().contains("byte limit"));
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn incomplete_body_preserves_status_and_quarantines_the_charged_slot() {
+    let body = "secret-sentinel";
+    let (endpoint, server) = serve_once("200 OK", body.into(), "Content-Length: 4096\r\n").await;
+    let context = ExecutionContext::new(
+        "partial-body",
+        &"b".repeat(64),
+        SystemTime::now() + Duration::from_secs(30),
+        1,
+    )
+    .unwrap();
+    let client = JevClient::with_endpoint("synthetic-test-key", None, &endpoint)
+        .unwrap()
+        .with_execution_context(context.clone());
+    let error = client
+        .decide(json!("ordinary passage"), diagnostic_question())
+        .await
+        .unwrap_err();
+    let failure = error.downcast_ref::<DecisionFailure>().unwrap();
+    let observed = failure.diagnostic();
+    assert_eq!(observed.kind, DecisionFailureKind::ResponseBody);
+    assert_eq!(observed.http_status, Some(200));
+    assert!(
+        observed
+            .response_bytes
+            .is_some_and(|bytes| bytes <= body.len())
+    );
+    assert!(observed.reported_usage.is_none());
+    assert!(std::error::Error::source(failure).is_none());
+    assert!(!format!("{error:#?}").contains("secret-sentinel"));
+    assert!(!format!("{error:#?}").contains(&endpoint));
+    server.await.unwrap();
+    let snapshot = context.snapshot().unwrap();
+    assert_eq!(snapshot.logical_reservations, 1);
+    assert_eq!(snapshot.send_start_observations, 1);
+    assert_eq!(snapshot.terminal_submissions, 0);
+    assert_eq!(snapshot.quarantined_slots, 1);
 }
 
 #[tokio::test]

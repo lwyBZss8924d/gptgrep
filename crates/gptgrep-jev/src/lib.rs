@@ -5,12 +5,17 @@
 
 mod clock;
 mod execution;
+mod failure;
 mod input;
 mod roles;
 mod validation;
 pub use clock::RunClockAnchor;
 pub use execution::{
     ExecutionContext, ExecutionSnapshot, MAX_CONCURRENT_REQUESTS, MAX_SUBMISSIONS,
+};
+pub use failure::{
+    DecisionFailure, DecisionFailureDiagnostic, DecisionFailureKind, FailedResponseUsage,
+    UsageObservation, UsagePresence,
 };
 pub use input::{
     DecisionInput, ImageEvidence, MAX_IMAGE_BASE64_BYTES, MAX_IMAGE_BYTES,
@@ -330,33 +335,40 @@ impl JevClient {
                 .body(body)
                 .send()
                 .await
-                .map_err(transport_error)?;
+                .map_err(|error| DecisionFailure::transport(&error, false, None, None))?;
+            let status = response.status().as_u16();
             if !response.status().is_success() {
                 reservation.terminal().await?;
-                return Err(anyhow!(
-                    "Jev provider returned HTTP {}; request was not retried",
-                    response.status().as_u16()
-                ));
+                return Err(DecisionFailure::http(status).into());
             }
             if response
                 .content_length()
                 .is_some_and(|len| len > MAX_RESPONSE_BYTES as u64)
             {
-                return Err(anyhow!("Jev response exceeded the byte limit"));
+                return Err(DecisionFailure::response_size(status, None).into());
             }
             let mut bytes = Vec::new();
-            while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
+            while let Some(chunk) = response.chunk().await.map_err(|error| {
+                DecisionFailure::transport(&error, true, Some(status), Some(bytes.len()))
+            })? {
                 if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
-                    return Err(anyhow!("Jev response exceeded the byte limit"));
+                    return Err(DecisionFailure::response_size(status, Some(bytes.len())).into());
                 }
                 bytes.extend_from_slice(&chunk);
             }
-            let result = validation::response(&bytes, questions);
+            let result = validation::response(&bytes, questions).map_err(|error| {
+                if let Some(failure) = error.downcast_ref::<DecisionFailure>() {
+                    failure.clone().with_response(status, bytes.len()).into()
+                } else {
+                    error
+                }
+            });
             reservation.terminal().await?;
             result
         };
-        tokio::time::timeout_at(deadline, submitted).await
-            .map_err(|_| anyhow!("Jev admission or request deadline expired; any reserved submission remains charged and unknown; request was not retried"))?
+        tokio::time::timeout_at(deadline, submitted)
+            .await
+            .map_err(|_| DecisionFailure::deadline())?
     }
 
     /// Prepare the unchanged absolute relevance rubric before paid admission.
@@ -424,14 +436,6 @@ impl JevClient {
             "Jev request exceeded the byte limit"
         );
         Ok(body)
-    }
-}
-
-fn transport_error(error: reqwest::Error) -> anyhow::Error {
-    if error.is_timeout() {
-        anyhow!("Jev request timed out; usage may be unknown and the request was not retried")
-    } else {
-        anyhow!("Jev transport failed; usage may be unknown and the request was not retried")
     }
 }
 
