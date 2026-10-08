@@ -272,6 +272,8 @@ async fn native_initial_pass_routes_unmatched_source_and_preserves_full_usage() 
     let report = initial.report();
     assert_eq!(report.hits.len(), 1);
     assert_eq!(report.validated_responses, 2);
+    assert_eq!(report.logical_calls_attempted, 2);
+    assert!(report.accounting_complete);
     assert!(
         report.attempts[0].full_usage()["unknown_detail"]
             .as_str()
@@ -376,6 +378,7 @@ async fn required_second_stage_failure_preserves_first_receipt_and_observer() ->
     server.await??;
     assert_eq!(error.stage, "evidence_reranking");
     assert_eq!(error.report.validated_responses, 1);
+    assert_eq!(error.report.logical_calls_attempted, 2);
     assert_eq!(error.report.attempts[0].usage.input_tokens, Some(json!(5)));
     assert_eq!(error.report.attempts[1].usage.cost, None);
     assert_eq!(*seen.lock().unwrap(), vec![json!(5)]);
@@ -737,6 +740,7 @@ async fn expired_original_context_and_observer_stop_do_not_submit_later_stage() 
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let error = prepared.execute().await.err().unwrap();
     assert_eq!(error.report.logical_calls_attempted, 0);
+    assert!(!error.report.accounting_complete);
     assert_eq!(execution.snapshot()?.logical_reservations, 0);
     let execution = context(2)?;
     let (endpoint, server) = mock(1, Arc::new(|_| Ok(())), false).await?;
@@ -754,6 +758,8 @@ async fn expired_original_context_and_observer_stop_do_not_submit_later_stage() 
     server.await??;
     assert_eq!(error.code, "rich_decisions_observer_failed");
     assert_eq!(error.report.validated_responses, 1);
+    assert_eq!(error.report.logical_calls_attempted, 1);
+    assert!(error.report.accounting_complete);
     assert_eq!(execution.snapshot()?.logical_reservations, 1);
     Ok(())
 }

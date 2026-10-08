@@ -1000,6 +1000,7 @@ dependencies = [
  "clap",
  "gptgrep-core",
  "gptgrep-jev",
+ "gptgrep-pageindex",
  "gptgrep-parse",
  "image",
  "libc",

@@ -21,6 +21,7 @@ struct Inner {
     header: Header,
     deadline: Option<Instant>,
     ledger: Option<PathBuf>,
+    ledger_existing_only: bool,
     clock_anchor: Mutex<Option<RunClockAnchor>>,
     state: Mutex<State>,
 }
@@ -128,6 +129,17 @@ impl ExecutionContext {
     /// Add an explicit persistent ledger before sharing the context with callers.
     /// Existing ledgers must match the entire immutable run/plan/deadline/limits header.
     pub fn with_ledger(self, path: impl AsRef<Path>) -> Result<Self> {
+        self.attach_ledger(path.as_ref(), false)
+    }
+
+    /// Join an already initialized same-host ledger, adopting its original anchor.
+    /// Missing journal or lock files are errors, including during later accesses.
+    /// This mode never creates a lock, journal, or run clock anchor.
+    pub fn with_existing_ledger(self, path: impl AsRef<Path>) -> Result<Self> {
+        self.attach_ledger(path.as_ref(), true)
+    }
+
+    fn attach_ledger(self, path: &Path, existing_only: bool) -> Result<Self> {
         ensure!(
             self.0.header.deadline_unix_ms.is_some(),
             "A ledger requires an explicit absolute deadline"
@@ -151,7 +163,6 @@ impl ExecutionContext {
                 "Attach the ledger before any execution context use"
             );
         }
-        let path = path.as_ref();
         let name = path
             .file_name()
             .ok_or_else(|| anyhow!("Invalid Decisions ledger path"))?;
@@ -168,6 +179,7 @@ impl ExecutionContext {
         let context = Self(
             Arc::new(Inner {
                 ledger: Some(path),
+                ledger_existing_only: existing_only,
                 ..inner
             }),
             self.1,
@@ -317,6 +329,7 @@ impl ExecutionContext {
                 header,
                 deadline,
                 ledger: None,
+                ledger_existing_only: false,
                 clock_anchor: Mutex::new(None),
             }),
             None,
@@ -456,7 +469,26 @@ impl ExecutionContext {
             !lock_path.is_symlink(),
             "Decisions ledger lock must not be a symlink"
         );
-        let (mut lock, created_lock_inode) = open_lock(&lock_path)?;
+        let (mut lock, created_lock_inode) = if self.0.ledger_existing_only {
+            ensure!(path.is_file(), "Existing Decisions ledger is unavailable");
+            let mut options = OpenOptions::new();
+            options.read(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NOFOLLOW);
+            }
+            let file = options
+                .open(&lock_path)
+                .map_err(|_| anyhow!("Existing Decisions ledger lock is unavailable"))?;
+            ensure!(
+                file.metadata()?.is_file(),
+                "Existing Decisions ledger lock is invalid"
+            );
+            (file, false)
+        } else {
+            open_lock(&lock_path)?
+        };
         // The journal update never holds a lock across HTTP or an await. Bound local
         // contention too: a foreign process cannot block this runtime indefinitely.
         let lock_deadline = Instant::now()
@@ -977,6 +1009,46 @@ mod tests {
         assert!(!dir.join("observed").exists());
         fs::remove_dir_all(dir).unwrap();
     }
+    #[test]
+    fn existing_only_join_never_initializes_missing_files_or_recaptures_anchor() {
+        let dir = directory();
+        let path = dir.join("existing-only");
+        let deadline = SystemTime::now() + Duration::from_secs(5);
+        assert!(context(deadline, 2).with_existing_ledger(&path).is_err());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        let original = context(deadline, 2).with_ledger(&path).unwrap();
+        let joined = context(deadline, 2).with_existing_ledger(&path).unwrap();
+        assert_eq!(original.snapshot().unwrap(), joined.snapshot().unwrap());
+        assert!(original.ledger_clock_anchor().unwrap() == joined.ledger_clock_anchor().unwrap());
+        let lock = sidecar(&path, ".lock");
+        fs::remove_file(&lock).unwrap();
+        assert!(joined.snapshot().is_err());
+        assert!(!lock.exists());
+        fs::remove_file(&path).unwrap();
+        assert!(joined.snapshot().is_err());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        assert!(context(deadline, 2).with_existing_ledger(&path).is_err());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn existing_only_join_retains_charged_unknown_and_shared_quota() {
+        let dir = directory();
+        let path = dir.join("charged-existing");
+        let deadline = SystemTime::now() + Duration::from_secs(5);
+        let original = context(deadline, 1).with_ledger(&path).unwrap();
+        let mut reservation = original.reserve(DIGEST, "ordinary-fixture").await.unwrap();
+        reservation.send_started().await.unwrap();
+        drop(reservation);
+        let joined = context(deadline, 1).with_existing_ledger(&path).unwrap();
+        assert_eq!(original.snapshot().unwrap(), joined.snapshot().unwrap());
+        assert_eq!(joined.snapshot().unwrap().quarantined_slots, 1);
+        assert!(joined.reserve(DIGEST, "ordinary-fixture").await.is_err());
+        assert_eq!(joined.snapshot().unwrap().logical_reservations, 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn only_the_acquired_lock_initializer_can_create_a_missing_journal() {
         let dir = directory();

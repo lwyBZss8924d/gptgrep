@@ -1,5 +1,11 @@
 # gptgrep-jev
 
+Trusted callers that already have an initialized same-host budget can use
+`ExecutionContext::with_existing_ledger`. It adopts the original clock anchor
+and reservations and refuses missing journal or lock files without initializing
+a replacement. The existing `with_ledger` initializer remains available for the
+owner of a new run; joining a ledger does not renew its deadline.
+
 A Rust client for Jev's structured Decisions endpoint on OpenRouter. It uses the process's `OPENROUTER_API_KEY` and does not read credential files. The default model selector is `typesafe/jev-1.13`. OpenRouter may resolve that selector to a dated revision; responses preserve the returned model identifier.
 
 ```rust,no_run

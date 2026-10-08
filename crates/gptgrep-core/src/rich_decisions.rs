@@ -151,6 +151,8 @@ pub struct RichTextSearchReport {
     pub attempts: Vec<RichTextAttempt>,
     pub logical_calls_attempted: usize,
     pub validated_responses: usize,
+    /// All nonzero attempted logical calls returned validated replies. This does
+    /// not imply search success, available usage, physical requests or billing.
     pub accounting_complete: bool,
     pub read_intervals: Vec<ReaderReadMetrics>,
     pub read_meter_scope: &'static str,
@@ -546,7 +548,12 @@ impl PreparedRichTextSearch {
     pub fn full_pool_request_bytes(&self) -> usize {
         self.full_pool_bytes
     }
+    fn finalize_logical_accounting(&mut self) {
+        self.report.accounting_complete = self.report.logical_calls_attempted != 0
+            && self.report.logical_calls_attempted == self.report.validated_responses;
+    }
     fn failure(mut self, stage: &'static str, code: &'static str) -> RichTextSearchError {
+        self.finalize_logical_accounting();
         if self.report.read_intervals.len() < 3
             && let Ok(after) = self.reader.read_metrics()
             && let Ok(delta) = after.since(&self.last_meter)
@@ -746,6 +753,7 @@ impl PreparedRichTextSearch {
             self.report.read_intervals.push(delta);
         }
         self.report.elapsed_ms = self.started.elapsed().as_millis();
+        self.finalize_logical_accounting();
         if measure(&self.report, self.output_reserved).is_err()
             || self.client.execution_context().check_deadline().is_err()
         {

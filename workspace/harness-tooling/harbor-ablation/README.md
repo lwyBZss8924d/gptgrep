@@ -453,6 +453,61 @@ umasks remains unqualified. The parser retains its frozen admission budgets.
 
 ## Source-custodied production export
 
+### Trusted native-text pilot bootstrap
+
+`gptgrep-harbor-rich-helper` is an explicit host-side retrieval bootstrap for a
+controlled pipeline pilot. It calls the existing v2
+`prepare_rich_text_search` plan and executes document routing plus evidence
+reranking with exactly `openai/gpt-6-luna-decisions`, without retry or fallback.
+Successful retrieval requires both calls; failure may stop before either call or
+after one. A shared pool can exhaust between stages, so this is not an atomic
+two-credit reservation.
+
+Run the helper after sealing a generation built from raw documents and projecting
+the current task's query, before the treatment reader starts. Count all helper
+execution and query projection time, submissions and observed usage as retrieval.
+Its work is never excluded as indexing. The control reader receives raw PDFs.
+This initial pipeline is not an interactive agent tool or a utility qualification.
+
+With no arguments the helper emits its nonexecuting frontdoor description.
+`--config PATH --config-sha256 SHA` validates bounded inputs and the existing
+initialization without joining a ledger, sampling its clock, reading credentials,
+writing outputs or submitting requests. Add `--execute` only in the trusted host:
+it consumes a new private output directory, joins the already initialized original
+ledger, checks the original anchor and expected counters, and reads
+`OPENROUTER_API_KEY` from that process's environment. There is no initializer,
+endpoint override, reset, resume, deadline renewal or native reader launch.
+
+The closed `gptgrep.harbor.rich_helper.v1` config binds an exact
+`GenerationPin`, corpus root, raw UTF-8 query file with bytes/SHA, retrieval
+options, expected canonical returned model, output directory and original context.
+The context includes ledger path, immutable initialization SHA, original anchor
+SHA, run/plan/deadline/submission limit and an exact prior
+`ExecutionSnapshot`. Root-owned monetary admission and original clock
+initialization remain prerequisites outside this helper.
+
+Only a successful process and completed `accounting.json` authorize passing
+`reader-evidence.json` to the treatment reader.
+The helper rechecks its retained original context before publishing completed
+evidence and after the final accounting sync. Expiration revokes reader evidence
+and retains prior observations and charges in failed accounting, without retry.
+Evidence preserves the product's source bindings, hit order and bounded coverage without granting citation or
+reader-delivery authority. Keep the accounting file and helper credentials outside
+both reader environments. Accounting retains original context, observed counters,
+checked numeric usage and complete validated-usage digests. Missing values remain
+null, failed-stage usage remains unavailable, and observed logical/send-start
+counts are never called physical or billed provider requests. Provider freeform
+metadata and raw bodies are not retained. No money settlement is performed.
+The product's `accounting_complete` flag means every nonzero attempted logical
+call returned a validated response; it does not require search success or optional
+usage. An observer failure after a validated response can therefore retain true,
+while zero-attempt or partially validated failures remain false. The separate
+`helper_logical_accounting_complete` requires two validated observations, checked
+available token/cost fields, and exactly two reservations, send starts, submission
+observations and terminal results in the unchanged original context. Concurrent
+unrelated ledger changes invalidate that attribution; failed response usage,
+physical requests and billed cost remain outside this completeness claim.
+
 The exporter adds explicit commands with no task selection shortcuts:
 
 ```sh
