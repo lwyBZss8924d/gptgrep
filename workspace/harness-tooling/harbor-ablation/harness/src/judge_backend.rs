@@ -3,6 +3,9 @@
 use super::*;
 use std::os::fd::AsRawFd;
 
+#[path = "judge_app_server.rs"]
+mod app_server;
+
 const CONTROL_MAX: usize = 65_536;
 const BINARY_MAX: u64 = 1_073_741_824;
 const STDOUT_CAP: usize = 1_048_576;
@@ -304,6 +307,9 @@ fn intent(value: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
+pub(super) fn dispatch_app_server(path: &Path, sha: &str, run: bool) -> Result<String> {
+    app_server::dispatch(path, sha, run)
+}
 pub(super) fn dispatch(path: &Path, sha: &str, run: bool) -> Result<String> {
     let admitted = Admission::load(path, sha)?;
     if !run {
@@ -437,6 +443,12 @@ fn consume(a: &Admission, permit: &ExecutionPermit) -> Result<File> {
         }),
         RECEIPT_CAP,
     )?;
+    // Synchronous held-source/binary freshness may use the remaining phase time.
+    // Recheck the original permit deadline immediately before the durable effect.
+    ensure!(
+        Instant::now() < permit.deadline,
+        "native_execution_policy_unavailable"
+    );
     let mut claim = private_file(&root, &format!("{}.claim.json", a.control.invocation_id))?;
     claim.write_all(&claim_bytes)?;
     claim.sync_all()?;
@@ -989,6 +1001,7 @@ fn execute(a: &Admission, permit: ExecutionPermit) -> Result<Outcome> {
             identity(&open_held(&a.control.invocation_root, true)?)? == claim_root_id,
             "native_claim_root_changed"
         );
+        ensure!(Instant::now() < permit.deadline, "native_deadline");
         Ok(())
     }) {
         Ok(sha) => {

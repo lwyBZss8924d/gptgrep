@@ -288,8 +288,63 @@ uv run --offline --no-project --no-sync --no-python-downloads --python /path/to/
 
 ## Original judge request foundation
 
+The same binary also exposes a fixed app-server broker source preflight:
+
+```sh
+gptgrep-harbor-judge-request execute-app-server \
+  --control /path/to/verifier/control.json --control-sha256 CONTROL_SHA256
+```
+
+It admits the existing `gptgrep.judge.native-control.v1` held inputs and reports
+the computed `gptgrep.judge.app-server-recipe.v1` digest separately from the
+declared runtime recipe digest. This preflight does not reconstruct the formatter,
+open actor homes or claims, initialize a clock or ledger, or launch a process.
+Adding `--run` always refuses before these effects because the existing opaque
+production permit constructor remains unavailable. A matching caller digest
+does not grant execution authority.
+
+The private actor is wired to a bidirectional nonblocking stdio state machine
+using the standard `codex app-server --listen stdio:// --strict-config` front door.
+It sends one initialize/thread/turn sequence with the original held prompt and
+schema and requested `gpt-6-luna`, `max`, `fast`. It binds the returned native
+thread and turn IDs, bounds early notifications before binding, and requires an
+ordinary `agentMessage` with `final_answer` plus a matching completed turn.
+RPC IDs remain distinct from native IDs.
+The receipt records at most four outbound frame methods, exact prepared byte
+counts and SHA-256 values (including the newline delimiter), plus separately
+observed write counts and full-write facts. A prepared frame digest does not
+assert that it was written. The actual turn frame includes the returned native
+thread ID; its digest is distinct from the request/template recipe digests.
+No raw outbound payload is retained in the receipt.
+
+Optional native usage and raw response
+IDs stay absent when no matching event is observed; configured acknowledgements
+do not establish served identity, cost, or provider request counts. The local
+source normalizes a requested Fast tier to `priority`; the broker retains the
+raw configured tier and admits `fast`/`priority` as source-equivalent Fast
+acknowledgements, while refusing absent, Flex or unknown tiers. This establishes
+no served tier or profile. The source map is local protocol evidence, not a claim
+about the latest remote version.
+
+Input frames are limited before parsing, with recursive duplicate-key, depth,
+node, event-count and aggregate early-buffer limits. Output, final text and
+receipt serialization are bounded separately. Only numeric RPC error codes and
+fixed failure codes survive rejection; diagnostic, reasoning and stderr content
+is not published. Unknown/tool/server requests fail closed, without replies or
+retries. Such rejection observes a request or item and does not prove that a
+server-owned tool was prevented from running. The actor retains once-only claims
+and unknown provider lifetime on failure, with held-source checks before receipt
+publication and private files/directories.
+
+Pure protocol and generic Python fake-child tests qualify this source transport
+only. Actual byte framing, runtime/profile/tool closure, auth, native identities,
+OS resources, shared original-clock accounting, original judge semantics and
+signal/cancellation behavior and
+Harbor trials remain unqualified. Structural verdicts keep
+`judge_status="unavailable"` and emit no reward.
+
 `gptgrep-harbor-judge-request` prepares a verifier-only request or validates a
-typed verdict artifact. It has no judge backend, model invocation, retry,
+typed verdict artifact. Its production judge execution policy is unavailable; it performs no model invocation, retry,
 fallback or reward output. The generated Harbor verifier remains unavailable.
 Reference answers, questions, expected formats and real answer artifacts belong
 only to the verifier. Source documents, indexes and citations are not inputs.

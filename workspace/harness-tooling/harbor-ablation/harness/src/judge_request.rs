@@ -37,6 +37,15 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Operation {
+    /// Admit the fixed app-server broker recipe. --run refuses before effects.
+    ExecuteAppServer {
+        #[arg(long)]
+        control: PathBuf,
+        #[arg(long)]
+        control_sha256: String,
+        #[arg(long, default_value_t = false)]
+        run: bool,
+    },
     /// Admit a native source plan only. --run fails closed before effects.
     ExecuteNative {
         #[arg(long)]
@@ -1041,6 +1050,11 @@ fn validate_verdict(
 }
 fn run(operation: Operation) -> Result<String> {
     match operation {
+        Operation::ExecuteAppServer {
+            control,
+            control_sha256,
+            run,
+        } => judge_backend::dispatch_app_server(&control, &control_sha256, run),
         Operation::ExecuteNative {
             control,
             control_sha256,
@@ -1129,7 +1143,10 @@ fn failure_code(error: &anyhow::Error) -> &'static str {
 }
 fn main() {
     let operation = Cli::parse().command;
-    let native = matches!(&operation, Operation::ExecuteNative { .. });
+    let native = matches!(
+        &operation,
+        Operation::ExecuteNative { .. } | Operation::ExecuteAppServer { .. }
+    );
     match run(operation) {
         Ok(response) if native => println!("{response}"),
         Ok(sha) => println!(
