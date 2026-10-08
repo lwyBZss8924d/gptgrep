@@ -42,6 +42,73 @@ enum Mode {
     Semantic,
 }
 
+#[derive(Debug, Clone, ValueEnum)]
+enum IndexOcr {
+    Off,
+    Auto,
+}
+
+#[derive(Debug, Args)]
+struct RichIndexArgs {
+    #[arg(
+        long,
+        help = "Explicitly publish source-bound v2 PDF/PNG/JPEG artifacts; default index retains v1"
+    )]
+    rich: bool,
+    #[arg(
+        long,
+        value_enum,
+        help = "Select v2 ingestion: off is local; auto requires the qualified native OCR runtime"
+    )]
+    ocr: Option<IndexOcr>,
+    #[arg(
+        long,
+        help = "Prepare all native pages and OCR routing without model calls or CURRENT publication"
+    )]
+    plan_only: bool,
+    #[arg(
+        long,
+        help = "Reuse only verified completed OCR results; unknown/failed tasks cannot be retried"
+    )]
+    resume: bool,
+    #[arg(
+        long,
+        help = "Explicit immutable OCR run identity, required for live OCR"
+    )]
+    ocr_run_id: Option<String>,
+    #[arg(
+        long,
+        help = "Operator-owned qualified OcrRuntimeProfile JSON; never an authentication file"
+    )]
+    ocr_runtime_profile: Option<PathBuf>,
+    #[arg(
+        long,
+        default_value = "codex",
+        help = "Pinned official Codex binary from the OCR runtime profile"
+    )]
+    ocr_codex_bin: String,
+    #[arg(
+        long,
+        help = "Existing independent authenticated OCR home; no login or credential reads"
+    )]
+    ocr_codex_home: Option<PathBuf>,
+    #[arg(long, default_value_t = 24)]
+    ocr_max_pages: usize,
+    #[arg(
+        long,
+        default_value_t = 1800,
+        help = "One original OCR run deadline; resume adopts it unchanged"
+    )]
+    ocr_timeout_seconds: u64,
+    #[arg(long, default_value_t = 25)]
+    page_window: usize,
+    #[arg(
+        long,
+        help = "Require the frozen rich-ingest plan digest before live execution"
+    )]
+    expected_plan_sha256: Option<String>,
+}
+
 #[derive(Debug, Args)]
 struct HostArgs {
     #[arg(long, default_value = "codex")]
@@ -163,6 +230,8 @@ enum Command {
             help = "Apply PageIndex scan-cost merging to native paginated documents"
         )]
         optimize_merge: bool,
+        #[command(flatten)]
+        rich: RichIndexArgs,
     },
     /// Build source-bound, non-citable navigation hints over a published index.
     Enrich {
@@ -392,7 +461,7 @@ fn contract() -> Value {
         "exit_codes":{"0":"success or matches","1":"no matches","2":"error, stale evidence, or incomplete enrichment"},
         "commands":{
             "batch":{"usage":"gptgrep batch --root ROOT --input FILE_OR_DASH --json","effect":"local generation-pinned search/catalog/tree/read operations","network":false,"request_schema":"gptgrep.batch.request.v1","output_schema":"gptgrep.batch.response.v1","limits":{"input_bytes":1048576,"operations":64,"output_bytes":1048576},"output_order":"input operation order","model_operations":"hybrid/semantic return output_budget_insufficient before any provider work in this foundation","continuation":"deterministic cursors bind generation, scope and projection; no model continuation","output":"always JSON; exit2 for any item or global failure"},
-            "index":{"usage":"gptgrep index ROOT [--max-files 100000] [--optimize-merge] --json","effect":"write owned .gptgrep immutable generation","network":false},
+            "index":{"usage":"gptgrep index ROOT [--ocr auto|off] [--rich] [--plan-only] --json","effect":"default legacy v1; explicit rich/ocr prepares source-bound v2 candidates and atomically publishes only complete documents","network":"none for plan-only/off; explicit auto uses qualified native OCR only for required source pages","options":{"ocr":{"enum":["off","auto"],"default":"legacy index when absent"},"plan-only":{"type":"boolean","effect":"local native parse/render; zero model calls and no CURRENT change"},"resume":{"type":"boolean","effect":"same immutable run; verified result reuse, no failed/unknown task retries or deadline renewal"},"ocr-run-id":{"type":"string","required":"live auto"},"ocr-runtime-profile":{"type":"path","required":"live auto; accepted image qualification required"},"ocr-codex-home":{"type":"path","required":"explicit independent existing home for live auto"},"ocr-max-pages":{"type":"integer","default":24,"minimum":1,"maximum":24},"ocr-timeout-seconds":{"type":"integer","default":1800,"minimum":1,"maximum":86400},"page-window":{"type":"integer","default":25,"minimum":1,"maximum":25}},"output_schema":"gptgrep.rich-ingest.v1 for explicit rich/ocr/plan-only; legacy gptgrep.v1 otherwise","limitations":"rich PDF/PNG/baseline JPEG only; Office/other rich conversion unsupported; v2 consumption requires rich reader"},
             "enrich":{"usage":"gptgrep enrich ROOT --ledger-path ABSOLUTE_PATH --max-builder-calls N --max-jev-calls N [--plan-only] [--expected-plan-sha256 SHA] --json","effect":"explicit raw-only Codex/Jev navigation-overlay build after deterministic index","model_assisted":true,"plan_only_model_calls":0,"defaults":{"builder_model":"gpt-6-luna","reasoning_effort":"max","service_tier":"fast","jev_model":gptgrep_jev::DEFAULT_MODEL,"window_bytes":8192,"max_hints_per_window":4},"output":"complete publishes a separate source-bound navigation overlay; incomplete/failed leaves the current index unchanged and exits 2","hint_authority":"non-citable navigation only; not full PageIndex Flash parity","resume":"same absolute ledger and bound plan; pending or failed calls are not automatically retried"},
             "search":{"usage":"gptgrep search QUERY ROOT --mode regex|lexical|hybrid|semantic --json","options":{"mode":{"type":"string","default":"hybrid","enum":["hybrid","semantic","regex","lexical"]},"document":{"type":"string","description":"Exact indexed source-relative path; scope applies before candidate limits"},"limit":{"type":"integer","default":20,"minimum":1,"maximum":1000},"context":{"type":"integer","default":0,"maximum":100},"max-candidates":{"type":"integer","default":24,"maximum":24},"routing-docs":{"type":"integer","default":32,"maximum":32},"ignore-case":{"type":"boolean"},"fixed-strings":{"type":"boolean"},"model":{"type":"string","default":gptgrep_jev::DEFAULT_MODEL},"min-score":{"type":"number","minimum":0,"maximum":1,"default":0.5}},"network":"required Jev for default hybrid and semantic; explicit regex/lexical primitives are local","credentials":"OPENROUTER_API_KEY environment only","output_schema":"gptgrep.v1"},
             "tree":{"usage":"gptgrep tree FILE --root ROOT --json","effect":"read"},
@@ -477,7 +546,7 @@ fn contract() -> Value {
 }
 
 fn llms() -> &'static str {
-    "# GPTgrep\n\nLocal vectorless retrieval helper for agents. No MCP server.\n\n1. gptgrep index ./docs --json\n1a. gptgrep enrich ./docs --ledger-path /path/to/private/enrich.jsonl --max-builder-calls 100 --max-jev-calls 100 --plan-only --json\n2. gptgrep search 'concept in natural language' ./docs --json\n3. gptgrep search 'pattern' ./docs --mode regex --json\n4. gptgrep tree manual.pdf --root ./docs --json\n5. gptgrep read DOCUMENT_ID:NODE_ID --root ./docs --json\n6. gptgrep batch --root ./docs --input operations.json --json\n7. gptgrep batch --rich --root ./docs --input rich-operations.json\n\nBatch accepts gptgrep.batch.request.v1 JSON, pins one generation and preserves operation order. Local search/catalog/tree/read operations share bounded output reservations. Batch hybrid/semantic are currently rejected before provider work; inspect each item status and coverage.\n\nFor a separately published v2 generation, batch --rich accepts gptgrep.batch.rich.request.v1 with inspect_documents, inspect_pages, read_artifact, search_artifacts, inspect_visual and read_visual. Text inspection returns indexed metadata only. Text read/search preserve typed native/OCR evidence; their cursors bind generation and operation options. Search pages cover a bounded max_hits window; inspect truncation and exhaustion. Opt-in inspect_visual takes scope (document_ids, first_page, last_page), query, max_candidates and its own cursor; use result.next_cursor and retain the batch output budget and per-item reservation when continuing. read_visual takes rendition_id and returns complete image_base64 plus pinned candidate metadata; no image byte windows, truncation or cursor. Both visual operations reuse the generation resource budget and report actual_image_delivery=false and citation_authority=false. They establish local observations, not model delivery or citation rights. This route is local and performs zero model submissions.\n\nJev routing/reranking is required by default search, ask and summarize. OPENROUTER_API_KEY must be supplied for model-assisted runs; failures never silently downgrade to local retrieval. Explicit regex/lexical and enrich --plan-only remain offline. Enrich is an explicit Codex/Jev step that creates non-citable navigation hints after local indexing. Use --document RELATIVE_PATH to scope before candidate budgets. The default Decisions model is openai/gpt-6-luna-decisions; native Codex defaults separately to gpt-6-luna/max/fast. Hybrid/semantic and judge send bounded data to OpenRouter Decisions. Judge input accepts state/questions or typed input.text/input.images with explicit source bindings and local PNG/JPEG paths. --decisions-budget FILE joins an existing original-clock shared budget; it never initializes or resets a ledger. Without the file, paid calls share their single-invocation bounded client context. Explicit --model typesafe/jev-1.13 remains text-only. Inspect coverage, source_fresh, coordinate_system and text_truncated before citing evidence. The main agent performs reasoning and controls follow-up reads. New files require reindexing. --schema provides the command contract.\n"
+    "# GPTgrep\n\nLocal vectorless retrieval helper for agents. No MCP server.\n\n1. gptgrep index ./docs --json\n1r. gptgrep index ./documents --ocr auto --plan-only --json\n1n. gptgrep index ./native-documents --ocr off --json\n1a. gptgrep enrich ./docs --ledger-path /path/to/private/enrich.jsonl --max-builder-calls 100 --max-jev-calls 100 --plan-only --json\n2. gptgrep search 'concept in natural language' ./docs --json\n3. gptgrep search 'pattern' ./docs --mode regex --json\n4. gptgrep tree manual.pdf --root ./docs --json\n5. gptgrep read DOCUMENT_ID:NODE_ID --root ./docs --json\n6. gptgrep batch --root ./docs --input operations.json --json\n7. gptgrep batch --rich --root ./docs --input rich-operations.json\n\nBatch accepts gptgrep.batch.request.v1 JSON, pins one generation and preserves operation order. Local search/catalog/tree/read operations share bounded output reservations. Batch hybrid/semantic are currently rejected before provider work; inspect each item status and coverage.\n\nFor a separately published v2 generation, batch --rich accepts gptgrep.batch.rich.request.v1 with inspect_documents, inspect_pages, read_artifact, search_artifacts, inspect_visual and read_visual. Text inspection returns indexed metadata only. Text read/search preserve typed native/OCR evidence; their cursors bind generation and operation options. Search pages cover a bounded max_hits window; inspect truncation and exhaustion. Opt-in inspect_visual takes scope (document_ids, first_page, last_page), query, max_candidates and its own cursor; use result.next_cursor and retain the batch output budget and per-item reservation when continuing. read_visual takes rendition_id and returns complete image_base64 plus pinned candidate metadata; no image byte windows, truncation or cursor. Both visual operations reuse the generation resource budget and report actual_image_delivery=false and citation_authority=false. They establish local observations, not model delivery or citation rights. This route is local and performs zero model submissions.\n\nJev routing/reranking is required by default search, ask and summarize. OPENROUTER_API_KEY must be supplied for model-assisted runs; failures never silently downgrade to local retrieval. Explicit regex/lexical and enrich --plan-only remain offline. Enrich is an explicit Codex/Jev step that creates non-citable navigation hints after local indexing. Use --document RELATIVE_PATH to scope before candidate budgets. The default Decisions model is openai/gpt-6-luna-decisions; native Codex defaults separately to gpt-6-luna/max/fast. Hybrid/semantic and judge send bounded data to OpenRouter Decisions. Judge input accepts state/questions or typed input.text/input.images with explicit source bindings and local PNG/JPEG paths. --decisions-budget FILE joins an existing original-clock shared budget; it never initializes or resets a ledger. Without the file, paid calls share their single-invocation bounded client context. Explicit --model typesafe/jev-1.13 remains text-only. Inspect coverage, source_fresh, coordinate_system and text_truncated before citing evidence. The main agent performs reasoning and controls follow-up reads. New files require reindexing. --schema provides the command contract.\n"
 }
 
 fn emit(value: &Value) -> Result<()> {
@@ -576,6 +645,136 @@ fn prepare_judge(
     }
 }
 
+/// One fixed host root per task; all executors share the existing two-page
+/// context, original clock and persistent ledger. No alternate model route.
+struct RichOcrExecutor {
+    pages: std::collections::BTreeMap<String, gptgrep_host::OcrHostExecutor>,
+}
+impl gptgrep_parse::OcrExecutor for RichOcrExecutor {
+    fn execute<'a>(
+        &'a self,
+        task: gptgrep_parse::OcrTask,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<gptgrep_parse::OcrPageResult>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let page = self
+                .pages
+                .get(&task.task_sha256)
+                .context("unplanned rich OCR task")?;
+            gptgrep_parse::OcrExecutor::execute(page, task).await
+        })
+    }
+}
+
+async fn run_rich_index(
+    root: &std::path::Path,
+    max_files: usize,
+    args: RichIndexArgs,
+) -> Result<i32> {
+    let mode = if matches!(args.ocr, Some(IndexOcr::Auto)) {
+        gptgrep_parse::OcrMode::Auto
+    } else {
+        gptgrep_parse::OcrMode::Off
+    };
+    if args.resume && args.ocr_run_id.is_none() {
+        bail!("--resume requires --ocr-run-id");
+    }
+    let profile = if let Some(path) = &args.ocr_runtime_profile {
+        let bytes = gptgrep_core::read_rich_runtime_descriptor(path)?;
+        let profile: gptgrep_host::OcrRuntimeProfile = serde_json::from_slice(&bytes)
+            .map_err(|_| anyhow::anyhow!("invalid OCR runtime profile"))?;
+        profile.validate()?;
+        Some(profile)
+    } else {
+        None
+    };
+    let mut options = gptgrep_core::RichIngestOptions {
+        max_files,
+        mode,
+        max_ocr_pages: args.ocr_max_pages,
+        run_id: args.ocr_run_id.clone(),
+        resume: args.resume,
+        runtime_profile_sha256: profile.as_ref().map(|p| p.sha256()).transpose()?,
+        ..Default::default()
+    };
+    options.native.page_window = args.page_window;
+    let ingest = gptgrep_core::prepare_rich_ingest(root, options).await?;
+    if args
+        .expected_plan_sha256
+        .as_ref()
+        .is_some_and(|sha| sha != &ingest.report().plan_sha256)
+    {
+        bail!("rich ingest plan digest differs from --expected-plan-sha256");
+    }
+    if args.plan_only || !ingest.report().blockers.is_empty() {
+        emit(&serde_json::to_value(ingest.report())?)?;
+        return Ok(if ingest.report().blockers.is_empty() {
+            0
+        } else {
+            2
+        });
+    }
+    if mode == gptgrep_parse::OcrMode::Auto && ingest.needs_ocr_executor() {
+        let profile = profile
+            .context("live OCR requires --ocr-runtime-profile with accepted image qualification")?;
+        if profile.accepted_image_qualification_sha256.is_none() {
+            bail!("ocr_runtime_image_qualification_required");
+        }
+        let home = args
+            .ocr_codex_home
+            .context("live OCR requires an explicit independent --ocr-codex-home")?;
+        let state = ingest.state_dir()?;
+        let clock = ingest.ocr_clock(args.ocr_timeout_seconds)?;
+        let context = gptgrep_host::OcrExecutionContext::with_clock_anchor(
+            args.ocr_run_id
+                .as_deref()
+                .context("live OCR run ID required")?,
+            &ingest.report().plan_sha256,
+            clock,
+            args.ocr_max_pages,
+        )?
+        .with_ledger(state.join("budget.json"))?;
+        let raw = state.join("raw");
+        if raw.is_symlink() {
+            bail!("OCR raw result directory cannot be a symlink");
+        }
+        std::fs::create_dir_all(&raw)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&raw, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let mut pages = std::collections::BTreeMap::new();
+        for (hash, prepared_root) in ingest.ocr_staging_roots() {
+            pages.insert(
+                hash,
+                gptgrep_host::OcrHostExecutor::new(
+                    gptgrep_host::OcrHostConfig {
+                        codex_bin: args.ocr_codex_bin.clone(),
+                        codex_home: home.clone(),
+                        prepared_root,
+                        raw_results_dir: raw.clone(),
+                        runtime_profile: profile.clone(),
+                        transport: gptgrep_host::OcrImageTransport::DynamicImages,
+                    },
+                    context.clone(),
+                )?,
+            );
+        }
+        let executor = RichOcrExecutor { pages };
+        let report = ingest.publish(Some(&executor)).await;
+        let ok = report.status == "published" && report.failure_code.is_none();
+        emit(&serde_json::to_value(report)?)?;
+        Ok(if ok { 0 } else { 2 })
+    } else {
+        let report = ingest.publish(None).await;
+        let ok = report.status == "published" && report.failure_code.is_none();
+        emit(&serde_json::to_value(report)?)?;
+        Ok(if ok { 0 } else { 2 })
+    }
+}
+
 async fn run(cli: Cli) -> Result<i32> {
     if cli.schema {
         emit(&contract())?;
@@ -670,7 +869,23 @@ async fn run(cli: Cli) -> Result<i32> {
             root,
             max_files,
             optimize_merge,
+            rich,
         } => {
+            if rich.rich || rich.ocr.is_some() || rich.plan_only {
+                if optimize_merge {
+                    bail!(
+                        "rich ingestion rebuilds complete projection; --optimize-merge is legacy-only"
+                    );
+                }
+                return run_rich_index(&root, max_files, rich).await;
+            }
+            if rich.resume
+                || rich.ocr_run_id.is_some()
+                || rich.ocr_runtime_profile.is_some()
+                || rich.ocr_codex_home.is_some()
+            {
+                bail!("OCR options require explicit --ocr auto or --rich");
+            }
             let report = gptgrep_core::index_with_options(&root, max_files, optimize_merge).await?;
             if cli.json {
                 emit(&serde_json::to_value(&report)?)?;

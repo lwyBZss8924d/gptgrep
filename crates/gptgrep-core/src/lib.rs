@@ -28,6 +28,7 @@ mod navigation_overlay;
 mod planned;
 mod read_cache;
 mod rich_generation;
+mod rich_ingest;
 use gptgrep_pageindex::TreeNode;
 pub use navigation_overlay::{
     BoundNavigationOverlay, MAX_NAVIGATION_HINT_BYTES, MAX_NAVIGATION_OVERLAY_BYTES,
@@ -50,6 +51,10 @@ pub use rich_generation::{
     StoredArtifact, TextEvidenceBinding, VerifiedRenditionFile, VerifiedVisualPayload,
     VisualCandidate, VisualCandidateReport, VisualCandidateRequest, VisualCoverage,
     VisualGenerationReader, VisualScope,
+};
+pub use rich_ingest::{
+    MAX_RICH_OCR_PAGES, PreparedRichIngest, RichIngestDocumentPlan, RichIngestOptions,
+    RichIngestPagePlan, RichIngestReport, prepare_rich_ingest, read_rich_runtime_descriptor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
