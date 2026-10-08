@@ -2846,7 +2846,7 @@ mod tests {
                             )
                         })
                         .collect();
-                    json!({"model":format!("typesafe/jev-fixture-{ordinal}"),"answers":answers,
+                    json!({"model":"openai/gpt-6-luna-decisions-20261006","answers":answers,
                         "usage":{"input_tokens":100+ordinal,"output_tokens":2,"cost":0.001*(ordinal+1) as f64}}).to_string()
                 } else {
                     "secret-provider-body-sentinel".into()
@@ -3251,7 +3251,10 @@ mod tests {
         );
         assert_eq!(
             report.metrics.jev_models,
-            ["typesafe/jev-fixture-0", "typesafe/jev-fixture-1"]
+            [
+                "openai/gpt-6-luna-decisions-20261006",
+                "openai/gpt-6-luna-decisions-20261006"
+            ]
         );
         let events = events.lock().unwrap();
         assert_eq!(events.len(), 4);
@@ -3278,6 +3281,50 @@ mod tests {
         assert!(events.iter().all(|event| event.generation.as_deref()
             == Some(indexed.generation.as_str())
             && !event.accounting_complete));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shared_decisions_context_spans_routing_reranking_and_later_searches() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("subject.txt"),
+            "needle source evidence",
+        )?;
+        index(directory.path(), 10).await?;
+        let (client, server) = mock_jev(vec![200, 200]).await?;
+        let context = gptgrep_jev::ExecutionContext::new(
+            "ordinary-shared-search-test",
+            &"a".repeat(64),
+            std::time::SystemTime::now() + Duration::from_secs(10),
+            2,
+        )?;
+        let client = client.with_execution_context(context.clone());
+        let options = SearchOptions {
+            document: Some("subject.txt".into()),
+            ..Default::default()
+        };
+        let report =
+            search_with_client(directory.path(), "needle", &options, &client.clone()).await?;
+        assert_eq!(report.metrics.jev_requests, 2);
+        assert_eq!(
+            report.metrics.jev_models,
+            [
+                "openai/gpt-6-luna-decisions-20261006",
+                "openai/gpt-6-luna-decisions-20261006"
+            ]
+        );
+        assert_eq!(server.await?.len(), 2);
+        let snapshot = context.snapshot()?;
+        assert_eq!(snapshot.logical_reservations, 2);
+        assert_eq!(snapshot.send_start_observations, 2);
+        assert_eq!(snapshot.terminal_submissions, 2);
+        assert!(
+            search_with_client(directory.path(), "needle", &options, &client)
+                .await
+                .is_err()
+        );
+        assert_eq!(context.snapshot()?.logical_reservations, 2);
         Ok(())
     }
 
@@ -3314,7 +3361,10 @@ mod tests {
             ),
             (2, 1)
         );
-        assert_eq!(failure.metrics.jev_models, ["typesafe/jev-fixture-0"]);
+        assert_eq!(
+            failure.metrics.jev_models,
+            ["openai/gpt-6-luna-decisions-20261006"]
+        );
         assert_eq!(failure.metrics.jev_usage[0]["cost"], json!(0.001));
         assert_eq!(failure.coverage.scoped_files, 1);
         assert_eq!(failure.document_scope.as_deref(), Some("subject.txt"));

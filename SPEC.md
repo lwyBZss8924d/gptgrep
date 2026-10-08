@@ -5,7 +5,9 @@ trigram-filtered regex verification, document structure, and required Jev routin
 and reranking in its default retrieval and reasoning workflows.
 The primary agent retains planning and reasoning; the helper returns source evidence.
 There is no vector database and no MCP server.
-Local Codex workflows default to `gpt-5.6-luna`, reasoning effort `max`, and service
+OpenRouter Decisions defaults to `openai/gpt-6-luna-decisions`; explicit
+`typesafe/jev-1.13` remains a text-only legacy selection with no fallback.
+Local Codex workflows default to `gpt-6-luna`, reasoning effort `max`, and service
 tier `fast`. Account selection belongs to the caller's private runtime environment;
 workstation-specific account aliases and routing are not part of the public product.
 

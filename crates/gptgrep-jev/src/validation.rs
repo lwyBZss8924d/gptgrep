@@ -168,7 +168,24 @@ pub(crate) fn request(state: &Value, questions: &Value) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn response(bytes: &[u8], questions: &Value) -> Result<DecisionResponse> {
+    response_checked(bytes, questions, None)
+}
+
+pub(crate) fn response_for_model(
+    bytes: &[u8],
+    questions: &Value,
+    requested: &str,
+) -> Result<DecisionResponse> {
+    response_checked(bytes, questions, Some(requested))
+}
+
+fn response_checked(
+    bytes: &[u8],
+    questions: &Value,
+    requested: Option<&str>,
+) -> Result<DecisionResponse> {
     ensure!(
         bytes.len() <= MAX_RESPONSE_BYTES,
         "Jev response exceeded the byte limit"
@@ -176,6 +193,13 @@ pub(crate) fn response(bytes: &[u8], questions: &Value) -> Result<DecisionRespon
     let value = unique_json(bytes).map_err(|_| DecisionFailure::invalid_json())?;
     let usage = FailedResponseUsage::from_response(&value);
     validate_response(value, questions)
+        .and_then(|response| {
+            ensure!(
+                requested.is_none_or(|model| crate::response_model_matches(model, &response.model)),
+                "Decisions response model does not match the requested model"
+            );
+            Ok(response)
+        })
         .map_err(|error| DecisionFailure::validation(&error, usage).into())
 }
 
@@ -424,6 +448,61 @@ mod tests {
 
     fn parse(value: Value) -> Result<DecisionResponse> {
         response(&serde_json::to_vec(&value).unwrap(), &questions())
+    }
+
+    #[test]
+    fn exact_model_admission_preserves_usage_when_identity_is_rejected() {
+        let requested = crate::DEFAULT_MODEL;
+        for actual in [requested, "openai/gpt-6-luna-decisions-20261006"] {
+            let mut value = valid_response();
+            value["model"] = json!(actual);
+            assert!(
+                response_for_model(
+                    &serde_json::to_vec(&value).unwrap(),
+                    &questions(),
+                    requested
+                )
+                .is_ok()
+            );
+        }
+        for actual in [
+            "openai/gpt-6-luna-decisions-20261007",
+            "other/model",
+            "typesafe/jev-1.13",
+        ] {
+            let mut value = valid_response();
+            value["model"] = json!(actual);
+            value["usage"] = json!({"input_tokens":3,"output_tokens":2,"cost":0.001});
+            let error = response_for_model(
+                &serde_json::to_vec(&value).unwrap(),
+                &questions(),
+                requested,
+            )
+            .unwrap_err();
+            let diagnostic = error
+                .downcast_ref::<DecisionFailure>()
+                .unwrap()
+                .diagnostic();
+            assert_eq!(diagnostic.validation_code, Some("model_mismatch"));
+            assert!(diagnostic.reported_usage.is_some());
+            assert!(!error.to_string().contains(actual));
+        }
+        assert!(crate::response_model_matches(
+            crate::LEGACY_MODEL,
+            "typesafe/jev-1.13-20260917"
+        ));
+        assert!(!crate::response_model_matches(
+            crate::LEGACY_MODEL,
+            "typesafe/jev-1.13-20260918"
+        ));
+        assert!(crate::response_model_matches(
+            "explicit/other",
+            "explicit/other"
+        ));
+        assert!(!crate::response_model_matches(
+            "explicit/other",
+            "explicit/other-dated"
+        ));
     }
 
     #[test]

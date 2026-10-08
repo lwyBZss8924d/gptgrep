@@ -225,7 +225,7 @@ async fn mock_with_score_and_delay(
                 })
                 .collect::<serde_json::Map<_, _>>();
             let body = serde_json::to_vec(
-                &json!({"model":"synthetic-returned-model","answers":answers,
+                &json!({"model":"openai/gpt-6-luna-decisions-20261006","answers":answers,
                 "usage":{"input_tokens":5,"output_tokens":2,"cost":0.001,"unknown_detail":"x".repeat(131072)},"id":"synthetic-response","provider":"synthetic-loopback"}),
             )?;
             socket.write_all(format!("HTTP/1.1 {status} Synthetic\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).as_bytes()).await?;

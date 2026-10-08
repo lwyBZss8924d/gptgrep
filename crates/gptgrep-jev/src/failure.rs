@@ -264,6 +264,10 @@ impl DecisionFailure {
                 "distribution_sum",
                 "Jev response probabilities do not sum to one",
             ),
+            "Decisions response model does not match the requested model" => (
+                "model_mismatch",
+                "Decisions response model does not match the requested model",
+            ),
             _ => ("other_validation", "Jev response failed validation"),
         };
         let kind = if code == "schema" {

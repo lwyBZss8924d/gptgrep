@@ -11,7 +11,7 @@ mod roles;
 mod validation;
 pub use clock::RunClockAnchor;
 pub use execution::{
-    ExecutionContext, ExecutionSnapshot, MAX_CONCURRENT_REQUESTS, MAX_SUBMISSIONS,
+    DecisionsBudget, ExecutionContext, ExecutionSnapshot, MAX_CONCURRENT_REQUESTS, MAX_SUBMISSIONS,
 };
 pub use failure::{
     DecisionFailure, DecisionFailureDiagnostic, DecisionFailureKind, FailedResponseUsage,
@@ -39,7 +39,27 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, net::IpAddr, sync::Arc, time::Duration};
 
-pub const DEFAULT_MODEL: &str = "typesafe/jev-1.13";
+pub const DEFAULT_MODEL: &str = "openai/gpt-6-luna-decisions";
+/// Explicit legacy text-only model. Never selected as fallback.
+pub const LEGACY_MODEL: &str = "typesafe/jev-1.13";
+
+/// Admit an exact requested identifier or an observed canonical identifier for
+/// the two supported aliases. Other models require exact equality.
+pub fn response_model_matches(requested: &str, actual: &str) -> bool {
+    requested == actual
+        || matches!(
+            (requested, actual),
+            (DEFAULT_MODEL, "openai/gpt-6-luna-decisions-20261006")
+                | (LEGACY_MODEL, "typesafe/jev-1.13-20260917")
+        )
+}
+
+pub(crate) fn luna_decisions_model(model: &str) -> bool {
+    matches!(
+        model,
+        DEFAULT_MODEL | "openai/gpt-6-luna-decisions-20261006"
+    )
+}
 pub const DEFAULT_ENDPOINT: &str = "https://openrouter.ai/api/alpha/decisions";
 /// A local application cap, not a provider-advertised limit.
 pub const MAX_QUESTIONS: usize = 64;
@@ -370,13 +390,14 @@ impl JevClient {
                 }
                 bytes.extend_from_slice(&chunk);
             }
-            let result = validation::response(&bytes, questions).map_err(|error| {
-                if let Some(failure) = error.downcast_ref::<DecisionFailure>() {
-                    failure.clone().with_response(status, bytes.len()).into()
-                } else {
-                    error
-                }
-            });
+            let result =
+                validation::response_for_model(&bytes, questions, &self.model).map_err(|error| {
+                    if let Some(failure) = error.downcast_ref::<DecisionFailure>() {
+                        failure.clone().with_response(status, bytes.len()).into()
+                    } else {
+                        error
+                    }
+                });
             reservation.terminal().await?;
             result
         };

@@ -105,7 +105,8 @@ owned cache payloads and crop admission, not total process memory.
 
 ## Core Jev retrieval
 
-Jev is a required part of the GPTgrep search system. Default search performs
+The required Decisions stage defaults to `openai/gpt-6-luna-decisions`.
+Explicit `--model typesafe/jev-1.13` selects legacy text-only Jev. Default search performs
 document routing and evidence reranking; there is no automatic local-only
 fallback. Parsing and index publication are deterministic local preparation.
 Use `--document manual.pdf` to constrain retrieval to one exact indexed path
@@ -146,7 +147,7 @@ The dedicated helper defaults in [config/codex-host.toml](config/codex-host.toml
 are:
 
 ```toml
-model = "gpt-5.6-luna"
+model = "gpt-6-luna"
 model_reasoning_effort = "max"
 service_tier = "fast"
 approval_policy = "never"
@@ -164,7 +165,7 @@ gptgrep ask 'What is the recovery procedure, and how long are snapshots kept?' \
   ./documents --json
 
 gptgrep summarize DOCUMENT_ID:NODE_ID --root ./documents \
-  --model gpt-5.6-luna --reasoning-effort max --service-tier fast --json
+  --model gpt-6-luna --reasoning-effort max --service-tier fast --json
 ```
 
 By default, before starting the reader, the host executes required Jev hybrid retrieval and
@@ -303,3 +304,36 @@ and experimental interpretation remain under the ignored `docs/research/` path.
 
 Original code is [MIT licensed](LICENSE). Dependency and native-runtime notices
 are described in [THIRD_PARTY.md](THIRD_PARTY.md).
+
+
+The default OpenRouter Decisions selector is `openai/gpt-6-luna-decisions`.
+`--model typesafe/jev-1.13` explicitly selects the legacy text-only route. Native
+Codex reasoning uses `gpt-6-luna`, `max`, and `fast` independently. Responses retain
+actual returned model metadata; admission requires the requested identifier or the
+observed canonical mapping (`openai/gpt-6-luna-decisions-20261006` for Luna and
+`typesafe/jev-1.13-20260917` for legacy Jev). Other explicit models require exact
+identifier equality. No guessed dated aliases or fallback models are accepted.
+
+`gptgrep judge --input evidence.json --json` also accepts the normal typed image
+contract: `input.text` contains `{source, text}` objects and `input.images` contains
+`{source, path}` objects for local PNG/JPEG files, alongside `questions`. Each
+`source` contains `source_id`, `unit_id`, and `source_sha256`. The source digest is
+caller provenance, not an independent freshness claim. Text is literal; image
+bytes are admitted as bounded snapshots and sent in order as flat `image_url`
+data URLs. Source bindings and local paths stay out of the provider body. The
+64 KiB control/text envelope, four-image cap, per-image 1 MiB/8 million pixel cap,
+24 million total pixel cap, 8 MiB request cap and 1 MiB response cap remain explicit.
+Legacy Jev rejects typed images before submission. Refusals, unknown answers,
+partial bodies and malformed responses do not become successful decisions.
+
+For a shared experiment, add `--decisions-budget budget.json` to hybrid/semantic
+search, judge, ask, summarize, or non-plan enrich. The portable control file is at
+most 16 KiB and contains `schema_version: "gptgrep.decisions-budget-contract.v1"`,
+`run_id`, `plan_digest`, `deadline_unix_ms`, `max_submissions` and an absolute
+`ledger_path`. A trusted owner must already have initialized that matching ledger.
+The CLI joins its original clock and consumed reservations; missing files or a
+changed run, deadline, plan or cap are errors. It never creates or resets a ledger.
+Routing, reranking and follow-up host clients share the same context. Without the
+option, calls use a bounded single-invocation context. Regex/lexical, schema,
+doctor and enrich `--plan-only` do not open the budget file. Numeric usage and cost
+remain reported provider metadata; absent fields remain unavailable.

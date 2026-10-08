@@ -1,4 +1,4 @@
-//! Offline syntax/admission tests. None submit requests or initialize host clocks/ledgers.
+//! Offline codec/admission tests; transport fixtures use only same-process loopback.
 use super::*;
 use crate::{ExecutionContext, MAX_QUESTIONS};
 use image::{
@@ -15,6 +15,53 @@ fn binding(id: &str) -> SourceBinding {
         source_id: "fixture-source".into(),
         unit_id: id.into(),
         source_sha256: "a".repeat(64),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn image_file_rejects_fifo_without_blocking() {
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    const CHILD_PATH: &str = "GPTGREP_IMAGE_FIFO_TEST_PATH";
+    if let Some(path) = std::env::var_os(CHILD_PATH) {
+        let error = match ImageEvidence::from_file(binding("fifo"), path) {
+            Ok(_) => panic!("FIFO unexpectedly admitted as an image"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), "Decisions image must be a file");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("image-fifo");
+    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    // The owned FIFO is used only by the bounded test child, with no writer.
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "input::image_qualification_tests::image_file_rejects_fifo_without_blocking",
+        ])
+        .env_clear()
+        .env(CHILD_PATH, &path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "FIFO refusal child failed: {status}");
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("image FIFO acquisition blocked before regular-file refusal");
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -264,8 +311,13 @@ fn changing_only_provenance_changes_sidecar_without_changing_wire() {
 
 #[test]
 fn exact_endpoint_and_requested_model_are_required() {
+    assert!(
+        JevClient::new("offline-fixture-only", None)
+            .unwrap()
+            .prepare_image_qualification(input(), questions(), MAX_RESPONSE_BYTES)
+            .is_ok()
+    );
     for model in [
-        None,
         Some("typesafe/jev-1.13"),
         Some("openai/gpt-6-luna-decisions-20261006"),
     ] {
@@ -298,18 +350,29 @@ fn exact_endpoint_and_requested_model_are_required() {
 }
 
 #[test]
-fn output_capacity_and_default_image_gate_reject_before_admission() {
+fn output_capacity_is_required_and_legacy_images_reject_before_admission() {
     let client = client();
     assert!(
         client
             .prepare_image_qualification(input(), questions(), MAX_RESPONSE_BYTES - 1)
             .is_err()
     );
-    let error = client
+    assert!(
+        client
+            .prepare_input(input(), questions(), MAX_RESPONSE_BYTES)
+            .is_ok()
+    );
+    let legacy = JevClient::new("offline-fixture-only", Some(crate::LEGACY_MODEL)).unwrap();
+    let error = legacy
         .prepare_input(input(), questions(), MAX_RESPONSE_BYTES)
         .err()
         .unwrap();
-    assert!(error.to_string().contains("unqualified"));
+    assert!(
+        error
+            .to_string()
+            .contains("require the Luna Decisions model")
+    );
+    assert_no_admission(&legacy);
     assert_no_admission(&client);
 }
 
@@ -594,8 +657,8 @@ fn png_header_pixel_limit_precedes_decoder_and_aggregate_bound_is_preserved() {
 }
 
 #[test]
-fn ordinary_typed_text_wire_and_direct_preparation_are_unchanged() {
-    let client = client();
+fn explicit_legacy_typed_text_wire_and_direct_preparation_are_unchanged() {
+    let client = JevClient::new("offline-fixture-only", Some(crate::LEGACY_MODEL)).unwrap();
     let mut text = input();
     text.images.clear();
     let expected = json!({"evidence":[{"source":text.text[0].source,"text":text.text[0].text,
@@ -623,4 +686,148 @@ fn refusal_unknown_and_wrong_answer_types_stay_fail_closed() {
                 .is_err()
         );
     }
+}
+
+#[test]
+fn normal_default_typed_input_matches_the_canonical_image_codec() {
+    let client = JevClient::new("offline-fixture-only", None).unwrap();
+    let ordinary = client
+        .prepare_input(input(), questions(), MAX_RESPONSE_BYTES)
+        .unwrap();
+    let explicit = client
+        .prepare_image_qualification(input(), questions(), MAX_RESPONSE_BYTES)
+        .unwrap();
+    assert_eq!(ordinary.canonical_body(), explicit.request.canonical_body());
+    let wire: Value = serde_json::from_slice(ordinary.canonical_body()).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&wire).unwrap(),
+        ordinary.canonical_body()
+    );
+    assert!(wire["state"][0].is_string());
+    assert_eq!(wire["state"][1]["type"], "image_url");
+    assert!(wire["state"][1].get("source").is_none());
+    let canonical = JevClient::new(
+        "offline-fixture-only",
+        Some("openai/gpt-6-luna-decisions-20261006"),
+    )
+    .unwrap();
+    assert!(
+        canonical
+            .prepare_input(input(), questions(), MAX_RESPONSE_BYTES)
+            .is_ok()
+    );
+    let mut text = input();
+    text.images.clear();
+    let prepared = client
+        .prepare_input(text, questions(), MAX_RESPONSE_BYTES)
+        .unwrap();
+    assert!(
+        serde_json::from_slice::<Value>(prepared.canonical_body()).unwrap()["state"][0].is_string()
+    );
+    assert_no_admission(&client);
+}
+
+#[tokio::test]
+async fn normal_image_submission_binds_model_and_shares_charged_admissions() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!(
+        "http://{}/api/alpha/decisions",
+        listener.local_addr().unwrap()
+    );
+    let context = ExecutionContext::new(
+        "ordinary-local-codec-test",
+        &"a".repeat(64),
+        SystemTime::now() + Duration::from_secs(10),
+        2,
+    )
+    .unwrap();
+    let client = JevClient::with_endpoint("ordinary-mock-only", None, &endpoint)
+        .unwrap()
+        .with_execution_context(context.clone());
+    let server = tokio::spawn(async move {
+        for actual in ["openai/gpt-6-luna-decisions-20261006", "other/model"] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let header_end = loop {
+                let mut chunk = [0; 1024];
+                let size = stream.read(&mut chunk).await.unwrap();
+                assert!(size > 0);
+                bytes.extend_from_slice(&chunk[..size]);
+                if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break end + 4;
+                }
+                assert!(bytes.len() < 4096);
+            };
+            let header = std::str::from_utf8(&bytes[..header_end]).unwrap();
+            let length: usize = header
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")
+                        .and_then(|v| v.parse().ok())
+                })
+                .unwrap();
+            assert!(length < 64 * 1024);
+            while bytes.len() < header_end + length {
+                let mut chunk = [0; 1024];
+                let size = stream.read(&mut chunk).await.unwrap();
+                assert!(size > 0);
+                bytes.extend_from_slice(&chunk[..size]);
+            }
+            let wire: Value =
+                serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+            assert_eq!(wire["model"], crate::DEFAULT_MODEL);
+            assert_eq!(wire["provider"]["allow_fallbacks"], false);
+            assert!(
+                wire["state"][1]["image_url"]["url"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("data:image/png;base64,")
+            );
+            let body = serde_json::to_vec(&json!({"model":actual,
+                "answers":{"predicate":{"type":"noul","noul":0.9},
+                    "decision":{"type":"choice","choice":"a"}, "level":{"type":"score","score":1.0}},
+                "usage":{"input_tokens":3,"output_tokens":1,"cost":0.002}})).unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(&body).await.unwrap();
+        }
+    });
+    let prepared = client
+        .prepare_input(input(), questions(), MAX_RESPONSE_BYTES)
+        .unwrap();
+    let result = client.clone().submit_prepared(prepared).await.unwrap();
+    assert_eq!(result.model, "openai/gpt-6-luna-decisions-20261006");
+    let second = client
+        .prepare_input(input(), questions(), MAX_RESPONSE_BYTES)
+        .unwrap();
+    let error = client.submit_prepared(second).await.unwrap_err();
+    let diagnostic = error
+        .downcast_ref::<crate::DecisionFailure>()
+        .unwrap()
+        .diagnostic();
+    assert_eq!(diagnostic.validation_code, Some("model_mismatch"));
+    assert!(diagnostic.reported_usage.is_some());
+    let snapshot = context.snapshot().unwrap();
+    assert_eq!(snapshot.logical_reservations, 2);
+    assert_eq!(snapshot.send_start_observations, 2);
+    assert_eq!(snapshot.terminal_submissions, 2);
+    assert_eq!(snapshot.quarantined_slots, 0);
+    assert!(
+        client
+            .decide(json!("no more admissions"), questions())
+            .await
+            .is_err()
+    );
+    assert_eq!(context.snapshot().unwrap().logical_reservations, 2);
+    server.await.unwrap();
 }

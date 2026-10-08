@@ -97,7 +97,7 @@ async fn mock(
                 let response = if statuses[ordinal] == 200 {
                     let answers: serde_json::Map<String, Value> = body["questions"].as_object().unwrap().keys()
                         .map(|id| (id.clone(), json!({"type":"score", "score":if evidence { final_score } else { 3.0 }}))).collect();
-                    json!({"model":format!("typesafe/invented-{ordinal}"), "answers":answers,
+                    json!({"model":"openai/gpt-6-luna-decisions-20261006", "answers":answers,
                         "id":format!("response-{ordinal}"), "provider":"invented-provider",
                         "usage":{"input_tokens":100+ordinal,"output_tokens":2,"cost":0.001*(ordinal+1) as f64}}).to_string()
                 } else { "private-provider-body-sentinel".into() };

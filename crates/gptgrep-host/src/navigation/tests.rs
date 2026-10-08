@@ -170,7 +170,7 @@ async fn server(replies: Vec<Reply>, reverse_answers: bool) -> Result<Server> {
                 .collect::<Vec<_>>()
                 .join(",");
             let response = format!(
-                "{{\"model\":\"typesafe/jev-1.13\",\"id\":\"navigation-response-{ordinal}\",\"provider\":\"synthetic\",\"usage\":{{\"input_tokens\":7,\"output_tokens\":2,\"cost\":0.001}},\"answers\":{{{answers}}}}}"
+                "{{\"model\":\"openai/gpt-6-luna-decisions-20261006\",\"id\":\"navigation-response-{ordinal}\",\"provider\":\"synthetic\",\"usage\":{{\"input_tokens\":7,\"output_tokens\":2,\"cost\":0.001}},\"answers\":{{{answers}}}}}"
             );
             let status = if matches!(reply, Reply::Failure) {
                 503

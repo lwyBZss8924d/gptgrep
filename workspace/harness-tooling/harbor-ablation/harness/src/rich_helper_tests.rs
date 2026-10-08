@@ -567,25 +567,44 @@ async fn original_deadline_expiry_at_publication_barriers_revokes_evidence_and_k
     Ok(())
 }
 #[tokio::test]
-async fn model_mismatch_stops_after_one_observation_without_fallback_or_freeform_retention()
+async fn model_mismatch_stops_after_one_submission_without_fallback_or_freeform_retention()
 -> Result<()> {
     let fixture = Fixture::new()?;
     let (endpoint, server) = mock(1, None, "PRIVATE_WRONG_MODEL", Arc::new(|_| Ok(()))).await?;
     let result = run(&fixture, &endpoint).await?;
-    assert_eq!(server.await??.len(), 1);
+    let requests = server.await??;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["provider"]["allow_fallbacks"], false);
     assert_eq!(result["status"], "failed");
     assert_eq!(result["product"]["logical_calls_attempted"], 1);
-    assert_eq!(result["product"]["accounting_complete"], true);
+    // The SDK rejects the model before returning a validated routing response,
+    // so the helper observer receives no DTO or usage from this attempted call.
+    assert_eq!(result["product"]["validated_responses"], 0);
+    assert_eq!(result["product"]["accounting_complete"], false);
     assert_eq!(result["helper_logical_accounting_complete"], false);
     assert_eq!(
-        result["validated_observations"][0]["actual_model"],
-        Value::Null
+        result["validated_observations"].as_array().unwrap().len(),
+        0
     );
+    assert_eq!(result["logical_reservations_delta"], 1);
+    assert_eq!(result["send_start_observations_delta"], 1);
+    assert_eq!(result["terminal_submissions_delta"], 1);
+    assert_eq!(result["code"], "rich_decisions_required_stage_failed");
+    assert_eq!(result["failed_stage"], "document_routing");
     assert_eq!(
-        result["validated_observations"][0]["actual_model_matches_expected"],
-        false
+        result["failed_response_usage"],
+        "unavailable_when_core_required_stage_fails"
+    );
+    assert_eq!(result["actual_provider_requests"], Value::Null);
+    assert_eq!(result["reader_must_not_start"], true);
+    assert_eq!(
+        fixture.read_output("reader-evidence.json")?["status"],
+        "unavailable"
     );
     assert!(!result.to_string().contains("PRIVATE_WRONG_MODEL"));
+    assert!(!result.to_string().contains("DO_NOT_RETAIN_PROVIDER_DETAIL"));
+    assert!(!result.to_string().contains("PRIVATE_ID"));
+    assert!(!result.to_string().contains("PRIVATE_PROVIDER"));
     Ok(())
 }
 #[tokio::test]

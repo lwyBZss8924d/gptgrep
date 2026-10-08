@@ -322,7 +322,7 @@ printf '%s\n' '{"id":100,"result":{"account":{"type":"chatgpt"}}}'
 read -r request
 printf '%s\n' '{"id":2,"result":{"config":{}}}'
 read -r request
-printf '%s\n' '{"id":3,"result":{"thread":{"id":"thread-native"},"model":"gpt-5.6-luna","modelProvider":"openai","reasoningEffort":"max","serviceTier":"priority","approvalPolicy":"never","sandbox":{"type":"readOnly","networkAccess":false}}}'
+printf '%s\n' '{"id":3,"result":{"thread":{"id":"thread-native"},"model":"gpt-6-luna","modelProvider":"openai","reasoningEffort":"max","serviceTier":"priority","approvalPolicy":"never","sandbox":{"type":"readOnly","networkAccess":false}}}'
 read -r request
 printf '%s\n' '{"id":4,"result":{"turn":{"id":"turn-native"}}}'
 printf '%s' "$$" > "$CODEX_HOME/turn-ready.pid"

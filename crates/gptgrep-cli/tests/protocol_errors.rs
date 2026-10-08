@@ -26,7 +26,7 @@ printf '%s\n' '{"id":100,"result":{"account":{"type":"chatgpt"}}}'
 read -r request
 printf '%s\n' '{"id":2,"result":{"config":{"mcp_servers":{}}}}'
 read -r request
-printf '%s\n' '{"id":3,"result":{"thread":{"id":"offline-thread"},"model":"gpt-5.6-luna","modelProvider":"openai","reasoningEffort":"max","serviceTier":"priority","approvalPolicy":"never","sandbox":{"type":"readOnly","networkAccess":false}}}'
+printf '%s\n' '{"id":3,"result":{"thread":{"id":"offline-thread"},"model":"gpt-6-luna","modelProvider":"openai","reasoningEffort":"max","serviceTier":"priority","approvalPolicy":"never","sandbox":{"type":"readOnly","networkAccess":false}}}'
 read -r request
 printf '%s\n' '{"id":4,"result":{"turn":{"id":"offline-turn"}}}'
 printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"offline-thread","turnId":"offline-turn","tokenUsage":{"total":{"inputTokens":37,"outputTokens":5,"totalTokens":42},"last":{"inputTokens":37,"outputTokens":5,"totalTokens":42}}}}'

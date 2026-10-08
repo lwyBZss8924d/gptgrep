@@ -1,6 +1,6 @@
 # Portable defaults for GPTgrep's optional local Codex host.
 # Runtime profile/auth selection stays with the caller's CODEX_HOME or --codex-home.
-model = "gpt-5.6-luna"
+model = "gpt-6-luna"
 model_reasoning_effort = "max"
 service_tier = "fast"
 approval_policy = "never"

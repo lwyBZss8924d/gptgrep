@@ -82,7 +82,7 @@ async fn mock_jev(
                         )
                     })
                     .collect();
-                json!({"model":format!("typesafe/jev-host-fixture-{ordinal}"),"answers":answers,
+                json!({"model":"openai/gpt-6-luna-decisions-20261006","answers":answers,
                     "usage":{"input_tokens":100+ordinal,"output_tokens":2,"cost":0.001*(ordinal+1) as f64}}).to_string()
             } else {
                 "private-provider-body-sentinel".into()

@@ -81,6 +81,7 @@ pub(crate) struct Evidence {
     selected_document: Option<(String, String)>,
     document: Option<String>,
     jev_model: Option<String>,
+    decisions_execution: Option<gptgrep_jev::ExecutionContext>,
     client: Option<JevClient>,
     accounting: Option<Accounting>,
     pub initial_payload: Option<Value>,
@@ -116,6 +117,7 @@ impl Evidence {
             selected_document,
             document: None,
             jev_model: None,
+            decisions_execution: None,
             client: None,
             accounting: None,
             initial_payload: None,
@@ -139,7 +141,11 @@ impl Evidence {
             .as_ref()
             .is_some_and(|plan| plan.evidence_roles);
         self.accounting = Some(accounting);
-        self.client = client;
+        self.decisions_execution = config.decisions_execution.clone();
+        self.client = client.map(|client| match &self.decisions_execution {
+            Some(context) => client.with_execution_context(context.clone()),
+            None => client,
+        });
         self.jev_model = config.jev_model.clone();
         let document = match (&self.selected_document, &config.document) {
             (Some((selected, _)), Some(requested)) if selected != requested => {
@@ -292,13 +298,15 @@ impl Evidence {
 
     fn ensure_jev_client(&mut self) -> Result<()> {
         if self.client.is_none() {
-            self.client = Some(JevClient::from_env(self.jev_model.as_deref()).map_err(
-                |error| {
-                    anyhow!(crate::jev_accounting::InitializationError {
-                        cause: error.to_string()
-                    })
-                },
-            )?);
+            let client = JevClient::from_env(self.jev_model.as_deref()).map_err(|error| {
+                anyhow!(crate::jev_accounting::InitializationError {
+                    cause: error.to_string()
+                })
+            })?;
+            self.client = Some(match &self.decisions_execution {
+                Some(context) => client.with_execution_context(context.clone()),
+                None => client,
+            });
         }
         Ok(())
     }
@@ -796,20 +804,11 @@ impl Evidence {
         let assisted = matches!(mode, "hybrid" | "semantic");
         let result = if assisted {
             self.last_search_fatal = true;
-            if self.client.is_none() {
-                match JevClient::from_env(self.jev_model.as_deref()) {
-                    Ok(client) => self.client = Some(client),
-                    Err(error) => {
-                        // JevClient constructors return redacted messages; never wrap provider bodies here.
-                        let error = anyhow!(crate::jev_accounting::InitializationError {
-                            cause: error.to_string()
-                        });
-                        if let (Some(accounting), Some(index)) = (&self.accounting, index) {
-                            self.last_search = Some(accounting.failure(index, &error)?);
-                        }
-                        return Err(error);
-                    }
+            if let Err(error) = self.ensure_jev_client() {
+                if let (Some(accounting), Some(index)) = (&self.accounting, index) {
+                    self.last_search = Some(accounting.failure(index, &error)?);
                 }
+                return Err(error);
             }
             let client = self.client.as_ref().expect("initialized client");
             if let (Some(accounting), Some(index)) = (&self.accounting, index) {

@@ -63,7 +63,7 @@ use std::{
 use tokio::io::BufReader;
 use tokio::{io::AsyncReadExt, process::Command};
 
-pub const DEFAULT_MODEL: &str = "gpt-5.6-luna";
+pub const DEFAULT_MODEL: &str = "gpt-6-luna";
 pub const DEFAULT_REASONING_EFFORT: &str = "max";
 pub const DEFAULT_SERVICE_TIER: &str = "fast";
 
@@ -88,6 +88,8 @@ pub struct HostConfig {
     pub max_input_bytes: usize,
     pub trace_path: Option<PathBuf>,
     pub jev_model: Option<String>,
+    /// Shared Decisions admissions, original deadline and optional existing ledger.
+    pub decisions_execution: Option<gptgrep_jev::ExecutionContext>,
     pub document: Option<String>,
     pub query_plan: Option<QueryPlanConfig>,
     pub navigation: Option<NavigationConfig>,
@@ -111,6 +113,7 @@ impl Default for HostConfig {
             max_input_bytes: 256 * 1024,
             trace_path: None,
             jev_model: None,
+            decisions_execution: None,
             document: None,
             query_plan: None,
             navigation: None,
@@ -201,6 +204,16 @@ async fn execute_with_client(
     );
     let started = Instant::now();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs);
+    let bounded_config;
+    let config = if let Some(context) = &config.decisions_execution {
+        bounded_config = HostConfig {
+            decisions_execution: Some(context.with_deadline(deadline.into_std())?),
+            ..config.clone()
+        };
+        &bounded_config
+    } else {
+        config
+    };
     let root = root
         .canonicalize()
         .map_err(|_| anyhow!("Document root is unavailable"))?;

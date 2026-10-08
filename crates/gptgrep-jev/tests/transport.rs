@@ -64,7 +64,7 @@ async fn serve_once(
 
 #[tokio::test]
 async fn prepared_decision_binds_exact_bytes_model_and_endpoint() {
-    let response = json!({"model":"typesafe/jev-1.13-20260917",
+    let response = json!({"model":"openai/gpt-6-luna-decisions-20261006",
         "answers":{"support":{"type":"choice","choice":"supported"}},
         "usage":{"input_tokens":9,"output_tokens":2}});
     let (endpoint, server) = serve_once("200 OK", response.to_string(), "").await;
@@ -100,7 +100,7 @@ async fn prepared_decision_binds_exact_bytes_model_and_endpoint() {
     let prepared = client.prepare_decision(state, questions).unwrap();
     let bytes = prepared.body_bytes();
     let sha = prepared.body_sha256().to_owned();
-    assert_eq!(prepared.requested_model(), "typesafe/jev-1.13");
+    assert_eq!(prepared.requested_model(), gptgrep_jev::DEFAULT_MODEL);
     let result = client.submit_prepared(prepared).await.unwrap();
     assert_eq!(
         result.answers["support"],
@@ -261,7 +261,7 @@ async fn mathematical_rejection_retains_its_specific_validation_code() {
 #[tokio::test]
 async fn sends_decisions_contract_and_preserves_model_and_usage() {
     let response = json!({
-        "model":"typesafe/jev-1.13-20260917",
+        "model":"openai/gpt-6-luna-decisions-20261006",
         "id":"gen-dec-synthetic",
         "provider":"TypeSafe",
         "answers":{
@@ -288,7 +288,7 @@ async fn sends_decisions_contract_and_preserves_model_and_usage() {
         )
         .await
         .unwrap();
-    assert_eq!(result.model, "typesafe/jev-1.13-20260917");
+    assert_eq!(result.model, "openai/gpt-6-luna-decisions-20261006");
     assert_eq!(result.rankings[0].id, "answer");
     assert_eq!(result.rankings[0].score, 1.0);
     assert_eq!(result.rankings[1].score, 0.5);
@@ -431,7 +431,7 @@ async fn incomplete_body_preserves_status_and_quarantines_the_charged_slot() {
 
 #[tokio::test]
 async fn absent_provider_metadata_and_usage_remain_unavailable() {
-    let response = json!({"model":"typesafe/jev-fixture", "answers":{"candidate_0":{"type":"score","score":3.0}}});
+    let response = json!({"model":"openai/gpt-6-luna-decisions-20261006", "answers":{"candidate_0":{"type":"score","score":3.0}}});
     let (endpoint, server) = serve_once("200 OK", response.to_string(), "").await;
     let client = JevClient::with_endpoint("synthetic-test-key", None, &endpoint).unwrap();
     let result = client
@@ -449,7 +449,7 @@ async fn absent_provider_metadata_and_usage_remain_unavailable() {
     assert!(result.usage.is_null());
     server.await.unwrap();
     let old_report: gptgrep_jev::RerankResponse = serde_json::from_value(
-        json!({"model":"typesafe/jev-fixture", "rankings":[], "usage":null}),
+        json!({"model":"openai/gpt-6-luna-decisions-20261006", "rankings":[], "usage":null}),
     )
     .unwrap();
     assert!(old_report.provider_response_id.is_none());
@@ -459,7 +459,7 @@ async fn absent_provider_metadata_and_usage_remain_unavailable() {
 #[tokio::test]
 async fn mixed_roles_use_one_prepared_request_and_preserve_optional_unknowns() {
     use gptgrep_jev::EvidenceRole;
-    let response = json!({"model":"typesafe/invented-role-model","answers":{
+    let response = json!({"model":"openai/gpt-6-luna-decisions-20261006","answers":{
         "relevance_0":{"type":"score","score":2.4},
         "role_0":{"type":"choice","choice":"source_local_incomplete"}
     }});
@@ -507,7 +507,7 @@ async fn missing_wrong_type_or_unknown_role_is_an_explicit_failure() {
     ] {
         let (endpoint, server) = serve_once(
             "200 OK",
-            json!({"model":"typesafe/invented","answers":answers}).to_string(),
+            json!({"model":"openai/gpt-6-luna-decisions-20261006","answers":answers}).to_string(),
             "",
         )
         .await;

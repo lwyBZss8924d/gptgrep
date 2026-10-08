@@ -23,6 +23,13 @@ struct Cli {
     schema: bool,
     #[arg(long, global = true, help = "Print a compact agent usage manifest")]
     llms: bool,
+    #[arg(
+        long,
+        global = true,
+        value_name = "FILE",
+        help = "Join an existing shared Decisions budget contract for paid operations"
+    )]
+    decisions_budget: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -44,7 +51,7 @@ struct HostArgs {
         help = "Existing Codex account home; defaults to CODEX_HOME or ~/.codex"
     )]
     codex_home: Option<PathBuf>,
-    #[arg(long, default_value = "gpt-5.6-luna")]
+    #[arg(long, default_value = "gpt-6-luna")]
     model: String,
     #[arg(long, default_value = "max")]
     reasoning_effort: String,
@@ -80,6 +87,7 @@ impl HostArgs {
                 .unwrap_or_else(|| gptgrep_host::HostConfig::default().codex_home),
             model: self.model,
             jev_model: None,
+            decisions_execution: None,
             document: None,
             reasoning_effort: self.reasoning_effort,
             service_tier: self.service_tier,
@@ -208,7 +216,10 @@ enum Command {
         max_windows_per_run: usize,
         #[arg(long, default_value_t = 900)]
         deadline_seconds: u64,
-        #[arg(long, help = "Jev Decisions model; default typesafe/jev-1.13")]
+        #[arg(
+            long,
+            help = "Jev Decisions model; default openai/gpt-6-luna-decisions"
+        )]
         jev_model: Option<String>,
         #[command(flatten)]
         host: EnrichHostArgs,
@@ -237,7 +248,10 @@ enum Command {
         max_candidates: usize,
         #[arg(long, default_value_t = 32)]
         routing_docs: usize,
-        #[arg(long, help = "OpenRouter Decisions model; default typesafe/jev-1.13")]
+        #[arg(
+            long,
+            help = "OpenRouter Decisions model; default openai/gpt-6-luna-decisions"
+        )]
         model: Option<String>,
         #[arg(
             long,
@@ -290,7 +304,10 @@ enum Command {
         question: String,
         #[arg(default_value = ".")]
         root: PathBuf,
-        #[arg(long, help = "Jev Decisions model; default typesafe/jev-1.13")]
+        #[arg(
+            long,
+            help = "Jev Decisions model; default openai/gpt-6-luna-decisions"
+        )]
         jev_model: Option<String>,
         #[arg(
             long,
@@ -334,7 +351,10 @@ enum Command {
         node_id: String,
         #[arg(long, default_value = ".")]
         root: PathBuf,
-        #[arg(long, help = "Jev Decisions model; default typesafe/jev-1.13")]
+        #[arg(
+            long,
+            help = "Jev Decisions model; default openai/gpt-6-luna-decisions"
+        )]
         jev_model: Option<String>,
         #[arg(
             long,
@@ -373,15 +393,15 @@ fn contract() -> Value {
         "commands":{
             "batch":{"usage":"gptgrep batch --root ROOT --input FILE_OR_DASH --json","effect":"local generation-pinned search/catalog/tree/read operations","network":false,"request_schema":"gptgrep.batch.request.v1","output_schema":"gptgrep.batch.response.v1","limits":{"input_bytes":1048576,"operations":64,"output_bytes":1048576},"output_order":"input operation order","model_operations":"hybrid/semantic return output_budget_insufficient before any provider work in this foundation","continuation":"deterministic cursors bind generation, scope and projection; no model continuation","output":"always JSON; exit2 for any item or global failure"},
             "index":{"usage":"gptgrep index ROOT [--max-files 100000] [--optimize-merge] --json","effect":"write owned .gptgrep immutable generation","network":false},
-            "enrich":{"usage":"gptgrep enrich ROOT --ledger-path ABSOLUTE_PATH --max-builder-calls N --max-jev-calls N [--plan-only] [--expected-plan-sha256 SHA] --json","effect":"explicit raw-only Codex/Jev navigation-overlay build after deterministic index","model_assisted":true,"plan_only_model_calls":0,"defaults":{"builder_model":"gpt-6-luna","reasoning_effort":"max","service_tier":"fast","jev_model":"typesafe/jev-1.13","window_bytes":8192,"max_hints_per_window":4},"output":"complete publishes a separate source-bound navigation overlay; incomplete/failed leaves the current index unchanged and exits 2","hint_authority":"non-citable navigation only; not full PageIndex Flash parity","resume":"same absolute ledger and bound plan; pending or failed calls are not automatically retried"},
-            "search":{"usage":"gptgrep search QUERY ROOT --mode regex|lexical|hybrid|semantic --json","options":{"mode":{"type":"string","default":"hybrid","enum":["hybrid","semantic","regex","lexical"]},"document":{"type":"string","description":"Exact indexed source-relative path; scope applies before candidate limits"},"limit":{"type":"integer","default":20,"minimum":1,"maximum":1000},"context":{"type":"integer","default":0,"maximum":100},"max-candidates":{"type":"integer","default":24,"maximum":24},"routing-docs":{"type":"integer","default":32,"maximum":32},"ignore-case":{"type":"boolean"},"fixed-strings":{"type":"boolean"},"model":{"type":"string","default":"typesafe/jev-1.13"},"min-score":{"type":"number","minimum":0,"maximum":1,"default":0.5}},"network":"required Jev for default hybrid and semantic; explicit regex/lexical primitives are local","credentials":"OPENROUTER_API_KEY environment only","output_schema":"gptgrep.v1"},
+            "enrich":{"usage":"gptgrep enrich ROOT --ledger-path ABSOLUTE_PATH --max-builder-calls N --max-jev-calls N [--plan-only] [--expected-plan-sha256 SHA] --json","effect":"explicit raw-only Codex/Jev navigation-overlay build after deterministic index","model_assisted":true,"plan_only_model_calls":0,"defaults":{"builder_model":"gpt-6-luna","reasoning_effort":"max","service_tier":"fast","jev_model":gptgrep_jev::DEFAULT_MODEL,"window_bytes":8192,"max_hints_per_window":4},"output":"complete publishes a separate source-bound navigation overlay; incomplete/failed leaves the current index unchanged and exits 2","hint_authority":"non-citable navigation only; not full PageIndex Flash parity","resume":"same absolute ledger and bound plan; pending or failed calls are not automatically retried"},
+            "search":{"usage":"gptgrep search QUERY ROOT --mode regex|lexical|hybrid|semantic --json","options":{"mode":{"type":"string","default":"hybrid","enum":["hybrid","semantic","regex","lexical"]},"document":{"type":"string","description":"Exact indexed source-relative path; scope applies before candidate limits"},"limit":{"type":"integer","default":20,"minimum":1,"maximum":1000},"context":{"type":"integer","default":0,"maximum":100},"max-candidates":{"type":"integer","default":24,"maximum":24},"routing-docs":{"type":"integer","default":32,"maximum":32},"ignore-case":{"type":"boolean"},"fixed-strings":{"type":"boolean"},"model":{"type":"string","default":gptgrep_jev::DEFAULT_MODEL},"min-score":{"type":"number","minimum":0,"maximum":1,"default":0.5}},"network":"required Jev for default hybrid and semantic; explicit regex/lexical primitives are local","credentials":"OPENROUTER_API_KEY environment only","output_schema":"gptgrep.v1"},
             "tree":{"usage":"gptgrep tree FILE --root ROOT --json","effect":"read"},
             "read":{"usage":"gptgrep read DOCUMENT_ID:NODE_ID --root ROOT --max-bytes 8192 --offset BYTES --json","effect":"read"},
             "files":{"usage":"gptgrep files ROOT --json","effect":"read"},
             "status":{"usage":"gptgrep status ROOT --json","scope":"existing indexed files; index discovers new files"},
             "parse":{"usage":"gptgrep parse FILE --json","effect":"local parser"},
             "judge":{"usage":"gptgrep judge --input FILE [--model MODEL] --json","input":{"state":"JSON","questions":"Choice/Noul/Score map"},"effect":"explicit remote Decisions call"},
-            "ask":{"usage":"gptgrep ask QUESTION ROOT [--codex-home HOME] [--codex-bin codex] [--experimental-query-plan] [--planner-model MODEL] [--navigation-overlay-sha256 SHA --navigation-max-jev-calls N --navigation-max-request-bytes BYTES] [--experimental-evidence-roles] --json","effect":"required Jev routing/reranking followed by bounded local Codex reasoning","options":{"jev-model":{"type":"string","default":"typesafe/jev-1.13"},"document":{"type":"string"},"navigation-overlay-sha256":{"type":"string","requires":["experimental-query-plan","document"],"effect":"require exact completed source-bound overlay and full Jev hint scan before planned retrieval","report_schema":"gptgrep.navigation-query.v1","citation_authority":false},"navigation-max-jev-calls":{"type":"integer","requires":"navigation-overlay-sha256","minimum":1,"maximum":128,"default":32},"navigation-max-request-bytes":{"type":"integer","requires":"navigation-overlay-sha256","minimum":1,"maximum":8388608,"default":2097152},"experimental-query-plan":{"type":"boolean","default":false,"effect":"one extra no-tools Luna planner turn; up to two alternate retrieval queries; bounded parallel routes and final Jev reranking against the original question","limits":{"alternate_queries":2,"routing_concurrency":2,"union_candidates":24,"planner_timeout_seconds":45},"accounting":"model_attempts reports planner and reader separately; legacy usage is reader-only; overall timeout is shared"},"planner-model":{"type":"string","default":"gpt-6-luna","requires":"experimental-query-plan","effect":"select the query-planner Codex model independently from the final reader"},"experimental-evidence-roles":{"type":"boolean","default":false,"requires":"experimental-query-plan","effect":"one additional Choice per union candidate in the same mandatory Jev decision; source-bound role ordering and continuation hints","limits":{"union_candidates":24,"final_questions":48,"complete_request_bytes":65536},"sufficiency":"unassessed","accounting":"extra judgments and tokens are measured within the existing request; discarded-candidate metadata stays private and is not citable"}},"defaults":{"model":"gpt-5.6-luna","reasoning_effort":"max","service_tier":"fast","timeout_seconds":180,"max_tool_calls":12}},
+            "ask":{"usage":"gptgrep ask QUESTION ROOT [--codex-home HOME] [--codex-bin codex] [--experimental-query-plan] [--planner-model MODEL] [--navigation-overlay-sha256 SHA --navigation-max-jev-calls N --navigation-max-request-bytes BYTES] [--experimental-evidence-roles] --json","effect":"required Jev routing/reranking followed by bounded local Codex reasoning","options":{"jev-model":{"type":"string","default":gptgrep_jev::DEFAULT_MODEL},"document":{"type":"string"},"navigation-overlay-sha256":{"type":"string","requires":["experimental-query-plan","document"],"effect":"require exact completed source-bound overlay and full Jev hint scan before planned retrieval","report_schema":"gptgrep.navigation-query.v1","citation_authority":false},"navigation-max-jev-calls":{"type":"integer","requires":"navigation-overlay-sha256","minimum":1,"maximum":128,"default":32},"navigation-max-request-bytes":{"type":"integer","requires":"navigation-overlay-sha256","minimum":1,"maximum":8388608,"default":2097152},"experimental-query-plan":{"type":"boolean","default":false,"effect":"one extra no-tools Luna planner turn; up to two alternate retrieval queries; bounded parallel routes and final Jev reranking against the original question","limits":{"alternate_queries":2,"routing_concurrency":2,"union_candidates":24,"planner_timeout_seconds":45},"accounting":"model_attempts reports planner and reader separately; legacy usage is reader-only; overall timeout is shared"},"planner-model":{"type":"string","default":"gpt-6-luna","requires":"experimental-query-plan","effect":"select the query-planner Codex model independently from the final reader"},"experimental-evidence-roles":{"type":"boolean","default":false,"requires":"experimental-query-plan","effect":"one additional Choice per union candidate in the same mandatory Jev decision; source-bound role ordering and continuation hints","limits":{"union_candidates":24,"final_questions":48,"complete_request_bytes":65536},"sufficiency":"unassessed","accounting":"extra judgments and tokens are measured within the existing request; discarded-candidate metadata stays private and is not citable"}},"defaults":{"model":"gpt-6-luna","reasoning_effort":"max","service_tier":"fast","timeout_seconds":180,"max_tool_calls":12}},
             "summarize":{"usage":"gptgrep summarize DOCUMENT_ID:NODE_ID --root ROOT [host options] --json","effect":"required Jev retrieval in the selected document, then model-written summary with issued evidence citations"},
             "host-complete":{"usage":"gptgrep host-complete --input FILE_OR_DASH [host options] --json","input":{"instructions":"string","state":"JSON","schema":"JSON Schema object"},"effect":"explicit schema-validated local Codex completion; no citation assertion","defaults":{"max_input_bytes":262144,"service_tier":"fast"},"hard_max_input_bytes":1048576},
             "doctor":{"usage":"gptgrep doctor --json","effect":"local capability probe"}
@@ -436,11 +456,28 @@ fn contract() -> Value {
         "citation_authority":"only issued source spans; no inferred unseen text or scope expansion",
         "report_schema":"gptgrep.source-continuation.v1","additional_model_calls":0
     });
+    contract["global_options"] = json!({"decisions-budget": {
+        "type":"file", "optional":true, "schema":"gptgrep.decisions-budget-contract.v1",
+        "control_bytes":16384, "effect":"join existing shared original-clock ledger for search hybrid/semantic, judge, ask, summarize and non-plan enrich",
+        "initialization":false, "missing_files":"error", "without_file":"single-invocation bounded context",
+        "local_commands":"regex/lexical, schema, doctor and enrich --plan-only do not open it"
+    }});
+    contract["decisions"] = json!({"default_model":gptgrep_jev::DEFAULT_MODEL,
+        "legacy_model":gptgrep_jev::LEGACY_MODEL, "legacy_images":false,
+        "model_admission":"exact requested identifier or the observed canonical mapping for Luna Decisions and legacy Jev; no other aliases or fallback",
+        "typed_wire":"flat literal text plus PNG/JPEG image_url data URLs; local source bindings excluded",
+        "limits":{"text_envelope_bytes":gptgrep_jev::MAX_REQUEST_BYTES,"body_bytes":gptgrep_jev::MAX_MULTIMODAL_REQUEST_BYTES,
+            "images":gptgrep_jev::MAX_IMAGES,"image_file_bytes":gptgrep_jev::MAX_IMAGE_BYTES,"response_bytes":gptgrep_jev::MAX_RESPONSE_BYTES}});
+    contract["commands"]["judge"]["input"] = json!({"one_of":[
+        {"state":"JSON","questions":"Choice/Noul/Score map"},
+        {"input":{"text":[{"source":{"source_id":"string","unit_id":"string","source_sha256":"sha256"},"text":"literal string"}],
+            "images":[{"source":{"source_id":"string","unit_id":"string","source_sha256":"sha256"},"path":"local PNG/JPEG path"}]},
+        "questions":"Choice/Noul/Score map"}],"control_bytes":65536});
     contract
 }
 
 fn llms() -> &'static str {
-    "# GPTgrep\n\nLocal vectorless retrieval helper for agents. No MCP server.\n\n1. gptgrep index ./docs --json\n1a. gptgrep enrich ./docs --ledger-path /path/to/private/enrich.jsonl --max-builder-calls 100 --max-jev-calls 100 --plan-only --json\n2. gptgrep search 'concept in natural language' ./docs --json\n3. gptgrep search 'pattern' ./docs --mode regex --json\n4. gptgrep tree manual.pdf --root ./docs --json\n5. gptgrep read DOCUMENT_ID:NODE_ID --root ./docs --json\n6. gptgrep batch --root ./docs --input operations.json --json\n7. gptgrep batch --rich --root ./docs --input rich-operations.json\n\nBatch accepts gptgrep.batch.request.v1 JSON, pins one generation and preserves operation order. Local search/catalog/tree/read operations share bounded output reservations. Batch hybrid/semantic are currently rejected before provider work; inspect each item status and coverage.\n\nFor a separately published v2 generation, batch --rich accepts gptgrep.batch.rich.request.v1 with inspect_documents, inspect_pages, read_artifact, search_artifacts, inspect_visual and read_visual. Text inspection returns indexed metadata only. Text read/search preserve typed native/OCR evidence; their cursors bind generation and operation options. Search pages cover a bounded max_hits window; inspect truncation and exhaustion. Opt-in inspect_visual takes scope (document_ids, first_page, last_page), query, max_candidates and its own cursor; use result.next_cursor and retain the batch output budget and per-item reservation when continuing. read_visual takes rendition_id and returns complete image_base64 plus pinned candidate metadata; no image byte windows, truncation or cursor. Both visual operations reuse the generation resource budget and report actual_image_delivery=false and citation_authority=false. They establish local observations, not model delivery or citation rights. This route is local and performs zero model submissions.\n\nJev routing/reranking is required by default search, ask and summarize. OPENROUTER_API_KEY must be supplied for model-assisted runs; failures never silently downgrade to local retrieval. Explicit regex/lexical and enrich --plan-only remain offline. Enrich is an explicit Codex/Jev step that creates non-citable navigation hints after local indexing. Use --document RELATIVE_PATH to scope before candidate budgets. Hybrid/semantic and judge send bounded data to OpenRouter Jev. Inspect coverage, source_fresh, coordinate_system and text_truncated before citing evidence. The main agent performs reasoning and controls follow-up reads. New files require reindexing. --schema provides the command contract.\n"
+    "# GPTgrep\n\nLocal vectorless retrieval helper for agents. No MCP server.\n\n1. gptgrep index ./docs --json\n1a. gptgrep enrich ./docs --ledger-path /path/to/private/enrich.jsonl --max-builder-calls 100 --max-jev-calls 100 --plan-only --json\n2. gptgrep search 'concept in natural language' ./docs --json\n3. gptgrep search 'pattern' ./docs --mode regex --json\n4. gptgrep tree manual.pdf --root ./docs --json\n5. gptgrep read DOCUMENT_ID:NODE_ID --root ./docs --json\n6. gptgrep batch --root ./docs --input operations.json --json\n7. gptgrep batch --rich --root ./docs --input rich-operations.json\n\nBatch accepts gptgrep.batch.request.v1 JSON, pins one generation and preserves operation order. Local search/catalog/tree/read operations share bounded output reservations. Batch hybrid/semantic are currently rejected before provider work; inspect each item status and coverage.\n\nFor a separately published v2 generation, batch --rich accepts gptgrep.batch.rich.request.v1 with inspect_documents, inspect_pages, read_artifact, search_artifacts, inspect_visual and read_visual. Text inspection returns indexed metadata only. Text read/search preserve typed native/OCR evidence; their cursors bind generation and operation options. Search pages cover a bounded max_hits window; inspect truncation and exhaustion. Opt-in inspect_visual takes scope (document_ids, first_page, last_page), query, max_candidates and its own cursor; use result.next_cursor and retain the batch output budget and per-item reservation when continuing. read_visual takes rendition_id and returns complete image_base64 plus pinned candidate metadata; no image byte windows, truncation or cursor. Both visual operations reuse the generation resource budget and report actual_image_delivery=false and citation_authority=false. They establish local observations, not model delivery or citation rights. This route is local and performs zero model submissions.\n\nJev routing/reranking is required by default search, ask and summarize. OPENROUTER_API_KEY must be supplied for model-assisted runs; failures never silently downgrade to local retrieval. Explicit regex/lexical and enrich --plan-only remain offline. Enrich is an explicit Codex/Jev step that creates non-citable navigation hints after local indexing. Use --document RELATIVE_PATH to scope before candidate budgets. The default Decisions model is openai/gpt-6-luna-decisions; native Codex defaults separately to gpt-6-luna/max/fast. Hybrid/semantic and judge send bounded data to OpenRouter Decisions. Judge input accepts state/questions or typed input.text/input.images with explicit source bindings and local PNG/JPEG paths. --decisions-budget FILE joins an existing original-clock shared budget; it never initializes or resets a ledger. Without the file, paid calls share their single-invocation bounded client context. Explicit --model typesafe/jev-1.13 remains text-only. Inspect coverage, source_fresh, coordinate_system and text_truncated before citing evidence. The main agent performs reasoning and controls follow-up reads. New files require reindexing. --schema provides the command contract.\n"
 }
 
 fn emit(value: &Value) -> Result<()> {
@@ -453,6 +490,90 @@ fn emit(value: &Value) -> Result<()> {
 fn program_available(name: &str) -> bool {
     std::env::var_os("PATH")
         .is_some_and(|paths| std::env::split_paths(&paths).any(|p| p.join(name).is_file()))
+}
+
+fn decisions_context(
+    path: Option<&std::path::Path>,
+) -> Result<Option<gptgrep_jev::ExecutionContext>> {
+    path.map(gptgrep_jev::ExecutionContext::from_budget_file)
+        .transpose()
+}
+
+fn require_keys(value: &Value, allowed: &[&str]) -> Result<()> {
+    let object = value
+        .as_object()
+        .context("judge input requires an object")?;
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        bail!("judge input contains an unknown field");
+    }
+    Ok(())
+}
+
+/// Admit either the original state/questions contract or typed local image evidence.
+fn prepare_judge(
+    client: &gptgrep_jev::JevClient,
+    data: &Value,
+) -> Result<gptgrep_jev::PreparedDecision> {
+    let questions = data
+        .get("questions")
+        .context("judge input requires questions")?
+        .clone();
+    if let Some(input) = data.get("input") {
+        require_keys(data, &["input", "questions"])?;
+        require_keys(input, &["text", "images"])?;
+        let mut evidence = gptgrep_jev::DecisionInput::default();
+        if let Some(text) = input.get("text") {
+            let items = text
+                .as_array()
+                .context("judge text evidence requires an array")?;
+            for item in items {
+                require_keys(item, &["source", "text"])?;
+                evidence.text.push(gptgrep_jev::TextEvidence {
+                    source: serde_json::from_value(
+                        item.get("source")
+                            .context("judge evidence requires source")?
+                            .clone(),
+                    )?,
+                    text: item
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .context("judge evidence requires literal text")?
+                        .into(),
+                });
+            }
+        }
+        if let Some(images) = input.get("images") {
+            let items = images
+                .as_array()
+                .context("judge image evidence requires an array")?;
+            if items.len() > gptgrep_jev::MAX_IMAGES {
+                bail!("judge image count exceeds the limit");
+            }
+            for item in items {
+                require_keys(item, &["source", "path"])?;
+                let source = serde_json::from_value(
+                    item.get("source")
+                        .context("judge evidence requires source")?
+                        .clone(),
+                )?;
+                let path = item
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .context("judge image evidence requires path")?;
+                evidence.images.push(gptgrep_jev::ImageEvidence::from_file(
+                    source,
+                    std::path::Path::new(path),
+                )?);
+            }
+        }
+        client.prepare_input(evidence, questions, gptgrep_jev::MAX_RESPONSE_BYTES)
+    } else {
+        let state = data
+            .get("state")
+            .context("judge input requires state or input")?
+            .clone();
+        client.prepare_decision(state, questions)
+    }
 }
 
 async fn run(cli: Cli) -> Result<i32> {
@@ -581,6 +702,9 @@ async fn run(cli: Cli) -> Result<i32> {
         } => {
             let mut host = host.config();
             host.jev_model = jev_model;
+            if !plan_only {
+                host.decisions_execution = decisions_context(cli.decisions_budget.as_deref())?;
+            }
             let config = gptgrep_host::EnrichConfig {
                 host,
                 ledger_path,
@@ -691,7 +815,17 @@ async fn run(cli: Cli) -> Result<i32> {
                 model,
                 min_score,
             };
-            let report = gptgrep_core::search(&root, &query, &options).await?;
+            let report = if matches!(mode, Mode::Hybrid | Mode::Semantic) {
+                if let Some(context) = decisions_context(cli.decisions_budget.as_deref())? {
+                    let client = gptgrep_jev::JevClient::from_env(options.model.as_deref())?
+                        .with_execution_context(context);
+                    gptgrep_core::search_with_client(&root, &query, &options, &client).await?
+                } else {
+                    gptgrep_core::search(&root, &query, &options).await?
+                }
+            } else {
+                gptgrep_core::search(&root, &query, &options).await?
+            };
             if cli.json {
                 emit(&serde_json::to_value(&report)?)?;
             } else {
@@ -747,29 +881,30 @@ async fn run(cli: Cli) -> Result<i32> {
             emit(&result)?;
         }
         Command::Judge { input, model } => {
-            let metadata = std::fs::metadata(&input)?;
-            if metadata.len() > 65536 {
+            let mut bytes = Vec::new();
+            std::fs::File::open(input)?
+                .take(gptgrep_jev::MAX_REQUEST_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > gptgrep_jev::MAX_REQUEST_BYTES {
                 bail!("judge input exceeds 64 KiB limit");
             }
-            let data: Value = serde_json::from_slice(&std::fs::read(input)?)?;
-            let state = data
-                .get("state")
-                .context("judge input requires state")?
-                .clone();
-            let questions = data
-                .get("questions")
-                .context("judge input requires questions")?
-                .clone();
+            let data = gptgrep_jev::parse_unique_json(&bytes)?;
             let client = gptgrep_jev::JevClient::from_env(model.as_deref())?;
+            let client = match decisions_context(cli.decisions_budget.as_deref())? {
+                Some(context) => client.with_execution_context(context),
+                None => client,
+            };
+            let prepared = prepare_judge(&client, &data)?;
             emit(&serde_json::to_value(
-                client.decide(state, questions).await?,
+                client.submit_prepared(prepared).await?,
             )?)?;
         }
+
         Command::Doctor => {
             emit(
                 &json!({"schema_version":"gptgrep.doctor.v1","version":env!("CARGO_PKG_VERSION"),
                 "native_index":"embedded tgrep-core","vector_database":false,"mcp":false,
-                "jev":{"required_for":["default search","ask","summarize"],"configured":std::env::var_os("OPENROUTER_API_KEY").is_some(),"default_model":"typesafe/jev-1.13","endpoint":"https://openrouter.ai/api/alpha/decisions","network_checked":false},
+                "jev":{"required_for":["default search","ask","summarize"],"configured":std::env::var_os("OPENROUTER_API_KEY").is_some(),"default_model":gptgrep_jev::DEFAULT_MODEL,"endpoint":"https://openrouter.ai/api/alpha/decisions","network_checked":false},
                 "parsing":{"plaintext":true,"liteparse":"embedded Rust library; PDFium required at runtime","ocr":false,"libreoffice_available":program_available("libreoffice") || program_available("soffice")},
                 "full_pageindex_flash_parity":false}),
             )?;
@@ -790,6 +925,7 @@ async fn run(cli: Cli) -> Result<i32> {
         } => {
             let mut config = host.config();
             config.jev_model = jev_model;
+            config.decisions_execution = decisions_context(cli.decisions_budget.as_deref())?;
             config.document = document;
             config.source_continuation = experimental_source_continuation;
             config.navigation = navigation_overlay_sha256.map(|expected_overlay_sha256| {
@@ -817,6 +953,7 @@ async fn run(cli: Cli) -> Result<i32> {
         } => {
             let mut config = host.config();
             config.jev_model = jev_model;
+            config.decisions_execution = decisions_context(cli.decisions_budget.as_deref())?;
             config.document = document;
             emit(&serde_json::to_value(
                 gptgrep_host::summarize(&root, &node_id, &config).await?,
@@ -953,6 +1090,72 @@ async fn shutdown_signal() {
 mod query_plan_cli_tests {
     use super::*;
 
+    #[test]
+    fn production_defaults_budget_option_and_typed_judge_frontdoor_are_reachable() {
+        let cli = Cli::try_parse_from([
+            "gptgrep",
+            "search",
+            "ordinary query",
+            ".",
+            "--decisions-budget",
+            "budget.json",
+        ])
+        .unwrap();
+        assert_eq!(cli.decisions_budget, Some(PathBuf::from("budget.json")));
+        let contract = contract();
+        assert_eq!(
+            contract["decisions"]["default_model"],
+            gptgrep_jev::DEFAULT_MODEL
+        );
+        assert_eq!(
+            contract["commands"]["ask"]["defaults"]["model"],
+            "gpt-6-luna"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let image = directory.path().join("evidence.png");
+        // Fixed 1x1 PNG fixture; generic source text contains no evaluator input.
+        std::fs::write(
+            &image,
+            [
+                137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0,
+                1, 8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 248,
+                207, 192, 240, 31, 0, 5, 0, 1, 255, 137, 153, 61, 29, 0, 0, 0, 0, 73, 69, 78, 68,
+                174, 66, 96, 130,
+            ],
+        )
+        .unwrap();
+        let source = json!({"source_id":"source","unit_id":"page","source_sha256":"a".repeat(64)});
+        let data = json!({"input":{"text":[{"source":{"source_id":"source","unit_id":"caption","source_sha256":"a".repeat(64)},"text":"Observe this image."}],
+            "images":[{"source":source,"path":image}]},"questions":{"visible":{"type":"noul","instructions":"Is the image visible?"}}});
+        let client = gptgrep_jev::JevClient::new("ordinary-mock-only", None).unwrap();
+        let prepared = prepare_judge(&client, &data).unwrap();
+        let wire: Value = serde_json::from_slice(prepared.canonical_body()).unwrap();
+        assert!(wire["state"][0].is_string());
+        assert_eq!(wire["state"][1]["type"], "image_url");
+        assert!(wire["state"][1].get("source").is_none());
+        assert_eq!(
+            client
+                .execution_context()
+                .snapshot()
+                .unwrap()
+                .logical_reservations,
+            0
+        );
+        let legacy =
+            gptgrep_jev::JevClient::new("ordinary-mock-only", Some(gptgrep_jev::LEGACY_MODEL))
+                .unwrap();
+        assert!(prepare_judge(&legacy, &data).is_err());
+        let mut unknown = data.clone();
+        unknown["state"] = json!("ambiguous");
+        assert!(prepare_judge(&client, &unknown).is_err());
+        assert!(
+            prepare_judge(
+                &client,
+                &json!({"state":"original structured state","questions":data["questions"]})
+            )
+            .is_ok()
+        );
+    }
     #[test]
     fn planning_is_explicit_and_limited_to_ask() {
         let plain =

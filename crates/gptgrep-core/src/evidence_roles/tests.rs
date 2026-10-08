@@ -372,7 +372,7 @@ async fn server(direct_fact: String, status: u16) -> Result<Server> {
                 (id.clone(),value)
             }).collect();
             let response = if http_status == 200 {
-                json!({"model":"typesafe/invented","answers":answers,"usage":{"input_tokens":123,"output_tokens":4},"id":"invented-response","provider":"invented-provider"}).to_string()
+                json!({"model":"openai/gpt-6-luna-decisions-20261006","answers":answers,"usage":{"input_tokens":123,"output_tokens":4},"id":"invented-response","provider":"invented-provider"}).to_string()
             } else {
                 "private-error-body".into()
             };

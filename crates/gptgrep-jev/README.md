@@ -6,7 +6,7 @@ and reservations and refuses missing journal or lock files without initializing
 a replacement. The existing `with_ledger` initializer remains available for the
 owner of a new run; joining a ledger does not renew its deadline.
 
-A Rust client for Jev's structured Decisions endpoint on OpenRouter. It uses the process's `OPENROUTER_API_KEY` and does not read credential files. The default model selector is `typesafe/jev-1.13`. OpenRouter may resolve that selector to a dated revision; responses preserve the returned model identifier.
+A Rust client for Jev's structured Decisions endpoint on OpenRouter. It uses the process's `OPENROUTER_API_KEY` and does not read credential files. The default selector is `openai/gpt-6-luna-decisions`. Explicit `typesafe/jev-1.13` remains text-only. Responses preserve the actual model identifier and must match the requested identifier or its supported observed canonical mapping: Luna `openai/gpt-6-luna-decisions-20261006`, legacy Jev `typesafe/jev-1.13-20260917`. Other explicit models require exact equality; unknown aliases fail validation, with no fallback.
 
 ```rust,no_run
 use gptgrep_jev::{Candidate, JevClient};
@@ -37,9 +37,28 @@ For an experiment, create `ExecutionContext::new(run_id, plan_digest, absolute_d
 
 `context.with_ledger(path)` adds optional same-host coordination before the context is cloned. The ledger parent must exist. Every joining process must supply exactly the same run ID, plan digest, absolute deadline and limits. An OS file lock protects a bounded private JSON ledger; reservations and local send-start observations are synced before HTTP. Logical reservations permanently consume the submission allowance, including failures. Completed HTTP failures and fully received schema failures release their slots. Cancellation and uncertain transport outcomes retain their slots through run end. A crashed process leaves a charged reserved/in-flight slot that is also unavailable; no automatic recovery or slot reuse occurs. A new run uses a new ledger. There are no source bodies, image bytes, keys or provider response bodies in the ledger. `snapshot()` separates charged reservations, local send-start observations, terminal submissions and occupied/quarantined slots. These observations do not prove physical provider requests or billing.
 
-`prepare_input(DecisionInput, questions, output_capacity)` is an additive typed evidence seam. `TextEvidence` binds its text and content hash to a `SourceBinding` (source ID, unit ID, raw-source digest). `ImageEvidence::from_bytes` and `from_file` admit an exact PNG/JPEG snapshot with a 1 MiB compressed/base64-decoded file cap, a 1,398,104-byte padded-base64 cap, 8 million pixels, and a 32 MiB decoded pixel-buffer limit. Input admission allows at most four images and 24 million total pixels; the proposed multimodal envelope cap is 8 MiB. Source/unit pairs must be unique and one source ID cannot have conflicting raw-source digests. Typed preparation requires capacity for the entire 1 MiB response before submission.
+`prepare_input(DecisionInput, questions, output_capacity)` is an additive typed evidence seam. `TextEvidence` binds its text and content hash to a `SourceBinding` (source ID, unit ID, raw-source digest). `ImageEvidence::from_bytes` and `from_file` admit an exact PNG/JPEG snapshot with a 1 MiB compressed/base64-decoded file cap, a 1,398,104-byte padded-base64 cap, 8 million pixels, and a 32 MiB decoded pixel-buffer limit. Input admission allows at most four images and 24 million total pixels; the multimodal envelope cap is 8 MiB. Source/unit pairs must be unique and one source ID cannot have conflicting raw-source digests. Typed preparation requires capacity for the entire 1 MiB response before submission.
 
-Image preparation currently fails explicitly before reservation or HTTP. The `openai/gpt-6-luna-decisions` model card advertises images, but the official Decisions schema does not define their exact encoding, and its refusal/unknown mapping has not been qualified. Chat Completions `image_url` encoding is not evidence for Decisions. The generated SDK's `UNKNOWN` wrapper is not a server answer; unsupported answer types fail schema validation. The default remains `typesafe/jev-1.13` until separate live qualification and promotion gates pass. Raw `decide` remains the existing JSON text/structured-state API; it does not interpret arbitrary objects as images.
+Normal `prepare_input` uses the flat Luna Decisions codec: literal text strings,
+then PNG/JPEG `image_url` data URL objects. Object keys match canonical JSON Value
+encoding and the provider body excludes source metadata. The escaped text/questions
+envelope stays within 64 KiB before image encoding; the complete body stays within
+8 MiB. Explicit legacy or other models retain text-only evidence objects and reject
+images before reservation. Raw `decide` remains the JSON structured-state API and
+does not interpret arbitrary objects as images. `prepare_image_qualification`
+remains a compatible explicit wrapper around the same codec. Supported syntax and
+observed simple image controls do not establish general image or refusal semantics.
+Unsupported answer types, including refusal/UNKNOWN wrappers, remain failures.
+
+`ExecutionContext::from_budget_file` admits a portable, bounded 16 KiB
+`gptgrep.decisions-budget-contract.v1` file with `run_id`, `plan_digest`,
+`deadline_unix_ms`, `max_submissions`, and absolute `ledger_path`. It joins only an
+existing matching ledger and retains the original clock and charged reservations.
+It never initializes missing files or renews a deadline. Share the context through
+`with_execution_context` before preparing requests; clones retain one allowance.
+The CLI exposes this as `--decisions-budget FILE` for paid paths. Native Codex
+execution and its budget remain separate. Without an explicit context, one client
+invocation uses the bounded compatibility context.
 
 Response validation rejects missing, unexpected or duplicate answer IDs, duplicate JSON object keys, wrong answer types, non-finite/out-of-range numbers, invalid choices, inconsistent probability keys and malformed usage. Optional gateway confidence/distributions/legend stay optional; supplied values are validated. No provider body, query, excerpt or credential is included in error text. After a transport failure, usage may be unknown.
 

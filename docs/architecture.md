@@ -42,7 +42,13 @@ flowchart TD
 | `gptgrep-cli` | Native argv, JSON, schema and grep presentation | None for local commands |
 | `packages/cli` | Optional incur presentation and discovery wrapper | Node and published incur 0.5.1 |
 
-The host profile defaults are `model = "gpt-5.6-luna"` and
+Decisions defaults to `openai/gpt-6-luna-decisions`, with bounded flat typed
+PNG/JPEG input and exact returned-model admission. `typesafe/jev-1.13` remains an
+explicit text-only option. One optional existing-ledger `ExecutionContext` is
+shared by routing, reranking and host follow-ups; joining it never renews the
+original clock or consumed allowance. Native Codex selection stays separate.
+
+The host profile defaults are `model = "gpt-6-luna"` and
 `model_reasoning_effort = "max"`, with `service_tier = "fast"`, as selected for this project. They are local
 helper settings; they do not change the development agent's model. Runtime
 `CODEX_HOME` selects an existing Codex configuration and authentication directory. The program does not read/copy auth

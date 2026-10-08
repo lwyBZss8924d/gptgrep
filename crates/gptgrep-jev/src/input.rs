@@ -1,4 +1,4 @@
-//! Typed evidence admission and an explicit, experimental image qualification route.
+//! Bounded typed evidence admission and the flat Luna Decisions wire codec.
 use crate::{
     DEFAULT_ENDPOINT, JevClient, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, PreparedDecision,
     execution::valid_digest,
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize, Serializer, ser::SerializeSeq};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    fs::File,
+    fs::OpenOptions,
     io::{self, Cursor, Read, Write},
     path::Path,
 };
@@ -112,7 +112,17 @@ impl ImageEvidence {
     }
     /// Open once and read a bounded snapshot; admission and hashing use those exact bytes.
     pub fn from_file(source: SourceBinding, path: impl AsRef<Path>) -> Result<Self> {
-        let file = File::open(path).map_err(|_| anyhow!("Could not open Decisions image"))?;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Refuse nonregular inputs without waiting for a FIFO writer.
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        let file = options
+            .open(path)
+            .map_err(|_| anyhow!("Could not open Decisions image"))?;
         ensure!(
             file.metadata()
                 .map_err(|_| anyhow!("Could not inspect Decisions image"))?
@@ -153,7 +163,8 @@ pub struct DecisionInput {
 /// Experimental image request with its exact admitted sources retained locally.
 ///
 /// Preparing this request establishes syntax and local admission only. It does not
-/// qualify image semantics or change the default typed image rejection. There is
+/// attest image semantics or provider identity. The ordinary typed route now uses
+/// the same bounded codec for Luna Decisions. There is
 /// deliberately no Debug or serde implementation for these source-bearing bytes.
 pub struct PreparedImageQualification {
     request: PreparedDecision,
@@ -286,11 +297,49 @@ impl JevClient {
         );
         crate::validation::request(&Value::String("typed evidence".into()), &questions)?;
 
-        // Count the escaped envelope before allocating base64 or request bytes.
-        // This pass borrows text/questions and never visits the image encoder.
+        let request = self.prepare_flat_input(&input, questions)?;
+        Ok(PreparedImageQualification { request, input })
+    }
+
+    /// Prepare literal text and admitted PNG/JPEG evidence for Luna Decisions.
+    /// Source bindings stay local; flat wire state preserves text/image order.
+    /// Explicit legacy and other models retain the text-only evidence object.
+    pub fn prepare_input(
+        &self,
+        input: DecisionInput,
+        questions: Value,
+        output_capacity: usize,
+    ) -> Result<PreparedDecision> {
+        self.execution.remaining()?;
+        input.validate()?;
+        ensure!(
+            output_capacity >= MAX_RESPONSE_BYTES,
+            "Decisions output capacity must reserve the full response byte limit"
+        );
+        crate::validation::request(&json!("typed evidence"), &questions)?;
+        if crate::luna_decisions_model(&self.model) {
+            return self.prepare_flat_input(&input, questions);
+        }
+        ensure!(
+            input.images.is_empty(),
+            "Decisions images require the Luna Decisions model; no request was prepared or submitted"
+        );
+        let state = json!({"evidence": input.text.iter().map(|item| json!({
+            "source": item.source, "text": item.text,
+            "content_sha256": format!("{:x}", Sha256::digest(item.text.as_bytes()))
+        })).collect::<Vec<_>>()});
+        self.prepare_decision(state, questions)
+    }
+
+    fn prepare_flat_input(
+        &self,
+        input: &DecisionInput,
+        questions: Value,
+    ) -> Result<PreparedDecision> {
+        // Count escaped text/questions before allocating base64 or request bytes.
         let mut envelope = BoundedWriter::counting(MAX_REQUEST_BYTES);
-        serialize_qualification(self, &input, &questions, false, &mut envelope).map_err(|_| {
-            anyhow!("Image qualification escaped text/questions envelope exceeded the byte limit")
+        serialize_qualification(self, input, &questions, false, &mut envelope).map_err(|_| {
+            anyhow!("Decisions escaped text/questions envelope exceeded the byte limit")
         })?;
         let upper_bound = input.images.iter().try_fold(envelope.len, |total, image| {
             total.checked_add(image.base64_bytes())?.checked_add(128)
@@ -302,37 +351,11 @@ impl JevClient {
         let mut body = BoundedWriter::buffered(MAX_MULTIMODAL_REQUEST_BYTES);
         body.bytes
             .try_reserve_exact(upper_bound.expect("The bound was checked above"))
-            .map_err(|_| anyhow!("Could not allocate the bounded qualification request"))?;
-        serialize_qualification(self, &input, &questions, true, &mut body)
-            .map_err(|_| anyhow!("Could not serialize the bounded image qualification request"))?;
+            .map_err(|_| anyhow!("Could not allocate the bounded Decisions request"))?;
+        serialize_qualification(self, input, &questions, true, &mut body)
+            .map_err(|_| anyhow!("Could not serialize the bounded Decisions request"))?;
         self.execution.remaining()?;
-        let request = self.bind_prepared_body(body.bytes, questions);
-        Ok(PreparedImageQualification { request, input })
-    }
-
-    /// Admit typed sources and reserve sufficient response capacity before paid admission.
-    /// Images cannot become a prepared request until the exact Decisions codec is qualified.
-    pub fn prepare_input(
-        &self,
-        input: DecisionInput,
-        questions: Value,
-        output_capacity: usize,
-    ) -> Result<PreparedDecision> {
-        input.validate()?;
-        ensure!(
-            output_capacity >= MAX_RESPONSE_BYTES,
-            "Decisions output capacity must reserve the full response byte limit"
-        );
-        crate::validation::request(&json!("typed evidence"), &questions)?;
-        ensure!(
-            input.images.is_empty(),
-            "Decisions image wire codec and refusal contract are unqualified; no request was prepared or submitted"
-        );
-        let state = json!({"evidence": input.text.iter().map(|item| json!({
-            "source": item.source, "text": item.text,
-            "content_sha256": format!("{:x}", Sha256::digest(item.text.as_bytes()))
-        })).collect::<Vec<_>>()});
-        self.prepare_decision(state, questions)
+        Ok(self.bind_prepared_body(body.bytes, questions))
     }
 }
 

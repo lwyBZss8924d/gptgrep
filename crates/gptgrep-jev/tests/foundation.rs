@@ -89,7 +89,7 @@ async fn clones_share_four_slots_and_completed_failures_keep_submission_counts()
                 tokio::time::sleep(Duration::from_millis(35)).await;
                 active.fetch_sub(1, Ordering::SeqCst);
                 match index % 3 {
-                    0 => respond(&mut socket, "200 OK", r#"{"model":"invented-actual-model","answers":{"q":{"type":"noul","noul":0.8}}}"#).await,
+                    0 => respond(&mut socket, "200 OK", r#"{"model":"openai/gpt-6-luna-decisions-20261006","answers":{"q":{"type":"noul","noul":0.8}}}"#).await,
                     1 => respond(&mut socket, "429 Too Many Requests", "invented-private-body-sentinel").await,
                     _ => respond(&mut socket, "200 OK", r#"{"model":"invented-model","answers":{"q":{"type":"UNKNOWN","isUnknown":true,"raw":{}}}}"#).await,
                 }
@@ -115,7 +115,7 @@ async fn clones_share_four_slots_and_completed_failures_keep_submission_counts()
         match task.await.unwrap() {
             Ok(response) => {
                 successes += 1;
-                assert_eq!(response.model, "invented-actual-model");
+                assert_eq!(response.model, "openai/gpt-6-luna-decisions-20261006");
                 assert!(response.usage.is_null());
             }
             Err(error) => {
@@ -277,7 +277,7 @@ async fn oversized_headers_and_partial_chunked_body_quarantine_charged_slots_bef
 }
 
 #[tokio::test]
-async fn typed_input_output_and_unqualified_codec_rejections_make_zero_submissions() {
+async fn typed_input_output_and_legacy_image_rejections_make_zero_submissions() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!(
         "http://{}/api/alpha/decisions",
@@ -343,14 +343,23 @@ async fn typed_input_output_and_unqualified_codec_rejections_make_zero_submissio
         text: vec![],
         images: vec![image.clone()],
     };
-    let error = client
+    assert!(
+        client
+            .prepare_input(image_input.clone(), questions(), MAX_RESPONSE_BYTES)
+            .is_ok()
+    );
+    let legacy =
+        JevClient::with_endpoint("invented-key", Some(gptgrep_jev::LEGACY_MODEL), &endpoint)
+            .unwrap()
+            .with_execution_context(ctx.clone());
+    let error = legacy
         .prepare_input(image_input, questions(), MAX_RESPONSE_BYTES)
         .err()
         .unwrap();
     assert!(
         error
             .to_string()
-            .contains("wire codec and refusal contract are unqualified")
+            .contains("images require the Luna Decisions model")
     );
     assert!(
         ImageEvidence::from_bytes(binding("page"), vec![0; gptgrep_jev::MAX_IMAGE_BYTES + 1])

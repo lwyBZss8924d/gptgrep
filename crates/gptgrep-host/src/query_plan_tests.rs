@@ -22,7 +22,7 @@ fn planner_effort_inherits_ask_effort_for_comparable_profiles() {
 }
 use crate::{HostConfig, jev_accounting::Accounting, retrieval::Evidence};
 use gptgrep_jev::JevClient;
-use std::time::Duration;
+use std::{fs, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[test]
@@ -165,6 +165,47 @@ async fn planner_descriptors_limit_documents_and_utf8_metadata() {
     }
 }
 
+#[tokio::test]
+async fn host_retrieval_reuses_the_supplied_shared_decisions_context() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    fs::write(
+        directory.path().join("source.txt"),
+        "ordinary needle source evidence",
+    )?;
+    gptgrep_core::index(directory.path(), 10).await?;
+    let (client, server) = mock_jev(vec![200, 200]).await;
+    let context = gptgrep_jev::ExecutionContext::new(
+        "ordinary-shared-host-test",
+        &"a".repeat(64),
+        std::time::SystemTime::now() + std::time::Duration::from_secs(10),
+        2,
+    )?;
+    let config = HostConfig {
+        decisions_execution: Some(context.clone()),
+        document: Some("source.txt".into()),
+        ..Default::default()
+    };
+    let mut evidence = Evidence::open(directory.path(), None)?;
+    let accounting = Accounting::create(directory.path(), &evidence.generation)?;
+    evidence.configure(&config, accounting, Some(client))?;
+    evidence.bootstrap("needle").await?;
+    assert_eq!(server.await?.len(), 2);
+    assert_eq!(context.snapshot()?.logical_reservations, 2);
+    assert_eq!(context.snapshot()?.terminal_submissions, 2);
+    assert!(
+        evidence
+            .call(
+                "later",
+                "gptgrep_search",
+                json!({"query":"needle","mode":"hybrid"})
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(context.snapshot()?.logical_reservations, 2);
+    Ok(())
+}
+
 pub(crate) async fn mock_jev(plan: Vec<u16>) -> (JevClient, tokio::task::JoinHandle<Vec<Value>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client = JevClient::with_endpoint(
@@ -218,7 +259,7 @@ pub(crate) async fn mock_jev(plan: Vec<u16>) -> (JevClient, tokio::task::JoinHan
                 .keys()
                 .map(|id| (id.clone(), json!({"type":"score","score":3.0})))
                 .collect();
-            let body = json!({"model":"typesafe/jev-fixture","id":format!("reply-{ordinal}"),"provider":"fixture","answers":answers,"usage":{"input_tokens":ordinal+11,"output_tokens":2,"cost":0.001}}).to_string();
+            let body = json!({"model":"openai/gpt-6-luna-decisions-20261006","id":format!("reply-{ordinal}"),"provider":"fixture","answers":answers,"usage":{"input_tokens":ordinal+11,"output_tokens":2,"cost":0.001}}).to_string();
             socket.write_all(format!("HTTP/1.1 {status} Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
         }
         requests

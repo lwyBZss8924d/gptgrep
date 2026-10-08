@@ -82,7 +82,84 @@ pub struct ExecutionSnapshot {
     pub deadline_unix_ms: Option<u64>,
 }
 
+/// Portable control file for joining an already initialized shared Decisions budget.
+/// The ledger retains its original run clock, deadline and consumed admissions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionsBudget {
+    pub schema_version: String,
+    pub run_id: String,
+    pub plan_digest: String,
+    pub deadline_unix_ms: u64,
+    pub max_submissions: u32,
+    pub ledger_path: PathBuf,
+}
+
+impl std::fmt::Debug for ExecutionContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExecutionContext")
+            .field("shared_ledger", &self.0.ledger.is_some())
+            .field("max_submissions", &self.0.header.max_submissions)
+            .finish_non_exhaustive()
+    }
+}
+
 impl ExecutionContext {
+    /// Read a bounded portable budget contract and join its existing ledger.
+    /// No missing journal, lock, or clock anchor is initialized by this front door.
+    pub fn from_budget_file(path: impl AsRef<Path>) -> Result<Self> {
+        const LIMIT: u64 = 16 * 1024;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Refuse nonregular inputs without waiting for a FIFO writer.
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        let file = options
+            .open(path.as_ref())
+            .map_err(|_| anyhow!("Decisions budget file unavailable"))?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| anyhow!("Decisions budget file unavailable"))?;
+        ensure!(
+            metadata.is_file() && metadata.len() <= LIMIT,
+            "Decisions budget file exceeds the control byte limit"
+        );
+        let mut bytes = Vec::new();
+        file.take(LIMIT + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| anyhow!("Decisions budget file unavailable"))?;
+        ensure!(
+            bytes.len() as u64 <= LIMIT,
+            "Decisions budget file exceeds the control byte limit"
+        );
+        let value = crate::validation::unique_json(&bytes)
+            .map_err(|_| anyhow!("Invalid Decisions budget contract"))?;
+        let budget: DecisionsBudget = serde_json::from_value(value)
+            .map_err(|_| anyhow!("Invalid Decisions budget contract"))?;
+        ensure!(
+            budget.schema_version == "gptgrep.decisions-budget-contract.v1",
+            "Unsupported Decisions budget contract"
+        );
+        ensure!(
+            budget.ledger_path.is_absolute(),
+            "Decisions ledger path must be absolute"
+        );
+        let deadline = UNIX_EPOCH
+            .checked_add(Duration::from_millis(budget.deadline_unix_ms))
+            .ok_or_else(|| anyhow!("Invalid Decisions deadline"))?;
+        Self::new(
+            &budget.run_id,
+            &budget.plan_digest,
+            deadline,
+            budget.max_submissions,
+        )?
+        .with_existing_ledger(&budget.ledger_path)
+    }
+
     /// An explicit experiment context. The absolute deadline also has a monotonic backstop.
     pub fn new(
         run_id: &str,
@@ -760,6 +837,110 @@ mod tests {
             .unwrap()
             .keep()
     }
+    #[cfg(unix)]
+    #[test]
+    fn budget_file_rejects_fifo_without_blocking() {
+        const CHILD_PATH: &str = "GPTGREP_BUDGET_FIFO_TEST_PATH";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let error = ExecutionContext::from_budget_file(PathBuf::from(path)).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Decisions budget file exceeds the control byte limit"
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control-fifo");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // The owned FIFO is used only by the bounded test child, with no writer.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "execution::tests::budget_file_rejects_fifo_without_blocking",
+            ])
+            .env_clear()
+            .env(CHILD_PATH, &path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "FIFO refusal child failed: {status}");
+                break;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("budget FIFO acquisition blocked before regular-file refusal");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    #[tokio::test]
+    async fn portable_budget_file_joins_original_clock_and_charged_quota_without_initialization() {
+        let dir = directory();
+        let ledger = dir.join("budget.json");
+        let control = dir.join("control.json");
+        let deadline_ms = (SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64)
+            + 10_000;
+        let deadline = UNIX_EPOCH + Duration::from_millis(deadline_ms);
+        let budget = DecisionsBudget {
+            schema_version: "gptgrep.decisions-budget-contract.v1".into(),
+            run_id: "invented-test-run".into(),
+            plan_digest: DIGEST.into(),
+            deadline_unix_ms: deadline_ms,
+            max_submissions: 2,
+            ledger_path: ledger.clone(),
+        };
+        fs::write(&control, serde_json::to_vec(&budget).unwrap()).unwrap();
+        assert!(ExecutionContext::from_budget_file(&control).is_err());
+        assert!(!ledger.exists());
+        assert!(!sidecar(&ledger, ".lock").exists());
+        let original = context(deadline, 2).with_ledger(&ledger).unwrap();
+        let mut first = original
+            .reserve(DIGEST, crate::DEFAULT_MODEL)
+            .await
+            .unwrap();
+        first.send_started().await.unwrap();
+        first.terminal().await.unwrap();
+        let joined = ExecutionContext::from_budget_file(&control).unwrap();
+        assert!(joined.ledger_clock_anchor().unwrap() == original.ledger_clock_anchor().unwrap());
+        assert_eq!(joined.snapshot().unwrap(), original.snapshot().unwrap());
+        let held = joined
+            .clone()
+            .reserve(DIGEST, crate::DEFAULT_MODEL)
+            .await
+            .unwrap();
+        drop(held);
+        assert!(
+            original
+                .reserve(DIGEST, crate::DEFAULT_MODEL)
+                .await
+                .is_err()
+        );
+        let before = fs::read(&ledger).unwrap();
+        let mut mismatch = budget.clone();
+        mismatch.deadline_unix_ms += 1;
+        fs::write(&control, serde_json::to_vec(&mismatch).unwrap()).unwrap();
+        assert!(ExecutionContext::from_budget_file(&control).is_err());
+        assert_eq!(fs::read(&ledger).unwrap(), before);
+        fs::write(
+            &control,
+            br#"{"schema_version":"one","schema_version":"two"}"#,
+        )
+        .unwrap();
+        assert!(ExecutionContext::from_budget_file(&control).is_err());
+        fs::write(&control, vec![b' '; 16 * 1024 + 1]).unwrap();
+        assert!(ExecutionContext::from_budget_file(&control).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn immutable_binding_accessors_and_snapshots_have_no_admission_effects() {
         let deadline = SystemTime::now() + Duration::from_secs(5);
@@ -1262,8 +1443,7 @@ mod tests {
         let candidate = context(deadline, 6).with_ledger(path);
         if mode == "join_lost" || mode == "join_malformed" {
             let error = candidate
-                .err()
-                .expect("a fresh process must reject a lost or malformed existing journal");
+                .expect_err("a fresh process must reject a lost or malformed existing journal");
             assert!(error.to_string().contains(if mode == "join_lost" {
                 "cannot be reset"
             } else {
