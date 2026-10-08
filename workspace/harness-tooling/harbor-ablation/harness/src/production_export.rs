@@ -729,6 +729,12 @@ struct Options {
     cpus: u32,
     memory_mb: u32,
     network_mode: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_hosts",
+        skip_serializing_if = "Option::is_none"
+    )]
+    allowed_hosts: Option<Vec<String>>,
     repetitions: u32,
     seed: u32,
     reader_uid: u32,
@@ -976,7 +982,6 @@ fn options(bytes: &[u8]) -> Result<Options> {
         || !(1..=3600).contains(&o.timeout_sec)
         || !(1..=16).contains(&o.cpus)
         || !(256..=16384).contains(&o.memory_mb)
-        || o.network_mode != "no-network"
         || !(1..=10).contains(&o.repetitions)
         || o.reader_uid == 0
         || o.reader_gid == 0
@@ -987,6 +992,7 @@ fn options(bytes: &[u8]) -> Result<Options> {
     {
         return Err("production_options".into());
     }
+    network_policy(&o.network_mode, o.allowed_hosts.as_deref())?;
     check_hash(&o.codex_binary_sha256)?;
     for image in [&o.reader_image, &o.verifier_image] {
         check_hash(
@@ -1003,6 +1009,221 @@ fn options(bytes: &[u8]) -> Result<Options> {
         }
     }
     Ok(o)
+}
+fn network_policy(mode: &str, hosts: Option<&[String]>) -> Result<()> {
+    let hosts = hosts.unwrap_or_default();
+    if !matches!(mode, "no-network" | "allowlist")
+        || (mode == "no-network" && !hosts.is_empty())
+        || (mode == "allowlist" && hosts.is_empty())
+        || hosts.len() > 32
+    {
+        return Err("production_network_policy".into());
+    }
+    let mut seen = BTreeSet::new();
+    for host in hosts {
+        if !exact_network_host(host) || !seen.insert(host) {
+            return Err("production_network_host".into());
+        }
+    }
+    Ok(())
+}
+fn deserialize_hosts<'de, D>(deserializer: D) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::<String>::deserialize(deserializer).map(Some)
+}
+fn exact_network_host(host: &str) -> bool {
+    if host.is_empty() || host.len() > 253 || !host.is_ascii() || host.contains('%') {
+        return false;
+    }
+    if let Ok(address) = host.parse::<std::net::IpAddr>() {
+        return address.to_string() == host;
+    }
+    // Numeric final labels can be interpreted as legacy IPv4 aliases by consumers.
+    // Refuse that fallback instead of treating an invalid IP spelling as DNS.
+    let final_label = host.rsplit('.').next().unwrap_or_default();
+    if final_label.bytes().all(|b| b.is_ascii_digit())
+        || final_label
+            .strip_prefix("0x")
+            .is_some_and(|digits| digits.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return false;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label.as_bytes()[0].is_ascii_alphanumeric()
+            && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    })
+}
+
+#[cfg(test)]
+mod network_policy_tests {
+    use super::*;
+    fn hosts(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).into()).collect()
+    }
+    fn fixture() -> Value {
+        value!({"schema_version":"gptgrep.harbor.production-options.v1", "reader_image":format!("example/reader@sha256:{}","a".repeat(64)), "verifier_image":format!("example/verifier@sha256:{}","b".repeat(64)), "codex_binary_sha256":"c".repeat(64), "codex_argv":["codex","exec","-"], "model":"gpt-6-luna", "effort":"max", "service_tier":"fast", "timeout_sec":60, "cpus":1, "memory_mb":512, "network_mode":"no-network", "repetitions":1, "seed":0, "reader_uid":1000, "reader_gid":1000})
+    }
+    #[test]
+    fn legacy_default_omits_allowlist_and_explicit_empty_stays_offline() {
+        let mut input = fixture();
+        let admitted = options(&serde_json::to_vec(&input).unwrap()).unwrap();
+        assert!(
+            serde_json::to_value(admitted)
+                .unwrap()
+                .get("allowed_hosts")
+                .is_none()
+        );
+        input["allowed_hosts"] = value!([]);
+        let admitted = options(&serde_json::to_vec(&input).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(admitted).unwrap()["allowed_hosts"],
+            value!([])
+        );
+    }
+    #[test]
+    fn explicit_bounded_exact_hosts_are_admitted_and_retained() {
+        let mut input = fixture();
+        input["network_mode"] = value!("allowlist");
+        input["allowed_hosts"] = value!([
+            "api.openai.com",
+            "openrouter.ai",
+            "192.0.2.1",
+            "2001:db8::1"
+        ]);
+        let admitted = options(&serde_json::to_vec(&input).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(admitted).unwrap()["allowed_hosts"],
+            input["allowed_hosts"]
+        );
+        let bounded: Vec<_> = (0..32)
+            .map(|index| format!("host-{index}.example.com"))
+            .collect();
+        network_policy("allowlist", Some(&bounded)).unwrap();
+    }
+    #[test]
+    fn cross_policy_empty_missing_and_duplicate_hosts_are_refused() {
+        assert!(network_policy("allowlist", None).is_err());
+        assert!(network_policy("allowlist", Some(&[])).is_err());
+        assert!(network_policy("public", None).is_err());
+        assert!(network_policy("no-network", Some(&hosts(&["openrouter.ai"]))).is_err());
+        assert!(
+            network_policy(
+                "allowlist",
+                Some(&hosts(&["openrouter.ai", "openrouter.ai"]))
+            )
+            .is_err()
+        );
+        let too_many: Vec<_> = (0..33)
+            .map(|index| format!("host-{index}.example.com"))
+            .collect();
+        assert!(network_policy("allowlist", Some(&too_many)).is_err());
+        let mut input = fixture();
+        input["allowed_hosts"] = Value::Null;
+        assert!(options(&serde_json::to_vec(&input).unwrap()).is_err());
+    }
+    #[test]
+    fn numeric_aliases_and_scoped_ipv6_are_refused_without_blocking_canonical_hosts() {
+        for host in [
+            "192.0.2.01",
+            "127.1",
+            "127.0.1",
+            "2130706433",
+            "127",
+            "0177.0.0.1",
+            "0x7f000001",
+            "0x7f.0.0.1",
+            "0x7f.0x1",
+            "0x",
+            "256.1.1.1",
+            "4294967296",
+            "example.123",
+            "example.0x10",
+            "fe80::1%eth0",
+            "fe80::1%25en0",
+            "2001:db8::1%2",
+            "::ffff:192.0.2.01",
+        ] {
+            assert!(!exact_network_host(host), "{host}");
+            assert!(
+                network_policy("allowlist", Some(&hosts(&[host]))).is_err(),
+                "{host}"
+            );
+            let mut input = fixture();
+            input["network_mode"] = value!("allowlist");
+            input["allowed_hosts"] = value!([host]);
+            assert!(
+                options(&serde_json::to_vec(&input).unwrap()).is_err(),
+                "{host}"
+            );
+        }
+        for host in [
+            "192.0.2.1",
+            "2001:db8::1",
+            "::1",
+            "api2.example.com",
+            "123.api.example.com",
+            "127.example.com",
+            "0xrouter.example.com",
+            "localhost",
+        ] {
+            assert!(exact_network_host(host), "{host}");
+            let mut input = fixture();
+            input["network_mode"] = value!("allowlist");
+            input["allowed_hosts"] = value!([host]);
+            let admitted = options(&serde_json::to_vec(&input).unwrap()).unwrap();
+            assert_eq!(
+                serde_json::to_value(admitted).unwrap()["allowed_hosts"],
+                value!([host])
+            );
+        }
+    }
+    #[test]
+    fn urls_credentials_wildcards_cidr_ports_and_noncanonical_hosts_are_refused() {
+        for host in [
+            "",
+            "*.example.com",
+            "api.*.example.com",
+            "https://api.openai.com",
+            "user:password@api.openai.com",
+            "192.0.2.0/24",
+            "2001:db8::/32",
+            "api.openai.com:443",
+            "api.openai.com/path",
+            "API.OPENAI.COM",
+            "api.openai.com.",
+            " api.openai.com",
+            "api.openai.com\n",
+            "-bad.example.com",
+            "bad-.example.com",
+            "a..example.com",
+            "bad_host.example.com",
+            "é.example.com",
+            "2001:0db8::1",
+        ] {
+            assert!(
+                network_policy("allowlist", Some(&hosts(&[host]))).is_err(),
+                "{host}"
+            );
+        }
+        assert!(!exact_network_host(&format!(
+            "{}.example.com",
+            "a".repeat(64)
+        )));
+        assert!(!exact_network_host(&format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(63)
+        )));
+    }
 }
 pub(super) fn prepare(
     corpus_path: &Path,

@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 import math
+import ipaddress
 import os
 from importlib.metadata import version
 from pathlib import Path, PurePosixPath
@@ -359,21 +360,58 @@ def private_new(root, files):
             data.fresh()
 
 
+def reader_network_policy(opt, production):
+    mode = opt["network_mode"]
+    hosts = opt.get("allowed_hosts", [])
+    if not isinstance(hosts, list) or len(hosts) > 32 or mode not in ("no-network", "allowlist") \
+            or (mode == "no-network" and hosts) or (mode == "allowlist" and (not production or not hosts)):
+        raise ValueError("reader_network_policy")
+    seen = set()
+    for host in hosts:
+        if not isinstance(host, str) or not host or len(host) > 253 or not host.isascii() or "%" in host or host in seen:
+            raise ValueError("reader_network_host")
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            labels = host.split(".")
+            # Refuse legacy IPv4 interpretation instead of falling back to DNS.
+            final_label = labels[-1]
+            numeric = final_label.isdecimal() or (final_label.startswith("0x")
+                       and all(c in "0123456789abcdefABCDEF" for c in final_label[2:]))
+            if numeric or not all(label and len(label) <= 63 and label[0].isalnum() and label[-1].isalnum()
+                       and all(c in "abcdefghijklmnopqrstuvwxyz0123456789-" for c in label) for label in labels):
+                raise ValueError("reader_network_host") from None
+        else:
+            canonical = str(address)
+            if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+                canonical = "::ffff:" + str(address.ipv4_mapped)
+            if host != canonical:
+                raise ValueError("reader_network_host")
+        seen.add(host)
+    policy = {"network_mode": mode}
+    if hosts:
+        policy["allowed_hosts"] = list(hosts)
+    return policy
+
+
 def config(descriptor, production=False):
     if set(descriptor) != {"task_id", "arm", "options"} or descriptor["arm"] not in ("control", "gptgrep"):
         raise ValueError("descriptor_schema")
     opt = descriptor["options"]
+    policy = reader_network_policy(opt, production)
     common = {"cpus": opt["cpus"], "memory_mb": opt["memory_mb"],
-              "network_mode": opt["network_mode"], "os": "linux", "workdir": "/app"}
+              **policy, "os": "linux", "workdir": "/app"}
+    verifier_environment = {"cpus": opt["cpus"], "memory_mb": opt["memory_mb"],
+                            "network_mode": "no-network", "os": "linux", "workdir": "/app"}
     cfg = TaskConfig.model_validate({
         "schema_version": "1.4",
         "task": {"name": f"gptgrep/{descriptor['arm']}-{descriptor['task_id']}", "version": "0.0.0"},
         "metadata": {"synthetic": not production, "execution_qualified": False,
                      "estimand": "whole_prebuilt_search_harness", "preprocessing_in_reward": False},
         "environment": common,
-        "agent": {"timeout_sec": opt["timeout_sec"], "network_mode": opt["network_mode"]},
+        "agent": {"timeout_sec": opt["timeout_sec"], **policy},
         "verifier": {"timeout_sec": 60, "environment_mode": "separate",
-                     "environment": dict(common), "network_mode": "no-network"},
+                     "environment": verifier_environment, "network_mode": "no-network"},
         "artifacts": [{"source": "/app/answer.json", "destination": "answer.json"}],
     })
     # The verifier Dockerfile is intentionally different and lives only in tests/.

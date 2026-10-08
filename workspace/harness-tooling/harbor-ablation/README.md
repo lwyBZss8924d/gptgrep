@@ -65,6 +65,19 @@ mode `0600`. Every new directory component uses `0700`; existing caller parents
 are never chmodded. Controlled subprocess tests cover caller masks `000` and
 `777` without changing the test parent's or global umask.
 
+Production options default to `network_mode="no-network"` with `allowed_hosts`
+absent or an empty list. An explicit `network_mode="allowlist"` requires one to
+32 unique canonical exact DNS names or IP addresses in `allowed_hosts`; each
+entry is bounded to 253 ASCII bytes. Wildcards, CIDR ranges, URLs, credentials,
+ports, paths, IPv6 scope identifiers and noncanonical IP spellings are refused.
+DNS fallback also refuses numeric or hex-numeric final labels, including legacy
+IPv4 aliases such as `127.1` and `0x7f000001`; names such as `123.api.example.com`
+remain valid. Both reader arms receive
+the same selected environment and agent policy. The separate verifier retains
+explicit `no-network` in both its environment and phase, with no inherited host
+list. The synthetic interface retains its offline policy. Config parsing does
+not qualify container egress, authentication or a native trial.
+
 The task tree is:
 
 ```text
