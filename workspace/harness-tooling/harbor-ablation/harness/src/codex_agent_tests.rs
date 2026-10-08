@@ -1010,3 +1010,105 @@ mod generation {
         }
     }
 }
+#[test]
+fn treatment_tool_events_project_pinned_search_and_read_without_raw_contents() {
+    let pin = gptgrep_core::GenerationPin {
+        generation: "generic-generation".into(),
+        manifest_sha256: "a".repeat(64),
+    };
+    let context = ToolContext {
+        root: "/app/groups/group-a/raw".into(),
+        pin: pin.clone(),
+    };
+    let window = json!({"text":"PRIVATE_GENERIC_DOCUMENT_TEXT","next_offset":null,"evidence":{"kind":"native_text","binding":{"generation":pin,"source_sha256":"b".repeat(64),"artifact_sha256":"c".repeat(64)}}});
+    let response = json!({"schema_version":"gptgrep.batch.rich.response.v1","generation":pin,"execution":{"scope":"local_deterministic_no_model_context","model_submissions":0},"items":[{"id":"search","status":"ok","error":null,"coverage":{"unit":"bounded_search_hits"},"result":{"hits":[window.clone()]}},{"id":"read","status":"ok","coverage":{"unit":"bytes"},"result":window}]});
+    let command =
+        "/app/tool/gptgrep batch --rich --root /app/groups/group-a/raw --input /app/request.json";
+    let item = json!({"id":"private-native-item-id","type":"command_execution","status":"completed","exit_code":0,"command":command,"aggregated_output":response.to_string()});
+    let mut events = Events {
+        tool_context: Some(context),
+        ..Events::default()
+    };
+    events
+        .line(&serde_json::to_vec(&json!({"type":"item.completed","item":item})).unwrap())
+        .unwrap();
+    let projection: Value = serde_json::from_slice(&events.projected).unwrap();
+    assert_eq!(projection["tool_use"]["native_text_searches"], 1);
+    assert_eq!(projection["tool_use"]["native_text_reads"], 1);
+    assert_eq!(projection["tool_use"]["native_text_windows"], 2);
+    assert_eq!(
+        projection["tool_use"]["output_sha256"],
+        sha(response.to_string().as_bytes())
+    );
+    let serialized = String::from_utf8(events.projected).unwrap();
+    assert!(!serialized.contains(command));
+    assert!(!serialized.contains("PRIVATE_GENERIC_DOCUMENT_TEXT"));
+    assert!(!serialized.contains("private-native-item-id"));
+}
+
+#[test]
+fn bounded_direct_tool_command_rejects_discovery_echo_chains_and_substitution() {
+    let root = "/app/groups/group-a/raw";
+    let command = format!("/app/tool/gptgrep batch --rich --root {root} --input /app/request.json");
+    for valid in [
+        command.clone(),
+        format!("/bin/bash -lc '{command}'"),
+        format!("/bin/zsh -lc \"{command}\""),
+        format!("/app/tool/gptgrep batch --input /app/request.json --root {root} --rich"),
+    ] {
+        assert!(pinned_batch_command(&valid, root), "{valid}");
+    }
+    for invalid in [
+        "/app/tool/gptgrep --schema".into(),
+        format!("echo {command}"),
+        format!("{command}; echo done"),
+        command.replace("/app/request.json", "$(echo /app/request.json)"),
+        command.replace("/app/request.json", "/app/../outside"),
+        command.replace(root, "/app/groups/other/raw"),
+        "x".repeat(8193),
+    ] {
+        assert!(!pinned_batch_command(&invalid, root), "{invalid}");
+    }
+}
+
+#[test]
+fn tool_observation_never_promotes_baseline_failure_foreign_pin_or_metadata() {
+    let pin = gptgrep_core::GenerationPin {
+        generation: "generic-generation".into(),
+        manifest_sha256: "a".repeat(64),
+    };
+    let context = ToolContext {
+        root: "/app/groups/group-a/raw".into(),
+        pin: pin.clone(),
+    };
+    let response = json!({"schema_version":"gptgrep.batch.rich.response.v1","generation":pin,"execution":{"scope":"local_deterministic_no_model_context","model_submissions":0},"items":[{"id":"search","status":"ok","coverage":{"unit":"bounded_search_hits"},"result":{"hits":[]}}]});
+    let item = json!({"id":"item","type":"command_execution","status":"completed","exit_code":0,"command":"/app/tool/gptgrep batch --rich --root /app/groups/group-a/raw --input /app/request.json","aggregated_output":response.to_string()});
+    assert_eq!(
+        tool_projection(&item, &context).unwrap()["native_text_windows"],
+        0
+    );
+    let mut baseline = Events::default();
+    baseline
+        .line(&serde_json::to_vec(&json!({"type":"item.completed","item":item.clone()})).unwrap())
+        .unwrap();
+    assert!(serde_json::from_slice::<Value>(&baseline.projected).unwrap()["tool_use"].is_null());
+    for (key, value) in [
+        ("exit_code", json!(2)),
+        ("exit_code", json!(false)),
+        ("status", json!("failed")),
+        ("aggregated_output", json!("malformed")),
+    ] {
+        let mut bad = item.clone();
+        bad[key] = value;
+        assert!(tool_projection(&bad, &context).is_none());
+    }
+    let mut foreign = response.clone();
+    foreign["generation"]["generation"] = json!("other");
+    let mut bad = item.clone();
+    bad["aggregated_output"] = json!(foreign.to_string());
+    assert!(tool_projection(&bad, &context).is_none());
+    let mut metadata = response;
+    metadata["items"][0]["coverage"]["unit"] = json!("objects");
+    bad["aggregated_output"] = json!(metadata.to_string());
+    assert!(tool_projection(&bad, &context).is_none());
+}

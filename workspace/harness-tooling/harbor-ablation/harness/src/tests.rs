@@ -1095,6 +1095,35 @@ mod production {
         Ok(())
     }
     #[tokio::test]
+    async fn production_treatment_guidance_is_bound_and_baseline_stays_raw_only() -> Result<()> {
+        let f = ProductionFixture::new().await?;
+        let out = f.base.join("tool-guidance-readers");
+        f.export(&out);
+        let question = "What material is named?";
+        let baseline = fs::read(out.join("control/task-a/instruction.md"))?;
+        assert_eq!(baseline, format!("{question}\n\nRead the raw PDF groups named in /app/reader-input.json. Write only {{\"answer\":\"...\"}} to /app/answer.json.\n").into_bytes());
+        let treatment = fs::read(out.join("gptgrep/task-a/instruction.md"))?;
+        assert!(treatment.starts_with(&baseline));
+        assert!(
+            String::from_utf8(treatment)?
+                .contains("/app/tool/gptgrep batch --rich --root ROOT --input FILE")
+        );
+        assert!(!out.join("control/task-a/environment/tool").exists());
+        // Refresh editable inventory, so the instruction comparison is the discriminator.
+        let name = "gptgrep/task-a/instruction.md";
+        fs::write(out.join(name), &baseline)?;
+        let manifest_path = out.join("export-manifest.json");
+        let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+        manifest["files"][name] = json!(hash(&baseline));
+        save(&manifest_path, &manifest)?;
+        assert_eq!(
+            production_export::validate(&out).err().unwrap(),
+            "production_instruction_binding"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn production_bridge_fixture_if_selected() -> Result<()> {
         let f = ProductionFixture::new().await?;
         let Some(output) = std::env::var_os("GPTGREP_PRODUCTION_BRIDGE_FIXTURE") else {

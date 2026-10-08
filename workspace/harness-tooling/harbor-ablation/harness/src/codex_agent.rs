@@ -305,6 +305,12 @@ struct Admitted {
     control_sha256: String,
     schema: Vec<u8>,
     prompt: Option<Vec<u8>>,
+    tool_context: Option<ToolContext>,
+}
+
+struct ToolContext {
+    root: String,
+    pin: gptgrep_core::GenerationPin,
 }
 
 fn fresh_outputs(control: &Control, phase_reserved: bool) -> Result<()> {
@@ -784,6 +790,21 @@ fn admit(path: &Path, expected: &str, run: bool) -> Result<Admitted> {
     }
     fresh_outputs(&control, false)?;
     verify_raw_inputs(&control)?;
+    // These are the same hash-bound references whose complete generation was
+    // verified above. They qualify custody, not external operator capabilities.
+    let tool_context = control
+        .treatment_capabilities
+        .as_ref()
+        .map(|reference| {
+            let refs: CapabilityReferences =
+                serde_json::from_slice(&asset(reference, 65_536, false)?)
+                    .map_err(|_| "capability_schema")?;
+            Ok::<ToolContext, &'static str>(ToolContext {
+                root: control.raw_dir.to_string_lossy().into_owned(),
+                pin: refs.generation_binding.pin,
+            })
+        })
+        .transpose()?;
     executable(&control.runtime)?;
     let schema = asset(&control.answer_schema, 65_536, false)?;
     let schema_value: Value = serde_json::from_slice(&schema).map_err(|_| "answer_schema")?;
@@ -815,6 +836,7 @@ fn admit(path: &Path, expected: &str, run: bool) -> Result<Admitted> {
         control_sha256: expected.to_owned(),
         schema,
         prompt,
+        tool_context,
     })
 }
 
@@ -873,6 +895,167 @@ struct Events {
     active_turn: bool,
     failed: bool,
     projected: Vec<u8>,
+    tool_context: Option<ToolContext>,
+}
+
+fn command_words(command: &str) -> Option<Vec<String>> {
+    if command.len() > 8192
+        || command.contains(['$', '`', ';', '|', '&', '<', '>', '\n', '\r', '\0'])
+    {
+        return None;
+    }
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for c in command.chars() {
+        if escaped {
+            word.push(c);
+            escaped = false;
+            continue;
+        }
+        if c == '\\' && quote != Some('\'') {
+            escaped = true;
+            continue;
+        }
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            } else {
+                word.push(c);
+            }
+        } else if c == '\'' || c == '"' {
+            quote = Some(c);
+        } else if c.is_ascii_whitespace() {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+        } else {
+            word.push(c);
+        }
+    }
+    if quote.is_some() || escaped {
+        return None;
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    Some(words)
+}
+
+fn pinned_batch_command(command: &str, root: &str) -> bool {
+    let Some(mut args) = command_words(command) else {
+        return false;
+    };
+    if args.len() == 3
+        && ["/bin/bash", "/bin/sh", "/bin/zsh", "bash", "sh", "zsh"].contains(&args[0].as_str())
+        && ["-c", "-lc"].contains(&args[1].as_str())
+    {
+        let Some(inner) = command_words(&args[2]) else {
+            return false;
+        };
+        args = inner;
+    }
+    if args.len() != 7 || args[0] != "/app/tool/gptgrep" || args[1] != "batch" {
+        return false;
+    }
+    let mut options = BTreeMap::new();
+    let mut i = 2;
+    while i < args.len() {
+        let key = &args[i];
+        if options.contains_key(key) {
+            return false;
+        }
+        if key == "--rich" {
+            options.insert(key.clone(), String::new());
+            i += 1;
+        } else if ["--root", "--input"].contains(&key.as_str()) && i + 1 < args.len() {
+            options.insert(key.clone(), args[i + 1].clone());
+            i += 2;
+        } else {
+            return false;
+        }
+    }
+    let Some(input) = options.get("--input") else {
+        return false;
+    };
+    options.contains_key("--rich")
+        && options.get("--root").is_some_and(|v| v == root)
+        && input.starts_with("/app/")
+        && !input.contains('\\')
+        && Path::new(input)
+            .components()
+            .all(|v| matches!(v, Component::RootDir | Component::Normal(_)))
+}
+
+fn tool_projection(item: &Value, context: &ToolContext) -> Option<Value> {
+    if item["type"] != "command_execution"
+        || item["status"] != "completed"
+        || item["exit_code"].as_i64() != Some(0)
+    {
+        return None;
+    }
+    let command = item["command"].as_str()?;
+    if !pinned_batch_command(command, &context.root) {
+        return None;
+    }
+    let output = item["aggregated_output"].as_str()?;
+    if output.len() > 1_048_576 {
+        return None;
+    }
+    let value: Value = serde_json::from_str(output).ok()?;
+    let pin = serde_json::to_value(&context.pin).ok()?;
+    if value["schema_version"] != "gptgrep.batch.rich.response.v1"
+        || value["generation"] != pin
+        || value["execution"]
+            != json!({"scope":"local_deterministic_no_model_context","model_submissions":0})
+    {
+        return None;
+    }
+    let items = value["items"].as_array()?;
+    if items.is_empty() || items.len() > 64 {
+        return None;
+    }
+    let window = |w: &Value| {
+        w["text"].is_string()
+            && w["evidence"]["kind"] == "native_text"
+            && w["evidence"]["binding"]["generation"] == pin
+            && ["source_sha256", "artifact_sha256"].iter().all(|key| {
+                w["evidence"]["binding"][key]
+                    .as_str()
+                    .is_some_and(digest_shape)
+            })
+    };
+    let (mut reads, mut searches, mut windows) = (0, 0, 0);
+    for item in items {
+        if item["status"] != "ok" || !item["error"].is_null() {
+            continue;
+        }
+        match item["coverage"]["unit"].as_str() {
+            Some("bytes") if window(&item["result"]) => {
+                reads += 1;
+                windows += 1;
+            }
+            Some("bounded_search_hits") => {
+                if let Some(hits) = item["result"]["hits"]
+                    .as_array()
+                    .filter(|v| v.len() <= 200 && v.iter().all(window))
+                {
+                    searches += 1;
+                    windows += hits.len();
+                }
+            }
+            _ => {}
+        }
+    }
+    if reads + searches == 0 {
+        return None;
+    }
+    Some(json!({"schema_version":"gptgrep.harbor.tool_use_item.v1",
+        "scope":"native_command_event_and_typed_output_observation_only",
+        "raw_root_sha256":sha(context.root.as_bytes()),"generation":context.pin,
+        "command_sha256":sha(command.as_bytes()),"output_sha256":sha(output.as_bytes()),
+        "native_text_reads":reads,"native_text_searches":searches,"native_text_windows":windows}))
 }
 
 impl Events {
@@ -952,6 +1135,14 @@ impl Events {
                 self.item_ids.insert(id.to_owned());
                 self.observations.unique_items = self.item_ids.len();
                 projection["item_id_sha256"] = Value::String(sha(id.as_bytes()));
+                if kind == "item.completed"
+                    && let Some(tool) = self
+                        .tool_context
+                        .as_ref()
+                        .and_then(|context| tool_projection(&value["item"], context))
+                {
+                    projection["tool_use"] = tool;
+                }
             }
             "turn.failed" | "error" => {
                 self.failed = true;
@@ -1100,7 +1291,10 @@ fn execute(admitted: Admitted) -> Result<Value> {
     let mut stdout_hash = Sha256::new();
     let mut stderr_hash = Sha256::new();
     let mut line = Vec::new();
-    let mut events = Events::default();
+    let mut events = Events {
+        tool_context: admitted.tool_context,
+        ..Events::default()
+    };
     let mut eof = [false, false];
     let mut exit = None;
     while failure.is_none() && !(exit.is_some() && eof.iter().all(|v| *v)) {

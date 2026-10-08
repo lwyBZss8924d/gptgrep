@@ -241,6 +241,30 @@ class ProductionPackagingTests(unittest.TestCase):
             self.compose()
         self.assertFalse(self.package.exists())
 
+    def test_treatment_tool_guidance_and_same_question_raw_config(self):
+        self.compose()
+        baseline = (self.package / "control/task-a/instruction.md").read_bytes()
+        treatment = (self.package / "gptgrep/task-a/instruction.md").read_bytes()
+        self.assertTrue(treatment.startswith(baseline))
+        self.assertNotIn(b"/app/tool/gptgrep", baseline)
+        self.assertIn(b"/app/tool/gptgrep batch --rich --root ROOT --input FILE", treatment)
+        for name in ("reader-input.json", "codex-config.json"):
+            a = (self.package / "control/task-a/environment" / name).read_bytes()
+            b = (self.package / "gptgrep/task-a/environment" / name).read_bytes()
+            if name == "reader-input.json":
+                a, b = json.loads(a), json.loads(b)
+                a.pop("arm"); b.pop("arm")
+            self.assertEqual(a, b)
+
+    def test_self_consistent_treatment_guidance_removal_and_baseline_insertion_denied(self):
+        for arm, replacement in (("gptgrep", "control"), ("control", "gptgrep")):
+            self.fresh_case(f"guidance-{arm}")
+            payload = (self.readers / replacement / "task-a/instruction.md").read_bytes()
+            self.tamper_reader_payload(f"{arm}/task-a/instruction.md", payload)
+            with self.assertRaisesRegex(ValueError, "production_instruction_binding"):
+                self.compose()
+            self.assertFalse(self.package.exists())
+
     def test_self_consistent_reader_input_changes_and_gold_extension_are_denied(self):
         mutations = {
             "question": lambda value: value.update(question="Changed ordinary question"),
@@ -495,6 +519,75 @@ class ProductionPackagingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "production_exact_reader_namespace"):
             self.compose()
         self.assertFalse(self.package.exists())
+
+
+class ToolObservationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=SCRATCH)
+        self.root = Path(self.temp.name)
+        self.pin = {"generation": "generic-generation", "manifest_sha256": "a" * 64}
+        self.pin_path = self.root / "pin.json"
+        self.pin_path.write_text(json.dumps(self.pin))
+        self.events = self.root / "events.jsonl"
+        self.raw_root = "/app/groups/group-a/raw"
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def item(self, identity="b" * 64):
+        return {"type": "item.completed", "item_id_sha256": identity,
+                "tool_use": {"schema_version": "gptgrep.harbor.tool_use_item.v1",
+                             "scope": "native_command_event_and_typed_output_observation_only",
+                             "generation": self.pin, "raw_root_sha256": bridge.digest(self.raw_root.encode()),
+                             "command_sha256": "c" * 64, "output_sha256": "d" * 64,
+                             "native_text_reads": 0, "native_text_searches": 1, "native_text_windows": 2}}
+
+    def observe(self, events):
+        self.events.write_bytes(b"".join(json.dumps(event).encode() + b"\n" for event in events))
+        return bridge.observe_tool_use(self.events, self.pin_path, self.raw_root)
+
+    def test_typed_projections_deduplicated_and_no_raw_payload_reward(self):
+        first = self.item(); second = self.item("e" * 64)
+        result = self.observe([first, first, second])
+        self.assertEqual(result["pinned_batch_invocations"], 2)
+        self.assertEqual(result["native_text_windows"], 4)
+        self.assertTrue(result["pinned_retrieval_observed"])
+        self.assertFalse(result["physical_execution_attested"])
+        self.assertIsNone(result["reward"])
+        self.assertNotIn("command", result)
+
+    def test_legacy_projection_and_static_prelude_never_infer_tool_use(self):
+        result = self.observe([{"type": "item.completed", "item_id_sha256": "b" * 64},
+                               {"type": "item.completed", "item_id_sha256": "e" * 64, "helper_prelude": "static text"}])
+        self.assertFalse(result["pinned_retrieval_observed"])
+        self.assertFalse(result["helper_invocations_inferred"])
+
+    def test_pin_root_type_unknownfield_and_identity_bindings_refuse(self):
+        for mutation in (lambda x: x["tool_use"].update(generation={"generation": "other", "manifest_sha256": "a" * 64}),
+                         lambda x: x["tool_use"].update(raw_root_sha256="f" * 64),
+                         lambda x: x["tool_use"].update(native_text_reads=True),
+                         lambda x: x["tool_use"].update(native_text_searches=65),
+                         lambda x: x["tool_use"].update(raw_command="forbidden"),
+                         lambda x: x.update(item_id_sha256="malformed")):
+            value = self.item(); mutation(value)
+            with self.assertRaisesRegex(ValueError, "tool_projection_binding"):
+                self.observe([value])
+        changed = self.item(); changed["tool_use"]["output_sha256"] = "e" * 64
+        with self.assertRaisesRegex(ValueError, "tool_item_redefinition"):
+            self.observe([self.item(), changed])
+
+    def test_ambiguous_oversized_and_symlink_input_refused(self):
+        for raw in (b'{"type":"item.completed","type":"error"}\n', b'{"value":NaN}\n', b'{"nested":{"x":1e999}}\n', b"x" * 65537):
+            self.events.write_bytes(raw)
+            with self.assertRaises(ValueError):
+                bridge.observe_tool_use(self.events, self.pin_path, self.raw_root)
+        with self.events.open("wb") as file:
+            file.truncate(1024 * 1024 + 1)
+        with self.assertRaises(ValueError):
+            bridge.observe_tool_use(self.events, self.pin_path, self.raw_root)
+        self.events.unlink(); self.events.symlink_to(self.pin_path)
+        with self.assertRaises(OSError):
+            bridge.observe_tool_use(self.events, self.pin_path, self.raw_root)
 
 
 if __name__ == "__main__":

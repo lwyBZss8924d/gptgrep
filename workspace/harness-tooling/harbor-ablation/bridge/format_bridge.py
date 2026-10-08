@@ -5,6 +5,7 @@ import json
 import math
 import ipaddress
 import os
+import re
 from importlib.metadata import version
 from pathlib import Path, PurePosixPath
 
@@ -301,6 +302,15 @@ def production_reader_dockerfile(options, groups, scope, arm):
     return (docker + f"USER {uid}:{gid}\n").encode()
 
 
+def production_instruction(question, arm):
+    instruction = (question + '\n\nRead the raw PDF groups named in /app/reader-input.json. '
+                   'Write only {"answer":"..."} to /app/answer.json.\n')
+    if arm == "gptgrep":
+        instruction += (
+            '\nGPTgrep retrieval is available at /app/tool/gptgrep. Discover its command and request contracts with /app/tool/gptgrep --schema and /app/tool/gptgrep --llms. For each relevant group named in /app/reader-input.json, read its canonical_root and exact generation pin from /app/prebuild-seals/GROUP/receipt.json and /app/prebuild-seals/GROUP/pin.json. Use the pinned rich batch interface to retrieve document evidence: save a bounded JSON request to a file and invoke /app/tool/gptgrep batch --rich --root ROOT --input FILE as a direct command. Use inspect_documents and inspect_pages to discover artifact identifiers, then search_artifacts and read_artifact for relevant native text. Preserve the exact generation pin and continuation cursors, respect the documented operation/output limits, and inspect coverage and errors. The tool and prebuilt generation are local retrieval resources; they do not supply a verified answer or an interactive model helper. Native PDF tools remain available.\n')
+    return instruction.encode("utf-8")
+
+
 def production_reader_namespace(manifest, files):
     option_bytes = small_bytes(files["frozen-options.json"])
     options = production_json(option_bytes)
@@ -352,9 +362,7 @@ def production_reader_namespace(manifest, files):
                     or not isinstance(reader_input["question"], str) or not reader_input["question"] \
                     or digest(reader_input["question"].encode("utf-8")) != task["question_sha256"]:
                 raise ValueError("production_reader_input_binding")
-            expected_instruction = (
-                reader_input["question"] + '\n\nRead the raw PDF groups named in /app/reader-input.json. '
-                'Write only {"answer":"..."} to /app/answer.json.\n').encode("utf-8")
+            expected_instruction = production_instruction(reader_input["question"], arm)
             if small_bytes(files[f"{prefix}/instruction.md"]) != expected_instruction:
                 raise ValueError("production_instruction_binding")
             expected.update(f"{prefix}/{name}" for name in (
@@ -672,6 +680,66 @@ def validate(root):
     return {"valid": True, "execution_qualified": False, "task_count": sum(map(len, receipt["task_refs"].values()))}
 
 
+def observe_tool_use(events_path, pin_path, root):
+    """Summarize the launcher's bounded safe projections, not raw native output.
+
+    Presence is observational evidence only, never reward or an attestation
+    against a process fabricating command output. Static helper text is excluded.
+    """
+    pin = production_json(regular(pin_path, 1024))
+    if not isinstance(pin, dict) or set(pin) != {"generation", "manifest_sha256"} \
+            or not isinstance(pin["generation"], str) or not pin["generation"] \
+            or not isinstance(pin["manifest_sha256"], str) or re.fullmatch("[0-9a-f]{64}", pin["manifest_sha256"]) is None:
+        raise ValueError("tool_pin")
+    path = PurePosixPath(root)
+    if not path.is_absolute() or str(path) != root or ".." in path.parts or "\\" in root or "\0" in root:
+        raise ValueError("tool_root")
+    data = regular(events_path, 1024 * 1024)
+    frames = data.splitlines()
+    if len(frames) > 16384:
+        raise ValueError("tool_events_limit")
+    completed = {}
+    reads = searches = windows = 0
+    keys = {"schema_version", "scope", "raw_root_sha256", "generation", "command_sha256", "output_sha256",
+            "native_text_reads", "native_text_searches", "native_text_windows"}
+    for line in frames:
+        if len(line) > 65536:
+            raise ValueError("tool_frame_limit")
+        event = production_json(line)
+        if not isinstance(event, dict):
+            raise ValueError("tool_event_object")
+        tool = event.get("tool_use")
+        if tool is None:
+            continue
+        identity = event.get("item_id_sha256")
+        if event.get("type") != "item.completed" or not isinstance(identity, str) or re.fullmatch("[0-9a-f]{64}", identity) is None \
+                or not isinstance(tool, dict) or set(tool) != keys \
+                or tool["schema_version"] != "gptgrep.harbor.tool_use_item.v1" \
+                or tool["scope"] != "native_command_event_and_typed_output_observation_only" \
+                or tool["generation"] != pin or tool["raw_root_sha256"] != digest(root.encode("utf-8")) \
+                or any(not isinstance(tool[k], str) or re.fullmatch("[0-9a-f]{64}", tool[k]) is None
+                       for k in ("command_sha256", "output_sha256")) \
+                or any(type(tool[k]) is not int or not 0 <= tool[k] <= 12800
+                       for k in ("native_text_reads", "native_text_searches", "native_text_windows")) \
+                or not 1 <= tool["native_text_reads"] + tool["native_text_searches"] <= 64:
+            raise ValueError("tool_projection_binding")
+        if identity in completed:
+            if completed[identity] != tool:
+                raise ValueError("tool_item_redefinition")
+            continue
+        completed[identity] = tool
+        reads += tool["native_text_reads"]
+        searches += tool["native_text_searches"]
+        windows += tool["native_text_windows"]
+    return {"schema_version": "gptgrep.harbor.tool_use_observation.v1",
+            "scope": "native_command_event_and_typed_output_observation_only",
+            "events_sha256": digest(data), "events_bytes": len(data), "event_count": len(frames),
+            "pinned_batch_invocations": len(completed), "native_text_reads": reads,
+            "native_text_searches": searches, "native_text_windows": windows,
+            "pinned_retrieval_observed": bool(completed), "reward": None,
+            "physical_execution_attested": False, "helper_invocations_inferred": False}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     command = parser.add_subparsers(dest="command", required=True)
@@ -681,8 +749,17 @@ def main():
     writer.add_argument("--output-dir", required=True)
     checker = command.add_parser("validate")
     checker.add_argument("--export-dir", required=True)
+    observer = command.add_parser("observe-tool-use")
+    observer.add_argument("--events", required=True)
+    observer.add_argument("--pin", required=True)
+    observer.add_argument("--root", required=True)
     args = parser.parse_args()
-    result = compose(args.readers, args.graders, args.output_dir) if args.command == "compose" else validate(args.export_dir)
+    if args.command == "compose":
+        result = compose(args.readers, args.graders, args.output_dir)
+    elif args.command == "validate":
+        result = validate(args.export_dir)
+    else:
+        result = observe_tool_use(args.events, args.pin, args.root)
     print(json.dumps(result, sort_keys=True))
 
 

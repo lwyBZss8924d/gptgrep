@@ -1382,6 +1382,18 @@ mod network_policy_tests {
         )));
     }
 }
+pub(super) fn reader_instruction(question: &str, arm: &str) -> Vec<u8> {
+    let mut instruction = format!(
+        "{question}\n\nRead the raw PDF groups named in /app/reader-input.json. Write only {{\"answer\":\"...\"}} to /app/answer.json.\n"
+    );
+    if arm == "gptgrep" {
+        instruction.push_str(
+            "\nGPTgrep retrieval is available at /app/tool/gptgrep. Discover its command and request contracts with /app/tool/gptgrep --schema and /app/tool/gptgrep --llms. For each relevant group named in /app/reader-input.json, read its canonical_root and exact generation pin from /app/prebuild-seals/GROUP/receipt.json and /app/prebuild-seals/GROUP/pin.json. Use the pinned rich batch interface to retrieve document evidence: save a bounded JSON request to a file and invoke /app/tool/gptgrep batch --rich --root ROOT --input FILE as a direct command. Use inspect_documents and inspect_pages to discover artifact identifiers, then search_artifacts and read_artifact for relevant native text. Preserve the exact generation pin and continuation cursors, respect the documented operation/output limits, and inspect coverage and errors. The tool and prebuilt generation are local retrieval resources; they do not supply a verified answer or an interactive model helper. Native PDF tools remain available.\n",
+        );
+    }
+    instruction.into_bytes()
+}
+
 fn reader_dockerfile(
     o: &Options,
     groups: &[GroupBinding],
@@ -1525,7 +1537,10 @@ pub(super) fn prepare(
         }
         for arm in ["control", "gptgrep"] {
             let prefix = format!("{arm}/{}", t.id);
-            plan.put(format!("{prefix}/instruction.md"),Payload::Bytes(format!("{}\n\nRead the raw PDF groups named in /app/reader-input.json. Write only {{\"answer\":\"...\"}} to /app/answer.json.\n",t.question).into_bytes()))?;
+            plan.put(
+                format!("{prefix}/instruction.md"),
+                Payload::Bytes(reader_instruction(&t.question, arm)),
+            )?;
             plan.put(format!("{prefix}/environment/reader-input.json"),Payload::Bytes(json(&value!({"schema_version":"gptgrep.harbor.production-reader-input.v1","task_id":t.id,"question":t.question,"question_sha256":t.question_sha256,"group_scope":t.group_scope,"arm":arm}))?))?;
             plan.put(
                 format!("{prefix}/environment/codex-config.json"),
@@ -1685,6 +1700,14 @@ pub(super) fn validate(root: &Path) -> Result<(Manifest, String)> {
                     ) != t.question_sha256
                 {
                     return Err("production_input_binding".into());
+                }
+                if super::regular_bytes(&root.join(&prefix).join("instruction.md"), MAX_JSON)?
+                    != reader_instruction(
+                        input["question"].as_str().ok_or("production_question")?,
+                        arm,
+                    )
+                {
+                    return Err("production_instruction_binding".into());
                 }
                 let mut expected_raw = BTreeMap::new();
                 for id in &t.group_scope {
