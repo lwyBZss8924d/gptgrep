@@ -44,6 +44,7 @@ pub(crate) async fn run<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         frame_limit: usize::try_from(page.task.budget.frame_bytes)?,
         deadline,
         transport,
+        metadata: AutomaticMetadata::default(),
     };
     rpc.request(1, "initialize", json!({"clientInfo":{"name":"gptgrep_ocr","title":"GPTgrep bounded OCR","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true,"explicitGatewayOauth":true}})).await?;
     rpc.send(json!({"method":"initialized"})).await?;
@@ -172,6 +173,9 @@ pub(crate) async fn run<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 "ocr_turn_start_rejected_or_unexpected_response"
             );
             bind_turn(&mut turn_id, &message["result"]["turn"]["id"])?;
+            continue;
+        }
+        if rpc.metadata.observe(&message)? {
             continue;
         }
         match message["method"].as_str() {
@@ -351,6 +355,7 @@ struct OcrRpc<R, W> {
     frame_limit: usize,
     deadline: tokio::time::Instant,
     transport: TransportBudget,
+    metadata: AutomaticMetadata,
 }
 impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> OcrRpc<R, W> {
     async fn send(&mut self, value: Value) -> Result<()> {
@@ -426,6 +431,9 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> OcrRpc<R, W> {
                     self.deny(server_id.clone()).await?;
                     return Err(anyhow!("ocr_unapproved_startup_request"));
                 }
+                if self.metadata.observe(&reply)? {
+                    continue;
+                }
                 ensure!(
                     !matches!(
                         reply["method"].as_str(),
@@ -445,6 +453,198 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> OcrRpc<R, W> {
                 .ok_or_else(|| anyhow!("ocr_startup_result_missing"));
         }
     }
+}
+
+/// Official 0.161.0 automatic metadata is validated and discarded, never used as
+/// model, quota, pricing or image-capability evidence. One counter covers all RPC
+/// startup waits and the active turn; no values are retained in the OCR outcome.
+#[derive(Default)]
+struct AutomaticMetadata {
+    notifications: usize,
+}
+
+impl AutomaticMetadata {
+    fn observe(&mut self, message: &Value) -> Result<bool> {
+        let method = message["method"].as_str();
+        if !matches!(
+            method,
+            Some("account/updated" | "account/rateLimits/updated" | "remoteControl/status/changed")
+        ) {
+            return Ok(false);
+        }
+        ensure!(
+            message.get("id").is_none(),
+            "ocr_automatic_metadata_server_request"
+        );
+        ensure!(self.notifications < 32, "ocr_automatic_metadata_limit");
+        let params = &message["params"];
+        match method {
+            Some("account/updated") => {
+                metadata_object(params, &["authMode"], &["authMode", "planType"])?;
+                ensure!(
+                    params["authMode"] == "chatgpt",
+                    "ocr_native_chatgpt_auth_required"
+                );
+                ensure!(
+                    nullable_enum(&params["planType"], PLAN_TYPES),
+                    "ocr_invalid_automatic_metadata"
+                );
+            }
+            Some("remoteControl/status/changed") => {
+                metadata_object(
+                    params,
+                    &["installationId", "serverName", "status"],
+                    &["installationId", "serverName", "status", "environmentId"],
+                )?;
+                ensure!(
+                    params["installationId"].is_string()
+                        && params["serverName"].is_string()
+                        && nullable_string(&params["environmentId"]),
+                    "ocr_invalid_automatic_metadata"
+                );
+                ensure!(
+                    params["status"] == "disabled",
+                    "ocr_remote_control_not_disabled"
+                );
+            }
+            Some("account/rateLimits/updated") => validate_rate_metadata(params)?,
+            _ => unreachable!(),
+        }
+        self.notifications += 1;
+        Ok(true)
+    }
+}
+
+// Public enum values from the installed official AccountUpdatedNotification and
+// AccountRateLimitsUpdatedNotification DTOs. These are syntax, not entitlement.
+const PLAN_TYPES: &[&str] = &[
+    "free",
+    "go",
+    "plus",
+    "pro",
+    "prolite",
+    "promax",
+    "team",
+    "self_serve_business_prolite",
+    "self_serve_business_usage_based",
+    "business",
+    "ent26",
+    "enterprise_cbp_automation",
+    "enterprise_cbp_usage_based",
+    "enterprise",
+    "edu",
+    "edu_plus",
+    "edu_pro",
+    "unknown",
+];
+const RATE_REACHED_TYPES: &[&str] = &[
+    "rate_limit_reached",
+    "workspace_owner_credits_depleted",
+    "workspace_member_credits_depleted",
+    "workspace_owner_usage_limit_reached",
+    "workspace_member_usage_limit_reached",
+];
+
+fn metadata_object<'a>(
+    value: &'a Value,
+    required: &[&str],
+    allowed: &[&str],
+) -> Result<&'a serde_json::Map<String, Value>> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("ocr_invalid_automatic_metadata"))?;
+    ensure!(
+        required.iter().all(|key| object.contains_key(*key))
+            && object.keys().all(|key| allowed.contains(&key.as_str())),
+        "ocr_invalid_automatic_metadata"
+    );
+    Ok(object)
+}
+fn nullable_string(value: &Value) -> bool {
+    value.is_null() || value.is_string()
+}
+fn nullable_enum(value: &Value, allowed: &[&str]) -> bool {
+    value.is_null() || value.as_str().is_some_and(|name| allowed.contains(&name))
+}
+fn metadata_i32(value: &Value) -> bool {
+    value.as_i64().is_some_and(|n| i32::try_from(n).is_ok())
+}
+fn validate_rate_metadata(params: &Value) -> Result<()> {
+    metadata_object(params, &["rateLimits"], &["rateLimits"])?;
+    let rates = &params["rateLimits"];
+    metadata_object(
+        rates,
+        &[],
+        &[
+            "credits",
+            "individualLimit",
+            "limitId",
+            "limitName",
+            "normalModelSlug",
+            "planType",
+            "primary",
+            "rateLimitReachedType",
+            "secondary",
+            "spendControlReached",
+        ],
+    )?;
+    ensure!(
+        ["limitId", "limitName", "normalModelSlug"]
+            .iter()
+            .all(|key| nullable_string(&rates[*key]))
+            && nullable_enum(&rates["planType"], PLAN_TYPES)
+            && nullable_enum(&rates["rateLimitReachedType"], RATE_REACHED_TYPES)
+            && (rates["spendControlReached"].is_null()
+                || rates["spendControlReached"].is_boolean()),
+        "ocr_invalid_automatic_metadata"
+    );
+    for name in ["primary", "secondary"] {
+        let window = &rates[name];
+        if !window.is_null() {
+            metadata_object(
+                window,
+                &["usedPercent"],
+                &["usedPercent", "resetsAt", "windowDurationMins"],
+            )?;
+            ensure!(
+                metadata_i32(&window["usedPercent"])
+                    && ["resetsAt", "windowDurationMins"]
+                        .iter()
+                        .all(|key| window[*key].is_null() || window[*key].is_i64()),
+                "ocr_invalid_automatic_metadata"
+            );
+        }
+    }
+    let credits = &rates["credits"];
+    if !credits.is_null() {
+        metadata_object(
+            credits,
+            &["hasCredits", "unlimited"],
+            &["hasCredits", "unlimited", "balance"],
+        )?;
+        ensure!(
+            credits["hasCredits"].is_boolean()
+                && credits["unlimited"].is_boolean()
+                && nullable_string(&credits["balance"]),
+            "ocr_invalid_automatic_metadata"
+        );
+    }
+    let limit = &rates["individualLimit"];
+    if !limit.is_null() {
+        metadata_object(
+            limit,
+            &["limit", "used", "remainingPercent", "resetsAt"],
+            &["limit", "used", "remainingPercent", "resetsAt"],
+        )?;
+        ensure!(
+            limit["limit"].is_string()
+                && limit["used"].is_string()
+                && metadata_i32(&limit["remainingPercent"])
+                && limit["resetsAt"].is_i64(),
+            "ocr_invalid_automatic_metadata"
+        );
+    }
+    Ok(())
 }
 
 struct BoundedBytes {
@@ -470,6 +670,294 @@ impl Write for BoundedBytes {
 }
 
 #[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    fn notice(method: &str, params: Value) -> Value {
+        json!({"method":method,"params":params})
+    }
+
+    fn full_rates() -> Value {
+        json!({"rateLimits":{
+            "limitId":"MOCK-private-limit", "limitName":"MOCK-private-name",
+            "normalModelSlug":"MOCK-private-slug", "planType":"pro",
+            "rateLimitReachedType":"rate_limit_reached", "spendControlReached":false,
+            "primary":{"usedPercent":i32::MIN,"resetsAt":i64::MIN,"windowDurationMins":i64::MAX},
+            "secondary":{"usedPercent":i32::MAX},
+            "credits":{"hasCredits":true,"unlimited":false,"balance":"MOCK-private-balance"},
+            "individualLimit":{"limit":"MOCK-private-limit","used":"MOCK-private-used","remainingPercent":0,"resetsAt":1}
+        }})
+    }
+
+    #[test]
+    fn automatic_metadata_validates_nullable_dtos_and_retains_only_count() {
+        let mut metadata = AutomaticMetadata::default();
+        for params in [
+            json!({"authMode":"chatgpt"}),
+            json!({"authMode":"chatgpt","planType":null}),
+        ] {
+            assert!(
+                metadata
+                    .observe(&notice("account/updated", params))
+                    .unwrap()
+            );
+        }
+        for plan in PLAN_TYPES {
+            assert!(
+                metadata
+                    .observe(&notice(
+                        "account/updated",
+                        json!({"authMode":"chatgpt","planType":plan})
+                    ))
+                    .unwrap()
+            );
+        }
+        for environment in [Value::Null, json!("MOCK-private-environment")] {
+            assert!(metadata.observe(&notice("remoteControl/status/changed", json!({"status":"disabled","installationId":"MOCK-private-installation","serverName":"MOCK-private-server","environmentId":environment}))).unwrap());
+        }
+        assert!(
+            metadata
+                .observe(&notice("account/rateLimits/updated", full_rates()))
+                .unwrap()
+        );
+        assert!(
+            metadata
+                .observe(&notice(
+                    "account/rateLimits/updated",
+                    json!({"rateLimits":{}})
+                ))
+                .unwrap()
+        );
+        assert!(metadata.observe(&notice("account/rateLimits/updated", json!({"rateLimits":{
+            "credits":null,"individualLimit":null,"limitId":null,"limitName":null,"normalModelSlug":null,
+            "planType":null,"primary":null,"secondary":null,"rateLimitReachedType":null,"spendControlReached":null
+        }}))).unwrap());
+        assert_eq!(metadata.notifications, 25);
+    }
+
+    #[test]
+    fn nonnative_auth_remote_modes_and_private_extras_are_denied_without_count() {
+        let mut metadata = AutomaticMetadata::default();
+        for mode in [
+            json!("apikey"),
+            json!("chatgptAuthTokens"),
+            json!("headers"),
+            json!("agentIdentity"),
+            json!("personalAccessToken"),
+            json!("bedrockApiKey"),
+            json!("bedrockAccessKeys"),
+            json!("MOCK-unknown"),
+            Value::Null,
+            json!(false),
+        ] {
+            assert!(
+                metadata
+                    .observe(&notice("account/updated", json!({"authMode":mode})))
+                    .is_err()
+            );
+        }
+        for status in ["connected", "connecting", "errored", "MOCK-unknown"] {
+            assert!(
+                metadata
+                    .observe(&notice(
+                        "remoteControl/status/changed",
+                        json!({"status":status,"installationId":"MOCK","serverName":"MOCK"})
+                    ))
+                    .is_err()
+            );
+        }
+        for (method, params) in [
+            ("account/updated", json!({"planType":null})),
+            (
+                "account/updated",
+                json!({"authMode":"chatgpt","planType":"MOCK-unknown"}),
+            ),
+            (
+                "account/updated",
+                json!({"authMode":"chatgpt","email":"MOCK-private"}),
+            ),
+            (
+                "remoteControl/status/changed",
+                json!({"status":"disabled","serverName":"MOCK"}),
+            ),
+            (
+                "remoteControl/status/changed",
+                json!({"status":"disabled","installationId":"MOCK","serverName":false}),
+            ),
+            (
+                "remoteControl/status/changed",
+                json!({"status":"disabled","installationId":"MOCK","serverName":"MOCK","environmentId":7}),
+            ),
+            (
+                "remoteControl/status/changed",
+                json!({"status":"disabled","installationId":"MOCK","serverName":"MOCK","extra":"MOCK-private"}),
+            ),
+        ] {
+            assert!(metadata.observe(&notice(method, params)).is_err());
+        }
+        assert_eq!(metadata.notifications, 0);
+    }
+
+    #[test]
+    fn sparse_rates_reject_wrong_nested_types_ranges_and_unknown_keys() {
+        for rates in [
+            Value::Null,
+            json!([]),
+            json!({"extra":"MOCK-private"}),
+            json!({"primary":{}}),
+            json!({"primary":{"usedPercent":true}}),
+            json!({"primary":{"usedPercent":1.5}}),
+            json!({"primary":{"usedPercent":i64::from(i32::MAX)+1}}),
+            json!({"secondary":{"usedPercent":0,"resetsAt":u64::MAX}}),
+            json!({"primary":{"usedPercent":0,"windowDurationMins":false}}),
+            json!({"primary":{"usedPercent":0,"extra":"MOCK-private"}}),
+            json!({"credits":{"hasCredits":true}}),
+            json!({"credits":{"hasCredits":1,"unlimited":false}}),
+            json!({"credits":{"hasCredits":true,"unlimited":false,"balance":7}}),
+            json!({"individualLimit":{"limit":"MOCK","used":"MOCK","remainingPercent":0}}),
+            json!({"individualLimit":{"limit":"MOCK","used":"MOCK","remainingPercent":u64::MAX,"resetsAt":0}}),
+            json!({"individualLimit":{"limit":1,"used":"MOCK","remainingPercent":0,"resetsAt":0}}),
+            json!({"planType":"MOCK-private"}),
+            json!({"rateLimitReachedType":"MOCK-unknown"}),
+            json!({"spendControlReached":1}),
+            json!({"normalModelSlug":{}}),
+        ] {
+            let mut metadata = AutomaticMetadata::default();
+            assert!(
+                metadata
+                    .observe(&notice(
+                        "account/rateLimits/updated",
+                        json!({"rateLimits":rates})
+                    ))
+                    .is_err()
+            );
+            assert_eq!(metadata.notifications, 0);
+        }
+        assert!(
+            AutomaticMetadata::default()
+                .observe(&notice("account/rateLimits/updated", json!({})))
+                .is_err()
+        );
+        assert!(
+            AutomaticMetadata::default()
+                .observe(&notice(
+                    "account/rateLimits/updated",
+                    json!({"rateLimits":{},"extra":null})
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn metadata_cap_is_shared_and_unrelated_methods_are_not_newly_admitted() {
+        let mut metadata = AutomaticMetadata::default();
+        for method in [
+            "configWarning",
+            "config/warning",
+            "model/rerouted",
+            "MOCK-unknown",
+            "item/tool/call",
+        ] {
+            assert!(!metadata.observe(&notice(method, json!({}))).unwrap());
+        }
+        for index in 0..32 {
+            let message = match index % 3 {
+                0 => notice("account/updated", json!({"authMode":"chatgpt"})),
+                1 => notice("account/rateLimits/updated", json!({"rateLimits":{}})),
+                _ => notice(
+                    "remoteControl/status/changed",
+                    json!({"status":"disabled","installationId":"MOCK","serverName":"MOCK"}),
+                ),
+            };
+            assert!(metadata.observe(&message).unwrap());
+        }
+        assert_eq!(
+            metadata
+                .observe(&notice("account/updated", json!({"authMode":"chatgpt"})))
+                .unwrap_err()
+                .to_string(),
+            "ocr_automatic_metadata_limit"
+        );
+        assert_eq!(metadata.notifications, 32);
+    }
+
+    #[tokio::test]
+    async fn startup_metadata_server_request_is_denied_before_validation() {
+        for method in [
+            "account/updated",
+            "account/rateLimits/updated",
+            "remoteControl/status/changed",
+        ] {
+            let mut rpc = OcrRpc {
+                reader: BufReader::new(std::io::Cursor::new(
+                    format!("{}\n", json!({"id":9,"method":method,"params":{}})).into_bytes(),
+                )),
+                writer: tokio::io::sink(),
+                messages: 0,
+                frame_limit: 262144,
+                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                transport: TransportBudget::new(1048576),
+                metadata: AutomaticMetadata::default(),
+            };
+            assert_eq!(
+                rpc.request(1, "initialize", json!({}))
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "ocr_unapproved_startup_request"
+            );
+            assert_eq!(rpc.metadata.notifications, 0);
+        }
+    }
+
+    /// An explicitly selected exported schema directory is metadata evidence only.
+    #[test]
+    #[ignore = "requires operator-selected official runtime schema directory"]
+    fn automatic_metadata_matches_selected_official_schema() {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("GPTGREP_OCR_RUNTIME_SCHEMA_ROOT").expect("selected schema root"),
+        );
+        for (file, params) in [
+            (
+                "v2/AccountUpdatedNotification.json",
+                json!({"authMode":"chatgpt","planType":null}),
+            ),
+            ("v2/AccountRateLimitsUpdatedNotification.json", full_rates()),
+            (
+                "v2/RemoteControlStatusChangedNotification.json",
+                json!({"status":"disabled","installationId":"MOCK","serverName":"MOCK","environmentId":null}),
+            ),
+        ] {
+            let schema: Value =
+                serde_json::from_slice(&std::fs::read(root.join(file)).unwrap()).unwrap();
+            assert!(
+                jsonschema::validator_for(&schema)
+                    .unwrap()
+                    .is_valid(&params),
+                "{file}"
+            );
+        }
+        let account: Value = serde_json::from_slice(
+            &std::fs::read(root.join("v2/AccountUpdatedNotification.json")).unwrap(),
+        )
+        .unwrap();
+        let rates: Value = serde_json::from_slice(
+            &std::fs::read(root.join("v2/AccountRateLimitsUpdatedNotification.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            account["definitions"]["PlanType"]["enum"],
+            json!(PLAN_TYPES)
+        );
+        assert_eq!(rates["definitions"]["PlanType"]["enum"], json!(PLAN_TYPES));
+        assert_eq!(
+            rates["definitions"]["RateLimitReachedType"]["enum"],
+            json!(RATE_REACHED_TYPES)
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
@@ -488,6 +976,7 @@ mod tests {
             frame_limit: 64,
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(5),
             transport: transport.clone(),
+            metadata: AutomaticMetadata::default(),
         };
         assert_eq!(
             rpc.send(json!({"text":"x".repeat(64)}))
@@ -514,6 +1003,7 @@ mod tests {
             frame_limit: 64,
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(5),
             transport: transport.clone(),
+            metadata: AutomaticMetadata::default(),
         };
         rpc.send(json!({"sent":"1234567890"})).await.unwrap();
         assert_eq!(
@@ -540,6 +1030,7 @@ mod tests {
             frame_limit: 64,
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(5),
             transport: transport.clone(),
+            metadata: AutomaticMetadata::default(),
         };
         assert_eq!(
             rpc.send(json!({"message":"x"}))

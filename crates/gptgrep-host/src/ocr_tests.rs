@@ -326,6 +326,116 @@ async fn dynamic_image_is_actual_bound_content_and_exact_profile() {
 }
 
 #[tokio::test]
+async fn automatic_metadata_is_discarded_during_startup_and_after_final_item() {
+    let fixture = Fixture::new();
+    let capture = Capture::default();
+    let mut frames = startup(json!({}));
+    frames.insert(0, json!({"method":"remoteControl/status/changed","params":{"status":"disabled","installationId":"MOCK-private-installation","serverName":"MOCK-private-server"}}));
+    frames.insert(
+        2,
+        json!({"method":"account/updated","params":{"authMode":"chatgpt","planType":null}}),
+    );
+    frames.insert(
+        4,
+        json!({"method":"account/rateLimits/updated","params":{"rateLimits":{}}}),
+    );
+    frames.push(tool(1, fixture.image_args()));
+    frames.push(json!({"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","item":{"type":"agentMessage","id":"answer","phase":"final_answer","text":"{}"}}}));
+    frames.push(json!({"method":"account/rateLimits/updated","params":{"rateLimits":{"limitId":"MOCK-private-limit","planType":"pro","primary":{"usedPercent":5,"resetsAt":null}}}}));
+    frames.push(completed("{}".into()));
+    let (result, budget) = replay(&fixture, frames, capture.clone()).await;
+    let result = result.unwrap();
+    result.page.verify_delivery().unwrap();
+    assert_eq!(result.answer, "{}");
+    assert_eq!(result.tool_calls, 1);
+    assert_eq!(budget.terminal_admissions, 1);
+    let sent = capture.frames();
+    assert_eq!(
+        sent.iter()
+            .filter(|frame| frame["method"] == "turn/start")
+            .count(),
+        1
+    );
+    assert!(
+        !serde_json::to_string(&sent)
+            .unwrap()
+            .contains("MOCK-private")
+    );
+    assert!(
+        sent.iter()
+            .filter_map(|frame| frame["method"].as_str())
+            .all(|method| !method.starts_with("account/") && !method.starts_with("remoteControl/"))
+    );
+}
+
+#[tokio::test]
+async fn automatic_metadata_cap_is_shared_across_startup_and_active_turn() {
+    for overflow in [false, true] {
+        let fixture = Fixture::new();
+        let capture = Capture::default();
+        let mut frames =
+            vec![json!({"method":"account/updated","params":{"authMode":"chatgpt"}}); 16];
+        frames.extend(startup(json!({})));
+        frames.extend(vec![
+            json!({"method":"account/rateLimits/updated","params":{"rateLimits":{}}});
+            16
+        ]);
+        if overflow {
+            frames.push(json!({"method":"remoteControl/status/changed","params":{"status":"disabled","installationId":"MOCK","serverName":"MOCK"}}));
+        }
+        frames.push(tool(1, fixture.image_args()));
+        frames.push(completed("{}".into()));
+        let (result, budget) = replay(&fixture, frames, capture.clone()).await;
+        if overflow {
+            assert_eq!(
+                result.err().unwrap().to_string(),
+                "ocr_automatic_metadata_limit"
+            );
+            assert_eq!(budget.quarantined_slots, 1);
+            assert!(!capture.frames().iter().any(|frame| frame["id"] == 101));
+        } else {
+            result.unwrap().page.verify_delivery().unwrap();
+            assert_eq!(budget.terminal_admissions, 1);
+        }
+        assert_eq!(budget.charged_admissions, 1);
+    }
+}
+
+#[tokio::test]
+async fn automatic_metadata_does_not_change_warning_reroute_or_server_request_refusal() {
+    let fixture = Fixture::new();
+    for method in ["configWarning", "config/warning", "model/rerouted"] {
+        let mut frames = startup(json!({}));
+        frames.push(json!({"method":method,"params":{}}));
+        let (result, _) = replay(&fixture, frames, Capture::default()).await;
+        assert_eq!(
+            result.err().unwrap().to_string(),
+            "ocr_runtime_configuration_not_admitted"
+        );
+    }
+    for method in [
+        "account/updated",
+        "account/rateLimits/updated",
+        "remoteControl/status/changed",
+    ] {
+        let capture = Capture::default();
+        let mut frames = startup(json!({}));
+        frames.push(json!({"id":99,"method":method,"params":{}}));
+        let (result, _) = replay(&fixture, frames, capture.clone()).await;
+        assert_eq!(
+            result.err().unwrap().to_string(),
+            "ocr_unapproved_server_request"
+        );
+        assert!(
+            capture
+                .frames()
+                .iter()
+                .any(|frame| frame["id"] == 99 && frame["error"]["code"] == -32601)
+        );
+    }
+}
+
+#[tokio::test]
 async fn ninth_queued_tool_is_denied_before_image_read() {
     let fixture = Fixture::new();
     let capture = Capture {
