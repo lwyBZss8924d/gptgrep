@@ -15,9 +15,12 @@ fn failed_completion_keeps_typed_metadata_without_server_error_text() {
     let launcher = root.join("mock-codex.sh");
     // This is an offline protocol fixture. Each response follows one actual CLI
     // request; no model, account, document or network is involved.
+    // Keep the fixture alive after EOF until owned-group termination settles
+    // cleanup, so exited-leader verification cannot mask the protocol assertion.
     fs::write(
         &launcher,
         r#"#!/bin/sh
+trap '' TERM
 read -r request
 printf '%s\n' '{"id":1,"result":{}}'
 read -r notification
@@ -33,6 +36,7 @@ printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"offli
 printf '%s\n' '{"method":"error","params":{"threadId":"offline-thread","turnId":"offline-turn","willRetry":true,"error":{"message":"private-error-sentinel","additionalDetails":"private-details-sentinel","codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":502}}}}}'
 printf '%s\n' '{"method":"error","params":{"threadId":"offline-thread","turnId":"offline-turn","willRetry":false,"error":{"message":"private-error-sentinel","additionalDetails":"private-details-sentinel","codexErrorInfo":{"responseTooManyFailedAttempts":{"httpStatusCode":503}}}}}'
 read -r request
+exec /bin/sleep 30
 "#,
     )
     .unwrap();
