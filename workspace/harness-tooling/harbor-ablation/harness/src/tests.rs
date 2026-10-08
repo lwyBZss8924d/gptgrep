@@ -655,6 +655,233 @@ mod production {
             save(&self.corpus, &c).unwrap();
         }
     }
+    fn runtime_asset(path: &Path) -> Value {
+        json!({"path":path,"bytes":fs::metadata(path).unwrap().len(),"sha256":hash(&fs::read(path).unwrap())})
+    }
+    fn bind_runtime(f: &ProductionFixture, manifest: &Value) -> PathBuf {
+        let path = f.base.join("runtime-packages.json");
+        save(&path, manifest).unwrap();
+        let mut o: Value = serde_json::from_slice(&fs::read(&f.options).unwrap()).unwrap();
+        o["runtime_debian_packages"] = external(&path);
+        save(&f.options, &o).unwrap();
+        path
+    }
+    fn runtime_fixture(f: &ProductionFixture) -> Value {
+        let deb = f.base.join("ordinary_2%3a1+2:3_arm64.deb");
+        let license = f.base.join("ordinary.copyright");
+        // Synthetic ar-header fixture only: never installed or executed.
+        fs::write(&deb, b"!<arch>\nMOCK package bytes, not installable").unwrap();
+        fs::write(&license, b"CC0-1.0 synthetic fixture license").unwrap();
+        json!({"schema_version":"gptgrep.harbor.runtime-debian.v1","packages":[{"deb":runtime_asset(&deb),"license":runtime_asset(&license)}]})
+    }
+    #[tokio::test]
+    async fn runtime_absent_and_null_preserve_legacy_dockerfiles() -> Result<()> {
+        let f = ProductionFixture::new().await?;
+        let first = f.base.join("absent");
+        f.export(&first);
+        let mut o: Value = serde_json::from_slice(&fs::read(&f.options)?)?;
+        o["runtime_debian_packages"] = Value::Null;
+        save(&f.options, &o)?;
+        let second = f.base.join("null");
+        f.export(&second);
+        for arm in ["control", "gptgrep"] {
+            let name = format!("{arm}/task-a/environment/Dockerfile");
+            let a = fs::read(first.join(&name))?;
+            assert_eq!(a, fs::read(second.join(&name))?);
+            assert!(!String::from_utf8(a)?.contains("runtime-debian"));
+        }
+        assert_eq!(
+            fs::read_to_string(first.join("control/task-a/environment/Dockerfile"))?,
+            format!(
+                "FROM example/reader@sha256:{}\nWORKDIR /app\nCOPY --chown=1000:1000 reader-input.json codex-config.json /app/\nCOPY --chown=1000:1000 groups/group-a/raw/ {}/\nUSER 1000:1000\n",
+                "a".repeat(64),
+                f.raw.display()
+            )
+        );
+        assert!(!second.join("frozen-runtime-debian-inputs.json").exists());
+        Ok(())
+    }
+    #[tokio::test]
+    async fn runtime_packages_are_symmetric_mapped_and_offline_before_user() -> Result<()> {
+        let f = ProductionFixture::new().await?;
+        let manifest = runtime_fixture(&f);
+        bind_runtime(&f, &manifest);
+        let output = f.base.join("reader");
+        f.export(&output);
+        let control = output.join("control/task-a/environment/runtime-debian");
+        let treatment = output.join("gptgrep/task-a/environment/runtime-debian");
+        assert_eq!(files(&control), files(&treatment));
+        let mapping: Value = serde_json::from_slice(&fs::read(control.join("manifest.json"))?)?;
+        assert_eq!(mapping["files"][0]["path"], "debs/package-0000.deb");
+        assert_eq!(
+            mapping["files"][0]["source_filename"],
+            "ordinary_2%3a1+2:3_arm64.deb"
+        );
+        let map_bytes = fs::read(control.join("manifest.json"))?;
+        assert!(!String::from_utf8(map_bytes)?.contains(f.base.to_str().unwrap()));
+        for arm in ["control", "gptgrep"] {
+            let docker =
+                fs::read_to_string(output.join(format!("{arm}/task-a/environment/Dockerfile")))?;
+            assert!(
+                docker.starts_with(&format!("FROM example/reader@sha256:{}\n", "a".repeat(64)))
+            );
+            assert!(docker.contains("sha256sum --check checksums.sha256 && dpkg -i debs/*.deb"));
+            assert!(docker.find("dpkg -i").unwrap() < docker.find("USER 1000:1000").unwrap());
+            assert!(!docker.contains("apt-get") && !docker.contains("ordinary_2"));
+        }
+        assert!(
+            !output
+                .join("control/task-a/environment/groups/group-a/raw/.gptgrep")
+                .exists()
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn runtime_digest_size_and_deb_header_are_required() -> Result<()> {
+        let f = ProductionFixture::new().await?;
+        let original = runtime_fixture(&f);
+        let mut m = original.clone();
+        m["packages"][0]["deb"]["sha256"] = json!("0".repeat(64));
+        bind_runtime(&f, &m);
+        assert!(f.prepare().err().unwrap().contains("digest"));
+        m = original.clone();
+        m["packages"][0]["license"]["bytes"] = json!(1);
+        bind_runtime(&f, &m);
+        assert!(f.prepare().err().unwrap().contains("size_binding"));
+        let deb = PathBuf::from(original["packages"][0]["deb"]["path"].as_str().unwrap());
+        fs::write(&deb, b"not an ar archive")?;
+        m["packages"][0]["deb"] = runtime_asset(&deb);
+        m["packages"][0]["license"] = original["packages"][0]["license"].clone();
+        bind_runtime(&f, &m);
+        assert!(f.prepare().err().unwrap().contains("deb_header"));
+        Ok(())
+    }
+    #[tokio::test]
+    async fn runtime_count_declared_and_actual_sizes_are_bounded_before_reads() -> Result<()> {
+        let f = ProductionFixture::new().await?;
+        let original = runtime_fixture(&f);
+        let mut m = original.clone();
+        m["packages"][0]["deb"]["path"] = json!(f.base.join("nonexistent.deb"));
+        m["packages"][0]["deb"]["bytes"] = json!(16 * 1024 * 1024 + 1);
+        bind_runtime(&f, &m);
+        assert!(f.prepare().err().unwrap().contains("asset_size"));
+        m = original.clone();
+        m["packages"] = json!(vec![original["packages"][0].clone(); 33]);
+        bind_runtime(&f, &m);
+        assert!(f.prepare().err().unwrap().contains("package_count"));
+        let mut packages = Vec::new();
+        for i in 0..3 {
+            let mut p = original["packages"][0].clone();
+            p["deb"]["path"] = json!(f.base.join(format!("nonexistent-{i}.deb")));
+            p["deb"]["bytes"] = json!(16 * 1024 * 1024);
+            packages.push(p);
+        }
+        m["packages"] = json!(packages);
+        bind_runtime(&f, &m);
+        assert!(f.prepare().err().unwrap().contains("total_size"));
+        m = original.clone();
+        let deb = PathBuf::from(m["packages"][0]["deb"]["path"].as_str().unwrap());
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&deb)?
+            .set_len(16 * 1024 * 1024 + 1)?;
+        bind_runtime(&f, &m);
+        assert!(f.prepare().err().unwrap().contains("type_or_size_limit"));
+        Ok(())
+    }
+    #[tokio::test]
+    async fn runtime_traversal_injection_leaf_and_ancestor_symlinks_are_rejected() -> Result<()> {
+        let f = ProductionFixture::new().await?;
+        let original = runtime_fixture(&f);
+        for path in [
+            f.base.join("../ordinary.deb"),
+            f.base.join("bad;touch-forbidden.deb"),
+            PathBuf::from("relative.deb"),
+        ] {
+            let mut m = original.clone();
+            m["packages"][0]["deb"]["path"] = json!(path);
+            bind_runtime(&f, &m);
+            assert!(f.prepare().err().unwrap().contains("filename"));
+        }
+        let deb = PathBuf::from(original["packages"][0]["deb"]["path"].as_str().unwrap());
+        let link = f.base.join("linked.deb");
+        std::os::unix::fs::symlink(&deb, &link)?;
+        let mut m = original.clone();
+        m["packages"][0]["deb"]["path"] = json!(link);
+        bind_runtime(&f, &m);
+        assert!(f.prepare().err().unwrap().contains("symlink"));
+        let alias = f.base.join("alias");
+        std::os::unix::fs::symlink(&f.base, &alias)?;
+        m["packages"][0]["deb"]["path"] = json!(alias.join(deb.file_name().unwrap()));
+        bind_runtime(&f, &m);
+        assert!(f.prepare().err().unwrap().contains("symlink"));
+        Ok(())
+    }
+    #[tokio::test]
+    async fn runtime_assets_and_manifest_remain_bound_until_publication() -> Result<()> {
+        for asset in ["deb", "license", "manifest"] {
+            let f = ProductionFixture::new().await?;
+            let m = runtime_fixture(&f);
+            let manifest = bind_runtime(&f, &m);
+            let prepared = f.prepare().unwrap();
+            let path = if asset == "manifest" {
+                manifest
+            } else {
+                PathBuf::from(m["packages"][0][asset]["path"].as_str().unwrap())
+            };
+            fs::write(path, b"changed after admission")?;
+            let out = f.base.join("must-not-exist");
+            assert!(prepared.publish(&out).is_err());
+            assert!(!out.exists());
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn runtime_rewritten_inventory_cannot_change_packages_or_install_command() -> Result<()> {
+        for name in ["runtime-debian/debs/package-0000.deb", "Dockerfile"] {
+            let f = ProductionFixture::new().await?;
+            bind_runtime(&f, &runtime_fixture(&f));
+            let out = f.base.join("reader");
+            f.export(&out);
+            let relative = format!("control/task-a/environment/{name}");
+            fs::write(out.join(&relative), b"rewritten")?;
+            let mp = out.join("export-manifest.json");
+            let mut manifest: Value = serde_json::from_slice(&fs::read(&mp)?)?;
+            manifest["files"][&relative] = json!(hash(b"rewritten"));
+            save(&mp, &manifest)?;
+            let error = production_export::validate(&out).err().unwrap();
+            assert!(if name == "Dockerfile" {
+                error == "production_reader_docker_binding"
+            } else {
+                error.contains("runtime_")
+            });
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn runtime_extra_run_and_root_user_cannot_refresh_inventory() -> Result<()> {
+        for arm in ["control", "gptgrep"] {
+            for addition in ["RUN touch /unrequested-command\n", "USER 0:0\n"] {
+                let f = ProductionFixture::new().await?;
+                bind_runtime(&f, &runtime_fixture(&f));
+                let out = f.base.join("reader");
+                f.export(&out);
+                let relative = format!("{arm}/task-a/environment/Dockerfile");
+                let mut data = fs::read(out.join(&relative))?;
+                data.extend_from_slice(addition.as_bytes());
+                fs::write(out.join(&relative), &data)?;
+                let mp = out.join("export-manifest.json");
+                let mut manifest: Value = serde_json::from_slice(&fs::read(&mp)?)?;
+                manifest["files"][&relative] = json!(hash(&data));
+                save(&mp, &manifest)?;
+                assert_eq!(
+                    production_export::validate(&out).err().unwrap(),
+                    "production_reader_docker_binding"
+                );
+            }
+        }
+        Ok(())
+    }
     #[tokio::test]
     async fn real_reader_group_topology_raw_only_baseline_and_role_reference() -> Result<()> {
         let f = ProductionFixture::new().await?;
@@ -777,7 +1004,7 @@ mod production {
             production_export::verifier(&grades, &reader)
                 .err()
                 .unwrap()
-                .contains("verifier_binding")
+                .contains("reader_docker_binding")
         );
         Ok(())
     }
@@ -874,6 +1101,26 @@ mod production {
             return Ok(());
         };
         let output = PathBuf::from(output);
+        if let Ok(image) = std::env::var("GPTGREP_PRODUCTION_BRIDGE_READER_IMAGE") {
+            let mut options: Value = serde_json::from_slice(&fs::read(&f.options)?)?;
+            options["reader_image"] = json!(image);
+            save(&f.options, &options)?;
+        }
+        match std::env::var("GPTGREP_PRODUCTION_BRIDGE_VARIANT")
+            .ok()
+            .as_deref()
+        {
+            None => {}
+            Some("runtime") => {
+                bind_runtime(&f, &runtime_fixture(&f));
+            }
+            Some("null") => {
+                let mut options: Value = serde_json::from_slice(&fs::read(&f.options)?)?;
+                options["runtime_debian_packages"] = Value::Null;
+                save(&f.options, &options)?;
+            }
+            Some(_) => anyhow::bail!("unknown explicit offline fixture variant"),
+        }
         fs::create_dir(&output)?;
         let reader = output.join("readers");
         f.export(&reader);

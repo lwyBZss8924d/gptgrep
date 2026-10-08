@@ -210,15 +210,111 @@ def read_export(root, role):
     return manifest, actual, manifest_sha256
 
 
+RUNTIME_DOCKER = (
+    "COPY runtime-debian/ /opt/gptgrep-runtime-debian/\n"
+    "RUN cd /opt/gptgrep-runtime-debian && sha256sum --check checksums.sha256 && dpkg -i debs/*.deb\n")
+
+
+def sha256_string(value):
+    return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+
+
+def runtime_debian_expected(options, files):
+    authority = options.get("runtime_debian_packages")
+    if authority is None:
+        return None
+    if not isinstance(authority, dict) or set(authority) != {"path", "sha256"} \
+            or not isinstance(authority["path"], str) or not authority["path"].startswith("/") \
+            or not sha256_string(authority["sha256"]):
+        raise ValueError("production_runtime_manifest_binding")
+    name = "frozen-runtime-debian-inputs.json"
+    if name not in files:
+        raise ValueError("production_runtime_manifest_binding")
+    data = small_bytes(files[name])
+    if digest(data) != authority["sha256"]:
+        raise ValueError("production_runtime_manifest_binding")
+    source = production_json(data)
+    if not isinstance(source, dict) or set(source) != {"schema_version", "packages"} \
+            or source["schema_version"] != "gptgrep.harbor.runtime-debian.v1" \
+            or not isinstance(source["packages"], list) or not 1 <= len(source["packages"]) <= 32:
+        raise ValueError("production_runtime_package_count")
+    assets, deb_paths, total = {}, set(), 0
+    for index, package in enumerate(source["packages"]):
+        if not isinstance(package, dict) or set(package) != {"deb", "license"}:
+            raise ValueError("production_runtime_package_schema")
+        for kind, field, cap, suffix in (("debs", "deb", 16*1024*1024, "deb"),
+                                         ("licenses", "license", 256*1024, "txt")):
+            asset = package[field]
+            if not isinstance(asset, dict) or set(asset) != {"path", "bytes", "sha256"} \
+                    or not sha256_string(asset["sha256"]) or type(asset["bytes"]) is not int \
+                    or not 1 <= asset["bytes"] <= cap:
+                raise ValueError("production_runtime_asset_schema_or_size")
+            path = asset["path"]
+            if not isinstance(path, str) or not path.startswith("/") or ".." in PurePosixPath(path).parts:
+                raise ValueError("production_runtime_filename")
+            leaf = PurePosixPath(path).name
+            if not leaf or len(leaf) > 160 or not leaf.isascii() or not leaf[0].isalnum() \
+                    or any(not (c.isalnum() or c in "._%+:-") for c in leaf) \
+                    or (field == "deb" and not leaf.endswith(".deb")):
+                raise ValueError("production_runtime_filename")
+            if field == "deb":
+                if PurePosixPath(path) in deb_paths:
+                    raise ValueError("production_runtime_duplicate_deb")
+                deb_paths.add(PurePosixPath(path))
+            total += asset["bytes"]
+            if total > 32*1024*1024:
+                raise ValueError("production_runtime_total_size")
+            assets[f"{kind}/package-{index:04}.{suffix}"] = {
+                "bytes": asset["bytes"], "sha256": asset["sha256"], "source_filename": leaf}
+    records = [{"path": name, **asset} for name, asset in sorted(assets.items())]
+    metadata = json.dumps({"schema_version": "gptgrep.harbor.runtime-debian.frozen.v1",
+                           "input_sha256": authority["sha256"], "files": records}, indent=2, sort_keys=True).encode()
+    checksums = "".join(f"{asset['sha256']}  {name}\n" for name, asset in sorted(assets.items())).encode()
+    return assets, metadata, checksums
+
+
+def production_reader_dockerfile(options, groups, scope, arm):
+    image = options["reader_image"]
+    if not isinstance(image, str) or "@sha256:" not in image \
+            or not sha256_string(image.rsplit("@sha256:", 1)[1]) \
+            or any(not (c.isascii() and (c.isalnum() or c in "/.:_-@")) for c in image):
+        raise ValueError("production_image_digest_or_injection")
+    uid, gid = options["reader_uid"], options["reader_gid"]
+    if type(uid) is not int or type(gid) is not int or not 1 <= uid <= 4294967295 or not 1 <= gid <= 4294967295:
+        raise ValueError("production_reader_user")
+    docker = f"FROM {image}\nWORKDIR /app\nCOPY --chown={uid}:{gid} reader-input.json codex-config.json /app/\n"
+    if options.get("runtime_debian_packages") is not None:
+        docker += RUNTIME_DOCKER
+    for group_id in scope:
+        group = groups.get(group_id)
+        if group is None:
+            raise ValueError("production_task_scope")
+        root = group["runtime_root"]
+        if not isinstance(root, str) or not root.startswith("/") \
+                or any(not (c.isascii() and (c.isalnum() or c in "/._-")) for c in root):
+            raise ValueError("production_runtime_path")
+        if arm == "gptgrep":
+            docker += f"COPY --chown={uid}:{gid} groups/{group_id}/seal/ /app/prebuild-seals/{group_id}/\n"
+        docker += f"COPY --chown={uid}:{gid} groups/{group_id}/raw/ {root}/\n"
+    if arm == "gptgrep":
+        docker += "COPY tool/ /app/tool/\nRUN chmod 0555 /app/tool/gptgrep\n"
+    return (docker + f"USER {uid}:{gid}\n").encode()
+
+
 def production_reader_namespace(manifest, files):
     option_bytes = small_bytes(files["frozen-options.json"])
-    production_json(option_bytes)
+    options = production_json(option_bytes)
+    if not isinstance(options, dict):
+        raise ValueError("production_options")
     if digest(option_bytes) != manifest["options_sha256"]:
         raise ValueError("options_digest_binding")
     groups = {group["id"]: group for group in manifest["group_bindings"]}
     if len(groups) != len(manifest["group_bindings"]) or not 1 <= len(groups) <= 16:
         raise ValueError("production_group_count")
     expected = {"frozen-options.json", "paired-schedule.json"}
+    runtime = runtime_debian_expected(options, files)
+    if runtime is not None:
+        expected.add("frozen-runtime-debian-inputs.json")
     ids = set()
     for task in manifest["task_bindings"]:
         task_id = relative(task["id"])
@@ -228,6 +324,22 @@ def production_reader_namespace(manifest, files):
         raw = {}
         for arm in ("control", "gptgrep"):
             prefix = f"{arm}/{task_id}"
+            if small_bytes(files[f"{prefix}/environment/Dockerfile"]) != production_reader_dockerfile(
+                    options, groups, task["group_scope"], arm):
+                raise ValueError("production_reader_docker_binding")
+            if runtime is not None:
+                assets, metadata, checksums = runtime
+                for name, asset in assets.items():
+                    output = f"{prefix}/environment/runtime-debian/{name}"
+                    if output not in files or len(files[output]) != asset["bytes"] \
+                            or payload_digest(files[output]) != asset["sha256"]:
+                        raise ValueError("production_runtime_asset_binding")
+                    expected.add(output)
+                for name, data in (("manifest.json", metadata), ("checksums.sha256", checksums)):
+                    output = f"{prefix}/environment/runtime-debian/{name}"
+                    if output not in files or small_bytes(files[output]) != data:
+                        raise ValueError("production_runtime_mapping_binding")
+                    expected.add(output)
             if small_bytes(files[f"{prefix}/environment/codex-config.json"]) != option_bytes:
                 raise ValueError("production_config_difference")
             reader_input = production_json(small_bytes(files[f"{prefix}/environment/reader-input.json"]))
@@ -453,6 +565,9 @@ def compose(readers, graders, output):
                 raise ValueError("production_reference_contract")
     options_bytes = small_bytes(reader_files["frozen-options.json"])
     options = production_json(options_bytes) if production else json.loads(options_bytes)
+    descriptor_options = dict(options)
+    if production and descriptor_options.get("runtime_debian_packages") is None:
+        descriptor_options.pop("runtime_debian_packages", None)
     if payload_digest(reader_files["frozen-options.json"]) != reader["options_sha256"]:
         raise ValueError("options_digest_binding")
     files = {}
@@ -463,7 +578,7 @@ def compose(readers, graders, output):
                         if name.startswith(prefix + "/")}
             descriptor_bytes = small_bytes(matching.pop("task-descriptor.json"))
             descriptor = production_json(descriptor_bytes) if production else json.loads(descriptor_bytes)
-            if descriptor != {"task_id": task_id, "arm": arm, "options": options}:
+            if descriptor != {"task_id": task_id, "arm": arm, "options": descriptor_options}:
                 raise ValueError("descriptor_binding")
             allowed = {"instruction.md"} | {name for name in matching if name.startswith("environment/")}
             if set(matching) != allowed:

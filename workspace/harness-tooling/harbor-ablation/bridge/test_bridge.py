@@ -434,6 +434,68 @@ class ProductionPackagingTests(unittest.TestCase):
         self.assertFalse(json.loads(status_path.read_bytes())["reward_emitted"])
         self.assertFalse((self.root / "reward.txt").exists())
 
+    def runtime_enabled(self):
+        options = json.loads((self.readers / "frozen-options.json").read_bytes())
+        if options.get("runtime_debian_packages") is None:
+            self.skipTest("explicit runtime-DEB production fixture not selected")
+        return options
+
+    def test_runtime_debs_compose_symmetrically_into_real_task_configs(self):
+        self.runtime_enabled()
+        self.assertEqual(self.compose()["task_count"], 2)
+        contexts = []
+        for arm in ("control", "gptgrep"):
+            task = self.package / arm / "task-a"
+            cfg = bridge.TaskConfig.model_validate_toml((task / "task.toml").read_text())
+            self.assertFalse(cfg.metadata["execution_qualified"])
+            self.assertEqual(cfg.environment.network_mode.value, "no-network")
+            self.assertEqual(cfg.agent.network_mode.value, "no-network")
+            self.assertEqual(cfg.verifier.environment_mode.value, "separate")
+            runtime = task / "environment/runtime-debian"
+            contexts.append({str(p.relative_to(runtime)): p.read_bytes()
+                             for p in runtime.rglob("*") if p.is_file()})
+            self.assertFalse((task / "environment/frozen-runtime-debian-inputs.json").exists())
+        self.assertEqual(*contexts)
+        self.assertFalse((self.package / "control/task-a/environment/groups/group-a/raw/.gptgrep").exists())
+        self.assertEqual(bridge.validate(self.package)["task_count"], 2)
+
+    def test_extra_run_and_root_user_cannot_refresh_inventory_and_role_hashes(self):
+        for index, command in enumerate((b"RUN touch /unrequested-command\n", b"USER 0:0\n")):
+            with self.subTest(command=command):
+                self.fresh_case(f"extra-docker-{index}")
+                name = "control/task-a/environment/Dockerfile"
+                self.tamper_reader_payload(name, (self.readers / name).read_bytes() + command)
+                with self.assertRaisesRegex(ValueError, "production_reader_docker_binding"):
+                    self.compose()
+                self.assertFalse(self.package.exists())
+
+    def test_runtime_package_license_and_sidecar_tamper_refuse_before_compose(self):
+        self.runtime_enabled()
+        names = ("debs/package-0000.deb", "licenses/package-0000.txt", "manifest.json", "checksums.sha256")
+        for index, suffix in enumerate(names):
+            with self.subTest(suffix=suffix):
+                self.fresh_case(f"runtime-tamper-{index}")
+                name = f"control/task-a/environment/runtime-debian/{suffix}"
+                self.tamper_reader_payload(name, b"rewritten runtime input")
+                with self.assertRaisesRegex(ValueError, "production_runtime_(asset|mapping)_binding"):
+                    self.compose()
+                self.assertFalse(self.package.exists())
+
+    def test_runtime_frozen_input_hash_and_unknown_payload_remain_bound(self):
+        self.runtime_enabled()
+        self.tamper_reader_payload("frozen-runtime-debian-inputs.json", b"{}")
+        with self.assertRaisesRegex(ValueError, "production_runtime_manifest_binding"):
+            self.compose()
+        self.assertFalse(self.package.exists())
+        self.fresh_case("extra-runtime-file")
+        name = "control/task-a/environment/runtime-debian/unrequested.txt"
+        (self.readers / name).write_bytes(b"unexpected payload")
+        self.refresh(self.readers, name)
+        self.rebind_reader()
+        with self.assertRaisesRegex(ValueError, "production_exact_reader_namespace"):
+            self.compose()
+        self.assertFalse(self.package.exists())
+
 
 if __name__ == "__main__":
     parser=argparse.ArgumentParser()

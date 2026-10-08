@@ -48,7 +48,10 @@ struct Held {
 }
 impl Held {
     fn open(path: &Path, expected: Option<&str>) -> Result<Arc<Self>> {
-        let file = regular_file(path, MAX_FILE)?;
+        Self::open_limit(path, expected, MAX_FILE)
+    }
+    fn open_limit(path: &Path, expected: Option<&str>, limit: u64) -> Result<Arc<Self>> {
+        let file = regular_file(path, limit)?;
         let m = file.metadata().map_err(err)?;
         let mut h = Self {
             path: path.to_path_buf(),
@@ -125,7 +128,7 @@ impl Held {
         Ok(())
     }
 }
-#[derive(Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct External {
     path: PathBuf,
@@ -739,6 +742,160 @@ struct Options {
     seed: u32,
     reader_uid: u32,
     reader_gid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_debian_packages: Option<External>,
+}
+
+const MAX_RUNTIME_PACKAGES: usize = 32;
+const MAX_RUNTIME_DEB: u64 = 16 * 1024 * 1024;
+const MAX_RUNTIME_LICENSE: u64 = 256 * 1024;
+const MAX_RUNTIME_BYTES: u64 = 32 * 1024 * 1024;
+const RUNTIME_DOCKER: &str = "COPY runtime-debian/ /opt/gptgrep-runtime-debian/\nRUN cd /opt/gptgrep-runtime-debian && sha256sum --check checksums.sha256 && dpkg -i debs/*.deb\n";
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeAsset {
+    path: PathBuf,
+    bytes: u64,
+    sha256: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimePackage {
+    deb: RuntimeAsset,
+    license: RuntimeAsset,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeInputs {
+    schema_version: String,
+    packages: Vec<RuntimePackage>,
+}
+// Metadata validation completes before any package descriptor or buffer is opened.
+fn runtime_assets(bytes: &[u8]) -> Result<BTreeMap<String, RuntimeAsset>> {
+    let input: RuntimeInputs = strict(bytes)?;
+    if input.schema_version != "gptgrep.harbor.runtime-debian.v1"
+        || input.packages.is_empty()
+        || input.packages.len() > MAX_RUNTIME_PACKAGES
+    {
+        return Err("production_runtime_package_count".into());
+    }
+    let mut files = BTreeMap::new();
+    let mut total = 0u64;
+    let mut deb_paths = BTreeSet::new();
+    for (i, package) in input.packages.into_iter().enumerate() {
+        if !deb_paths.insert(package.deb.path.clone()) {
+            return Err("production_runtime_duplicate_deb".into());
+        }
+        for (kind, asset, cap) in [
+            ("debs", package.deb, MAX_RUNTIME_DEB),
+            ("licenses", package.license, MAX_RUNTIME_LICENSE),
+        ] {
+            check_hash(&asset.sha256)?;
+            let name = asset
+                .path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or("production_runtime_filename")?;
+            if !asset.path.is_absolute()
+                || asset.path.components().any(|c| {
+                    !matches!(
+                        c,
+                        std::path::Component::RootDir | std::path::Component::Normal(_)
+                    )
+                })
+                || name.len() > 160
+                || !name
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._%+:-".contains(&b))
+                || (kind == "debs" && !name.ends_with(".deb"))
+            {
+                return Err("production_runtime_filename".into());
+            }
+            if asset.bytes == 0 || asset.bytes > cap {
+                return Err("production_runtime_asset_size".into());
+            }
+            total = total
+                .checked_add(asset.bytes)
+                .filter(|n| *n <= MAX_RUNTIME_BYTES)
+                .ok_or("production_runtime_total_size")?;
+            // Original Debian filenames may contain %, + or :. Only generated
+            // alphanumeric names enter Docker destinations and checksum lines.
+            let extension = if kind == "debs" { "deb" } else { "txt" };
+            files.insert(format!("{kind}/package-{i:04}.{extension}"), asset);
+        }
+    }
+    Ok(files)
+}
+fn runtime_metadata(
+    input_sha: &str,
+    assets: &BTreeMap<String, RuntimeAsset>,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let records = assets
+        .iter()
+        .map(|(path, a)| {
+            value!({"path":path,"source_filename":a.path.file_name().and_then(|n|n.to_str()),"bytes":a.bytes,"sha256":a.sha256})
+        })
+        .collect::<Vec<_>>();
+    let checksums = assets
+        .iter()
+        .map(|(name, a)| format!("{}  {name}\n", a.sha256))
+        .collect::<String>()
+        .into_bytes();
+    Ok((
+        json(
+            &value!({"schema_version":"gptgrep.harbor.runtime-debian.frozen.v1","input_sha256":input_sha,"files":records}),
+        )?,
+        checksums,
+    ))
+}
+struct AdmittedRuntime {
+    input: Arc<Held>,
+    files: BTreeMap<String, Arc<Held>>,
+    metadata: Vec<u8>,
+    checksums: Vec<u8>,
+}
+fn admit_runtime(input: &External) -> Result<AdmittedRuntime> {
+    check_hash(&input.sha256)?;
+    if !input.path.is_absolute() {
+        return Err("production_asset_absolute".into());
+    }
+    // The JSON ceiling is checked before hashing or deserializing the manifest.
+    let manifest = Held::open_limit(&input.path, Some(&input.sha256), MAX_JSON)?;
+    let assets = runtime_assets(&manifest.bytes()?)?;
+    let (metadata, checksums) = runtime_metadata(&manifest.sha, &assets)?;
+    let mut files = BTreeMap::new();
+    for (name, asset) in assets {
+        let limit = if name.starts_with("debs/") {
+            MAX_RUNTIME_DEB
+        } else {
+            MAX_RUNTIME_LICENSE
+        };
+        let held = Held::open_limit(&asset.path, Some(&asset.sha256), limit)?;
+        if held.bytes != asset.bytes {
+            return Err("production_runtime_size_binding".into());
+        }
+        if name.starts_with("debs/") {
+            let mut file = held.file.try_clone().map_err(err)?;
+            file.seek(SeekFrom::Start(0)).map_err(err)?;
+            let mut magic = [0u8; 8];
+            file.read_exact(&mut magic).map_err(err)?;
+            if &magic != b"!<arch>\n" {
+                return Err("production_runtime_deb_header".into());
+            }
+        }
+        files.insert(name, held);
+    }
+    Ok(AdmittedRuntime {
+        input: manifest,
+        files,
+        metadata,
+        checksums,
+    })
 }
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
@@ -1225,6 +1382,43 @@ mod network_policy_tests {
         )));
     }
 }
+fn reader_dockerfile(
+    o: &Options,
+    groups: &[GroupBinding],
+    scope: &[String],
+    arm: &str,
+) -> Result<Vec<u8>> {
+    let mut docker = format!(
+        "FROM {}\nWORKDIR /app\nCOPY --chown={}:{} reader-input.json codex-config.json /app/\n",
+        o.reader_image, o.reader_uid, o.reader_gid
+    );
+    if o.runtime_debian_packages.is_some() {
+        docker.push_str(RUNTIME_DOCKER);
+    }
+    for id in scope {
+        let group = groups
+            .iter()
+            .find(|g| &g.id == id)
+            .ok_or("production_scope")?;
+        if arm == "gptgrep" {
+            docker.push_str(&format!(
+                "COPY --chown={}:{} groups/{id}/seal/ /app/prebuild-seals/{id}/\n",
+                o.reader_uid, o.reader_gid
+            ));
+        }
+        docker.push_str(&format!(
+            "COPY --chown={}:{} groups/{id}/raw/ {}/\n",
+            o.reader_uid,
+            o.reader_gid,
+            group.runtime_root.display()
+        ));
+    }
+    if arm == "gptgrep" {
+        docker.push_str("COPY tool/ /app/tool/\nRUN chmod 0555 /app/tool/gptgrep\n");
+    }
+    docker.push_str(&format!("USER {}:{}\n", o.reader_uid, o.reader_gid));
+    Ok(docker.into_bytes())
+}
 pub(super) fn prepare(
     corpus_path: &Path,
     reader_path: &Path,
@@ -1238,6 +1432,11 @@ pub(super) fn prepare(
     let option_file = Held::open(option_path, None)?;
     let option_bytes = option_file.bytes()?;
     let o = options(&option_bytes)?;
+    let runtime = o
+        .runtime_debian_packages
+        .as_ref()
+        .map(admit_runtime)
+        .transpose()?;
     if readers.schema_version != "gptgrep.harbor.production-readers.v1"
         || readers.corpus_sha256 != corpus.digest
         || readers.tasks.is_empty()
@@ -1269,6 +1468,14 @@ pub(super) fn prepare(
         "frozen-options.json".into(),
         Payload::Bytes(option_bytes.clone()),
     )?;
+    if let Some(runtime) = &runtime {
+        plan.put(
+            "frozen-runtime-debian-inputs.json".into(),
+            Payload::File(runtime.input.clone()),
+        )?;
+        plan.held.push(runtime.input.clone());
+        plan.held.extend(runtime.files.values().cloned());
+    }
     let mut seen = BTreeSet::new();
     let mut schedule = Vec::new();
     for (ordinal, t) in readers.tasks.into_iter().enumerate() {
@@ -1324,10 +1531,23 @@ pub(super) fn prepare(
                 format!("{prefix}/environment/codex-config.json"),
                 Payload::Bytes(option_bytes.clone()),
             )?;
-            let mut docker = format!(
-                "FROM {}\nWORKDIR /app\nCOPY --chown={}:{} reader-input.json codex-config.json /app/\n",
-                o.reader_image, o.reader_uid, o.reader_gid
-            );
+            if let Some(runtime) = &runtime {
+                for (name, file) in &runtime.files {
+                    plan.put(
+                        format!("{prefix}/environment/runtime-debian/{name}"),
+                        Payload::File(file.clone()),
+                    )?;
+                }
+                for (name, bytes) in [
+                    ("manifest.json", &runtime.metadata),
+                    ("checksums.sha256", &runtime.checksums),
+                ] {
+                    plan.put(
+                        format!("{prefix}/environment/runtime-debian/{name}"),
+                        Payload::Bytes(bytes.clone()),
+                    )?;
+                }
+            }
             for id in &t.group_scope {
                 let g = corpus
                     .groups
@@ -1355,17 +1575,7 @@ pub(super) fn prepare(
                     for (name, f) in &g.seals {
                         plan.put(format!("{group}/seal/{name}"), Payload::File(f.clone()))?;
                     }
-                    docker.push_str(&format!(
-                        "COPY --chown={}:{} groups/{id}/seal/ /app/prebuild-seals/{id}/\n",
-                        o.reader_uid, o.reader_gid
-                    ));
                 }
-                docker.push_str(&format!(
-                    "COPY --chown={}:{} groups/{id}/raw/ {}/\n",
-                    o.reader_uid,
-                    o.reader_gid,
-                    g.binding.runtime_root.display()
-                ));
             }
             if arm == "gptgrep" {
                 plan.put(
@@ -1373,12 +1583,15 @@ pub(super) fn prepare(
                     Payload::File(corpus.tool_file.clone()),
                 )?;
                 plan.put(format!("{prefix}/environment/tool/provenance.json"),Payload::Bytes(json(&value!({"declared_artifact":corpus.tool,"qualification":"HOLD_metadata_not_runtime_or_helper_capability"}))?))?;
-                docker.push_str("COPY tool/ /app/tool/\nRUN chmod 0555 /app/tool/gptgrep\n");
             }
-            docker.push_str(&format!("USER {}:{}\n", o.reader_uid, o.reader_gid));
             plan.put(
                 format!("{prefix}/environment/Dockerfile"),
-                Payload::Bytes(docker.into_bytes()),
+                Payload::Bytes(reader_dockerfile(
+                    &o,
+                    &plan.manifest.group_bindings,
+                    &t.group_scope,
+                    arm,
+                )?),
             )?;
             plan.put(
                 format!("{prefix}/task-descriptor.json"),
@@ -1421,13 +1634,34 @@ pub(super) fn validate(root: &Path) -> Result<(Manifest, String)> {
             "paired-schedule.json".to_string(),
         ]);
         let option_bytes = super::regular_bytes(&root.join("frozen-options.json"), MAX_JSON)?;
-        options(&option_bytes)?;
+        let o = options(&option_bytes)?;
         if hash(&option_bytes) != m.options_sha256 {
             return Err("production_options_binding".into());
         }
+        let runtime = if let Some(input) = &o.runtime_debian_packages {
+            check_hash(&input.sha256)?;
+            let name = "frozen-runtime-debian-inputs.json";
+            let bytes = super::regular_bytes(&root.join(name), MAX_JSON)?;
+            if hash(&bytes) != input.sha256 {
+                return Err("production_runtime_manifest_binding".into());
+            }
+            all_allowed.insert(name.into());
+            let assets = runtime_assets(&bytes)?;
+            let (metadata, checksums) = runtime_metadata(&input.sha256, &assets)?;
+            Some((assets, metadata, checksums))
+        } else {
+            None
+        };
         for t in &m.task_bindings {
             for arm in ["control", "gptgrep"] {
                 let prefix = format!("{arm}/{}", t.id);
+                if super::regular_bytes(
+                    &root.join(&prefix).join("environment/Dockerfile"),
+                    MAX_JSON,
+                )? != reader_dockerfile(&o, &m.group_bindings, &t.group_scope, arm)?
+                {
+                    return Err("production_reader_docker_binding".into());
+                }
                 if super::regular_bytes(
                     &root.join(&prefix).join("environment/codex-config.json"),
                     MAX_JSON,
@@ -1535,6 +1769,31 @@ pub(super) fn validate(root: &Path) -> Result<(Manifest, String)> {
                     return Err("production_group_output_set".into());
                 }
                 all_allowed.extend(allowed);
+                if let Some((assets, metadata, checksums)) = &runtime {
+                    let runtime_prefix = format!("{prefix}/environment/runtime-debian");
+                    for (name, asset) in assets {
+                        let output = format!("{runtime_prefix}/{name}");
+                        if m.files.get(&output) != Some(&asset.sha256)
+                            || regular_file(&root.join(&output), asset.bytes)?
+                                .metadata()
+                                .map_err(err)?
+                                .len()
+                                != asset.bytes
+                        {
+                            return Err("production_runtime_asset_binding".into());
+                        }
+                        all_allowed.insert(output);
+                    }
+                    for (name, expected) in
+                        [("manifest.json", metadata), ("checksums.sha256", checksums)]
+                    {
+                        let output = format!("{runtime_prefix}/{name}");
+                        if super::regular_bytes(&root.join(&output), MAX_JSON)? != *expected {
+                            return Err("production_runtime_mapping_binding".into());
+                        }
+                        all_allowed.insert(output);
+                    }
+                }
                 for name in [
                     "instruction.md",
                     "task-descriptor.json",

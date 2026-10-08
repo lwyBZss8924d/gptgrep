@@ -499,6 +499,48 @@ image and Codex binary digests, direct `codex exec` argv, task time/CPU/memory/
 network limits, repeats, seed, and nonzero `reader_uid`/`reader_gid`. A
 counterbalanced schedule remains `executed=false`; it does not launch trials.
 
+Production options may additionally supply `runtime_debian_packages: {path,
+sha256}` for an absolute, regular manifest file. Omit it or use null to preserve
+the existing Dockerfile. The manifest has this strict schema:
+
+```json
+{
+  "schema_version": "gptgrep.harbor.runtime-debian.v1",
+  "packages": [{
+    "deb": {"path": "/path/to/runtime/package.deb", "bytes": 1234, "sha256": "<64 lowercase hex>"},
+    "license": {"path": "/path/to/runtime/package.copyright", "bytes": 234, "sha256": "<64 lowercase hex>"}
+  }]
+}
+```
+
+The limit is 1–32 packages, 16 MiB per DEB, 256 KiB per license, 32 MiB total,
+and 1 MiB for the manifest, within the existing total export ceiling. Admission
+checks declared sizes and hashes, regular files through no-follow ancestors, and
+the DEB ar signature. Descriptors stay held and all sources are rechecked before
+completion. Filenames accept ASCII letters, digits, `._%+:-`; DEBs must end in
+`.deb`. Export maps them to fixed `debs/package-NNNN.deb` and
+`licenses/package-NNNN.txt` names, preserving original filenames in a frozen
+mapping without source paths.
+
+Both reader arms receive identical package, license, mapping and checksum bytes.
+The generated fixed Dockerfile instruction verifies checksums and runs offline
+`dpkg -i debs/*.deb` before the reader `USER`. It adds no APT lookup, network
+download, shell fragment input, or image digest substitution. Installation or
+dependency errors fail the build. The pinned `reader_image` must already satisfy
+any dependencies outside the supplied DEBs; export itself does not establish
+package installability or run a container. Baseline document inputs remain raw
+PDFs. Package source/license provenance belongs in the caller-supplied records,
+separately from task material; the root-level frozen input manifest binds exact
+source metadata, and it is not copied into either arm's image context.
+Production validation regenerates the complete reader Dockerfile from the same
+options/group/arm constructor used by export, rejecting extra commands or user
+changes even when an inventory is refreshed. The Harbor bridge admits the added
+root snapshot and per-arm runtime namespace, binds all package/license/mapping/
+checksum bytes, and checks the complete Dockerfile before compose. Explicit null
+is normalized to the same omitted descriptor field as Rust serialization. Offline
+generic fixtures cover enabled, omitted and null options through real exporter,
+bridge composition and Harbor `TaskConfig`; these are not container or model runs.
+
 Each task preserves this context topology:
 
 ```text
