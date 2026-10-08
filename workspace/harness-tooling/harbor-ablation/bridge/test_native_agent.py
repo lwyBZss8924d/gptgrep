@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 from harbor.environments.base import ExecResult
 from harbor.models.agent.context import AgentContext
+from harbor.models.trial.config import AgentConfig
 from gptgrep_harbor_agent import FrozenCodexAgent
 
 
@@ -88,6 +89,38 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.env.uploads, [])
         self.assertFalse(agent.capabilities.atif)
         self.assertIsNone(agent.MODEL_CONNECTION)
+
+    async def test_numeric_user_matches_docker_user_through_harbor_config_and_execution(self):
+        config = AgentConfig(
+            import_path="gptgrep_harbor_agent:FrozenCodexAgent", model_name="gpt-6-luna",
+            kwargs={"launcher_path":"/app/harness/gptgrep-codex-native-agent",
+                    "control_path":"/logs/agent/phase/control.json",
+                    "control_sha256":DIGEST, "user":"501:20", "transport_timeout_sec":30})
+        restored = AgentConfig.model_validate_json(config.model_dump_json())
+        self.assertEqual(restored.kwargs["user"], "501:20")
+        options = FrozenCodexAgent.parse_options(restored.kwargs)
+        self.assertEqual(options.model_dump()["user"], "501:20")
+        agent = FrozenCodexAgent(self.logs, model_name=restored.model_name, **restored.kwargs)
+        await agent.setup(self.env)
+        await agent.run(PROMPT, self.env, AgentContext())
+        self.assertEqual([kwargs["user"] for _, kwargs in self.env.calls], ["501:20", "501:20"])
+        self.assertTrue(all(kwargs["env"] == {} for _, kwargs in self.env.calls))
+        self.assertEqual(len(self.env.calls), 2)
+        self.assertEqual(len(self.env.uploads), 1)
+
+    def test_numeric_user_boundaries_and_unsafe_aliases(self):
+        for value in ("1:1", "501:20", "4294967294:4294967294", "agent"):
+            with self.subTest(user=value):
+                self.assertEqual(self.agent(user=value).options.user, value)
+        for value in ("root", "0:20", "501:0", "00:20", "0501:20", "501:020",
+                      "501", ":20", "501:", "-1:20", "+501:20", "501:root", "root:20",
+                      "501:20:1", "501: 20", " 501:20", "501:20\n", "501:20\x00",
+                      "4294967295:20", "501:4294967295", "4294967296:20",
+                      "999999999999999999999:20", 501):
+            with self.subTest(user=value), self.assertRaises(ValueError):
+                self.agent(user=value)
+        self.assertEqual(self.env.calls, [])
+        self.assertEqual(self.env.uploads, [])
 
     async def test_instruction_is_exact_file_bytes_and_never_shell_command(self):
         agent = self.agent()

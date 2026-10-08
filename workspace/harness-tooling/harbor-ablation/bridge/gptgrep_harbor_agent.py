@@ -51,8 +51,15 @@ class NativeOptions(AgentOptions):
     @field_validator("user")
     @classmethod
     def nonroot(cls, value):
+        numeric = re.fullmatch("([1-9][0-9]{0,9}):([1-9][0-9]{0,9})", value)
+        if numeric is not None:
+            # Linux reserves the all-ones UID/GID. Preserve the canonical pair,
+            # rather than resolving names or rewriting the owner's Docker USER.
+            if any(int(part) >= 2**32 - 1 for part in numeric.groups()):
+                raise ValueError("nonzero Linux UID:GID required")
+            return value
         if value == "root" or re.fullmatch("[a-z_][a-z0-9_-]{0,63}", value) is None:
-            raise ValueError("explicit nonroot sandbox user required")
+            raise ValueError("explicit nonroot name or canonical UID:GID required")
         return value
 
 
