@@ -6,6 +6,7 @@
 
 use crate::{
     GenerationPin, ReaderCacheBudget, ReaderReadMetrics, RichDocument, RichGenerationReader,
+    VisualCandidate, VisualCandidateRequest, VisualGenerationReader, VisualScope,
 };
 use gptgrep_parse::{ArtifactRef, NativePage};
 use serde::{
@@ -85,6 +86,9 @@ fn default_search_page_size() -> usize {
 fn default_max_hits() -> usize {
     20
 }
+fn default_visual_candidates() -> usize {
+    16
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -136,6 +140,20 @@ pub enum RichBatchOperation {
         #[serde(default)]
         cursor: Option<String>,
     },
+    /// Local visual metadata; its continuation belongs to the visual reader.
+    InspectVisual {
+        id: String,
+        #[serde(default)]
+        scope: VisualScope,
+        #[serde(default)]
+        query: String,
+        #[serde(default = "default_visual_candidates")]
+        max_candidates: usize,
+        #[serde(default)]
+        cursor: Option<String>,
+    },
+    /// One complete locally verified rendition, never a partial image window.
+    ReadVisual { id: String, rendition_id: String },
 }
 impl RichBatchOperation {
     pub fn id(&self) -> &str {
@@ -143,7 +161,9 @@ impl RichBatchOperation {
             Self::InspectDocuments { id, .. }
             | Self::InspectPages { id, .. }
             | Self::ReadArtifact { id, .. }
-            | Self::SearchArtifacts { id, .. } => id,
+            | Self::SearchArtifacts { id, .. }
+            | Self::InspectVisual { id, .. }
+            | Self::ReadVisual { id, .. } => id,
         }
     }
     fn binding(&self) -> (&str, &str, Value, Option<&str>) {
@@ -198,6 +218,10 @@ impl RichBatchOperation {
                 serde_json::json!({"query":query,"case_insensitive":case_insensitive,"literal":literal,"document":document,"max_hits":max_hits,"page_size":page_size}),
                 cursor.as_deref(),
             ),
+            // These operations never use the text/metadata cursor codec.
+            Self::InspectVisual { .. } | Self::ReadVisual { .. } => {
+                ("visual", "visual", Value::Null, None)
+            }
         }
     }
 }
@@ -703,6 +727,38 @@ fn preflight(pin: &GenerationPin, op: &RichBatchOperation) -> Result<usize, Rich
                     )
                 })?;
         }
+        RichBatchOperation::InspectVisual {
+            scope,
+            query,
+            max_candidates,
+            cursor,
+            ..
+        } => {
+            let mut ids = BTreeSet::new();
+            if query.len() > 65_536
+                || !(1..=256).contains(max_candidates)
+                || cursor.as_ref().is_some_and(|v| v.len() > 4096)
+                || scope
+                    .document_ids
+                    .iter()
+                    .any(|id| id.is_empty() || id.len() > 256 || !ids.insert(id))
+                || scope.first_page == Some(0)
+                || scope.last_page == Some(0)
+                || scope
+                    .last_page
+                    .is_some_and(|p| p < scope.first_page.unwrap_or(1))
+                || measure(scope, 65_536).is_err()
+            {
+                return Err(bad());
+            }
+            return Ok(0);
+        }
+        RichBatchOperation::ReadVisual { rendition_id, .. } => {
+            if rendition_id.is_empty() || rendition_id.len() > 256 {
+                return Err(bad());
+            }
+            return Ok(0);
+        }
     }
     let cursor_bound = Cursor {
         body: cursor_body(pin, op, usize::MAX),
@@ -813,6 +869,26 @@ fn preflight_resource(
                 ));
             }
         }
+        RichBatchOperation::InspectVisual { scope, .. } => {
+            if scope
+                .document_ids
+                .iter()
+                .any(|id| !manifest.documents.iter().any(|doc| &doc.document.id == id))
+            {
+                return Err(absent());
+            }
+        }
+        RichBatchOperation::ReadVisual { rendition_id, .. }
+            if !manifest.documents.iter().any(|doc| {
+                doc.pages.iter().any(|page| {
+                    page.renditions
+                        .iter()
+                        .any(|r| &r.artifact.id == rendition_id)
+                })
+            }) =>
+        {
+            return Err(absent());
+        }
         _ => {}
     }
     Ok(())
@@ -860,6 +936,369 @@ fn reader_error(e: anyhow::Error) -> RichBatchError {
             RichBatchErrorCode::SharedIntegrity,
             "Pinned generation or artifact integrity validation failed",
         )
+    }
+}
+
+fn visual_error(
+    visual: &VisualGenerationReader,
+    manifest: &crate::RichManifest,
+    scope: &VisualScope,
+    cause: anyhow::Error,
+) -> RichBatchError {
+    let message = format!("{cause:#}");
+    let code = if message.contains("visual_cursor") {
+        RichBatchErrorCode::InvalidCursor
+    } else if message.contains("visual_response") || message.contains("visual_working") {
+        RichBatchErrorCode::OutputBudgetInsufficient
+    } else if message.contains("visual_document_not_in_pin")
+        || message.contains("visual_rendition_not_in_pin")
+    {
+        RichBatchErrorCode::ResourceNotFound
+    } else if message.contains("visual_request_limit")
+        || message.contains("visual_scope_rejected")
+        || message.contains("visual_rendition_id_rejected")
+    {
+        RichBatchErrorCode::InvalidOperation
+    } else if visual.validate().is_err() {
+        RichBatchErrorCode::SharedIntegrity
+    } else if manifest.documents.iter().any(|doc| {
+        (scope.document_ids.is_empty() || scope.document_ids.contains(&doc.document.id))
+            && visual.verify_source(&doc.document.id).is_err()
+    }) {
+        // Source-leaf changes are item-local; retained manifest/dir/artifact
+        // corruption still stops the batch. No diagnostic path is returned.
+        RichBatchErrorCode::SourceStale
+    } else {
+        RichBatchErrorCode::SharedIntegrity
+    };
+    error(
+        code,
+        "Local visual request or pinned custody validation failed",
+    )
+}
+
+fn visual_metrics_upper() -> ReaderReadMetrics {
+    ReaderReadMetrics {
+        logical_reader_bytes: u64::MAX,
+        cached_logical_bytes: u64::MAX,
+        uncached_logical_bytes: u64::MAX,
+        observed_rust_read_bytes: u64::MAX,
+        observed_hash_bytes: u64::MAX,
+        cache_hits: u64::MAX,
+        cache_misses: u64::MAX,
+        cache_fallbacks: u64::MAX,
+        uncached_load_bytes: u64::MAX,
+        coverage: String::new(),
+    }
+}
+
+fn checked_visual_source(
+    visual: &VisualGenerationReader,
+    document_id: &str,
+) -> Result<(), RichBatchError> {
+    visual.validate().map_err(|_| {
+        error(
+            RichBatchErrorCode::SharedIntegrity,
+            "Retained visual custody changed",
+        )
+    })?;
+    visual.verify_source(document_id).map_err(|_| {
+        error(
+            RichBatchErrorCode::SourceStale,
+            "Visual source changed or disappeared",
+        )
+    })
+}
+
+fn visual_coverage_upper() -> RichBatchItemCoverage {
+    RichBatchItemCoverage {
+        unit: "visual_candidates".into(),
+        available: Some(usize::MAX),
+        start: usize::MAX,
+        end: usize::MAX,
+        selected: usize::MAX,
+        exhausted: false,
+        budget_truncated: false,
+        search_ceiling_reached: false,
+        // The native visual token appears once, in result.next_cursor.
+        cursor: None,
+    }
+}
+
+fn visual_result_limit(op: &RichBatchOperation, quota: usize) -> Result<usize, RichBatchError> {
+    let base = measure(
+        &ItemCandidate {
+            id: op.id(),
+            status: RichBatchStatus::Ok,
+            reserved_output_bytes: quota,
+            result: &Value::Null,
+            coverage: &visual_coverage_upper(),
+            read_metrics: &visual_metrics_upper(),
+            error: None,
+        },
+        quota,
+    )?;
+    // Replace the four-byte null with a complete bounded visual result.
+    quota
+        .checked_sub(base - 4)
+        .filter(|n| *n > 0)
+        .ok_or_else(|| {
+            error(
+                RichBatchErrorCode::OutputBudgetInsufficient,
+                "Visual item envelope cannot fit",
+            )
+        })
+}
+
+#[derive(Serialize)]
+struct LocalVisual<T: Serialize> {
+    #[serde(flatten)]
+    observation: T,
+    actual_image_delivery: bool,
+    citation_authority: bool,
+}
+
+#[derive(Serialize)]
+struct VisualRead<'a> {
+    schema_version: &'static str,
+    candidate: &'a VisualCandidate,
+    image_base64: &'a str,
+    actual_image_delivery: bool,
+    citation_authority: bool,
+}
+
+fn visual_base64(bytes: &[u8], admitted_length: usize) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::with_capacity(admitted_length);
+    for chunk in bytes.chunks(3) {
+        let a = chunk[0];
+        let b = chunk.get(1).copied().unwrap_or(0);
+        let c = chunk.get(2).copied().unwrap_or(0);
+        result.push(ALPHABET[(a >> 2) as usize] as char);
+        result.push(ALPHABET[(((a & 3) << 4) | (b >> 4)) as usize] as char);
+        result.push(if chunk.len() > 1 {
+            ALPHABET[(((b & 15) << 2) | (c >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        result.push(if chunk.len() > 2 {
+            ALPHABET[(c & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    result
+}
+
+fn execute_visual(
+    reader: &RichGenerationReader,
+    op: &RichBatchOperation,
+    quota: usize,
+    before: &ReaderReadMetrics,
+) -> Result<RichBatchItem, RichBatchError> {
+    if reader.cache_status().map_err(reader_error)?["strict_cache_only"] == true {
+        return Err(error(
+            RichBatchErrorCode::InvalidOperation,
+            "Visual operations require uncached verified input access; no rendition cache exists",
+        ));
+    }
+    let manifest = reader.manifest().map_err(reader_error)?;
+    let visual = reader.visual_reader().map_err(reader_error)?;
+    let limit = visual_result_limit(op, quota)?;
+    match op {
+        RichBatchOperation::InspectVisual {
+            scope,
+            query,
+            max_candidates,
+            cursor,
+            ..
+        } => {
+            let limit = limit
+                .checked_sub(b",\"actual_image_delivery\":false,\"citation_authority\":false".len())
+                .filter(|n| *n > 0)
+                .ok_or_else(|| {
+                    error(
+                        RichBatchErrorCode::OutputBudgetInsufficient,
+                        "Visual result cannot fit",
+                    )
+                })?;
+            let report = visual
+                .enumerate(&VisualCandidateRequest {
+                    scope: scope.clone(),
+                    query: query.clone(),
+                    max_candidates: *max_candidates,
+                    max_output_bytes: limit,
+                    resources: manifest.resource_budget.clone(),
+                    cursor: cursor.clone(),
+                })
+                .map_err(|e| visual_error(&visual, manifest, scope, e))?;
+            let selected = report.candidates.len();
+            let cover = RichBatchItemCoverage {
+                unit: "visual_candidates".into(),
+                available: Some(report.coverage.available_candidates),
+                start: report.offset,
+                end: report.offset + selected,
+                selected,
+                exhausted: report.coverage.enumeration_complete,
+                budget_truncated: selected < *max_candidates
+                    && !report.coverage.enumeration_complete,
+                search_ceiling_reached: false,
+                cursor: None,
+            };
+            successful(
+                reader,
+                op,
+                quota,
+                before,
+                &LocalVisual {
+                    observation: report,
+                    actual_image_delivery: false,
+                    citation_authority: false,
+                },
+                cover,
+            )
+        }
+        RichBatchOperation::ReadVisual { rendition_id, .. } => {
+            let (doc, page) = manifest
+                .documents
+                .iter()
+                .find_map(|doc| {
+                    doc.pages
+                        .iter()
+                        .find(|page| {
+                            page.renditions
+                                .iter()
+                                .any(|r| &r.artifact.id == rendition_id)
+                        })
+                        .map(|page| (doc, page))
+                })
+                .ok_or_else(|| {
+                    error(
+                        RichBatchErrorCode::ResourceNotFound,
+                        "Rendition is absent from pinned generation",
+                    )
+                })?;
+            let scope = VisualScope {
+                document_ids: vec![doc.document.id.clone()],
+                first_page: Some(page.number),
+                last_page: Some(page.number),
+            };
+            checked_visual_source(&visual, &doc.document.id)?;
+            // Enumerate only this physical page's at-most-four metadata entries.
+            // This copies no rendition bytes and preserves native visual custody.
+            let mut request = VisualCandidateRequest {
+                scope: scope.clone(),
+                query: String::new(),
+                max_candidates: 1,
+                max_output_bytes: limit,
+                resources: manifest.resource_budget.clone(),
+                cursor: None,
+            };
+            let mut candidate = None;
+            for _ in 0..4 {
+                let mut report = visual
+                    .enumerate(&request)
+                    .map_err(|e| visual_error(&visual, manifest, &scope, e))?;
+                if let Some(found) = report.candidates.pop().filter(|value| {
+                    matches!(&value.evidence, crate::EvidenceRef::VisualRegion { rendition_id: id, .. } if id == rendition_id)
+                }) {
+                    candidate = Some(found);
+                    break;
+                }
+                request.cursor = report.next_cursor;
+                if request.cursor.is_none() {
+                    break;
+                }
+            }
+            let candidate = candidate.ok_or_else(|| {
+                error(
+                    RichBatchErrorCode::SharedIntegrity,
+                    "Indexed rendition is absent from visual metadata",
+                )
+            })?;
+            let bytes = usize::try_from(candidate.encoded_bytes).map_err(|_| {
+                error(
+                    RichBatchErrorCode::OutputBudgetInsufficient,
+                    "Visual byte count exceeds output bounds",
+                )
+            })?;
+            let encoded_length = bytes
+                .checked_add(2)
+                .and_then(|n| n.checked_div(3))
+                .and_then(|n| n.checked_mul(4))
+                .ok_or_else(|| {
+                    error(
+                        RichBatchErrorCode::OutputBudgetInsufficient,
+                        "Visual base64 count exceeds output bounds",
+                    )
+                })?;
+            let cover = RichBatchItemCoverage {
+                unit: "image_bytes".into(),
+                available: Some(bytes),
+                start: 0,
+                end: bytes,
+                selected: bytes,
+                exhausted: true,
+                budget_truncated: false,
+                search_ceiling_reached: false,
+                cursor: None,
+            };
+            let empty = VisualRead {
+                schema_version: "gptgrep.visual.payload.v1",
+                candidate: &candidate,
+                image_base64: "",
+                actual_image_delivery: false,
+                citation_authority: false,
+            };
+            let base = measure(
+                &ItemCandidate {
+                    id: op.id(),
+                    status: RichBatchStatus::Ok,
+                    reserved_output_bytes: quota,
+                    result: &empty,
+                    coverage: &cover,
+                    read_metrics: &visual_metrics_upper(),
+                    error: None,
+                },
+                quota,
+            )?;
+            if base.checked_add(encoded_length).is_none_or(|n| n > quota) {
+                return Err(error(
+                    RichBatchErrorCode::OutputBudgetInsufficient,
+                    "Complete image and batch item exceed reserved share",
+                ));
+            }
+            // Full batch item + ASCII base64 admission precedes artifact reads.
+            let payload = visual
+                .read_rendition(rendition_id, &manifest.resource_budget, limit)
+                .map_err(|e| visual_error(&visual, manifest, &scope, e))?;
+            checked_visual_source(&visual, &doc.document.id)?;
+            if payload.bytes().len() != bytes {
+                return Err(error(
+                    RichBatchErrorCode::SharedIntegrity,
+                    "Verified rendition byte count changed",
+                ));
+            }
+            let encoded = visual_base64(payload.bytes(), encoded_length);
+            successful(
+                reader,
+                op,
+                quota,
+                before,
+                &VisualRead {
+                    schema_version: "gptgrep.visual.payload.v1",
+                    candidate: payload.candidate(),
+                    image_base64: &encoded,
+                    actual_image_delivery: false,
+                    citation_authority: false,
+                },
+                cover,
+            )
+        }
+        _ => Err(error(
+            RichBatchErrorCode::InvalidOperation,
+            "Not a visual operation",
+        )),
     }
 }
 
@@ -1496,6 +1935,9 @@ fn execute(
     before: &ReaderReadMetrics,
 ) -> Result<RichBatchItem, RichBatchError> {
     match op {
+        RichBatchOperation::InspectVisual { .. } | RichBatchOperation::ReadVisual { .. } => {
+            execute_visual(reader, op, quota, before)
+        }
         RichBatchOperation::InspectDocuments {
             fields, page_size, ..
         } => {

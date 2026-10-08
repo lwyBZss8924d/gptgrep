@@ -156,6 +156,362 @@ fn publish(root: &Path, texts: &[&str]) -> Result<GenerationPin> {
     writer.publish()
 }
 
+// A real Writer/Reader generation with synthetic source-bound PNG artifacts.
+// This exercises local custody; it qualifies no native parser or model delivery.
+fn visual_png(value: u8) -> Vec<u8> {
+    fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        let mut crc = u32::MAX;
+        for byte in kind.iter().chain(data) {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ if crc & 1 != 0 { 0xedb8_8320 } else { 0 };
+            }
+        }
+        out.extend_from_slice(&(!crc).to_be_bytes());
+    }
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut header = vec![];
+    header.extend_from_slice(&1u32.to_be_bytes());
+    header.extend_from_slice(&1u32.to_be_bytes());
+    header.extend_from_slice(&[8, 2, 0, 0, 0]);
+    chunk(&mut png, b"IHDR", &header);
+    let raw = [0, value, 60, 78];
+    let mut zlib = vec![0x78, 0x01, 1, 4, 0, 251, 255];
+    zlib.extend_from_slice(&raw);
+    let (mut a, mut b) = (1u32, 0u32);
+    for byte in raw {
+        a = (a + u32::from(byte)) % 65521;
+        b = (b + a) % 65521;
+    }
+    zlib.extend_from_slice(&((b << 16) | a).to_be_bytes());
+    chunk(&mut png, b"IDAT", &zlib);
+    chunk(&mut png, b"IEND", &[]);
+    png
+}
+
+fn publish_visual(root: &Path, pages: usize) -> Result<(GenerationPin, Vec<Vec<u8>>)> {
+    let texts = vec!["synthetic visual source text\n"; pages];
+    let (staging, mut parsed) = candidate(root, &texts)?;
+    let mut images = Vec::new();
+    for page in &mut parsed.pages {
+        let bytes = visual_png(page.number as u8);
+        let name = format!("p{}-rendition.png", page.number);
+        let artifact = ArtifactRef {
+            id: gptgrep_parse::artifact_id(
+                &parsed.summary.source_sha256,
+                &parsed.native_profile_sha256,
+                &ArtifactKind::Rendition,
+                Some(page.number),
+                None,
+                &byte_digest(&bytes),
+            )?,
+            kind: ArtifactKind::Rendition,
+            relative_path: name.into(),
+            sha256: byte_digest(&bytes),
+            profile_sha256: parsed.native_profile_sha256.clone(),
+            bytes: bytes.len() as u64,
+            mime: "image/png".into(),
+            page: Some(page.number),
+            region_id: None,
+        };
+        let path = staging.path().join(&artifact.relative_path);
+        fs::write(&path, &bytes)?;
+        page.renditions.push(gptgrep_parse::OcrImage {
+            artifact: artifact.clone(),
+            path,
+            width: 1,
+            height: 1,
+            page_to_raster: AffineTransform {
+                a: 0.01,
+                d: 0.005,
+                ..AffineTransform::IDENTITY
+            },
+        });
+        parsed.artifacts.push(artifact);
+        images.push(bytes);
+    }
+    let mut writer = RichGenerationWriter::begin(root, ResourceBudget::default())?;
+    writer.add_document("source.pdf", &staging.path().canonicalize()?, parsed)?;
+    Ok((writer.publish()?, images))
+}
+
+fn decode_visual_base64(value: &str) -> Vec<u8> {
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut bytes = Vec::new();
+    for chunk in value.as_bytes().chunks_exact(4) {
+        let digit = |byte| alphabet.iter().position(|v| *v == byte).unwrap() as u32;
+        let word = (digit(chunk[0]) << 18)
+            | (digit(chunk[1]) << 12)
+            | if chunk[2] == b'=' {
+                0
+            } else {
+                digit(chunk[2]) << 6
+            }
+            | if chunk[3] == b'=' { 0 } else { digit(chunk[3]) };
+        bytes.push((word >> 16) as u8);
+        if chunk[2] != b'=' {
+            bytes.push((word >> 8) as u8);
+        }
+        if chunk[3] != b'=' {
+            bytes.push(word as u8);
+        }
+    }
+    bytes
+}
+
+#[test]
+fn visual_continuation_uses_native_fixed_pin_query_scope_and_options() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().canonicalize()?;
+    let (pin, _) = publish_visual(&root, 2)?;
+    let reader = RichGenerationReader::open(&root)?;
+    let first = dispatch_rich_batch_with_reader(
+        &reader,
+        request(json!([
+            {"id":"visual","op":"inspect_visual","query":"generic visual question","max_candidates":1}
+        ])),
+    )?;
+    let result = first.items[0].result.as_ref().unwrap();
+    assert_eq!(result["candidates"].as_array().unwrap().len(), 1);
+    assert_eq!(result["actual_image_delivery"], false);
+    assert_eq!(result["citation_authority"], false);
+    let token = result["next_cursor"].as_str().unwrap();
+    assert!(first.items[0].coverage.cursor.is_none());
+    let mut next = request(json!([{"id":"visual","op":"inspect_visual",
+        "query":"generic visual question","max_candidates":1,"cursor":token}]));
+    next.generation = RichBatchGeneration::Exact(pin.clone());
+    let second = dispatch_rich_batch_with_reader(&reader, next.clone())?;
+    assert_eq!(second.items[0].result.as_ref().unwrap()["offset"], 1);
+    assert!(second.items[0].result.as_ref().unwrap()["next_cursor"].is_null());
+    for changed in [
+        json!({"id":"visual","op":"inspect_visual","query":"other","max_candidates":1,"cursor":token}),
+        json!({"id":"visual","op":"inspect_visual","query":"generic visual question","max_candidates":2,"cursor":token}),
+        json!({"id":"visual","op":"inspect_visual","scope":{"first_page":2},"query":"generic visual question","max_candidates":1,"cursor":token}),
+        json!({"id":"text","op":"inspect_pages","document":"source.pdf","cursor":token}),
+    ] {
+        let response = dispatch_rich_batch_with_reader(&reader, request(json!([changed])))?;
+        assert_eq!(
+            response.items[0].error.as_ref().unwrap().code,
+            RichBatchErrorCode::InvalidCursor
+        );
+    }
+    let (new_pin, _) = publish_visual(&root, 3)?;
+    assert_ne!(pin, new_pin);
+    assert_eq!(dispatch_rich_batch(&root, next.clone())?.generation, pin);
+    next.generation = RichBatchGeneration::Current(CurrentRichGeneration::Current);
+    let response = dispatch_rich_batch(&root, next)?;
+    assert_eq!(
+        response.items[0].error.as_ref().unwrap().code,
+        RichBatchErrorCode::InvalidCursor
+    );
+    Ok(())
+}
+
+#[test]
+fn visual_read_is_exact_complete_local_observation_with_shared_metrics() -> Result<()> {
+    for (raw, encoded) in [
+        (b"".as_slice(), ""),
+        (b"f", "Zg=="),
+        (b"fo", "Zm8="),
+        (b"foo", "Zm9v"),
+        (b"foobar", "Zm9vYmFy"),
+    ] {
+        assert_eq!(visual_base64(raw, encoded.len()), encoded);
+    }
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().canonicalize()?;
+    let (_, images) = publish_visual(&root, 1)?;
+    let reader = RichGenerationReader::open(&root)?;
+    let id = &reader.manifest()?.documents[0].pages[0].renditions[0]
+        .artifact
+        .id;
+    let response = dispatch_rich_batch_with_reader(
+        &reader,
+        request(json!([
+            {"id":"read","op":"read_visual","rendition_id":id},
+            {"id":"catalog","op":"inspect_documents"}
+        ])),
+    )?;
+    let result = response.items[0].result.as_ref().unwrap();
+    assert_eq!(
+        decode_visual_base64(result["image_base64"].as_str().unwrap()),
+        images[0]
+    );
+    assert_eq!(result["candidate"]["encoded_bytes"], images[0].len());
+    assert_eq!(result["actual_image_delivery"], false);
+    assert_eq!(result["citation_authority"], false);
+    assert!(response.items[0].coverage.exhausted);
+    assert!(!response.items[0].coverage.budget_truncated);
+    assert!(response.items[0].coverage.cursor.is_none());
+    let item_reads: u64 = response
+        .items
+        .iter()
+        .map(|i| i.read_metrics.as_ref().unwrap().observed_rust_read_bytes)
+        .sum();
+    assert!(
+        response
+            .metrics
+            .read_metrics
+            .as_ref()
+            .unwrap()
+            .observed_rust_read_bytes
+            >= item_reads
+    );
+    assert_eq!(response.metrics.model_submissions, 0);
+    assert!(response.metrics.physical_bytes.is_none());
+    Ok(())
+}
+
+#[test]
+fn visual_missing_and_stale_sources_are_local_but_artifact_corruption_is_global() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().canonicalize()?;
+    publish_visual(&root, 1)?;
+    let reader = RichGenerationReader::open(&root)?;
+    let manifest = reader.manifest()?;
+    let artifact = &manifest.documents[0].pages[0].renditions[0].artifact;
+    let source = fs::read(root.join("source.pdf"))?;
+    for (id, stale) in [("missing", false), (artifact.id.as_str(), true)] {
+        if stale {
+            fs::write(root.join("source.pdf"), b"changed source")?;
+        }
+        let response = dispatch_rich_batch_with_reader(
+            &reader,
+            request(json!([
+                {"id":"read","op":"read_visual","rendition_id":id},
+                {"id":"later","op":"inspect_documents"}
+            ])),
+        )?;
+        assert_eq!(
+            response.items[0].error.as_ref().unwrap().code,
+            if stale {
+                RichBatchErrorCode::SourceStale
+            } else {
+                RichBatchErrorCode::ResourceNotFound
+            }
+        );
+        assert_eq!(response.items[1].status, RichBatchStatus::Ok);
+    }
+    fs::write(root.join("source.pdf"), &source)?;
+    let artifact_path = root
+        .join(".gptgrep/generations")
+        .join(&reader.pin().generation)
+        .join(&artifact.relative_path);
+    fs::write(&artifact_path, b"corrupted image")?;
+    let mut small = request(json!([{"id":"read","op":"read_visual","rendition_id":artifact.id}]));
+    small.budget.max_output_bytes = ENVELOPE_RESERVE + MIN_ITEM_OUTPUT;
+    let response = dispatch_rich_batch_with_reader(&reader, small)?;
+    assert_eq!(
+        response.items[0].error.as_ref().unwrap().code,
+        RichBatchErrorCode::OutputBudgetInsufficient
+    );
+    assert!(response.items[0].result.is_none());
+    let failure = dispatch_rich_batch_with_reader(
+        &reader,
+        request(json!([
+            {"id":"first","op":"inspect_documents"},
+            {"id":"read","op":"read_visual","rendition_id":artifact.id},
+            {"id":"later","op":"inspect_documents"}
+        ])),
+    )
+    .unwrap_err();
+    assert_eq!(failure.error.code, RichBatchErrorCode::SharedIntegrity);
+    assert_eq!(failure.items[0].status, RichBatchStatus::Ok);
+    assert_eq!(failure.items[2].status, RichBatchStatus::NotExecuted);
+    Ok(())
+}
+
+#[test]
+fn visual_reservations_do_not_borrow_other_items_and_no_image_cursor_is_admitted() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().canonicalize()?;
+    publish_visual(&root, 1)?;
+    let reader = RichGenerationReader::open(&root)?;
+    let id = &reader.manifest()?.documents[0].pages[0].renditions[0]
+        .artifact
+        .id;
+    let mut req = request(json!([
+        {"id":"visual","op":"read_visual","rendition_id":id},
+        {"id":"catalog","op":"inspect_documents"}
+    ]));
+    req.budget.max_output_bytes = ENVELOPE_RESERVE + 2 * MIN_ITEM_OUTPUT;
+    let response = dispatch_rich_batch_with_reader(&reader, req)?;
+    assert_eq!(response.items[0].reserved_output_bytes, MIN_ITEM_OUTPUT);
+    assert_eq!(response.items[1].reserved_output_bytes, MIN_ITEM_OUTPUT);
+    assert_eq!(
+        response.items[0].error.as_ref().unwrap().code,
+        RichBatchErrorCode::OutputBudgetInsufficient
+    );
+    assert_eq!(response.items[1].status, RichBatchStatus::Ok);
+    assert!(
+        parse_rich_batch_request(&serde_json::to_vec(
+            &json!({"schema_version":RICH_BATCH_REQUEST_SCHEMA,
+        "operations":[{"id":"x","op":"read_visual","rendition_id":id,"cursor":"forbidden"}]})
+        )?)
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn visual_counts_and_scope_errors_do_not_read_rendition_bytes() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().canonicalize()?;
+    publish_visual(&root, 1)?;
+    let reader = RichGenerationReader::open(&root)?;
+    let strict_reader = RichGenerationReader::open_with_cache_budget(
+        &root,
+        &ReaderCacheBudget {
+            strict_cache_only: true,
+            ..Default::default()
+        },
+    )?;
+    let doc = &reader.manifest()?.documents[0];
+    let artifact = &doc.pages[0].renditions[0].artifact;
+    fs::write(
+        root.join(".gptgrep/generations")
+            .join(&reader.pin().generation)
+            .join(&artifact.relative_path),
+        b"unread corrupted rendition",
+    )?;
+    let response = dispatch_rich_batch_with_reader(
+        &reader,
+        request(json!([
+            {"id":"zero","op":"inspect_visual","max_candidates":0},
+            {"id":"count","op":"inspect_visual","max_candidates":257},
+            {"id":"duplicate","op":"inspect_visual","scope":{"document_ids":[doc.document.id,doc.document.id]}},
+            {"id":"missing","op":"inspect_visual","scope":{"document_ids":["absent-document"]}},
+            {"id":"later","op":"inspect_documents"}
+        ])),
+    )?;
+    for item in &response.items[..3] {
+        assert_eq!(
+            item.error.as_ref().unwrap().code,
+            RichBatchErrorCode::InvalidOperation
+        );
+    }
+    assert_eq!(
+        response.items[3].error.as_ref().unwrap().code,
+        RichBatchErrorCode::ResourceNotFound
+    );
+    assert_eq!(response.items[4].status, RichBatchStatus::Ok);
+    let mut strict_request = request(json!([
+        {"id":"visual","op":"read_visual","rendition_id":artifact.id},
+        {"id":"later","op":"inspect_documents"}
+    ]));
+    strict_request.budget.cache.strict_cache_only = true;
+    let response = dispatch_rich_batch_with_reader(&strict_reader, strict_request)?;
+    assert_eq!(
+        response.items[0].error.as_ref().unwrap().code,
+        RichBatchErrorCode::InvalidOperation
+    );
+    assert_eq!(response.items[1].status, RichBatchStatus::Ok);
+    Ok(())
+}
+
 #[test]
 fn rich_batch_schema_rejects_invalid_envelopes() {
     assert!(parse_rich_batch_request(b"{}").is_err());

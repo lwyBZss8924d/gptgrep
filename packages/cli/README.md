@@ -22,12 +22,23 @@ All forwarding commands accept `--request` with one JSON object. `request-schema
 | `index` | `root` (default `.`), `optimizeMerge` (default false; native paginated documents only) | `gptgrep index ROOT [--optimize-merge] --json` |
 | `search` | `query`, `root`, `mode` (`regex`, `lexical`, `hybrid`, `semantic`; default `hybrid`), optional `document` and Jev `model`, `limit` (1–1000; default 20), `context` (0–100; default 0), `minScore` (0–1; default 0.5), `ignoreCase`, `fixedStrings` | `gptgrep search QUERY ROOT --mode MODE [--document PATH] [--model JEV_MODEL] --limit N --context C --min-score S --json` |
 | `tree` | `file`, `root` | `gptgrep tree FILE --root ROOT --json` |
+| `read` | `nodeId`, `root`, `offset` (default 0), `maxBytes` (1–65536; default 8192) | `gptgrep read DOCUMENT_ID:NODE_ID --root ROOT --offset OFFSET --max-bytes BYTES --json` |
+| `batch` | `root`, `rich` (default false), `batch` (native request object) | `gptgrep batch --root ROOT --input - [--rich] --json`, with the request sent on stdin |
 | `status` | `root` | `gptgrep status ROOT --json` |
 | `doctor` | none | `gptgrep doctor --json` |
 | `ask` | `question`, `root`, optional `document`, `jevModel` and host settings below | `gptgrep ask QUESTION ROOT [--document PATH] [--jev-model JEV_MODEL] --json` |
 | `summarize` | `nodeId`, `root`, optional `document`, `jevModel` and host settings below | `gptgrep summarize DOCUMENT_ID:NODE_ID --root ROOT [--document PATH] [--jev-model JEV_MODEL] --json` |
 
 Search defaults to hybrid with zero context. `minScore` is a relevance-rubric floor, not calibrated confidence. A search request's `model` selects the Jev Decisions model; omitting it preserves the native default. `document` restricts retrieval to one exact indexed source-relative path, including paths containing spaces.
+
+`read` preserves the native bounded source window, typed evidence and `next_offset`. `batch` serializes its nested request once and sends at most 1 MiB of UTF-8 JSON to native stdin. Native validation owns the versioned batch schema, operation IDs, generation binding and per-item output reservations. Inspect every item's status, coverage and continuation; global and item failures preserve the structured native report with a nonzero exit status.
+
+For a separately published rich v2 generation, opt in with `rich: true`. `inspect_visual` enumerates manifest-bound renditions independently of text matches; `read_visual` reads a complete verified rendition as base64. Copy rendition IDs and the generation pin from tool output. Enumeration cursors bind scope, query and options; image reads are never truncated or paginated. These local operations do not invoke OCR or a model, prove model image delivery, or issue visual citation rights. The stored generation resource bounds and the complete batch output budget also apply to image responses.
+
+```sh
+node src/cli.js read --request '{"nodeId":"DOCUMENT_ID:NODE_ID","root":"./docs","offset":0,"maxBytes":8192}' --json
+node src/cli.js batch --request '{"root":"./docs","rich":true,"batch":{"schema_version":"gptgrep.batch.rich.request.v1","operations":[{"id":"visual","op":"inspect_visual","max_candidates":2}]}}' --json
+```
 
 `ask` and `summarize` invoke the native local Codex host, using the existing account environment. Their host settings are `codexBin` (default `codex`), optional `codexHome`, `model` (the Codex model, default `gpt-5.6-luna`), `reasoningEffort` (default `max`), `serviceTier` (default `fast`), `timeout` (1–900 seconds; default 180), and `maxToolCalls` (1–64; default 12). Their separate `jevModel` field forwards `--jev-model`; omitting it preserves the native Jev default. The optional `document` scope forwards `--document`. For `summarize`, that path must match the selected node's source document; the native host rejects a conflict. The wrapper preserves the distinction between Codex and Jev model settings. Native citation verification and host receipts are preserved in its structured response.
 

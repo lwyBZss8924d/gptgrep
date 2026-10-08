@@ -6,6 +6,7 @@ import path from 'node:path'
 import { promisify } from 'node:util'
 import { after, before, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { runNative } from '../src/native.js'
 
 const exec = promisify(execFile)
 const entry = fileURLToPath(new URL('../src/cli.js', import.meta.url))
@@ -17,7 +18,27 @@ before(async () => {
   binary = path.join(temporary, 'native-fixture')
   await writeFile(binary, `#!/usr/bin/env node
 const args = process.argv.slice(2);
-if (args.includes('empty-result')) {
+if (args.includes('unread-stdin-fixture')) {
+  setInterval(() => {}, 1000);
+} else if (args.includes('early-batch-rejection')) {
+  process.stdout.write(JSON.stringify({schema_version: 'gptgrep.batch.rich.response.v1',
+    error: {code: 'invalid_request', message: 'early fixture rejection'}, items: []}));
+  process.exitCode = 2;
+} else if (args[0] === 'batch') {
+  let input = '';
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (part) => input += part);
+  process.stdin.on('end', () => {
+    const request = JSON.parse(input);
+    if (request.fixtureFailure) {
+      process.stdout.write(JSON.stringify({schema_version: 'gptgrep.batch.rich.response.v1',
+        execution: {scope: 'local_deterministic_no_model_context', model_submissions: 0},
+        generation: null, error: {code: 'invalid_request', message: 'fixture request rejected'},
+        items: [], read_metrics: null}));
+      process.exitCode = 2;
+    } else process.stdout.write(JSON.stringify({args, input, request}));
+  });
+} else if (args.includes('empty-result')) {
   process.stdout.write(JSON.stringify({hits: []})); process.exitCode = 1;
 } else if (args.includes('native-error')) {
   process.stdout.write(JSON.stringify({error: 'failed', hits: []}));
@@ -66,11 +87,70 @@ test('all supported operations forward explicit native arguments', async () => {
     ['index', { root: '/docs', optimizeMerge: true }, ['index', '--optimize-merge', '--json', '--', '/docs']],
     ['status', { root: '/docs' }, ['status', '--json', '--', '/docs']],
     ['tree', { root: '/docs', file: 'a.pdf' }, ['tree', '--root=/docs', '--json', '--', 'a.pdf']],
+    ['read', { root: '/docs', nodeId: '--schema', offset: 12, maxBytes: 1024 }, ['read', '--root=/docs', '--offset', '12', '--max-bytes', '1024', '--json', '--', '--schema']],
     ['doctor', {}, ['doctor', '--json']],
   ]) {
     const { stdout } = await run([command, '--request', JSON.stringify(request), '--json'])
     assert.deepEqual(JSON.parse(stdout).args, expected)
   }
+})
+
+test('rich batch reaches native stdin with exact pin, image operations and literal data', async () => {
+  const batch = { schema_version: 'gptgrep.batch.rich.request.v1', generation: {generation: 'fixed-generation', manifest_sha256: 'a'.repeat(64)},
+    operations: [{id: 'visual', op: 'inspect_visual', query: '图表 $(touch sentinel) --mcp'}, {id: 'bytes', op: 'read_visual', rendition_id: 'fixed-image'}] }
+  for (const rich of [false, true]) {
+    const {stdout} = await run(['batch', '--request', JSON.stringify({root: '/docs space', rich, batch}), '--json'])
+    const result = JSON.parse(stdout)
+    assert.deepEqual(result.args, ['batch', '--root=/docs space', '--input=-', ...(rich ? ['--rich'] : []), '--json'])
+    assert.equal(result.input, JSON.stringify(batch))
+    assert.deepEqual(result.request, batch)
+  }
+  const schema = JSON.parse((await run(['request-schema', 'batch', '--json'], '/missing/native')).stdout)
+  assert.equal(schema.properties.rich.default, false)
+  assert.equal(schema.properties.batch.type, 'object')
+  const readSchema = JSON.parse((await run(['request-schema', 'read', '--json'], '/missing/native')).stdout)
+  assert.equal(readSchema.properties.maxBytes.default, 8192)
+  assert.equal(readSchema.properties.offset.default, 0)
+})
+
+test('native batch failure retains complete structured evidence and nonzero exit', async () => {
+  for (const options of [[], ['--full-output']]) {
+    await assert.rejects(run(['batch', '--request', JSON.stringify({rich: true, batch: {fixtureFailure: true}}), '--json', ...options]), (error) => {
+      assert.equal(error.code, 2)
+      const outer = JSON.parse(error.stdout)
+      const report = options.length ? outer.data : outer
+      assert.equal(report.schema_version, 'gptgrep.batch.rich.response.v1')
+      assert.equal(report.error.code, 'invalid_request')
+      assert.deepEqual(report.items, [])
+      assert.equal(report.execution.model_submissions, 0)
+      if (options.length) assert.equal(outer.ok, false)
+      return true
+    })
+  }
+})
+
+test('stdin UTF-8 byte cap rejects before starting an executable', async () => {
+  await assert.rejects(runNative(['batch'], '/missing/native', 1000, '界'.repeat(349526)), /1048576 bytes/)
+  await assert.rejects(runNative(['batch'], '/missing/native', 1000, {}), /UTF-8 string/)
+})
+
+test('early native rejection preserves JSON when stdin cannot finish', async () => {
+  await assert.rejects(runNative(['batch', 'early-batch-rejection'], binary, 5000, 'x'.repeat(1048576)), (error) => {
+    assert.equal(error.name, 'NativeFailure')
+    assert.equal(error.exitCode, 2)
+    assert.equal(error.report.error.message, 'early fixture rejection')
+    return true
+  })
+})
+
+test('native timeout settles even when the child does not consume stdin', async () => {
+  await assert.rejects(runNative(['batch', 'unread-stdin-fixture'], binary, 150, 'x'.repeat(1048576)), /Native gptgrep failed/)
+})
+
+test('interrupt is forwarded while native stdin is blocked', async () => {
+  const pending = runNative(['batch', 'unread-stdin-fixture'], binary, 5000, 'x'.repeat(1048576))
+  const timer = setTimeout(() => process.emit('SIGINT'), 75)
+  try { await assert.rejects(pending, /SIGINT/) } finally { clearTimeout(timer) }
 })
 
 test('default search selects hybrid while deterministic modes remain explicit', async () => {

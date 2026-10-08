@@ -42,6 +42,32 @@ fn stdin_rich_request_reaches_generation_open_without_model_context() {
 }
 
 #[test]
+fn visual_operations_reach_the_same_local_pinned_generation_frontdoor() {
+    let root = tempfile::tempdir().unwrap();
+    for operation in [
+        json!({"id":"visual","op":"inspect_visual","scope":{},"query":"generic","max_candidates":1}),
+        json!({"id":"image","op":"read_visual","rendition_id":"source-bound-rendition"}),
+    ] {
+        let input = serde_json::to_vec(&json!({
+            "schema_version":"gptgrep.batch.rich.request.v1", "operations":[operation]
+        }))
+        .unwrap();
+        let response = error(&invoke(root.path(), &input));
+        // Accepted operation schema, then refusal because no generation exists.
+        assert_eq!(response["error"]["code"], "shared_integrity");
+        assert!(response["generation"].is_null());
+    }
+    let input = serde_json::to_vec(&json!({
+        "schema_version":"gptgrep.batch.rich.request.v1",
+        "operations":[{"id":"image","op":"read_visual","rendition_id":"synthetic","cursor":"not-an-image-window"}]
+    })).unwrap();
+    assert_eq!(
+        error(&invoke(root.path(), &input))["error"]["code"],
+        "invalid_request"
+    );
+}
+
+#[test]
 fn rich_schema_and_output_admission_happen_before_generation_open() {
     let root = tempfile::tempdir().unwrap();
     for (input, expected) in [
@@ -98,6 +124,30 @@ fn discovery_describes_rich_schema_and_bounded_search_window() {
     assert_eq!(rich["network"], false);
     assert_eq!(rich["model_submissions"], 0);
     assert!(
+        rich["operations"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("inspect_visual"))
+    );
+    assert!(
+        rich["operations"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("read_visual"))
+    );
+    assert!(
+        rich["visual_authority"]
+            .as_str()
+            .unwrap()
+            .contains("actual_image_delivery=false")
+    );
+    assert!(
+        rich["visual_admission"]
+            .as_str()
+            .unwrap()
+            .contains("before rendition byte reads")
+    );
+    assert!(
         rich["search_continuation"]
             .as_str()
             .unwrap()
@@ -109,9 +159,8 @@ fn discovery_describes_rich_schema_and_bounded_search_window() {
         .output()
         .unwrap();
     assert!(output.status.success());
-    assert!(
-        String::from_utf8(output.stdout)
-            .unwrap()
-            .contains("batch --rich")
-    );
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(help.contains("batch --rich"));
+    assert!(help.contains("inspect_visual") && help.contains("read_visual"));
+    assert!(help.contains("citation_authority=false"));
 }

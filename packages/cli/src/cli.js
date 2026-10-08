@@ -43,6 +43,17 @@ const requests = {
     file: z.string().min(1).describe('Source document path'),
     root,
   }).strict(),
+  read: z.object({
+    nodeId: z.string().min(1).describe('DOCUMENT_ID:NODE_ID from native search/tree output'),
+    root,
+    offset: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0),
+    maxBytes: z.number().int().min(1).max(65536).default(8192),
+  }).strict(),
+  batch: z.object({
+    root,
+    rich: z.boolean().default(false).describe('Use the opt-in v2 rich batch contract'),
+    batch: z.record(z.string(), z.unknown()).describe('Native batch request object; native validation owns its versioned operation schema'),
+  }).strict(),
   status: z.object({ root }).strict(),
   doctor: z.object({}).strict(),
   ask: z.object({
@@ -61,6 +72,8 @@ const descriptions = {
   search: 'Search with Jev hybrid retrieval by default; select regex or lexical for deterministic primitives.',
   index: 'Parse and index a document corpus with the native Rust pipeline.',
   tree: 'Read the indexed section tree for one source document.',
+  read: 'Read a bounded source node window, preserving native evidence and continuation.',
+  batch: 'Send a bounded native batch request through stdin; optionally use the rich v2 contract.',
   status: 'Inspect the current document generation.',
   doctor: 'Inspect native GPTgrep availability and configuration.',
   ask: 'Run an explicit bounded retrieval workflow through the local Codex host.',
@@ -83,6 +96,8 @@ const argumentsFor = {
     '--json', '--', r.query, r.root],
   index: (r) => ['index', ...(r.optimizeMerge ? ['--optimize-merge'] : []), '--json', '--', r.root],
   tree: (r) => ['tree', `--root=${r.root}`, '--json', '--', r.file],
+  read: (r) => ['read', `--root=${r.root}`, '--offset', String(r.offset), '--max-bytes', String(r.maxBytes), '--json', '--', r.nodeId],
+  batch: (r) => ['batch', `--root=${r.root}`, '--input=-', ...(r.rich ? ['--rich'] : []), '--json'],
   status: (r) => ['status', '--json', '--', r.root],
   doctor: () => ['doctor', '--json'],
   ask: (r) => ['ask', ...hostArguments(r), '--json', '--', r.question, r.root],
@@ -118,7 +133,10 @@ for (const [name, schema] of Object.entries(requests)) {
       }
       try {
         const timeout = name === 'ask' || name === 'summarize' ? (request.timeout + 10) * 1000 : undefined
-        return await runNative(argumentsFor[name](request), c.env.GPTGREP_BIN, timeout)
+        const input = name === 'batch' ? JSON.stringify(request.batch) : undefined
+        if (input !== undefined && Buffer.byteLength(input, 'utf8') > 1048576)
+          return c.error({ code: 'INVALID_REQUEST', message: 'Native batch input exceeds 1048576 UTF-8 bytes.' })
+        return await runNative(argumentsFor[name](request), c.env.GPTGREP_BIN, timeout, input)
       } catch (error) {
         if (error instanceof NativeFailure) {
           process.exitCode = error.exitCode
@@ -134,7 +152,7 @@ for (const [name, schema] of Object.entries(requests)) {
 cli.command('request-schema', {
   description: 'Return JSON Schema for the request object accepted by a command.',
   mcp: false,
-  args: z.object({ command: z.enum(['search', 'index', 'tree', 'status', 'doctor', 'ask', 'summarize']) }),
+  args: z.object({ command: z.enum(['search', 'index', 'tree', 'read', 'batch', 'status', 'doctor', 'ask', 'summarize']) }),
   output: z.record(z.string(), z.unknown()),
   run(c) {
     return z.toJSONSchema(requests[c.args.command])
