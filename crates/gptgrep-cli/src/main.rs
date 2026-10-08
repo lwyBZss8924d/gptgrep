@@ -289,6 +289,17 @@ impl EnrichHostArgs {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Rerank exact source-bound v2 references; JSON output, no document routing.
+    Rerank {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long, default_value = "-")]
+        input: PathBuf,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, default_value_t = 180, value_parser = clap::value_parser!(u64).range(1..=900))]
+        multimodal_timeout: u64,
+    },
     /// Run bounded local operations against one retained generation; JSON output.
     Batch {
         #[arg(long, default_value = ".")]
@@ -604,7 +615,7 @@ fn contract() -> Value {
         "usage":"gptgrep batch --rich --root ROOT --input FILE_OR_DASH",
         "request_schema":"gptgrep.batch.rich.request.v1",
         "output_schema":"gptgrep.batch.rich.response.v1",
-        "operations":["inspect_documents","inspect_pages","read_artifact","search_artifacts","inspect_visual","read_visual","search_multimodal"],
+        "operations":["inspect_documents","inspect_pages","read_artifact","search_artifacts","inspect_visual","read_visual","search_multimodal","rerank"],
         "generation":"CURRENT is resolved once; an exact generation and manifest SHA may be supplied",
         "limits":{"input_bytes":1048576,"operations":64,"output_bytes":1048576,"minimum_output_bytes":"4096 + 1536 * operation_count"},
         "inspection":"indexed_metadata_only; does not assert source freshness or grant citations",
@@ -615,11 +626,21 @@ fn contract() -> Value {
         "visual_continuation":"binds exact generation, scope, query, max_candidates, stored resource budget and derived item output reservation; retain batch output budget, operation count and reserved share across continuation",
         "visual_admission":"complete image/base64 and enclosing item must fit its fixed reservation before rendition byte reads; no borrowing from other operations; strict_cache_only refuses visual operations because no rendition cache exists",
         "visual_authority":"local observations only; actual_image_delivery=false and citation_authority=false; no native/model delivery or citation proof",
-        "network":"only explicit search_multimodal invokes OpenRouter Decisions; local operations remain offline",
+        "network":"only explicit search_multimodal and rerank invoke OpenRouter Decisions; local operations remain offline",
         "model_submissions":"local:0; paid:null when exact batch attribution is unavailable; scheduled_logical_attempts and shared context snapshots are separate",
         "search_multimodal":{"query":"nonempty UTF8 up to8192bytes","document":"optional exact source-relative path","window_bytes":"4..2048, default1024","max_visual_candidates":"1..16, default8","max_concurrent_batches":"1..4, default4","min_score":"0..1, default0.5","effect":"mandatory document routing then union text/independent visual rerank; no paid cursor or local fallback","admission":"all item output and worst-case call shares prepared before first submit; fixed shares never borrowed; one retained reader/context/original deadline","telemetry":"complete hit identities; bounded numeric usage projection retains full usage SHA, cost is lossy finite_f64 and is not an invoice","failure":"required paid failure retains partial observations and stops later paid operations; independent local items may continue"},
+        "rerank":{"query":"nonempty UTF8 up to8192bytes","candidates":"1..64 unique {id,evidence}; exact pinned native/OCR text <=2048bytes or up to16 visual source refs","max_concurrent_batches":"1..4, default4","effect":"rerank this supplied pool only; no document routing, caller content, dependency, cursor or reader citation rights","admission":"whole output and call share prepared before any batch submit"},
         "paid_budget":{"max_decisions_submissions":"0..200, default8; whole batch worst-case call allowance also bounded by parent context","retained_preparation_bytes":268435456,"output":"same1MiB total, fixed per-item complete reservations; insufficient paid share fails before submit"},
         "output":"always JSON without a trailing newline; exit2 for global or item failure/not_executed"
+    });
+    contract["commands"]["rerank"] = json!({
+        "usage":"gptgrep rerank --root ROOT --input FILE_OR_DASH --json",
+        "request_schema":"gptgrep.rich_rerank.request.v1","output_schema":"gptgrep.rich_rerank.response.v1",
+        "input":"query and1..64unique {id,evidence} resolved from one CURRENT/exact rich generation; no caller text, image bytes or URLs",
+        "limits":{"input_bytes":1048576,"output_bytes":1048576,"text_window_bytes":2048,"visual_candidates":16,"max_concurrent_batches":4},
+        "network":"explicit Luna Decisions; same original finite context; no routing/retry/fallback",
+        "output":"always bounded JSON; all supplied refs scored or typed failure; no inference cursor/initial routing pass/citation rights",
+        "options":{"model":"supported Luna Decisions profile","multimodal-timeout":"1..900seconds, default180; narrows existing deadline"}
     });
     contract["commands"]["ask"]["options"]["experimental-source-continuation"] = json!({
         "type":"boolean","default":false,"requires":["experimental-query-plan","document"],
@@ -701,7 +722,7 @@ fn contract() -> Value {
 }
 
 fn llms() -> &'static str {
-    "# GPTgrep\n\nLocal vectorless retrieval helper for agents. No MCP server.\n\n1. gptgrep index ./docs --json\n1r. gptgrep index ./documents --ocr auto --plan-only --json\n1n. gptgrep index ./native-documents --ocr off --json\n1a. gptgrep enrich ./docs --ledger-path /path/to/private/enrich.jsonl --max-builder-calls 100 --max-jev-calls 100 --plan-only --json\n2. gptgrep search 'concept in natural language' ./docs --json\n3. gptgrep search 'pattern' ./docs --mode regex --json\n4. gptgrep tree manual.pdf --root ./docs --json\n5. gptgrep read DOCUMENT_ID:NODE_ID --root ./docs --json\n6. gptgrep batch --root ./docs --input operations.json --json\n7. gptgrep batch --rich --root ./docs --input rich-operations.json\n\nBatch accepts gptgrep.batch.request.v1 JSON, pins one generation and preserves operation order. Local search/catalog/tree/read operations share bounded output reservations. Batch hybrid/semantic are currently rejected before provider work; inspect each item status and coverage.\n\nFor a separately published v2 generation, batch --rich accepts gptgrep.batch.rich.request.v1 with inspect_documents, inspect_pages, read_artifact, search_artifacts, inspect_visual, read_visual and explicit search_multimodal. Text inspection returns indexed metadata only. Text read/search preserve typed native/OCR evidence; their cursors bind generation and operation options. Search pages cover a bounded max_hits window; inspect truncation and exhaustion. Opt-in inspect_visual takes scope (document_ids, first_page, last_page), query, max_candidates and its own cursor; use result.next_cursor and retain the batch output budget and per-item reservation when continuing. read_visual takes rendition_id and returns complete image_base64 plus pinned candidate metadata; no image byte windows, truncation or cursor. Both visual operations reuse the generation resource budget and report actual_image_delivery=false and citation_authority=false. They establish local observations, not model delivery or citation rights. The six deterministic operations remain local and perform zero model submissions. search_multimodal requires mandatory document routing then source-bound text/visual reranking on the same finite Decisions context. All complete item output shares and worst-case call shares are prepared before the first submit. budget.max_decisions_submissions defaults to8 (hard cap200); no operation borrows a later share. Paid results have no inference cursor, preserve partial attempt receipts, and grant no reader citation rights. Required paid failure stops later paid items while independent local items may continue. model_submissions is null when exact batch attribution is unavailable; scheduled attempts and shared context snapshots are separate. Numeric cost telemetry is a labelled lossy finite_f64 projection with full usage SHA; missing cost remains null. Standalone arbitrary candidate rerank remains a separate unimplemented frontdoor.\n\nJev routing/reranking is required by default search, ask and summarize. OPENROUTER_API_KEY must be supplied for model-assisted runs; failures never silently downgrade to local retrieval. Explicit regex/lexical and enrich --plan-only remain offline. Enrich is an explicit Codex/Jev step that creates non-citable navigation hints after local indexing. Use --document RELATIVE_PATH to scope before candidate budgets. The default Decisions model is openai/gpt-6-luna-decisions; native Codex defaults separately to gpt-6-luna/max/fast. Hybrid/semantic and judge send bounded data to OpenRouter Decisions. Judge input accepts state/questions or typed input.text/input.images with explicit source bindings and local PNG/JPEG paths. --decisions-budget FILE joins an existing original-clock shared budget; it never initializes or resets a ledger. Without the file, paid calls share their single-invocation bounded client context. Explicit --model typesafe/jev-1.13 remains text-only. Inspect coverage, source_fresh, coordinate_system and text_truncated before citing evidence. The main agent performs reasoning and controls follow-up reads. Use search QUERY ROOT --multimodal or ask QUESTION ROOT --multimodal on a published v2 rich generation. Both retain one generation and one finite Decisions context, perform mandatory document routing, and rerank a union of text and independent visual candidates. Scope with --document PATH; bound --window-bytes, --max-visual-candidates, --max-concurrent-batches, --max-image-bytes, --max-image-pixels, --max-metadata-bytes and --max-output-bytes. --multimodal-timeout limits the same invocation and never extends an existing shared deadline. Search returns gptgrep.rich_multimodal_search.v1 JSON with model-exposure-only evidence and no citation rights. Ask uses native gpt-6-luna/max/fast, accepts --max-citations 1..8, and issues typed text/image citations only after actual complete reader delivery and freshness checks. Inspect coverage/truncation and actual observations; implementation and offline mocks do not qualify actual image influence/native runtime. No legacy generation, regex/lexical, grep-window or planning fallback is allowed. Rich ingestion supports lossless UTF-8 text/Markdown, PDF, PNG and restricted baseline JPEG. Office uses one bounded LibreOffice conversion; a working converter is required and real Office runtime qualification remains pending. The full JPEG family remains unsupported. New files require reindexing. --schema provides the command contract.\n"
+    "# GPTgrep\n\nLocal vectorless retrieval helper for agents. No MCP server.\n\n1. gptgrep index ./docs --json\n1r. gptgrep index ./documents --ocr auto --plan-only --json\n1n. gptgrep index ./native-documents --ocr off --json\n1a. gptgrep enrich ./docs --ledger-path /path/to/private/enrich.jsonl --max-builder-calls 100 --max-jev-calls 100 --plan-only --json\n2. gptgrep search 'concept in natural language' ./docs --json\n3. gptgrep search 'pattern' ./docs --mode regex --json\n4. gptgrep tree manual.pdf --root ./docs --json\n5. gptgrep read DOCUMENT_ID:NODE_ID --root ./docs --json\n6. gptgrep batch --root ./docs --input operations.json --json\n7. gptgrep batch --rich --root ./docs --input rich-operations.json\n\nBatch accepts gptgrep.batch.request.v1 JSON, pins one generation and preserves operation order. Local search/catalog/tree/read operations share bounded output reservations. Batch hybrid/semantic are currently rejected before provider work; inspect each item status and coverage.\n\nFor a separately published v2 generation, batch --rich accepts gptgrep.batch.rich.request.v1 with inspect_documents, inspect_pages, read_artifact, search_artifacts, inspect_visual, read_visual and explicit search_multimodal. Text inspection returns indexed metadata only. Text read/search preserve typed native/OCR evidence; their cursors bind generation and operation options. Search pages cover a bounded max_hits window; inspect truncation and exhaustion. Opt-in inspect_visual takes scope (document_ids, first_page, last_page), query, max_candidates and its own cursor; use result.next_cursor and retain the batch output budget and per-item reservation when continuing. read_visual takes rendition_id and returns complete image_base64 plus pinned candidate metadata; no image byte windows, truncation or cursor. Both visual operations reuse the generation resource budget and report actual_image_delivery=false and citation_authority=false. They establish local observations, not model delivery or citation rights. The six deterministic operations remain local and perform zero model submissions. search_multimodal requires mandatory document routing then source-bound text/visual reranking on the same finite Decisions context. All complete item output shares and worst-case call shares are prepared before the first submit. budget.max_decisions_submissions defaults to8 (hard cap200); no operation borrows a later share. Paid results have no inference cursor, preserve partial attempt receipts, and grant no reader citation rights. Required paid failure stops later paid items while independent local items may continue. model_submissions is null when exact batch attribution is unavailable; scheduled attempts and shared context snapshots are separate. Numeric cost telemetry is a labelled lossy finite_f64 projection with full usage SHA; missing cost remains null. Explicit rerank --root ROOT --input FILE_OR_DASH accepts gptgrep.rich_rerank.request.v1 with query and unique {id,evidence} candidates. It resolves exact pinned native/OCR text windows and visual refs, scores only that supplied pool using the same rubric, and creates neither routing-pass nor citation rights. The equivalent rich batch rerank operation shares the same prepaid output/call reservations. Caller text/image bytes/URLs, implicit dependencies and inference cursors are rejected.\n\nJev routing/reranking is required by default search, ask and summarize. OPENROUTER_API_KEY must be supplied for model-assisted runs; failures never silently downgrade to local retrieval. Explicit regex/lexical and enrich --plan-only remain offline. Enrich is an explicit Codex/Jev step that creates non-citable navigation hints after local indexing. Use --document RELATIVE_PATH to scope before candidate budgets. The default Decisions model is openai/gpt-6-luna-decisions; native Codex defaults separately to gpt-6-luna/max/fast. Hybrid/semantic and judge send bounded data to OpenRouter Decisions. Judge input accepts state/questions or typed input.text/input.images with explicit source bindings and local PNG/JPEG paths. --decisions-budget FILE joins an existing original-clock shared budget; it never initializes or resets a ledger. Without the file, paid calls share their single-invocation bounded client context. Explicit --model typesafe/jev-1.13 remains text-only. Inspect coverage, source_fresh, coordinate_system and text_truncated before citing evidence. The main agent performs reasoning and controls follow-up reads. Use search QUERY ROOT --multimodal or ask QUESTION ROOT --multimodal on a published v2 rich generation. Both retain one generation and one finite Decisions context, perform mandatory document routing, and rerank a union of text and independent visual candidates. Scope with --document PATH; bound --window-bytes, --max-visual-candidates, --max-concurrent-batches, --max-image-bytes, --max-image-pixels, --max-metadata-bytes and --max-output-bytes. --multimodal-timeout limits the same invocation and never extends an existing shared deadline. Search returns gptgrep.rich_multimodal_search.v1 JSON with model-exposure-only evidence and no citation rights. Ask uses native gpt-6-luna/max/fast, accepts --max-citations 1..8, and issues typed text/image citations only after actual complete reader delivery and freshness checks. Inspect coverage/truncation and actual observations; implementation and offline mocks do not qualify actual image influence/native runtime. No legacy generation, regex/lexical, grep-window or planning fallback is allowed. Rich ingestion supports lossless UTF-8 text/Markdown, PDF, PNG and restricted baseline JPEG. Office uses one bounded LibreOffice conversion; a working converter is required and real Office runtime qualification remains pending. The full JPEG family remains unsupported. New files require reindexing. --schema provides the command contract.\n"
 }
 
 fn emit(value: &Value) -> Result<()> {
@@ -976,6 +997,77 @@ async fn run(cli: Cli) -> Result<i32> {
         return Ok(0);
     };
     match command {
+        Command::Rerank {
+            root,
+            input,
+            model,
+            multimodal_timeout,
+        } => {
+            let mut bytes = Vec::with_capacity(8192);
+            let read_result = (|| -> io::Result<()> {
+                if input.as_os_str() == "-" {
+                    io::stdin().lock().take(1_048_577).read_to_end(&mut bytes)?;
+                } else {
+                    std::fs::File::open(&input)?
+                        .take(1_048_577)
+                        .read_to_end(&mut bytes)?;
+                }
+                Ok(())
+            })();
+            if read_result.is_err() {
+                serde_json::to_writer(
+                    io::stdout().lock(),
+                    &gptgrep_core::rich_rerank_input_io_failure(),
+                )?;
+                return Ok(2);
+            }
+            let request = match gptgrep_core::parse_rich_rerank_request(&bytes) {
+                Ok(request) => request,
+                Err(e) => {
+                    serde_json::to_writer(io::stdout().lock(), &e)?;
+                    return Ok(2);
+                }
+            };
+            let reader = match gptgrep_core::open_rich_rerank_reader(&root, &request) {
+                Ok(reader) => reader,
+                Err(e) => {
+                    serde_json::to_writer(io::stdout().lock(), &e)?;
+                    return Ok(2);
+                }
+            };
+            let client = match multimodal_client(
+                &reader,
+                model.as_deref(),
+                cli.decisions_budget.as_deref(),
+                multimodal_timeout,
+            ) {
+                Ok(client) => client,
+                Err(_) => {
+                    serde_json::to_writer(
+                        io::stdout().lock(),
+                        &gptgrep_core::rich_rerank_context_failure(reader.pin()),
+                    )?;
+                    return Ok(2);
+                }
+            };
+            let prepared = match gptgrep_core::prepare_rich_rerank(reader, client, request) {
+                Ok(prepared) => prepared,
+                Err(e) => {
+                    serde_json::to_writer(io::stdout().lock(), &e)?;
+                    return Ok(2);
+                }
+            };
+            return match prepared.execute().await {
+                Ok(report) => {
+                    serde_json::to_writer(io::stdout().lock(), &report)?;
+                    Ok(0)
+                }
+                Err(e) => {
+                    serde_json::to_writer(io::stdout().lock(), &e)?;
+                    Ok(2)
+                }
+            };
+        }
         Command::Batch {
             root,
             input,

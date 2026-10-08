@@ -26,8 +26,9 @@ to 180 seconds, can be 1..900, and only narrows an existing deadline. Local-only
 batches do not look up credentials or open a Decisions context.
 
 Input/output remain at most 1 MiB with 1..64 unique operation IDs. Complete
-output shares are fixed in input order before execution. Every paid operation
-prepares its actual routing and full-pool rerank bounds before the first submit;
+output shares are fixed in input order before execution. Before the first submit,
+every paid operation prepares its complete request bounds: routing and full-pool
+reranking for search, or supplied-pool scoring for explicit rerank;
 insufficient result space or a complete call share is an explicit item error
 with no submission. `max_decisions_submissions` defaults to 8 and can be 0..200;
 its deterministic worst-case allocations also fit the parent's remaining
@@ -49,9 +50,9 @@ Results stay in input order. Invalid items are errors; required paid failure
 retains partial observations, stops later paid items, and lets independent local
 items continue. A deadline stops remaining work. Shared integrity failure returns
 the accumulated ordered items and available accounting. Missing rows are
-`not_executed`, not omitted successes. Arbitrary caller-provided candidate
-reranking remains a separate future frontdoor; the operation above is a genuine
-routing-plus-rerank search.
+`not_executed`, not omitted successes. The `rerank` operation below accepts only
+source-bound references; raw caller-provided text or images remain unsupported.
+The `search_multimodal` operation above performs routing plus reranking.
 
 Local `model_submissions` remains `0`. Paid exact batch-attributable
 `model_submissions` is `null`; `scheduled_logical_attempts` includes futures that
@@ -79,3 +80,22 @@ actual native reader delivery, full harness utility, or release acceptance.
 Library callers can retain `PreparedRichBatch` and inspect its borrowed
 `prepared_searches()` routing/full-pool requests before execution. Inspection
 does not submit a request or grant delivery/citation rights.
+
+
+Explicit source-bound rerank is also a paid operation:
+
+```json
+{"id":"rank","op":"rerank","query":"What evidence addresses the question?","candidates":[{"id":"chosen-window","evidence":{"kind":"native_text","binding":"COPY_COMPLETE_BINDING_FROM_READ_RESULT"}}],"max_concurrent_batches":4}
+```
+
+The placeholder represents the complete typed `EvidenceRef` from a retained
+read/search/visual result; it is not a valid binding by itself. `rerank` accepts
+1–64 unique labels/references and resolves every exact artifact, range, lane and
+geometry on the same reader. It scores only this supplied pool and has no routing
+stage, inference cursor or implicit dependency on an earlier operation. Its
+result is `gptgrep.rich_rerank.response.v1`, distinct from search coverage. The
+normal `search_multimodal` member retains mandatory routing. Both use fixed item
+output/call shares before any submission. Preparation refusals are isolated item
+errors; an execution failure in an admitted paid member stops later paid members
+and leaves independent local operations available. See
+[source-bound rerank](rerank.md) for budgets and evidence validation.

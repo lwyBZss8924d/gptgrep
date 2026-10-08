@@ -2,8 +2,9 @@
 //! Serial operations retain the underlying search's bounded concurrent drain.
 use super::*;
 use crate::{
-    PreparedRichMultimodalSearch, RichMultimodalAttempt, RichMultimodalSearchOptions,
-    RichMultimodalSearchReport, prepare_rich_multimodal_search,
+    PreparedRichMultimodalSearch, PreparedRichRerank, RichMultimodalAttempt,
+    RichMultimodalSearchOptions, RichMultimodalSearchReport, RichRerankBudget, RichRerankReport,
+    RichRerankRequest, prepare_rich_multimodal_search,
 };
 use gptgrep_jev::{ExecutionSnapshot, JevClient, UsageObservation, UsagePresence};
 
@@ -43,6 +44,7 @@ pub struct PreparedRichBatch {
     quotas: Vec<usize>,
     starts: Vec<Result<usize, RichBatchError>>,
     searches: Vec<Option<PreparedRichMultimodalSearch>>,
+    reranks: Vec<Option<PreparedRichRerank>>,
     call_shares: Vec<usize>,
     before: ReaderReadMetrics,
     started: Instant,
@@ -62,6 +64,13 @@ impl PreparedRichBatch {
     }
     /// Actual source-bound preparations, borrowed from this retained batch.
     /// Inspection grants no delivery/citation or execution rights.
+    pub fn prepared_reranks(&self) -> impl Iterator<Item = (&str, &PreparedRichRerank)> {
+        self.request
+            .operations
+            .iter()
+            .zip(&self.reranks)
+            .filter_map(|(op, r)| r.as_ref().map(|r| (op.id(), r)))
+    }
     pub fn prepared_searches(&self) -> impl Iterator<Item = (&str, &PreparedRichMultimodalSearch)> {
         self.request
             .operations
@@ -157,6 +166,7 @@ pub fn prepare_rich_batch_with_reader(
         .map_err(|e| failure(reader_error(e), Some(pin.clone()), pending()))?;
     let mut starts = Vec::with_capacity(count);
     let mut searches = Vec::with_capacity(count);
+    let mut reranks = Vec::with_capacity(count);
     let mut call_shares = vec![0; count];
     let context_remaining = snapshot.as_ref().map_or(0, |s| {
         (s.max_submissions as usize).saturating_sub(s.logical_reservations)
@@ -170,6 +180,7 @@ pub fn prepare_rich_batch_with_reader(
             Ok(start)
         });
         let mut search = None;
+        let mut rerank = None;
         if let RichBatchOperation::SearchMultimodal {
             query,
             document,
@@ -245,8 +256,95 @@ pub fn prepare_rich_batch_with_reader(
                 Ok(0)
             })();
         }
+        if let RichBatchOperation::Rerank {
+            query,
+            candidates,
+            max_concurrent_batches,
+            ..
+        } = op
+            && ready.is_ok()
+        {
+            ready =
+                (|| {
+                    let client = client
+                        .as_ref()
+                        .filter(|c| {
+                            c.execution_context().run_id().is_some()
+                                && c.execution_context().plan_digest().is_some()
+                        })
+                        .ok_or_else(|| {
+                            error(
+                                RichBatchErrorCode::ModelContextRequired,
+                                "Paid operations require an explicit finite Decisions context",
+                            )
+                        })?;
+                    let result_budget=quotas[i].checked_sub(PAID_ITEM_OVERHEAD).filter(|n|*n>=4096)
+                    .ok_or_else(||error(RichBatchErrorCode::OutputBudgetInsufficient,
+                        "Paid item cannot reserve its complete result and accounting envelope"))?;
+                    let request = RichRerankRequest {
+                        schema_version: "gptgrep.rich_rerank.request.v1".into(),
+                        generation: RichBatchGeneration::Exact(pin.clone()),
+                        query: query.clone(),
+                        candidates: candidates.clone(),
+                        budget: RichRerankBudget {
+                            max_output_bytes: result_budget,
+                            max_decisions_submissions: remaining_calls as u32,
+                            max_concurrent_batches: *max_concurrent_batches,
+                            cache: request.budget.cache.clone(),
+                            ..Default::default()
+                        },
+                    };
+                    let prepared = crate::rich_multimodal::prepare_rich_rerank_with_working_limit(
+                        reader.clone(),
+                        client.clone(),
+                        request,
+                        MAX_RETAINED_PREPARATION_BYTES.saturating_sub(retained),
+                    )
+                    .map_err(|e| {
+                        error(
+                            match e.code {
+                                "model_context_required" => {
+                                    RichBatchErrorCode::ModelContextRequired
+                                }
+                                "invalid_generation" => RichBatchErrorCode::InvalidGeneration,
+                                "source_stale" => RichBatchErrorCode::SourceStale,
+                                "output_budget_insufficient" => {
+                                    RichBatchErrorCode::OutputBudgetInsufficient
+                                }
+                                "submission_budget_insufficient" => {
+                                    RichBatchErrorCode::SubmissionBudgetInsufficient
+                                }
+                                "deadline_exceeded" => RichBatchErrorCode::DeadlineExceeded,
+                                _ => RichBatchErrorCode::InvalidOperation,
+                            },
+                            "Source-bound rerank preparation failed before submission",
+                        )
+                    })?;
+                    let calls = prepared.reserved_calls();
+                    if calls > remaining_calls {
+                        return Err(error(
+                            RichBatchErrorCode::SubmissionBudgetInsufficient,
+                            "Complete rerank share cannot fit the batch or parent allowance",
+                        ));
+                    }
+                    retained = retained
+                        .checked_add(prepared.working_bytes_bound())
+                        .filter(|n| *n <= MAX_RETAINED_PREPARATION_BYTES)
+                        .ok_or_else(|| {
+                            error(
+                                RichBatchErrorCode::OutputBudgetInsufficient,
+                                "Retained paid preparations exceed the batch working bound",
+                            )
+                        })?;
+                    remaining_calls -= calls;
+                    call_shares[i] = calls;
+                    rerank = Some(prepared);
+                    Ok(0)
+                })();
+        }
         starts.push(ready);
         searches.push(search);
+        reranks.push(rerank);
     }
     reader
         .validate()
@@ -259,6 +357,7 @@ pub fn prepare_rich_batch_with_reader(
         quotas,
         starts,
         searches,
+        reranks,
         call_shares,
         before,
         started: Instant::now(),
@@ -334,8 +433,8 @@ fn cost(a: &RichMultimodalAttempt) -> Option<f64> {
         .or_else(|| a.failure.as_ref()?.reported_usage.as_ref()?.cost.value)
         .filter(|v| v.is_finite() && *v >= 0.0)
 }
-fn attempts<'a>(operation: &str, report: &'a RichMultimodalSearchReport) -> Vec<BatchAttempt<'a>> {
-    report.attempts.iter().map(|a| BatchAttempt {
+fn attempts<'a>(operation: &str, values: &'a [RichMultimodalAttempt]) -> Vec<BatchAttempt<'a>> {
+    values.iter().map(|a| BatchAttempt {
         batch_attempt_id: attempt_id(operation, a),
         batch_attempt_identity_scope: "batch_response_local_not_sdk_native_or_cross_batch",
         attempt: AttemptFields { stage:a.stage, batch_index:a.batch_index,
@@ -387,7 +486,7 @@ fn projection<'a>(op: &str, r: &'a RichMultimodalSearchReport) -> BatchReport<'a
         original_clock_anchor_sha256: r.original_clock_anchor_sha256.as_deref(),
         hits: &r.hits,
         coverage: &r.coverage,
-        attempts: attempts(op, r),
+        attempts: attempts(op, &r.attempts),
         logical_calls_attempted: r.logical_calls_attempted,
         validated_responses: r.validated_responses,
         accounting_complete: r.accounting_complete,
@@ -396,6 +495,13 @@ fn projection<'a>(op: &str, r: &'a RichMultimodalSearchReport) -> BatchReport<'a
         elapsed_ms: r.elapsed_ms,
         citation_status: r.citation_status,
     }
+}
+
+fn rerank_projection(op: &str, r: &RichRerankReport) -> Value {
+    let mut value = serde_json::to_value(r).expect("bounded source-bound rerank projection");
+    value["attempts"] =
+        serde_json::to_value(attempts(op, &r.attempts)).expect("bounded attempt projection");
+    value
 }
 
 #[derive(Default)]
@@ -408,15 +514,16 @@ impl Totals {
         &mut self,
         operation: &str,
         reserved: usize,
-        report: &RichMultimodalSearchReport,
+        attempts: &[RichMultimodalAttempt],
+        validated_responses: usize,
     ) -> RichBatchItemDecisions {
         let mut item = RichBatchItemDecisions {
             reserved_calls: reserved,
-            scheduled_logical_attempts: report.attempts.len(),
-            validated_responses: report.validated_responses,
+            scheduled_logical_attempts: attempts.len(),
+            validated_responses,
             ..Default::default()
         };
-        for a in &report.attempts {
+        for a in attempts {
             if let Some(c) = cost(a) {
                 item.observed_cost_attempts += 1;
                 item.observed_cost_subtotal_usd =
@@ -512,10 +619,7 @@ impl PreparedRichBatch {
             .map(|(op, q)| RichBatchItem::pending(op.id(), *q))
             .collect();
         for (i, item) in items.iter_mut().enumerate() {
-            if matches!(
-                self.request.operations[i],
-                RichBatchOperation::SearchMultimodal { .. }
-            ) {
+            if self.request.operations[i].requires_model() {
                 item.decisions = Some(RichBatchItemDecisions {
                     reserved_calls: self.call_shares[i],
                     ..Default::default()
@@ -532,7 +636,7 @@ impl PreparedRichBatch {
                 return Err(self.failed(reader_error(e), items, &totals));
             }
             let op = &self.request.operations[i];
-            let paid = matches!(op, RichBatchOperation::SearchMultimodal { .. });
+            let paid = op.requires_model();
             if self
                 .client
                 .as_ref()
@@ -562,43 +666,96 @@ impl PreparedRichBatch {
                     }
                 }
                 Ok(_) => {
-                    let search = self.searches[i]
-                        .take()
-                        .expect("admitted paid operation owns preparation");
-                    let (report, failed) = match search.execute().await {
-                        Ok(pass) => (pass.into_report(), None),
-                        Err(e) => {
-                            stopped_paid = true;
-                            let code = if e.report.attempts.iter().any(|a| a.failure.is_some()) {
-                                RichBatchErrorCode::ProviderFailure
-                            } else {
-                                RichBatchErrorCode::PaidSearchFailure
-                            };
-                            (
-                                e.report,
-                                Some(error(
-                                    code,
-                                    "Required paid search failed; observations retained without fallback",
-                                )),
-                            )
-                        }
+                    let (result, failed, accounting, coverage) = if let Some(search) =
+                        self.searches[i].take()
+                    {
+                        let (report, failed) = match search.execute().await {
+                            Ok(pass) => (pass.into_report(), None),
+                            Err(e) => {
+                                stopped_paid = true;
+                                let code = if e.report.attempts.iter().any(|a| a.failure.is_some())
+                                {
+                                    RichBatchErrorCode::ProviderFailure
+                                } else {
+                                    RichBatchErrorCode::PaidSearchFailure
+                                };
+                                (
+                                    e.report,
+                                    Some(error(
+                                        code,
+                                        "Required paid search failed; observations retained without fallback",
+                                    )),
+                                )
+                            }
+                        };
+                        let accounting = totals.observe(
+                            op.id(),
+                            self.call_shares[i],
+                            &report.attempts,
+                            report.validated_responses,
+                        );
+                        let coverage = RichBatchItemCoverage {
+                            unit: "model_ranked_evidence".into(),
+                            available: Some(report.hits.len()),
+                            end: report.hits.len(),
+                            selected: report.hits.len(),
+                            exhausted: report.coverage.semantic_scope_complete,
+                            ..Default::default()
+                        };
+                        (
+                            serde_json::to_value(projection(op.id(), &report))
+                                .expect("bounded owned report projection"),
+                            failed,
+                            accounting,
+                            coverage,
+                        )
+                    } else {
+                        let rerank = self.reranks[i]
+                            .take()
+                            .expect("admitted paid operation owns preparation");
+                        let (report, failed) = match rerank.execute().await {
+                            Ok(report) => (report, None),
+                            Err(mut e) => {
+                                stopped_paid = true;
+                                let report =
+                                    e.report.take().expect("executed rerank retains report");
+                                let code = if report.attempts.iter().any(|a| a.failure.is_some()) {
+                                    RichBatchErrorCode::ProviderFailure
+                                } else {
+                                    RichBatchErrorCode::PaidRerankFailure
+                                };
+                                (
+                                    report,
+                                    Some(error(
+                                        code,
+                                        "Required source-bound rerank failed; observations retained without fallback",
+                                    )),
+                                )
+                            }
+                        };
+                        let accounting = totals.observe(
+                            op.id(),
+                            self.call_shares[i],
+                            &report.attempts,
+                            report.validated_responses,
+                        );
+                        let coverage = RichBatchItemCoverage {
+                            unit: "supplied_candidate_pool".into(),
+                            available: Some(report.coverage.supplied_candidates),
+                            end: report.ranked_candidates.len(),
+                            selected: report.ranked_candidates.len(),
+                            exhausted: report.coverage.complete,
+                            ..Default::default()
+                        };
+                        (
+                            rerank_projection(op.id(), &report),
+                            failed,
+                            accounting,
+                            coverage,
+                        )
                     };
-                    let accounting = totals.observe(op.id(), self.call_shares[i], &report);
-                    let coverage = RichBatchItemCoverage {
-                        unit: "model_ranked_evidence".into(),
-                        available: Some(report.hits.len()),
-                        end: report.hits.len(),
-                        selected: report.hits.len(),
-                        exhausted: report.coverage.semantic_scope_complete,
-                        ..Default::default()
-                    };
-                    // The complete projected result and enclosing accounting were reserved before submission.
-                    let result = projection(op.id(), &report);
-                    // Serialize the already bounded projection without requiring a
-                    // successful post-paid reader-meter observation. Later shared
-                    // integrity failures must retain this actual attempt receipt.
-                    let value =
-                        serde_json::to_value(&result).expect("bounded owned report projection");
+                    // Bounded projection is retained before later shared integrity
+                    // checks, including failures after a paid response.
                     RichBatchItem {
                         id: op.id().into(),
                         status: if failed.is_some() {
@@ -607,7 +764,7 @@ impl PreparedRichBatch {
                             RichBatchStatus::Ok
                         },
                         reserved_output_bytes: self.quotas[i],
-                        result: Some(value),
+                        result: Some(result),
                         error: failed,
                         coverage,
                         read_metrics: None,

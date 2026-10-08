@@ -98,6 +98,15 @@ All complete output/call shares are admitted before submission; no paid cursor
 or fallback is provided. `budget.max_decisions_submissions` defaults to8 and
 never resets the parent allowance. See [rich batch composition](docs/rich-batch.md)
 for options, ordered failures, bounded telemetry, and observation limits.
+
+`gptgrep rerank --root ROOT --input candidates.json --json` scores only supplied
+native/OCR text or visual evidence references from one pinned rich generation.
+It resolves content from stored artifacts and rejects caller-supplied text, image
+bytes and URLs. The equivalent rich batch `rerank` operation shares fixed output
+and call reservations with local operations and `search_multimodal`. Explicit
+rerank omits document routing; ordinary search retains mandatory routing. Neither
+rerank interface grants reader delivery or citation authority. See
+[source-bound rerank](docs/rerank.md) for the strict input and result contracts.
 The ordinary `index` command currently publishes the original generation format.
 
 The Rust core provides `DerivedVisualCache` for PNG crops obtained from a

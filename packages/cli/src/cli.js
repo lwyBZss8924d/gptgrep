@@ -71,6 +71,11 @@ const requests = {
     decisionsBudget,
     batch: z.record(z.string(), z.unknown()).describe('Native batch request object; native validation owns its versioned operation schema'),
   }).strict(),
+  rerank: z.object({root,
+    model:z.string().min(1).max(128).optional(),
+    multimodalTimeout:z.number().int().min(1).max(900).optional(),decisionsBudget,
+    rerank:z.record(z.string(),z.unknown()).describe('Source-bound native rerank request; native validation owns exact evidence refs'),
+  }).strict(),
   status: z.object({ root }).strict(),
   doctor: z.object({}).strict(),
   ask: z.object({
@@ -95,6 +100,7 @@ const descriptions = {
   tree: 'Read the indexed section tree for one source document.',
   read: 'Read a bounded source node window, preserving native evidence and continuation.',
   batch: 'Send a bounded native batch request through stdin; optionally use the rich v2 contract.',
+  rerank:'Rerank only supplied source-bound evidence from one rich generation; no routing or citation grant.',
   status: 'Inspect the current document generation.',
   doctor: 'Inspect native GPTgrep availability and configuration.',
   ask: 'Run an explicit bounded retrieval workflow through the local Codex host.',
@@ -131,6 +137,9 @@ const argumentsFor = {
     ...(r.model === undefined ? [] : [`--model=${r.model}`]),
     ...(r.multimodalTimeout === undefined ? [] : [`--multimodal-timeout=${r.multimodalTimeout}`]),
     ...budgetArguments(r), '--json'],
+  rerank:(r)=>['rerank',`--root=${r.root}`,'--input=-',
+    ...(r.model===undefined?[]:[`--model=${r.model}`]),
+    ...(r.multimodalTimeout===undefined?[]:[`--multimodal-timeout=${r.multimodalTimeout}`]),...budgetArguments(r),'--json'],
   status: (r) => ['status', '--json', '--', r.root],
   doctor: () => ['doctor', '--json'],
   ask: (r) => ['ask', ...hostArguments(r), ...budgetArguments(r), ...multimodalArguments(r), ...(r.minScore === undefined ? [] : [`--min-score=${r.minScore}`]), '--json', '--', r.question, r.root],
@@ -174,10 +183,11 @@ for (const [name, schema] of Object.entries(requests)) {
         return c.error({ code: 'INVALID_REQUEST', message: error.message })
       }
       try {
-        const timeout = name === 'ask' || name === 'summarize' ? (request.timeout + 10) * 1000 : undefined
-        const input = name === 'batch' ? JSON.stringify(request.batch) : undefined
+        const timeout = name === 'ask' || name === 'summarize' ? (request.timeout + 10) * 1000
+          : name === 'rerank' ? ((request.multimodalTimeout ?? 180) + 10) * 1000 : undefined
+        const input = name === 'batch' ? JSON.stringify(request.batch) : name === 'rerank' ? JSON.stringify(request.rerank) : undefined
         if (input !== undefined && Buffer.byteLength(input, 'utf8') > 1048576)
-          return c.error({ code: 'INVALID_REQUEST', message: 'Native batch input exceeds 1048576 UTF-8 bytes.' })
+          return c.error({ code: 'INVALID_REQUEST', message: 'Native input exceeds 1048576 UTF-8 bytes.' })
         return await runNative(argumentsFor[name](request), c.env.GPTGREP_BIN, timeout, input)
       } catch (error) {
         if (error instanceof NativeFailure) {
@@ -194,7 +204,7 @@ for (const [name, schema] of Object.entries(requests)) {
 cli.command('request-schema', {
   description: 'Return JSON Schema for the request object accepted by a command.',
   mcp: false,
-  args: z.object({ command: z.enum(['search', 'index', 'tree', 'read', 'batch', 'status', 'doctor', 'ask', 'summarize']) }),
+  args: z.object({ command: z.enum(['search', 'index', 'tree', 'read', 'batch', 'rerank', 'status', 'doctor', 'ask', 'summarize']) }),
   output: z.record(z.string(), z.unknown()),
   run(c) {
     return z.toJSONSchema(requests[c.args.command])

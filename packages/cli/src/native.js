@@ -14,6 +14,10 @@ function recognizedFailure(report, command) {
   if (report.schema_version === 'gptgrep.error.v1')
     return report.ok === false && typeof report.code === 'string' && report.code.length > 0
       && typeof report.error === 'string' && report.error.length > 0
+  if (command === 'rerank' && report.schema_version === 'gptgrep.rich_rerank.response.v1')
+    return typeof report.code === 'string' && report.code.length > 0
+      && typeof report.message === 'string' && report.message.length > 0
+      && (report.report === null || (report.report !== null && typeof report.report === 'object' && !Array.isArray(report.report)))
   if (command === 'batch' && ['gptgrep.batch.response.v1', 'gptgrep.batch.rich.response.v1'].includes(report.schema_version)
       && Array.isArray(report.items) && report.items.every((item) => item !== null && typeof item === 'object' && !Array.isArray(item))) {
     const failure = (error) => error !== null && typeof error === 'object'

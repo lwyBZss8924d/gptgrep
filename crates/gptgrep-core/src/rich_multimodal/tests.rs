@@ -223,7 +223,7 @@ fn fixture_artifact(
     parsed.artifacts.push(artifact.clone());
     Ok(artifact)
 }
-fn publish_saved_ocr(root: &Path) -> Result<GenerationPin> {
+pub(super) fn publish_saved_ocr(root: &Path) -> Result<GenerationPin> {
     let (staging, mut parsed) = candidate(root, &["Native description\n"])?;
     let staging = staging.path().canonicalize()?;
     // Synthetic source/receipt DTO only: no OCR execution or image qualification.

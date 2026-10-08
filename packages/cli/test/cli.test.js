@@ -24,13 +24,17 @@ if (args.includes('unread-stdin-fixture')) {
   process.stdout.write(JSON.stringify({schema_version: 'gptgrep.batch.rich.response.v1',
     error: {code: 'invalid_request', message: 'early fixture rejection'}, items: []}));
   process.exitCode = 2;
-} else if (args[0] === 'batch') {
+} else if (args[0] === 'batch' || args[0] === 'rerank') {
   let input = '';
   process.stdin.setEncoding('utf8');
   process.stdin.on('data', (part) => input += part);
   process.stdin.on('end', () => {
     const request = JSON.parse(input);
-    if (request.fixtureFailure) {
+    if (request.fixtureFailure && args[0] === 'rerank') {
+      process.stdout.write(JSON.stringify({schema_version:'gptgrep.rich_rerank.response.v1',code:'required_stage_failed',
+        message:'fixture failure; partial observations retained',generation:null,report:{attempts:[{stage:'evidence_reranking'}]}}));
+      process.exitCode=2;
+    } else if (request.fixtureFailure) {
       process.stdout.write(JSON.stringify({schema_version: 'gptgrep.batch.rich.response.v1',
         execution: {scope: 'local_deterministic_no_model_context', model_submissions: 0},
         generation: null, error: {code: 'invalid_request', message: 'fixture request rejected'},
@@ -346,4 +350,28 @@ test('paid rich batch preserves exact request and explicit original-budget argum
   for (const option of [{model:'openai/gpt-6-luna-decisions'}, {multimodalTimeout:30}])
     await assert.rejects(run(['batch','--request',JSON.stringify({batch,...option}),'--json'], '/missing/native'),
       (error) => /INVALID_REQUEST/.test(error.stdout) && !/NATIVE_ERROR/.test(error.stdout))
+})
+
+
+test('source-bound rerank forwards refs through bounded stdin with exact shared options',async()=>{
+  const rerank={schema_version:'gptgrep.rich_rerank.request.v1',query:'ordinary source question',candidates:[{id:'label',evidence:{kind:'native_text',binding:{artifact_id:'source-ref'}}}]}
+  const request={root:'/documents',model:'openai/gpt-6-luna-decisions',multimodalTimeout:30,decisionsBudget:'/existing-original-budget.json',rerank}
+  const result=JSON.parse((await run(['rerank','--request',JSON.stringify(request),'--json'])).stdout)
+  assert.deepEqual(result.args,['rerank','--root=/documents','--input=-','--model=openai/gpt-6-luna-decisions','--multimodal-timeout=30','--decisions-budget=/existing-original-budget.json','--json'])
+  assert.equal(result.input,JSON.stringify(rerank));assert.deepEqual(result.request,rerank)
+  const schema=JSON.parse((await run(['request-schema','rerank','--json'],'/missing/native')).stdout)
+  assert.equal(schema.properties.rerank.type,'object');assert.equal(schema.additionalProperties,false)
+})
+test('source-bound rerank preserves structured partial failure and nonzero exit',async()=>{
+  await assert.rejects(run(['rerank','--request',JSON.stringify({rerank:{fixtureFailure:true}}),'--json']),error=>{
+    assert.equal(error.code,2);const r=JSON.parse(error.stdout);assert.equal(r.schema_version,'gptgrep.rich_rerank.response.v1')
+    assert.equal(r.code,'required_stage_failed');assert.equal(r.report.attempts.length,1);assert.equal(r.ok,undefined);return true
+  })
+})
+test('source-bound rerank wrapper refuses unknown fields and oversized stdin before native',async()=>{
+  for(const request of [{rerank:{},text:'untrusted'},{rerank:{},multimodalTimeout:901}])
+    await assert.rejects(run(['rerank','--request',JSON.stringify(request),'--json'],'/missing/native'),error=>{
+      assert.match(error.stdout,/INVALID_REQUEST/);assert.doesNotMatch(error.stdout,/NATIVE_ERROR/);return true
+    })
+  await assert.rejects(runNative(['rerank'],'/missing/native',1000,'界'.repeat(349526)),/1048576 bytes/)
 })

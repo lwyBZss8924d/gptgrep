@@ -52,7 +52,7 @@ impl RichBatchRequest {
     pub fn requires_model(&self) -> bool {
         self.operations
             .iter()
-            .any(|op| matches!(op, RichBatchOperation::SearchMultimodal { .. }))
+            .any(RichBatchOperation::requires_model)
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +110,14 @@ fn default_visual_candidates() -> usize {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RichBatchOperation {
+    /// Score only these exact source references; no routing, cursor or dependency.
+    Rerank {
+        id: String,
+        query: String,
+        candidates: Vec<crate::RichRerankCandidate>,
+        #[serde(default = "default_multimodal_concurrency")]
+        max_concurrent_batches: usize,
+    },
     InspectDocuments {
         id: String,
         #[serde(default)]
@@ -201,6 +209,9 @@ fn default_multimodal_score() -> f64 {
     0.5
 }
 impl RichBatchOperation {
+    fn requires_model(&self) -> bool {
+        matches!(self, Self::SearchMultimodal { .. } | Self::Rerank { .. })
+    }
     pub fn id(&self) -> &str {
         match self {
             Self::InspectDocuments { id, .. }
@@ -209,7 +220,8 @@ impl RichBatchOperation {
             | Self::SearchArtifacts { id, .. }
             | Self::InspectVisual { id, .. }
             | Self::ReadVisual { id, .. }
-            | Self::SearchMultimodal { id, .. } => id,
+            | Self::SearchMultimodal { id, .. }
+            | Self::Rerank { id, .. } => id,
         }
     }
     fn binding(&self) -> (&str, &str, Value, Option<&str>) {
@@ -267,7 +279,8 @@ impl RichBatchOperation {
             // These operations never use the text/metadata cursor codec.
             Self::InspectVisual { .. }
             | Self::ReadVisual { .. }
-            | Self::SearchMultimodal { .. } => ("visual", "visual", Value::Null, None),
+            | Self::SearchMultimodal { .. }
+            | Self::Rerank { .. } => ("visual", "visual", Value::Null, None),
         }
     }
 }
@@ -292,6 +305,7 @@ pub enum RichBatchErrorCode {
     SubmissionBudgetInsufficient,
     ProviderFailure,
     PaidSearchFailure,
+    PaidRerankFailure,
     DeadlineExceeded,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -745,6 +759,25 @@ fn preflight(pin: &GenerationPin, op: &RichBatchOperation) -> Result<usize, Rich
         )
     };
     match op {
+        RichBatchOperation::Rerank {
+            query,
+            candidates,
+            max_concurrent_batches,
+            ..
+        } => {
+            let request = crate::RichRerankRequest {
+                schema_version: "gptgrep.rich_rerank.request.v1".into(),
+                generation: RichBatchGeneration::Exact(pin.clone()),
+                query: query.clone(),
+                candidates: candidates.clone(),
+                budget: crate::RichRerankBudget {
+                    max_concurrent_batches: *max_concurrent_batches,
+                    ..Default::default()
+                },
+            };
+            crate::rich_multimodal::validate_rich_rerank_request(&request).map_err(|_| bad())?;
+            return Ok(0);
+        }
         RichBatchOperation::InspectDocuments {
             fields, page_size, ..
         } => {
@@ -2052,10 +2085,12 @@ fn execute(
     before: &ReaderReadMetrics,
 ) -> Result<RichBatchItem, RichBatchError> {
     match op {
-        RichBatchOperation::SearchMultimodal { .. } => Err(error(
-            RichBatchErrorCode::ModelContextRequired,
-            "Paid rich operations require the explicit asynchronous client frontdoor",
-        )),
+        RichBatchOperation::SearchMultimodal { .. } | RichBatchOperation::Rerank { .. } => {
+            Err(error(
+                RichBatchErrorCode::ModelContextRequired,
+                "Paid rich operations require the explicit asynchronous client frontdoor",
+            ))
+        }
         RichBatchOperation::InspectVisual { .. } | RichBatchOperation::ReadVisual { .. } => {
             execute_visual(reader, op, quota, before)
         }
@@ -2199,4 +2234,4 @@ fn execute(
 
 #[cfg(test)]
 #[path = "rich_batch/tests.rs"]
-mod tests;
+pub(crate) mod tests;

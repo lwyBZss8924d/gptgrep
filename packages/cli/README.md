@@ -66,3 +66,12 @@ node src/cli.js ask --request '{"question":"Explain this chart.","root":"./docum
 ```
 
 The optional `decisionsBudget` on search/ask forwards the existing `--decisions-budget` contract; it never initializes a ledger. The native model default is now `gpt-6-luna/max/fast`, matching the native CLI. Multimodal ask rejects other native profiles. Model exposure in search is noncitable, while ask requires complete actual reader delivery and fresh source/coordinate bindings. Offline wrapper checks do not qualify real provider image influence or native model availability.
+
+
+`rerank` forwards a nested `rerank` object to native bounded stdin. Its wrapper
+request fields are `root`, `model`, `multimodalTimeout`, `decisionsBudget` and
+`rerank`. Native validation owns `gptgrep.rich_rerank.request.v1`, including exact
+source references and budgets; the wrapper never adds candidate content.
+Structured native failures retain partial observations and a nonzero exit status.
+`request-schema rerank --json` describes this forwarding boundary. The equivalent
+rich batch `rerank` operation uses the same batch client and output/call shares.

@@ -26,10 +26,13 @@ pub use rich_decisions::{
     prepare_rich_text_search,
 };
 pub use rich_multimodal::{
-    PreparedRichMultimodalSearch, RichMultimodalAttempt, RichMultimodalContent,
+    PreparedRichMultimodalSearch, PreparedRichRerank, RichMultimodalAttempt, RichMultimodalContent,
     RichMultimodalCoverage, RichMultimodalHit, RichMultimodalInitialPass,
     RichMultimodalSearchError, RichMultimodalSearchOptions, RichMultimodalSearchReport,
-    prepare_rich_multimodal_search,
+    RichRankedCandidate, RichRerankBudget, RichRerankCandidate, RichRerankCoverage,
+    RichRerankFailure, RichRerankReport, RichRerankRequest, open_rich_rerank_reader,
+    parse_rich_rerank_request, prepare_rich_multimodal_search, prepare_rich_rerank,
+    rich_rerank_context_failure, rich_rerank_input_io_failure,
 };
 mod navigation_overlay;
 mod planned;

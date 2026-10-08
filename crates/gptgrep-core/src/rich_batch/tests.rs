@@ -149,7 +149,7 @@ fn candidate(root: &Path, texts: &[&str]) -> Result<(tempfile::TempDir, RichPars
     ))
 }
 
-pub(super) fn publish(root: &Path, texts: &[&str]) -> Result<GenerationPin> {
+pub(crate) fn publish(root: &Path, texts: &[&str]) -> Result<GenerationPin> {
     let (staging, parsed) = candidate(root, texts)?;
     let mut writer = RichGenerationWriter::begin(root, ResourceBudget::default())?;
     writer.add_document("source.pdf", &staging.path().canonicalize()?, parsed)?;
@@ -192,7 +192,7 @@ fn visual_png(value: u8) -> Vec<u8> {
     png
 }
 
-pub(super) fn publish_visual(root: &Path, pages: usize) -> Result<(GenerationPin, Vec<Vec<u8>>)> {
+pub(crate) fn publish_visual(root: &Path, pages: usize) -> Result<(GenerationPin, Vec<Vec<u8>>)> {
     let texts = vec!["synthetic visual source text\n"; pages];
     let (staging, mut parsed) = candidate(root, &texts)?;
     let mut images = Vec::new();

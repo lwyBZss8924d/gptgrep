@@ -19,6 +19,18 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, sync::Arc, time::Instant};
 
+mod rerank;
+pub use rerank::{
+    PreparedRichRerank, RichRankedCandidate, RichRerankBudget, RichRerankCandidate,
+    RichRerankCoverage, RichRerankFailure, RichRerankReport, RichRerankRequest,
+    open_rich_rerank_reader, parse_rich_rerank_request, prepare_rich_rerank,
+    rich_rerank_context_failure, rich_rerank_input_io_failure,
+};
+pub(crate) use rerank::{
+    prepare_with_working_limit as prepare_rich_rerank_with_working_limit,
+    validate_request as validate_rich_rerank_request,
+};
+
 const MAX_OUTPUT: usize = 1_048_576;
 const MAX_METADATA: usize = 524_288;
 // The same absolute evidence rubric as the existing text reranker.
@@ -211,6 +223,132 @@ impl std::fmt::Debug for RichMultimodalSearchError {
     }
 }
 impl std::error::Error for RichMultimodalSearchError {}
+
+// One executor for mandatory search stages and explicitly supplied rerank pools.
+// Borrowed state preserves observation ordering and drains all owned futures.
+struct EvidenceStage<'a> {
+    reader: &'a RichGenerationReader,
+    visual: &'a VisualGenerationReader,
+    client: &'a JevClient,
+    pool: &'a Arc<Vec<Entry>>,
+    resources: &'a ResourceBudget,
+    max_concurrent_batches: usize,
+    attempts: &'a mut Vec<RichMultimodalAttempt>,
+    logical_calls_attempted: &'a mut usize,
+    validated_responses: &'a mut usize,
+    read_intervals: &'a mut Vec<ReaderReadMetrics>,
+    last_meter: &'a mut ReaderReadMetrics,
+}
+impl EvidenceStage<'_> {
+    fn meter(&mut self) -> Result<()> {
+        let after = self.reader.read_metrics()?;
+        self.read_intervals.push(after.since(self.last_meter)?);
+        *self.last_meter = after;
+        Ok(())
+    }
+    async fn run(
+        &mut self,
+        stage: &'static str,
+        mut batches: Vec<Batch>,
+        observer: &(dyn Fn(&RichMultimodalAttempt) -> Result<()> + Send + Sync),
+    ) -> Result<Vec<(String, f64, Option<f64>)>> {
+        let mut pending = FuturesUnordered::new();
+        let mut next = 0usize;
+        let mut stopped = false;
+        let mut failed = false;
+        let mut scores = Vec::new();
+        while next < batches.len() || !pending.is_empty() {
+            while !stopped && next < batches.len() && pending.len() < self.max_concurrent_batches {
+                if validate_pool(
+                    self.reader,
+                    self.visual,
+                    self.client,
+                    self.pool,
+                    self.resources,
+                )
+                .is_err()
+                {
+                    stopped = true;
+                    failed = true;
+                    break;
+                }
+                let attempt = RichMultimodalAttempt::pending(stage, next, &batches[next]);
+                let ordinal = self.attempts.len();
+                self.attempts.push(attempt);
+                *self.logical_calls_attempted += 1;
+                let request = batches[next].request.take().expect("consume once");
+                let client = JevClient::clone(self.client);
+                let reader = RichGenerationReader::clone(self.reader);
+                let visual = VisualGenerationReader::clone(self.visual);
+                let pool = Arc::clone(self.pool);
+                let resources = ResourceBudget::clone(self.resources);
+                pending.push(async move {
+                    let result = match validate_pool(&reader, &visual, &client, &pool, &resources) {
+                        Ok(()) => client.submit_prepared(request).await,
+                        Err(error) => Err(error),
+                    };
+                    (ordinal, result)
+                });
+                next += 1;
+            }
+            let Some((ordinal, result)) = pending.next().await else {
+                break;
+            };
+            match result {
+                Ok(mut response) => {
+                    if self.attempts[ordinal].observe(&mut response).is_err() {
+                        stopped = true;
+                        failed = true;
+                    } else {
+                        *self.validated_responses += 1;
+                    }
+                    let attempt = &self.attempts[ordinal];
+                    for (i, id) in attempt.candidate_ids.iter().enumerate() {
+                        if let Some(DecisionAnswer::Score {
+                            score, confidence, ..
+                        }) = response.answers.get(&format!("candidate_{i}"))
+                        {
+                            scores.push((id.clone(), score / 3.0, *confidence));
+                        } else {
+                            stopped = true;
+                            failed = true;
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.attempts[ordinal].failure = error
+                        .downcast_ref::<DecisionFailure>()
+                        .map(|f| f.diagnostic().clone());
+                    self.attempts[ordinal].response_status = "failed";
+                    stopped = true;
+                    failed = true;
+                }
+            }
+            if observer(&self.attempts[ordinal]).is_err()
+                || validate_pool(
+                    self.reader,
+                    self.visual,
+                    self.client,
+                    self.pool,
+                    self.resources,
+                )
+                .is_err()
+            {
+                stopped = true;
+                failed = true;
+            }
+            if self.meter().is_err() {
+                stopped = true;
+                failed = true;
+            }
+            if stopped && pending.is_empty() {
+                break;
+            }
+        }
+        ensure!(!failed, "rich_multimodal_required_stage_failed");
+        Ok(scores)
+    }
+}
 
 struct Entry {
     id: String,
@@ -882,110 +1020,24 @@ impl PreparedRichMultimodalSearch {
     async fn stage(
         &mut self,
         stage: &'static str,
-        mut batches: Vec<Batch>,
+        batches: Vec<Batch>,
         observer: &(dyn Fn(&RichMultimodalAttempt) -> Result<()> + Send + Sync),
     ) -> Result<Vec<(String, f64, Option<f64>)>> {
-        let mut pending = FuturesUnordered::new();
-        let mut next = 0usize;
-        let mut stopped = false;
-        let mut failed = false;
-        let mut scores = Vec::new();
-        while next < batches.len() || !pending.is_empty() {
-            while !stopped
-                && next < batches.len()
-                && pending.len() < self.options.max_concurrent_batches
-            {
-                if validate_pool(
-                    &self.reader,
-                    &self.visual,
-                    &self.client,
-                    &self.pool,
-                    &self.options.resources,
-                )
-                .is_err()
-                {
-                    stopped = true;
-                    failed = true;
-                    break;
-                }
-                let attempt = RichMultimodalAttempt::pending(stage, next, &batches[next]);
-                let ordinal = self.report.attempts.len();
-                self.report.attempts.push(attempt);
-                self.report.logical_calls_attempted += 1;
-                let request = batches[next].request.take().expect("consume once");
-                let client = self.client.clone();
-                let reader = self.reader.clone();
-                let visual = self.visual.clone();
-                let pool = self.pool.clone();
-                let resources = self.options.resources.clone();
-                pending.push(async move {
-                    let result = match validate_pool(&reader, &visual, &client, &pool, &resources) {
-                        Ok(()) => client.submit_prepared(request).await,
-                        Err(error) => Err(error),
-                    };
-                    (ordinal, result)
-                });
-                next += 1;
-            }
-            let Some((ordinal, result)) = pending.next().await else {
-                break;
-            };
-            match result {
-                Ok(mut response) => {
-                    if self.report.attempts[ordinal]
-                        .observe(&mut response)
-                        .is_err()
-                    {
-                        stopped = true;
-                        failed = true;
-                    } else {
-                        self.report.validated_responses += 1;
-                    }
-                    let attempt = &self.report.attempts[ordinal];
-                    for (i, id) in attempt.candidate_ids.iter().enumerate() {
-                        if let Some(DecisionAnswer::Score {
-                            score, confidence, ..
-                        }) = response.answers.get(&format!("candidate_{i}"))
-                        {
-                            scores.push((id.clone(), score / 3.0, *confidence));
-                        } else {
-                            stopped = true;
-                            failed = true;
-                        }
-                    }
-                }
-                Err(error) => {
-                    self.report.attempts[ordinal].failure = error
-                        .downcast_ref::<DecisionFailure>()
-                        .map(|f| f.diagnostic().clone());
-                    self.report.attempts[ordinal].response_status = "failed";
-                    stopped = true;
-                    failed = true;
-                }
-            }
-            if observer(&self.report.attempts[ordinal]).is_err()
-                || validate_pool(
-                    &self.reader,
-                    &self.visual,
-                    &self.client,
-                    &self.pool,
-                    &self.options.resources,
-                )
-                .is_err()
-            {
-                stopped = true;
-                failed = true;
-            }
-            if self.meter().is_err() {
-                stopped = true;
-                failed = true;
-            }
-            if stopped && pending.is_empty() {
-                break;
-            }
+        EvidenceStage {
+            reader: &self.reader,
+            visual: &self.visual,
+            client: &self.client,
+            pool: &self.pool,
+            resources: &self.options.resources,
+            max_concurrent_batches: self.options.max_concurrent_batches,
+            attempts: &mut self.report.attempts,
+            logical_calls_attempted: &mut self.report.logical_calls_attempted,
+            validated_responses: &mut self.report.validated_responses,
+            read_intervals: &mut self.report.read_intervals,
+            last_meter: &mut self.last_meter,
         }
-        ensure!(!failed, "rich_multimodal_required_stage_failed");
-        Ok(scores)
+        .run(stage, batches, observer)
+        .await
     }
     pub async fn execute(
         self,

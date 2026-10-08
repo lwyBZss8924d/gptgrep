@@ -502,3 +502,154 @@ async fn loopback_provider_failure_keeps_receipt_stops_paid_and_continues_local(
     assert_eq!(ctx.snapshot()?.logical_reservations, 1);
     Ok(())
 }
+
+fn rerank_operation(reader: &RichGenerationReader, id: &str) -> Result<Value> {
+    let artifact = &reader.manifest()?.documents[0].pages[0].native_text.id;
+    let evidence = reader.read_text(artifact, 0, 128)?.evidence;
+    Ok(
+        json!({"id":id,"op":"rerank","query":"ordinary source evidence",
+        "candidates":[{"id":"output-side-label","evidence":evidence}]}),
+    )
+}
+#[test]
+fn rerank_schema_refuses_caller_content_cursors_dependencies_and_duplicate_evidence() -> Result<()>
+{
+    let root = tempfile::tempdir()?;
+    let reader = reader(root.path())?;
+    let operation = rerank_operation(&reader, "rank")?;
+    assert!(
+        parse_rich_batch_request(&serde_json::to_vec(&request(json!([operation.clone()])))?)
+            .is_ok()
+    );
+    for field in ["cursor", "text", "image_url", "depends_on"] {
+        let mut op = operation.clone();
+        op[field] = json!("forbidden");
+        assert!(
+            parse_rich_batch_request(&serde_json::to_vec(
+                &json!({"schema_version":RICH_BATCH_REQUEST_SCHEMA,"operations":[op]})
+            )?)
+            .is_err()
+        );
+    }
+    let mut op = operation;
+    let mut duplicate = op["candidates"][0].clone();
+    duplicate["id"] = json!("another-label");
+    op["candidates"].as_array_mut().unwrap().push(duplicate);
+    let c = client(8)?;
+    let ctx = c.execution_context().clone();
+    let prepared = prepare_rich_batch_with_reader(&reader, request(json!([op])), Some(c))?;
+    assert_eq!(
+        prepared.starts[0].as_ref().unwrap_err().code,
+        RichBatchErrorCode::InvalidOperation
+    );
+    assert_eq!(prepared.reserved_calls(), 0);
+    assert_eq!(ctx.snapshot()?.logical_reservations, 0);
+    Ok(())
+}
+#[test]
+fn mixed_rerank_search_local_prepares_fixed_shares_and_actual_no_route_rerank() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let reader = reader(root.path())?;
+    let c = client(8)?;
+    let ctx = c.execution_context().clone();
+    let p = prepare_rich_batch_with_reader(
+        &reader,
+        request(json!([
+            rerank_operation(&reader,"rerank")?,{"id":"local","op":"inspect_documents"},paid("search")
+        ])),
+        Some(c),
+    )?;
+    assert_eq!(p.item_call_shares(), &[1, 0, 2]);
+    assert_eq!(p.reserved_calls(), 3);
+    assert_eq!(
+        p.prepared_reranks().map(|(id, _)| id).collect::<Vec<_>>(),
+        ["rerank"]
+    );
+    assert_eq!(
+        p.prepared_searches().map(|(id, _)| id).collect::<Vec<_>>(),
+        ["search"]
+    );
+    let (_, rerank) = p.prepared_reranks().next().unwrap();
+    assert_eq!(rerank.requests().count(), 1);
+    let body: Value = serde_json::from_slice(rerank.requests().next().unwrap().canonical_body())?;
+    assert_eq!(body["questions"].as_object().unwrap().len(), 1);
+    assert!(
+        !std::str::from_utf8(rerank.requests().next().unwrap().canonical_body())?
+            .contains("output-side-label")
+    );
+    assert!(
+        p.prepared_searches()
+            .all(|(_, s)| s.routing_requests().count() == 1)
+    );
+    assert_eq!(ctx.snapshot()?.logical_reservations, 0);
+    Ok(())
+}
+#[test]
+fn rerank_never_borrows_later_search_or_parent_call_allowances() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let reader = reader(root.path())?;
+    let c = client(8)?;
+    let ctx = c.execution_context().clone();
+    let mut r = request(json!([rerank_operation(&reader, "rank")?, paid("search")]));
+    r.budget.max_decisions_submissions = 1;
+    let p = prepare_rich_batch_with_reader(&reader, r, Some(c))?;
+    assert_eq!(p.item_call_shares(), &[1, 0]);
+    assert_eq!(
+        p.starts[1].as_ref().unwrap_err().code,
+        RichBatchErrorCode::SubmissionBudgetInsufficient
+    );
+    assert_eq!(ctx.snapshot()?.logical_reservations, 0);
+    Ok(())
+}
+#[test]
+fn rerank_output_failure_and_forged_ref_do_not_borrow_other_item_capacity() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let reader = reader(root.path())?;
+    let c = client(8)?;
+    let ctx = c.execution_context().clone();
+    let mut r =
+        request(json!([rerank_operation(&reader,"rank")?,{"id":"local","op":"inspect_documents"}]));
+    r.budget.max_output_bytes = 8192;
+    let p = prepare_rich_batch_with_reader(&reader, r, Some(c.clone()))?;
+    assert_eq!(p.reserved_calls(), 0);
+    assert_eq!(
+        p.starts[0].as_ref().unwrap_err().code,
+        RichBatchErrorCode::OutputBudgetInsufficient
+    );
+    assert!(p.starts[1].is_ok());
+    let mut bad = rerank_operation(&reader, "bad")?;
+    bad["candidates"][0]["evidence"]["binding"]["source_sha256"] = json!("e".repeat(64));
+    let p = prepare_rich_batch_with_reader(
+        &reader,
+        request(json!([bad,{"id":"local","op":"inspect_documents"}])),
+        Some(c),
+    )?;
+    assert_eq!(p.reserved_calls(), 0);
+    assert_eq!(
+        p.starts[0].as_ref().unwrap_err().code,
+        RichBatchErrorCode::InvalidOperation
+    );
+    assert!(p.starts[1].is_ok());
+    assert_eq!(ctx.snapshot()?.logical_reservations, 0);
+    Ok(())
+}
+#[tokio::test]
+async fn local_sync_rerank_context_refusal_preserves_later_local_output() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let reader = reader(root.path())?;
+    let r =
+        request(json!([rerank_operation(&reader,"rank")?,{"id":"local","op":"inspect_documents"}]));
+    let sync = dispatch_rich_batch_with_reader(&reader, r.clone())?;
+    let asynchronous = dispatch_rich_batch_with_reader_and_client(&reader, r, None).await?;
+    assert_eq!(
+        sync.items[0].error.as_ref().unwrap().code,
+        RichBatchErrorCode::ModelContextRequired
+    );
+    assert_eq!(
+        asynchronous.items[0].error.as_ref().unwrap().code,
+        RichBatchErrorCode::ModelContextRequired
+    );
+    assert_eq!(sync.items[1].result, asynchronous.items[1].result);
+    assert_eq!(asynchronous.execution.model_submissions, None);
+    Ok(())
+}
