@@ -610,6 +610,20 @@ impl RichGenerationReader {
         Ok(())
     }
 
+    /// Exhaustively bind the selected engine's postings and masks to actual
+    /// normalized native/OCR artifacts under explicit input/scan/work limits.
+    /// This is local content verification, not model or runtime qualification.
+    pub fn verify_index_content(
+        &self,
+        limits: &gptgrep_index::IndexContentLimits,
+    ) -> Result<gptgrep_index::IndexContentReport> {
+        self.validate()?;
+        let report =
+            gptgrep_index::IndexSession::verify_content(&self.dir.join("artifact-index"), limits)?;
+        self.validate()?;
+        Ok(report)
+    }
+
     fn index_session(&self) -> Result<&gptgrep_index::IndexSession> {
         match self.index.get_or_init(|| {
             gptgrep_index::IndexSession::open(&self.dir.join("artifact-index"))

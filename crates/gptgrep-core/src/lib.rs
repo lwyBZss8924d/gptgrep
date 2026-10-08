@@ -8,6 +8,7 @@ mod custody;
 mod derived_visual;
 mod evidence_roles;
 pub mod rich_batch;
+pub use gptgrep_index::{IndexContentLimits, IndexContentReport};
 mod rich_decisions;
 pub use derived_visual::{
     DerivedCacheBudget, DerivedCacheStatus, DerivedRecipeToken, DerivedVisualCache,

@@ -500,3 +500,513 @@ fn stale_pending_receipt_refuses_admission_and_preclaim_launch() {
         b"EXISTING_SYNTHETIC_PENDING"
     );
 }
+
+// Actual v2 publication/index/Reader over generic MOCK parsed artifacts. No native parser.
+mod generation {
+    use super::*;
+    use gptgrep_core::{RichGenerationReader, RichGenerationWriter};
+    use gptgrep_parse::{
+        AffineTransform, ArtifactKind, ArtifactRef, CoverageState, FeatureState, NativePage,
+        OcrImage, PageGeometry, PreparedSummary, RICH_PARSER, ResourceBudget, RichParsedDocument,
+    };
+    async fn parsed_fixture(
+        root: &Path,
+        texts: &[&str],
+    ) -> anyhow::Result<(tempfile::TempDir, RichParsedDocument)> {
+        let staging = tempfile::tempdir()?;
+        let staging_path = staging.path().canonicalize()?;
+        let source_bytes = fs::read(root.join("document.pdf"))?;
+        let source = source_bytes.as_slice();
+        fs::write(staging_path.join("prepared.pdf"), source)?;
+        let source_sha = sha(source);
+        let profile = sha(b"synthetic parser recipe");
+        let mut artifacts = Vec::new();
+        let mut pages = Vec::new();
+        let mut create = |kind: ArtifactKind,
+                          page: Option<u32>,
+                          bytes: &[u8],
+                          name: &str|
+         -> anyhow::Result<ArtifactRef> {
+            let artifact = ArtifactRef {
+                id: gptgrep_parse::artifact_id(
+                    &source_sha,
+                    &profile,
+                    &kind,
+                    page,
+                    None,
+                    &sha(bytes),
+                )?,
+                kind,
+                relative_path: name.into(),
+                sha256: sha(bytes),
+                profile_sha256: profile.clone(),
+                bytes: bytes.len() as u64,
+                mime: if name.ends_with(".png") {
+                    "image/png"
+                } else if name.ends_with(".txt") {
+                    "text/plain; charset=utf-8"
+                } else {
+                    "application/json"
+                }
+                .into(),
+                page,
+                region_id: None,
+            };
+            fs::write(staging_path.join(name), bytes)?;
+            artifacts.push(artifact.clone());
+            Ok(artifact)
+        };
+        for (index, text) in texts.iter().enumerate() {
+            let number = index as u32 + 1;
+            let native_text = create(
+                ArtifactKind::NativeText,
+                Some(number),
+                text.as_bytes(),
+                &format!("p{number}-native.txt"),
+            )?;
+            let geometry = PageGeometry {
+                width_points: 100.0,
+                height_points: 200.0,
+                rotation_quarter_turns: 0,
+                user_unit: 1.0,
+                source_to_page: AffineTransform::IDENTITY,
+                page_to_source: AffineTransform::IDENTITY,
+            };
+            let complexity = serde_json::from_value(
+                json!({"page_number":number,"text_length":text.len(),"text_coverage":0.5,
+            "has_substantial_images":false,"image_block_count":0,"image_coverage":0.0,"largest_image_coverage":0.0,
+            "full_page_image":false,"uncovered_vector_area":null,"is_garbled":false,"page_area":20000.0,
+            "needs_ocr":false,"reasons":[],"layout":null}),
+            )?;
+            let capabilities =
+                BTreeMap::from([("annotation_count".into(), FeatureState::Present("0".into()))]);
+            let metadata_artifact = create(
+                ArtifactKind::NativeMetadata,
+                Some(number),
+                &serde_json::to_vec(
+                    &json!({"page":{"page_number":number,"page_width":100.0,"page_height":200.0,"text_items":[]},"objects":[],
+                "capabilities":capabilities,"complexity":complexity,"geometry":geometry,"image_rects":[]}),
+                )?,
+                &format!("p{number}-native.json"),
+            )?;
+            let mut pixels = Vec::new();
+            use image::{ExtendedColorType, ImageEncoder};
+            image::codecs::png::PngEncoder::new(&mut pixels).write_image(
+                &[255; 8 * 16 * 4],
+                8,
+                16,
+                ExtendedColorType::Rgba8,
+            )?;
+            let rendition = create(
+                ArtifactKind::Rendition,
+                Some(number),
+                &pixels,
+                &format!("p{number}.png"),
+            )?;
+            let image = OcrImage {
+                artifact: rendition.clone(),
+                path: staging_path.join(&rendition.relative_path),
+                width: 8,
+                height: 16,
+                page_to_raster: AffineTransform {
+                    a: 0.08,
+                    d: 0.08,
+                    ..AffineTransform::IDENTITY
+                },
+            };
+            pages.push(NativePage {
+                number,
+                label: FeatureState::Absent,
+                width_points: 100.0,
+                height_points: 200.0,
+                geometry,
+                native_text,
+                metadata_artifact,
+                renditions: vec![image],
+                complexity,
+                coverage: CoverageState::Native,
+                capabilities,
+            });
+        }
+        assert_eq!(texts.len(), 1);
+        fs::write(staging_path.join("fixture.txt"), texts[0])?;
+        let mut document = gptgrep_parse::parse_path(&staging_path.join("fixture.txt")).await?;
+        document.title = "synthetic".into();
+        document.parser = RICH_PARSER.into();
+        create(
+            ArtifactKind::MergedText,
+            None,
+            document.text.as_bytes(),
+            "merged.txt",
+        )?;
+        create(ArtifactKind::Layout, None, b"[]", "layout.json")?;
+        let unmapped_merged_lines = document.text.lines().count().max(1);
+        Ok((
+            staging,
+            RichParsedDocument {
+                summary: PreparedSummary {
+                    source_sha256: source_sha.clone(),
+                    prepared_sha256: source_sha,
+                    source_bytes: source.len() as u64,
+                    prepared_bytes: source.len() as u64,
+                    format: "pdf".into(),
+                    parser_identity: RICH_PARSER.into(),
+                    preparation_profile_sha256: sha(&serde_json::to_vec(&(
+                        "gptgrep.prepare.identity-pdf.v1",
+                        gptgrep_parse::LITEPARSE_REVISION,
+                    ))?),
+                    conversion: FeatureState::Present(gptgrep_parse::ConversionIdentity {
+                        converter: "identity-pdf".into(),
+                        version: gptgrep_parse::LITEPARSE_REVISION.into(),
+                        invocations: 0,
+                    }),
+                    image_geometry: FeatureState::Absent,
+                },
+                document,
+                pages,
+                artifacts,
+                native_profile_sha256: profile,
+                segments: vec![],
+                ocr_tasks: vec![],
+                ocr_results: vec![],
+                coverage: texts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| (i as u32 + 1, CoverageState::Native))
+                    .collect(),
+                unmapped_merged_lines,
+            },
+        ))
+    }
+
+    struct Generated {
+        f: Fixture,
+        root: PathBuf,
+        capabilities: Value,
+    }
+    impl Generated {
+        async fn new() -> Self {
+            Self::with_text("ordinary MOCK copper fixture\n").await
+        }
+        async fn with_text(text: &str) -> Self {
+            let mut f = Fixture::new("open('child-marker','w').write('MOCK')\n");
+            let raw = f.root.join("app/raw");
+            let (stage, parsed) = parsed_fixture(&raw, &[text]).await.unwrap();
+            let mut writer = RichGenerationWriter::begin(&raw, ResourceBudget::default()).unwrap();
+            writer
+                .add_document(
+                    "document.pdf",
+                    &stage.path().canonicalize().unwrap(),
+                    parsed,
+                )
+                .unwrap();
+            let pin = writer.publish().unwrap();
+            RichGenerationReader::open_pinned(&raw, &pin)
+                .unwrap()
+                .verify_all()
+                .unwrap();
+            // Exported consumer topology contains CURRENT + the selected generation, not writer locks.
+            fs::remove_file(raw.join(".gptgrep/write.lock")).unwrap();
+            let root = raw.join(".gptgrep/generations").join(&pin.generation);
+            let mut inventory = Vec::new();
+            fn walk(root: &Path, dir: &Path, inventory: &mut Vec<Value>) {
+                for entry in fs::read_dir(dir).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        walk(root, &path, inventory);
+                    } else {
+                        let bytes = fs::read(&path).unwrap();
+                        inventory.push(json!({"path":path.strip_prefix(root).unwrap(),"bytes":bytes.len(),"sha256":sha(&bytes)}));
+                    }
+                }
+            }
+            walk(&root, &root, &mut inventory);
+            inventory.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+            let capabilities = json!({"schema_version":2,"generation_v2":pin.manifest_sha256,
+                "regex":"a".repeat(64),"tree":"a".repeat(64),"visual":"a".repeat(64),
+                "multimodal":"a".repeat(64),"decisions_helper":"a".repeat(64),
+                "generation_binding":{"pin":pin,"current_sha256":sha(&fs::read(raw.join(".gptgrep/CURRENT.json")).unwrap()),"inventory":inventory}});
+            f.value["arm"] = json!("treatment");
+            // New synthetic fixture phase starts after offline index construction; production never reanchors.
+            let now = monotonic_ns().unwrap();
+            let wall = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            f.value["phase"]["issued_monotonic_ns"] = json!(now);
+            f.value["phase"]["deadline_monotonic_ns"] = json!(now + 10_000_000_000u64);
+            f.value["phase"]["deadline_unix_ms"] = json!(wall + 10000);
+            let mut result = Self {
+                f,
+                root,
+                capabilities,
+            };
+            result.save();
+            result
+        }
+        fn save(&mut self) {
+            let path = self.f.root.join("capabilities.json");
+            if path.exists() {
+                fs::remove_file(&path).unwrap();
+            }
+            let bytes = serde_json::to_vec(&self.capabilities).unwrap();
+            private_new(&path, &bytes).unwrap();
+            self.f.value["treatment_capabilities"] = json!({"path":path,"sha256":sha(&bytes)});
+        }
+        fn rejected(&self) -> &'static str {
+            let result = admit(&self.f.path, &self.f.control(), false);
+            assert!(!self.f.root.join("app/child-marker").exists());
+            assert!(!self.f.root.join("out/native-run.claim").exists());
+            result.err().expect("must refuse before launch/claim")
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn genuine_pinned_generation_admits_check_only_and_baseline_stays_pdf_only() {
+        let mut g = Generated::new().await;
+        admit(&g.f.path, &g.f.control(), false).unwrap();
+        assert!(!g.f.root.join("out/native-run.claim").exists());
+        assert!(!g.f.root.join("app/child-marker").exists());
+        g.f.value["arm"] = json!("baseline");
+        g.f.value["treatment_capabilities"] = Value::Null;
+        assert_eq!(g.rejected(), "raw_inventory_mismatch");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_foreign_engine_with_refreshed_inventory_refuses_before_claim_and_child() {
+        let mut g = Generated::new().await;
+        let foreign = Generated::with_text("different MOCK silver material\n").await;
+        admit(&g.f.path, &g.f.control(), false).unwrap();
+        for name in ["lookup.bin", "index.bin"] {
+            fs::copy(
+                foreign.root.join("artifact-index").join(name),
+                g.root.join("artifact-index").join(name),
+            )
+            .unwrap();
+        }
+        let meta_path = g.root.join("artifact-index/meta.json");
+        let mut meta: Value = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+        meta["num_trigrams"] = json!(
+            fs::metadata(g.root.join("artifact-index/lookup.bin"))
+                .unwrap()
+                .len()
+                / 16
+        );
+        fs::write(meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+        // Preserve original normalized source and file table, while refreshing
+        // every replaced byte's caller inventory. Reader.verify_all alone passes.
+        RichGenerationReader::open_pinned(
+            &g.f.root.join("app/raw"),
+            &serde_json::from_value(g.capabilities["generation_binding"]["pin"].clone()).unwrap(),
+        )
+        .unwrap()
+        .verify_all()
+        .unwrap();
+        for entry in g.capabilities["generation_binding"]["inventory"]
+            .as_array_mut()
+            .unwrap()
+        {
+            let bytes = fs::read(g.root.join(entry["path"].as_str().unwrap())).unwrap();
+            entry["bytes"] = json!(bytes.len());
+            entry["sha256"] = json!(sha(&bytes));
+        }
+        g.save();
+        assert_eq!(g.rejected(), "generation_index_content");
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn operator_version_one_is_not_a_generation_binding() {
+        let mut g = Generated::new().await;
+        g.capabilities["schema_version"] = json!(1);
+        g.capabilities
+            .as_object_mut()
+            .unwrap()
+            .remove("generation_binding");
+        g.save();
+        assert_eq!(g.rejected(), "capability_schema");
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn changed_current_or_missing_generation_refuses() {
+        let g = Generated::new().await;
+        fs::write(g.f.root.join("app/raw/.gptgrep/CURRENT.json"), b"{}").unwrap();
+        assert!(g.rejected().starts_with("generation_current"));
+        let g = Generated::new().await;
+        fs::remove_file(g.root.join("artifact-index/index.bin")).unwrap();
+        assert_eq!(g.rejected(), "path_missing");
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn tampered_artifact_and_self_consistent_inventory_cannot_bypass_reader() {
+        let mut g = Generated::new().await;
+        let entry = g.capabilities["generation_binding"]["inventory"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|v| v["path"].as_str().unwrap().ends_with("prepared.pdf"))
+            .unwrap();
+        let path = g.root.join(entry["path"].as_str().unwrap());
+        let bytes = b"self consistent changed MOCK prepared bytes";
+        fs::write(path, bytes).unwrap();
+        entry["bytes"] = json!(bytes.len());
+        entry["sha256"] = json!(sha(bytes));
+        g.save();
+        assert_eq!(g.rejected(), "generation_verification");
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn undeclared_files_empty_history_and_symlinks_are_not_excluded() {
+        for kind in ["raw", "artifact", "history", "hidden", "symlink"] {
+            let g = Generated::new().await;
+            match kind {
+                "raw" => fs::write(g.f.root.join("app/raw/extra.pdf"), b"extra").unwrap(),
+                "artifact" => fs::write(g.root.join("extra.txt"), b"extra").unwrap(),
+                "history" => {
+                    fs::create_dir(g.f.root.join("app/raw/.gptgrep/generations/extra")).unwrap()
+                }
+                "hidden" => fs::write(g.f.root.join("app/raw/.gptgrep/.extra"), b"extra").unwrap(),
+                _ => std::os::unix::fs::symlink(
+                    g.f.root.join("schema.json"),
+                    g.root.join("extra-link"),
+                )
+                .unwrap(),
+            }
+            let code = g.rejected();
+            assert!(
+                matches!(
+                    code,
+                    "raw_inventory_mismatch"
+                        | "generation_inventory_mismatch"
+                        | "generation_symlink"
+                ),
+                "{kind}: {code}"
+            );
+        }
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicate_escaping_inventory_and_noncanonical_root_refuse() {
+        let mut g = Generated::new().await;
+        let entry = g.capabilities["generation_binding"]["inventory"][0].clone();
+        g.capabilities["generation_binding"]["inventory"]
+            .as_array_mut()
+            .unwrap()
+            .push(entry);
+        g.save();
+        assert_eq!(g.rejected(), "generation_duplicate");
+        let mut g = Generated::new().await;
+        g.capabilities["generation_binding"]["inventory"][0]["path"] = json!("../outside");
+        g.save();
+        assert_eq!(g.rejected(), "generation_path");
+        let mut g = Generated::new().await;
+        g.f.value["raw_dir"] = json!(g.f.root.join("app/raw/.."));
+        assert!(matches!(
+            g.rejected(),
+            "path_component" | "generation_binding"
+        ));
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn changed_generation_after_admission_refuses_before_claim_or_child() {
+        let g = Generated::new().await;
+        g.f.prompt();
+        let admitted = admit(&g.f.path, &g.f.control(), true).unwrap();
+        fs::write(g.root.join("artifact-index/index.bin"), b"changed index").unwrap();
+        assert!(execute(admitted).is_err());
+        assert!(!g.f.root.join("out/native-run.claim").exists());
+        assert!(!g.f.root.join("app/child-marker").exists());
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn changed_raw_source_is_rejected_even_with_refreshed_control() {
+        let mut g = Generated::new().await;
+        let path = g.f.root.join("app/raw/document.pdf");
+        fs::write(&path, b"%PDF-1.4 changed MOCK source").unwrap();
+        g.f.value["raw_documents"][0]["sha256"] = json!(sha(&fs::read(path).unwrap()));
+        assert_eq!(g.rejected(), "generation_sources");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn self_consistent_extra_inventory_and_index_corruption_refuse() {
+        let mut g = Generated::new().await;
+        fs::write(g.root.join("extra.txt"), b"extra").unwrap();
+        g.capabilities["generation_binding"]["inventory"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"path":"extra.txt","bytes":5,"sha256":sha(b"extra")}));
+        g.save();
+        assert_eq!(g.rejected(), "generation_complete_inventory");
+        let mut g = Generated::new().await;
+        let path = g.root.join("artifact-index/index.bin");
+        fs::write(path, b"bad").unwrap();
+        let entry = g.capabilities["generation_binding"]["inventory"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|v| v["path"] == "artifact-index/index.bin")
+            .unwrap();
+        entry["bytes"] = json!(3);
+        entry["sha256"] = json!(sha(b"bad"));
+        g.save();
+        assert_eq!(g.rejected(), "generation_index_content");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refreshed_manifest_pin_cannot_relocate_canonical_root() {
+        let mut g = Generated::new().await;
+        let path = g.root.join("manifest.json");
+        let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        manifest["root"] = json!(g.f.root.join("different-root"));
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let digest = sha(&bytes);
+        let binding = &mut g.capabilities["generation_binding"];
+        binding["pin"]["manifest_sha256"] = json!(digest);
+        let entry = binding["inventory"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|v| v["path"] == "manifest.json")
+            .unwrap();
+        entry["bytes"] = json!(bytes.len());
+        entry["sha256"] = json!(digest);
+        let current = json!({"schema_version":"gptgrep.manifest.v2","generation":binding["pin"]["generation"],"manifest_sha256":digest});
+        let bytes = serde_json::to_vec(&current).unwrap();
+        fs::write(g.f.root.join("app/raw/.gptgrep/CURRENT.json"), &bytes).unwrap();
+        binding["current_sha256"] = json!(sha(&bytes));
+        g.save();
+        assert_eq!(g.rejected(), "generation_reader");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn generation_inventory_and_size_caps_are_preadmitted() {
+        let mut g = Generated::new().await;
+        let entry = g.capabilities["generation_binding"]["inventory"][0].clone();
+        g.capabilities["generation_binding"]["inventory"] = json!(vec![entry; 257]);
+        g.save();
+        assert_eq!(g.rejected(), "generation_binding");
+        let mut g = Generated::new().await;
+        g.capabilities["generation_binding"]["inventory"][0]["bytes"] = json!(67_108_865u64);
+        g.save();
+        assert_eq!(g.rejected(), "generation_file_limit_or_digest");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refreshed_index_manifest_cannot_select_merged_text_or_omit_artifacts() {
+        for change in ["root", "files"] {
+            let mut g = Generated::new().await;
+            let path = g.root.join("artifact-index/gptgrep-index.json");
+            let mut index: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            if change == "root" {
+                index["root_relative"] = json!("../text");
+            } else {
+                index["files"] = json!({});
+            }
+            let bytes = serde_json::to_vec(&index).unwrap();
+            fs::write(path, &bytes).unwrap();
+            let entry = g.capabilities["generation_binding"]["inventory"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|v| v["path"] == "artifact-index/gptgrep-index.json")
+                .unwrap();
+            entry["bytes"] = json!(bytes.len());
+            entry["sha256"] = json!(sha(&bytes));
+            g.save();
+            assert_eq!(g.rejected(), "generation_index_sources");
+        }
+    }
+}

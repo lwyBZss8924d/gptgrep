@@ -76,6 +76,32 @@ struct CapabilityReferences {
     visual: String,
     multimodal: String,
     decisions_helper: String,
+    /// Custody of actual source-bound files, independent of operator capability references.
+    generation_binding: GenerationBinding,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GenerationBinding {
+    pin: gptgrep_core::GenerationPin,
+    current_sha256: String,
+    inventory: Vec<GenerationFile>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GenerationFile {
+    path: PathBuf,
+    bytes: u64,
+    sha256: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CurrentGeneration {
+    schema_version: String,
+    generation: String,
+    manifest_sha256: String,
 }
 
 #[derive(Clone, Deserialize)]
@@ -308,6 +334,7 @@ fn raw_inventory(
     result: &mut BTreeSet<PathBuf>,
     depth: usize,
     visited: &mut usize,
+    verified_generation: &BTreeSet<PathBuf>,
 ) -> Result<()> {
     if depth > 8 || result.len() > 256 {
         return Err("raw_inventory_limit");
@@ -323,12 +350,339 @@ fn raw_inventory(
             return Err("raw_symlink");
         }
         if kind.is_dir() {
-            raw_inventory(&entry.path(), result, depth + 1, visited)?;
+            raw_inventory(
+                &entry.path(),
+                result,
+                depth + 1,
+                visited,
+                verified_generation,
+            )?;
         } else if kind.is_file() {
-            result.insert(entry.path());
+            if !verified_generation.contains(&entry.path()) {
+                result.insert(entry.path());
+            }
         } else {
             return Err("raw_kind");
         }
+    }
+    Ok(())
+}
+
+fn generation_relative(path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty()
+        || path.to_str().is_none()
+        || path
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err("generation_path");
+    }
+    Ok(())
+}
+
+/// A streamed file snapshot; no caller-provided inventory entry establishes semantic authority.
+fn generation_file(path: &Path, expected: &GenerationFile) -> Result<()> {
+    if expected.bytes > 67_108_864 || !digest_shape(&expected.sha256) {
+        return Err("generation_file_limit_or_digest");
+    }
+    path_custody(path, false)?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|_| "generation_file_open")?;
+    let before = file.metadata().map_err(|_| "generation_file_metadata")?;
+    if !before.is_file() || before.len() != expected.bytes {
+        return Err("generation_file_size_or_kind");
+    }
+    let mut digest = Sha256::new();
+    let mut total = 0u64;
+    let mut scratch = [0u8; 65_536];
+    loop {
+        let count = file
+            .read(&mut scratch)
+            .map_err(|_| "generation_file_read")?;
+        if count == 0 {
+            break;
+        }
+        total = total
+            .checked_add(count as u64)
+            .filter(|v| *v <= expected.bytes)
+            .ok_or("generation_file_changed")?;
+        digest.update(&scratch[..count]);
+    }
+    let after = file.metadata().map_err(|_| "generation_file_metadata")?;
+    let named = fs::symlink_metadata(path).map_err(|_| "generation_file_metadata")?;
+    if total != expected.bytes
+        || after.len() != before.len()
+        || after.mtime() != before.mtime()
+        || after.mtime_nsec() != before.mtime_nsec()
+        || named.dev() != before.dev()
+        || named.ino() != before.ino()
+        || named.file_type().is_symlink()
+        || format!("{:x}", digest.finalize()) != expected.sha256
+    {
+        return Err("generation_file_changed_or_digest");
+    }
+    Ok(())
+}
+
+fn generation_tree(
+    root: &Path,
+    files: &mut BTreeSet<PathBuf>,
+    dirs: &mut BTreeSet<PathBuf>,
+    depth: usize,
+    visited: &mut usize,
+) -> Result<()> {
+    if depth > 8 {
+        return Err("generation_inventory_limit");
+    }
+    for entry in fs::read_dir(root).map_err(|_| "generation_directory")? {
+        *visited += 1;
+        if *visited > 512 {
+            return Err("generation_inventory_limit");
+        }
+        let entry = entry.map_err(|_| "generation_entry")?;
+        let kind = entry.file_type().map_err(|_| "generation_kind")?;
+        if kind.is_symlink() {
+            return Err("generation_symlink");
+        }
+        if kind.is_dir() {
+            dirs.insert(entry.path());
+            generation_tree(&entry.path(), files, dirs, depth + 1, visited)?;
+        } else if kind.is_file() {
+            files.insert(entry.path());
+        } else {
+            return Err("generation_kind");
+        }
+    }
+    Ok(())
+}
+
+fn treatment_generation(control: &Control) -> Result<BTreeSet<PathBuf>> {
+    let reference = match (&control.treatment_capabilities, control.arm.as_str()) {
+        (None, "baseline") => return Ok(BTreeSet::new()),
+        (Some(reference), "treatment") => reference,
+        _ => return Err("arm_capabilities"),
+    };
+    let value: CapabilityReferences = serde_json::from_slice(&asset(reference, 65_536, false)?)
+        .map_err(|_| "capability_schema")?;
+    if value.schema_version != 2
+        || [
+            &value.generation_v2,
+            &value.regex,
+            &value.tree,
+            &value.visual,
+            &value.multimodal,
+            &value.decisions_helper,
+        ]
+        .iter()
+        .any(|v| !digest_shape(v))
+    {
+        return Err("capability_references");
+    }
+    let binding = &value.generation_binding;
+    if binding.inventory.is_empty()
+        || binding.inventory.len() > 256
+        || !digest_shape(&binding.current_sha256)
+        || !digest_shape(&binding.pin.manifest_sha256)
+        || binding.pin.generation.is_empty()
+        || binding.pin.generation.len() > 128
+        || !binding
+            .pin
+            .generation
+            .bytes()
+            .all(|v| v.is_ascii_alphanumeric() || v == b'-')
+        || fs::canonicalize(&control.raw_dir).map_err(|_| "generation_root")? != control.raw_dir
+    {
+        return Err("generation_binding");
+    }
+    let state = control.raw_dir.join(".gptgrep");
+    let current_path = state.join("CURRENT.json");
+    let current_bytes = snapshot(&current_path, 4096, false)?;
+    let current: CurrentGeneration =
+        serde_json::from_slice(&current_bytes).map_err(|_| "generation_current_schema")?;
+    if sha(&current_bytes) != binding.current_sha256
+        || current.schema_version != "gptgrep.manifest.v2"
+        || current.generation != binding.pin.generation
+        || current.manifest_sha256 != binding.pin.manifest_sha256
+    {
+        return Err("generation_current_pin");
+    }
+    let root = state.join("generations").join(&binding.pin.generation);
+    let mut names = BTreeSet::new();
+    let mut admitted_files = BTreeSet::from([current_path.clone()]);
+    let mut expected_dirs = BTreeSet::new();
+    let mut total = 0u64;
+    for entry in &binding.inventory {
+        generation_relative(&entry.path)?;
+        if !names.insert(entry.path.clone()) {
+            return Err("generation_duplicate");
+        }
+        total = total
+            .checked_add(entry.bytes)
+            .filter(|v| *v <= 134_217_728)
+            .ok_or("generation_total")?;
+        let path = root.join(&entry.path);
+        generation_file(&path, entry)?;
+        let mut parent = path.parent();
+        while let Some(dir) = parent.filter(|v| *v != state) {
+            expected_dirs.insert(dir.to_path_buf());
+            parent = dir.parent();
+        }
+        admitted_files.insert(path);
+    }
+    let mut actual_files = BTreeSet::new();
+    let mut actual_dirs = BTreeSet::new();
+    generation_tree(&state, &mut actual_files, &mut actual_dirs, 0, &mut 0)?;
+    if actual_files != admitted_files || actual_dirs != expected_dirs {
+        return Err("generation_inventory_mismatch");
+    }
+    let reader = gptgrep_core::RichGenerationReader::open_pinned(&control.raw_dir, &binding.pin)
+        .map_err(|_| "generation_reader")?;
+    let manifest = reader.manifest().map_err(|_| "generation_reader")?;
+    if manifest.documents.len() != control.raw_documents.len() {
+        return Err("generation_sources");
+    }
+    let declared: BTreeMap<_, _> = control
+        .raw_documents
+        .iter()
+        .map(|d| (&d.path, &d.sha256))
+        .collect();
+    let mut sources = BTreeSet::new();
+    let mut expected = BTreeSet::from([PathBuf::from("manifest.json")]);
+    let mut indexed = BTreeMap::new();
+    for doc in &manifest.documents {
+        let path = Path::new(&doc.document.path);
+        generation_relative(path)?;
+        let source = control.raw_dir.join(path);
+        if !sources.insert(source.clone())
+            || declared.get(&source) != Some(&&doc.document.source_sha256)
+            || fs::metadata(&source)
+                .map_err(|_| "generation_source_metadata")?
+                .len()
+                != doc.document.source_bytes
+            || doc.artifacts.len() > 256
+            || doc.pages.len() > 256
+        {
+            return Err("generation_sources");
+        }
+        generation_relative(&doc.prepared_path)?;
+        expected.insert(doc.prepared_path.clone());
+        expected.insert(PathBuf::from(format!("text/{}.txt", doc.document.id)));
+        for stored in &doc.artifacts {
+            generation_relative(&stored.artifact.relative_path)?;
+            expected.insert(stored.artifact.relative_path.clone());
+            if matches!(
+                stored.artifact.kind,
+                gptgrep_parse::ArtifactKind::NativeText | gptgrep_parse::ArtifactKind::OcrText
+            ) {
+                expected.insert(PathBuf::from(format!(
+                    "artifact-text/{}.txt",
+                    stored.artifact.id
+                )));
+                let name = format!("{}.txt", stored.artifact.id);
+                let path = root.join(&stored.artifact.relative_path);
+                let mut file = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(path)
+                    .map_err(|_| "generation_index_source")?;
+                let mut prefix = [0u8; 3];
+                let has_bom = if stored.artifact.bytes >= 3 {
+                    file.read_exact(&mut prefix)
+                        .map_err(|_| "generation_index_source")?;
+                    prefix == [0xef, 0xbb, 0xbf]
+                } else {
+                    false
+                };
+                indexed.insert(
+                    name,
+                    json!({"bytes":stored.artifact.bytes,
+                    "sha256":stored.artifact.sha256,"has_bom":has_bom}),
+                );
+            }
+        }
+        if expected.len() > 256 {
+            return Err("generation_inventory_limit");
+        }
+    }
+    for name in [
+        "gptgrep-index.json",
+        "meta.json",
+        "files-extra.bin",
+        "filestamps.json",
+        "files.bin",
+        "lookup.bin",
+        "index.bin",
+    ] {
+        expected.insert(PathBuf::from(format!("artifact-index/{name}")));
+    }
+    if names != expected {
+        return Err("generation_complete_inventory");
+    }
+    // Reader verifies the engine table. Bind that table's root and complete sources to
+    // precisely native/OCR artifacts, rather than accepting another valid sibling index.
+    let index: Value = serde_json::from_slice(&snapshot(
+        &root.join("artifact-index/gptgrep-index.json"),
+        1_048_576,
+        false,
+    )?)
+    .map_err(|_| "generation_index_schema")?;
+    if index["root_relative"] != "../artifact-text" || index["files"] != json!(indexed) {
+        return Err("generation_index_sources");
+    }
+    reader
+        .verify_index_content(&gptgrep_core::IndexContentLimits {
+            max_files: 256,
+            max_control_bytes: 1_048_576,
+            max_index_bytes: 134_217_728,
+            max_file_bytes: 67_108_864,
+            max_total_text_bytes: 134_217_728,
+            max_trigrams: 2_000_000,
+            max_postings: 8_000_000,
+            max_work_bytes: 268_435_456,
+        })
+        .map_err(|_| "generation_index_content")?;
+    reader.verify_all().map_err(|_| "generation_verification")?;
+    // Recheck named snapshots after the reader's synchronous semantic/index validation.
+    for entry in &binding.inventory {
+        generation_file(&root.join(&entry.path), entry)?;
+    }
+    if snapshot(&current_path, 4096, false)? != current_bytes {
+        return Err("generation_current_changed");
+    }
+    actual_files.clear();
+    actual_dirs.clear();
+    generation_tree(&state, &mut actual_files, &mut actual_dirs, 0, &mut 0)?;
+    if actual_files != admitted_files || actual_dirs != expected_dirs {
+        return Err("generation_inventory_mismatch");
+    }
+    Ok(admitted_files)
+}
+
+fn verify_raw_inputs(control: &Control) -> Result<()> {
+    let mut declared = BTreeSet::new();
+    let mut total = 0usize;
+    for document in &control.raw_documents {
+        if !document.path.starts_with(&control.raw_dir)
+            || document.path.extension().is_none_or(|v| v != "pdf")
+            || !declared.insert(document.path.clone())
+        {
+            return Err("raw_scope_or_duplicate");
+        }
+        total = total
+            .checked_add(asset(document, 67_108_864, false)?.len())
+            .ok_or("raw_total")?;
+        if total > 67_108_864 {
+            return Err("raw_total");
+        }
+    }
+    let verified = treatment_generation(control)?;
+    let mut actual = BTreeSet::new();
+    raw_inventory(&control.raw_dir, &mut actual, 0, &mut 0, &verified)?;
+    if actual != declared {
+        return Err("raw_inventory_mismatch");
     }
     Ok(())
 }
@@ -429,50 +783,7 @@ fn admit(path: &Path, expected: &str, run: bool) -> Result<Admitted> {
         return Err("directory_or_raw_scope");
     }
     fresh_outputs(&control, false)?;
-    let mut actual = BTreeSet::new();
-    raw_inventory(&control.raw_dir, &mut actual, 0, &mut 0)?;
-    let mut declared = BTreeSet::new();
-    let mut total = 0usize;
-    for document in &control.raw_documents {
-        if !document.path.starts_with(&control.raw_dir)
-            || document.path.extension().is_none_or(|v| v != "pdf")
-            || !declared.insert(document.path.clone())
-        {
-            return Err("raw_scope_or_duplicate");
-        }
-        total = total
-            .checked_add(asset(document, 67_108_864, false)?.len())
-            .ok_or("raw_total")?;
-        if total > 67_108_864 {
-            return Err("raw_total");
-        }
-    }
-    if actual != declared {
-        return Err("raw_inventory_mismatch");
-    }
-    match (&control.treatment_capabilities, control.arm.as_str()) {
-        (None, "baseline") => {}
-        (Some(reference), "treatment") => {
-            let value: CapabilityReferences =
-                serde_json::from_slice(&asset(reference, 65_536, false)?)
-                    .map_err(|_| "capability_schema")?;
-            if value.schema_version != 1
-                || [
-                    &value.generation_v2,
-                    &value.regex,
-                    &value.tree,
-                    &value.visual,
-                    &value.multimodal,
-                    &value.decisions_helper,
-                ]
-                .iter()
-                .any(|v| !digest_shape(v))
-            {
-                return Err("capability_references");
-            }
-        }
-        _ => return Err("arm_capabilities"),
-    }
+    verify_raw_inputs(&control)?;
     executable(&control.runtime)?;
     let schema = asset(&control.answer_schema, 65_536, false)?;
     let schema_value: Value = serde_json::from_slice(&schema).map_err(|_| "answer_schema")?;
@@ -723,6 +1034,8 @@ fn execute(admitted: Admitted) -> Result<Value> {
     let control = &admitted.control;
     prelaunch_guard(&control.phase)?;
     fresh_outputs(control, false)?;
+    verify_raw_inputs(control)?;
+    prelaunch_guard(&control.phase)?;
     private_new(
         &control.output_dir.join("native-run.claim"),
         admitted.control_sha256.as_bytes(),
@@ -735,9 +1048,7 @@ fn execute(admitted: Admitted) -> Result<Value> {
     prelaunch_guard(&control.phase)?;
     // Exact file snapshots are admitted. Read-only native/tool mounts remain an external gate.
     executable(&control.runtime)?;
-    for document in &control.raw_documents {
-        asset(document, 67_108_864, false)?;
-    }
+    verify_raw_inputs(control)?;
     prelaunch_guard(&control.phase)?;
     let mut command = Command::new(&control.runtime.path);
     command

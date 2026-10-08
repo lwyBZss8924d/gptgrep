@@ -2,7 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use gptgrep_index::{
-    IndexSession, Match, build, search, search_with_document, search_with_document_and_predicate,
+    IndexContentLimits, IndexSession, Match, build, search, search_with_document,
+    search_with_document_and_predicate,
 };
 use tempfile::TempDir;
 
@@ -18,6 +19,249 @@ fn fixture(files: &[(&str, &str)]) -> (TempDir, PathBuf, PathBuf) {
     }
     build(&root, &index).unwrap();
     (temp, root, index)
+}
+
+fn content_limits() -> IndexContentLimits {
+    IndexContentLimits {
+        max_files: 32,
+        max_control_bytes: 1_048_576,
+        max_index_bytes: 8_388_608,
+        max_file_bytes: 65_536,
+        max_total_text_bytes: 262_144,
+        max_trigrams: 100_000,
+        max_postings: 200_000,
+        max_work_bytes: 33_554_432,
+    }
+}
+
+fn refresh_trigram_count(index: &Path) {
+    let path = index.join("meta.json");
+    let mut meta: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    meta["num_trigrams"] = (fs::metadata(index.join("lookup.bin")).unwrap().len() / 16).into();
+    fs::write(path, serde_json::to_vec(&meta).unwrap()).unwrap();
+}
+
+#[test]
+fn content_verification_matches_actual_bom_unicode_multifile_and_short_indexes() {
+    let inputs = [
+        ("a.txt", "\u{feff}Copper WIRE\n中国文档\n"),
+        ("nested/b.txt", "copper wire\nKEY and ſymbol\n"),
+        ("c.txt", "ab"),
+        ("d.txt", ""),
+    ];
+    let (_temp, _root, index) = fixture(&inputs);
+    let report = IndexSession::verify_content(&index, &content_limits()).unwrap();
+    assert_eq!(report.files, 4);
+    assert_eq!(
+        report.text_bytes,
+        inputs.iter().map(|(_, s)| s.len() as u64).sum::<u64>()
+    );
+    assert!(report.trigrams > 0 && report.postings >= report.trigrams);
+    assert_eq!(
+        search(&index, "copper", true, true, 10).unwrap().hits.len(),
+        2
+    );
+    assert_eq!(search(&index, "key", true, true, 10).unwrap().hits.len(), 1);
+}
+
+#[test]
+fn content_verification_rejects_genuine_same_path_foreign_engine_despite_original_metadata() {
+    let (_temp, _root, index) = fixture(&[("a.txt", "ordinary copper needle\n")]);
+    let (_foreign, _foreign_root, foreign) = fixture(&[("a.txt", "different silver thread\n")]);
+    IndexSession::verify_content(&index, &content_limits()).unwrap();
+    assert_eq!(
+        search(&index, "copper", false, true, 10)
+            .unwrap()
+            .hits
+            .len(),
+        1
+    );
+    // Real separately built foreign postings, with all original path/file/source
+    // metadata retained and only the declared trigram count refreshed.
+    for name in ["lookup.bin", "index.bin"] {
+        fs::copy(foreign.join(name), index.join(name)).unwrap();
+    }
+    refresh_trigram_count(&index);
+    let unchecked = IndexSession::open(&index).unwrap();
+    assert!(
+        unchecked
+            .search("copper", false, true, 10)
+            .unwrap()
+            .hits
+            .is_empty()
+    );
+    let error = IndexSession::verify_content(&index, &content_limits()).unwrap_err();
+    assert!(error.to_string().contains("index content"));
+}
+
+#[test]
+fn content_verification_rejects_duplicate_path_engine_omitting_a_manifest_source() {
+    let (_temp, _root, index) = fixture(&[
+        ("a.txt", "genuine copper conductor\n"),
+        ("b.txt", "distinct silver document\n"),
+    ]);
+    let (_foreign, _foreign_root, foreign) = fixture(&[
+        ("a.txt", "genuine copper conductor\n"),
+        ("b.txt", "genuine copper conductor\n"),
+    ]);
+    IndexSession::verify_content(&index, &content_limits()).unwrap();
+    assert_eq!(
+        search(&index, "silver", false, true, 10)
+            .unwrap()
+            .hits
+            .len(),
+        1
+    );
+    // Both IDs' postings come from a real builder over A's text. The graft
+    // retains the selected A/B text and manifest, but maps both dense IDs to A.
+    for name in ["lookup.bin", "index.bin"] {
+        fs::copy(foreign.join(name), index.join(name)).unwrap();
+    }
+    let mut table = fs::read(index.join("files.bin")).unwrap();
+    let mut pos = 16;
+    while pos < table.len() {
+        let len = u16::from_le_bytes(table[pos + 4..pos + 6].try_into().unwrap()) as usize;
+        pos += 6;
+        assert_eq!(len, "a.txt".len());
+        table[pos..pos + len].copy_from_slice(b"a.txt");
+        pos += len;
+    }
+    fs::write(index.join("files.bin"), &table).unwrap();
+    let table_id = tgrep_core::meta::file_table_id(&table);
+    let mut meta = tgrep_core::meta::IndexMeta::load(&index).unwrap();
+    meta.file_table_id = Some(table_id);
+    meta.num_trigrams = fs::metadata(index.join("lookup.bin")).unwrap().len() / 16;
+    meta.save(&index).unwrap();
+    tgrep_core::path_index::write_extra_paths_with_visibility(
+        &index,
+        &[],
+        &meta.visibility,
+        table_id,
+        meta.hidden_complete,
+    )
+    .unwrap();
+    let manifest_path = index.join("gptgrep-index.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["file_table_id"] = table_id
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
+        .into();
+    fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let raw = tgrep_core::reader::IndexReader::open(&index).unwrap();
+    assert_eq!(raw.all_paths(), &["a.txt", "a.txt"]);
+    let plan = tgrep_core::query::build_query_plan("silver", false).unwrap();
+    let omitted = tgrep_core::query::execute_plan_with_masks(&plan, &|tri| {
+        raw.lookup_trigram_with_masks(tri)
+    });
+    assert!(
+        omitted.is_empty(),
+        "genuine foreign engine omits selected B's match"
+    );
+    match IndexSession::verify_content(&index, &content_limits()) {
+        Ok(report) => panic!(
+            "duplicate-path engine admitted: files={}, postings={}, omitted_source_candidates={}",
+            report.files,
+            report.postings,
+            omitted.len()
+        ),
+        Err(error) => assert!(error.to_string().contains("source set")),
+    }
+    assert!(IndexSession::open(&index).is_err());
+}
+
+#[test]
+fn content_verification_rejects_location_and_next_mask_edits() {
+    for field in [4, 5] {
+        let (_temp, _root, index) = fixture(&[("a.txt", "ordinary copper wire\n")]);
+        let path = index.join("index.bin");
+        let mut postings = fs::read(&path).unwrap();
+        postings[field] ^= 1;
+        if field == 4 && postings[field] == 0 {
+            postings[field] = 2;
+        }
+        fs::write(path, postings).unwrap();
+        IndexSession::open(&index).unwrap();
+        assert!(
+            IndexSession::verify_content(&index, &content_limits())
+                .unwrap_err()
+                .to_string()
+                .contains("mask mismatch"),
+            "field {field}"
+        );
+    }
+}
+
+#[test]
+fn content_verification_rejects_extra_missing_and_duplicate_postings() {
+    for change in ["extra", "missing", "duplicate", "invalid_id"] {
+        let (_temp, _root, index) = fixture(&[("a.txt", "ordinary copper wire\n")]);
+        let mut lookup = fs::read(index.join("lookup.bin")).unwrap();
+        let mut postings = fs::read(index.join("index.bin")).unwrap();
+        match change {
+            "extra" => {
+                lookup.extend_from_slice(&0x00ff_ffff_u32.to_le_bytes());
+                lookup.extend_from_slice(&(postings.len() as u64).to_le_bytes());
+                lookup.extend_from_slice(&1u32.to_le_bytes());
+                postings.extend_from_slice(&[0, 0, 0, 0, 1, 0]);
+            }
+            "missing" => {
+                lookup.drain(..16);
+                postings.drain(..6);
+                for row in lookup.chunks_exact_mut(16) {
+                    let offset = u64::from_le_bytes(row[4..12].try_into().unwrap()) - 6;
+                    row[4..12].copy_from_slice(&offset.to_le_bytes());
+                }
+            }
+            "duplicate" => {
+                let row = postings[..6].to_vec();
+                postings.splice(6..6, row);
+                lookup[12..16].copy_from_slice(&2u32.to_le_bytes());
+                for row in lookup.chunks_exact_mut(16).skip(1) {
+                    let offset = u64::from_le_bytes(row[4..12].try_into().unwrap()) + 6;
+                    row[4..12].copy_from_slice(&offset.to_le_bytes());
+                }
+            }
+            _ => postings[..4].copy_from_slice(&9u32.to_le_bytes()),
+        }
+        fs::write(index.join("lookup.bin"), lookup).unwrap();
+        fs::write(index.join("index.bin"), postings).unwrap();
+        refresh_trigram_count(&index);
+        assert!(
+            IndexSession::verify_content(&index, &content_limits()).is_err(),
+            "{change}"
+        );
+    }
+}
+
+#[test]
+fn content_verification_preadmits_all_size_count_and_work_bounds() {
+    for field in [
+        "control", "index", "file", "total", "files", "trigrams", "postings", "work",
+    ] {
+        let (_temp, root, index) = fixture(&[("a.txt", "ordinary copper wire\n")]);
+        // Missing text must not precede any of these admission failures.
+        fs::remove_file(root.join("a.txt")).unwrap();
+        let mut limits = content_limits();
+        match field {
+            "control" => limits.max_control_bytes = 1,
+            "index" => limits.max_index_bytes = 1,
+            "file" => limits.max_file_bytes = 1,
+            "total" => limits.max_total_text_bytes = 1,
+            "files" => limits.max_files = 0,
+            "trigrams" => limits.max_trigrams = 0,
+            "postings" => limits.max_postings = 0,
+            _ => limits.max_work_bytes = 1,
+        }
+        assert!(
+            IndexSession::verify_content(&index, &limits)
+                .unwrap_err()
+                .to_string()
+                .contains("limit"),
+            "{field}"
+        );
+    }
 }
 
 #[test]
