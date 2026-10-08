@@ -374,6 +374,87 @@ impl<'lib> Document<'lib> {
         Some(String::from_utf16_lossy(&buf[..end]))
     }
 
+    /// Query the UTF-16 length before any owned allocation. `admit` receives a
+    /// conservative serialized/held-data bound and must accept it before the
+    /// buffer and UTF-8 string are allocated. A zero native length is `None`:
+    /// PDFium does not provide an absence-versus-getter-error discriminator.
+    /// A changed length, malformed UTF-16 or missing terminator is an error.
+    pub fn meta_text_admitted<E: From<PdfiumError>>(
+        &self,
+        tag: &std::ffi::CStr,
+        max_utf8_bytes: u64,
+        admit: &mut impl FnMut(u64) -> Result<(), E>,
+    ) -> Result<Option<String>, E> {
+        read_utf16_admitted(max_utf8_bytes, admit, |buffer, length| unsafe {
+            ffi!(FPDF_GetMetaText(self.handle, tag.as_ptr(), buffer, length))
+        })
+    }
+
+    /// Bounded counterpart of `page_label`. Physical indices are checked
+    /// before the getter; zero length retains the native no-value/error
+    /// ambiguity rather than inventing an empty successful label.
+    pub fn page_label_admitted<E: From<PdfiumError>>(
+        &self,
+        page_index: i32,
+        max_utf8_bytes: u64,
+        admit: &mut impl FnMut(u64) -> Result<(), E>,
+    ) -> Result<Option<String>, E> {
+        if page_index < 0 || page_index >= self.page_count() {
+            return Err(PdfiumError::OperationFailed.into());
+        }
+        read_utf16_admitted(max_utf8_bytes, admit, |buffer, length| unsafe {
+            ffi!(FPDF_GetPageLabel(self.handle, page_index, buffer, length))
+        })
+    }
+
+    /// Complete pre-order outline traversal, bounded before every retained
+    /// node/title allocation. No document actions or form environment is
+    /// initialized. Circular/shared nodes, depth/count excess, getter failures
+    /// and destinations outside this document are errors, never truncation.
+    pub fn outline_admitted<E: From<PdfiumError>>(
+        &self,
+        max_nodes: usize,
+        max_depth: u8,
+        max_title_utf8_bytes: u64,
+        admit: &mut impl FnMut(u64) -> Result<(), E>,
+    ) -> Result<Vec<OutlineEntry>, E> {
+        let root = unsafe {
+            ffi!(FPDFBookmark_GetFirstChild(
+                self.handle,
+                std::ptr::null_mut()
+            ))
+        };
+        traverse_outline(
+            (!root.is_null()).then_some(root),
+            max_nodes,
+            max_depth,
+            admit,
+            &mut |node, depth, admit| {
+                let title =
+                    read_utf16_admitted(max_title_utf8_bytes, admit, |buffer, length| unsafe {
+                        ffi!(FPDFBookmark_GetTitle(node, buffer, length))
+                    })?
+                    .ok_or_else(|| E::from(PdfiumError::OperationFailed))?;
+                let (page_index, y) =
+                    resolve_dest_checked(self.handle, node, self.page_count()).map_err(E::from)?;
+                Ok(OutlineEntry {
+                    level: depth,
+                    title,
+                    page_index,
+                    y,
+                })
+            },
+            &mut |node| {
+                let child = unsafe { ffi!(FPDFBookmark_GetFirstChild(self.handle, node)) };
+                (!child.is_null()).then_some(child)
+            },
+            &mut |node| {
+                let next = unsafe { ffi!(FPDFBookmark_GetNextSibling(self.handle, node)) };
+                (!next.is_null()).then_some(next)
+            },
+        )
+    }
+
     /// The document's `/PageLabels` entry for a zero-based page index, when
     /// the document defines one.
     ///
@@ -662,6 +743,158 @@ fn read_bookmark_title(bookmark: pdfium_sys::FPDF_BOOKMARK) -> String {
     String::from_utf16_lossy(&buf[..end])
 }
 
+fn read_utf16_admitted<E: From<PdfiumError>>(
+    max_utf8_bytes: u64,
+    admit: &mut impl FnMut(u64) -> Result<(), E>,
+    mut getter: impl FnMut(*mut std::os::raw::c_void, std::os::raw::c_ulong) -> std::os::raw::c_ulong,
+) -> Result<Option<String>, E> {
+    let needed = usize::try_from(getter(std::ptr::null_mut(), 0))
+        .map_err(|_| E::from(PdfiumError::OperationFailed))?;
+    if needed == 0 {
+        return Ok(None);
+    }
+    if needed < 2 || needed % 2 != 0 {
+        return Err(PdfiumError::OperationFailed.into());
+    }
+    let units = needed / 2;
+    let utf8_upper = (units as u64 - 1)
+        .checked_mul(3)
+        .ok_or_else(|| E::from(PdfiumError::OperationFailed))?;
+    if utf8_upper > max_utf8_bytes {
+        return Err(PdfiumError::OperationFailed.into());
+    }
+    let estimate = (needed as u64)
+        .checked_mul(12)
+        .and_then(|n| n.checked_add(128))
+        .ok_or_else(|| E::from(PdfiumError::OperationFailed))?;
+    admit(estimate)?;
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(units)
+        .map_err(|_| E::from(PdfiumError::OperationFailed))?;
+    buffer.resize(units, 0xffff_u16);
+    let written = getter(buffer.as_mut_ptr().cast(), needed as std::os::raw::c_ulong);
+    if usize::try_from(written).ok() != Some(needed) || buffer.last() != Some(&0) {
+        return Err(PdfiumError::OperationFailed.into());
+    }
+    let mut text = String::new();
+    text.try_reserve_exact(
+        usize::try_from(utf8_upper).map_err(|_| E::from(PdfiumError::OperationFailed))?,
+    )
+    .map_err(|_| E::from(PdfiumError::OperationFailed))?;
+    for character in char::decode_utf16(buffer[..units - 1].iter().copied().map(u16::from_le)) {
+        let character = character.map_err(|_| E::from(PdfiumError::OperationFailed))?;
+        if character == '\0' {
+            return Err(PdfiumError::OperationFailed.into());
+        }
+        text.push(character);
+    }
+    Ok(Some(text))
+}
+
+fn traverse_outline<N: Copy + Eq, E: From<PdfiumError>, A: FnMut(u64) -> Result<(), E>>(
+    root: Option<N>,
+    max_nodes: usize,
+    max_depth: u8,
+    admit: &mut A,
+    visit: &mut impl FnMut(N, u8, &mut A) -> Result<OutlineEntry, E>,
+    child: &mut impl FnMut(N) -> Option<N>,
+    sibling: &mut impl FnMut(N) -> Option<N>,
+) -> Result<Vec<OutlineEntry>, E> {
+    if max_nodes == 0 || max_nodes > 1024 || max_depth == 0 || max_depth > 32 {
+        return Err(PdfiumError::OperationFailed.into());
+    }
+    let mut out = Vec::new();
+    let mut visited = Vec::new();
+    let mut pending = Vec::new();
+    let mut current = root;
+    let mut depth = 1;
+    while let Some(node) = current {
+        if depth > max_depth || visited.len() >= max_nodes || visited.contains(&node) {
+            return Err(PdfiumError::OperationFailed.into());
+        }
+        // One output entry, one visited handle and one deferred sibling slot.
+        // reserve_exact is used only after the caller's accounting accepts.
+        admit(512)?;
+        visited
+            .try_reserve_exact(1)
+            .map_err(|_| E::from(PdfiumError::OperationFailed))?;
+        out.try_reserve_exact(1)
+            .map_err(|_| E::from(PdfiumError::OperationFailed))?;
+        visited.push(node);
+        out.push(visit(node, depth, admit)?);
+        let next = sibling(node);
+        if let Some(first_child) = child(node) {
+            if depth == max_depth {
+                return Err(PdfiumError::OperationFailed.into());
+            }
+            pending
+                .try_reserve_exact(1)
+                .map_err(|_| E::from(PdfiumError::OperationFailed))?;
+            pending.push((next, depth));
+            current = Some(first_child);
+            depth += 1;
+        } else if next.is_some() {
+            current = next;
+        } else {
+            current = None;
+            while let Some((next, previous_depth)) = pending.pop() {
+                depth = previous_depth;
+                if next.is_some() {
+                    current = next;
+                    break;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn resolve_dest_checked(
+    doc: pdfium_sys::FPDF_DOCUMENT,
+    bookmark: pdfium_sys::FPDF_BOOKMARK,
+    page_count: i32,
+) -> Result<(Option<i32>, Option<f32>), PdfiumError> {
+    // The native GetDest implementation may resolve an action internally.
+    // With no action-type discriminator, reject all action-bearing targets
+    // before asking for any destination. Titles and hierarchy remain retained.
+    if !unsafe { ffi!(FPDFBookmark_GetAction(bookmark)) }.is_null() {
+        return Ok((None, None));
+    }
+    let dest = unsafe { ffi!(FPDFBookmark_GetDest(doc, bookmark)) };
+    if dest.is_null() {
+        // Without the pinned action-type API, action destinations cannot be
+        // proved local. Preserve the title/tree and mark target unsupported.
+        return Ok((None, None));
+    }
+    let page_index = unsafe { ffi!(FPDFDest_GetDestPageIndex(doc, dest)) };
+    if page_index < 0 || page_index >= page_count {
+        return Err(PdfiumError::OperationFailed);
+    }
+    let mut has_x = 0;
+    let mut has_y = 0;
+    let mut has_zoom = 0;
+    let mut x = 0_f32;
+    let mut y = 0_f32;
+    let mut zoom = 0_f32;
+    let ok = unsafe {
+        ffi!(FPDFDest_GetLocationInPage(
+            dest,
+            &mut has_x,
+            &mut has_y,
+            &mut has_zoom,
+            &mut x,
+            &mut y,
+            &mut zoom
+        ))
+    };
+    let y = (ok != 0 && has_y != 0).then_some(y);
+    if y.is_some_and(|y| !y.is_finite()) {
+        return Err(PdfiumError::OperationFailed);
+    }
+    Ok((Some(page_index), y))
+}
+
 fn resolve_dest(
     doc: pdfium_sys::FPDF_DOCUMENT,
     bookmark: pdfium_sys::FPDF_BOOKMARK,
@@ -701,5 +934,142 @@ fn resolve_dest(
 impl Drop for Document<'_> {
     fn drop(&mut self) {
         unsafe { ffi!(FPDF_CloseDocument(self.handle)) };
+    }
+}
+
+#[cfg(test)]
+mod admitted_metadata_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn getter_admission_precedes_buffer_and_rejects_invalid_lengths() {
+        for needed in [1, 3, 200_000] {
+            let calls = Cell::new(0);
+            let mut admitted = 0;
+            let result = read_utf16_admitted(
+                65_536,
+                &mut |bytes| {
+                    admitted += bytes;
+                    Ok::<_, PdfiumError>(())
+                },
+                |_, _| {
+                    calls.set(calls.get() + 1);
+                    needed
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(calls.get(), 1);
+            assert_eq!(admitted, 0);
+        }
+        let calls = Cell::new(0);
+        let result =
+            read_utf16_admitted(100, &mut |_| Err(PdfiumError::OperationFailed), |_, _| {
+                calls.set(calls.get() + 1);
+                4
+            });
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 1);
+        let zero: Result<Option<String>, PdfiumError> = read_utf16_admitted(
+            100,
+            &mut |_| panic!("zero getter must not allocate"),
+            |_, _| 0,
+        );
+        assert_eq!(zero.unwrap(), None);
+    }
+
+    #[test]
+    fn getter_requires_same_written_length_terminator_and_valid_utf16() {
+        for (written, values) in [
+            (2, vec![65, 0]),
+            (4, vec![65, 66]),
+            (4, vec![0xd800, 0]),
+            (6, vec![65, 0]),
+        ] {
+            let result =
+                read_utf16_admitted(100, &mut |_| Ok::<_, PdfiumError>(()), |buffer, _| {
+                    if !buffer.is_null() {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                values.as_ptr(),
+                                buffer.cast::<u16>(),
+                                values.len(),
+                            )
+                        };
+                        written
+                    } else {
+                        4
+                    }
+                });
+            assert!(result.is_err());
+        }
+        let text = read_utf16_admitted(100, &mut |_| Ok::<_, PdfiumError>(()), |buffer, _| {
+            if !buffer.is_null() {
+                let values = [65_u16.to_le(), 0x03a9_u16.to_le(), 0];
+                unsafe { std::ptr::copy_nonoverlapping(values.as_ptr(), buffer.cast::<u16>(), 3) };
+            }
+            6
+        })
+        .unwrap();
+        assert_eq!(text.as_deref(), Some("AΩ"));
+    }
+
+    #[test]
+    fn traversal_rejects_cycles_shared_nodes_depth_and_count_without_truncation() {
+        for case in 0..4 {
+            let mut visits = 0;
+            let result = traverse_outline(
+                Some(1_u8),
+                if case == 3 { 1 } else { 3 },
+                if case == 2 { 1 } else { 3 },
+                &mut |_| Ok::<_, PdfiumError>(()),
+                &mut |_, level, _| {
+                    visits += 1;
+                    Ok(OutlineEntry {
+                        level,
+                        title: "title".into(),
+                        page_index: Some(0),
+                        y: None,
+                    })
+                },
+                &mut |node| match (case, node) {
+                    (1, 1) => Some(2),
+                    (2, 1) => Some(2),
+                    _ => None,
+                },
+                &mut |node| match (case, node) {
+                    (0, 1) => Some(1),
+                    (1, 2) => Some(1),
+                    (3, 1) => Some(2),
+                    _ => None,
+                },
+            );
+            assert!(result.is_err(), "case {case}");
+            assert!(visits <= 2);
+        }
+        let result = traverse_outline(
+            Some(1_u8),
+            4,
+            3,
+            &mut |_| Ok::<_, PdfiumError>(()),
+            &mut |node, level, _| {
+                Ok(OutlineEntry {
+                    level,
+                    title: node.to_string(),
+                    page_index: Some(0),
+                    y: None,
+                })
+            },
+            &mut |node| (node == 1).then_some(2),
+            &mut |node| (node == 1).then_some(3),
+        )
+        .unwrap();
+        assert_eq!(
+            result
+                .iter()
+                .map(|x| (x.title.as_str(), x.level))
+                .collect::<Vec<_>>(),
+            [("1", 1), ("2", 2), ("3", 1)]
+        );
     }
 }

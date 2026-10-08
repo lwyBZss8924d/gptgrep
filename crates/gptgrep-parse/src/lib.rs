@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 
 mod artifact;
 mod crop;
+mod document_metadata;
+#[cfg(test)]
+mod document_metadata_tests;
 mod geometry;
 mod image_prepare;
 #[cfg(test)]
@@ -26,6 +29,11 @@ mod rich_text;
 
 pub use artifact::{ArtifactKind, ArtifactRef, FeatureState, artifact_id};
 pub use crop::{CropAdmission, CropOutput, CropRecipe, PixelCrop, crop_rendition};
+pub use document_metadata::{
+    DOCUMENT_METADATA_NATIVE_RECIPE, DOCUMENT_METADATA_SCHEMA, MAX_NATIVE_BOOKMARK_DEPTH,
+    MAX_NATIVE_BOOKMARKS, NativeBookmark, NativeBookmarkDestination, NativeDocumentMetadata,
+    NativePageLabel, document_metadata_native_profile_digest, validate_native_document_metadata,
+};
 pub use geometry::{AffineTransform, BoundingBox, PageGeometry};
 pub use image_prepare::image_preparation_profile_digest;
 pub use ocr::{

@@ -738,6 +738,50 @@ impl RichGenerationReader {
         Ok(window)
     }
 
+    /// Read a v5 document's bound native Info/labels/outline snapshot. This is
+    /// structural metadata, not text/image delivery or citation authority.
+    /// Source, manifest and artifact freshness are rechecked on every read.
+    pub fn read_document_metadata(
+        &self,
+        document_id: &str,
+    ) -> Result<gptgrep_parse::NativeDocumentMetadata> {
+        self.validate()?;
+        let doc = self
+            .manifest
+            .documents
+            .iter()
+            .find(|doc| doc.document.id == document_id)
+            .context("document not present in pinned generation")?;
+        self.verify_source_metered(doc)?;
+        let stored = document_metadata_artifact(doc)?
+            .context("document metadata unavailable in this generation recipe")?;
+        let budget = &self.manifest.resource_budget;
+        admit_document_metadata_validation(&stored.artifact, budget)?;
+        let bytes = bounded_read_metered(
+            &owned_path(&self.dir, &stored.artifact.relative_path)?,
+            stored.artifact.bytes,
+            &self.read_meter,
+        )?;
+        ensure!(
+            bytes.len() as u64 == stored.artifact.bytes
+                && digest_metered(&bytes, &self.read_meter)? == stored.artifact.sha256,
+            "native document metadata artifact changed"
+        );
+        let metadata: gptgrep_parse::NativeDocumentMetadata = serde_json::from_slice(&bytes)?;
+        validate_document_metadata_binding(doc, stored, &metadata, budget)?;
+        ensure!(
+            hash_reader_file(
+                &owned_path(&self.dir, &stored.artifact.relative_path)?,
+                artifact_limit(&stored.artifact, budget),
+                &self.read_meter
+            )? == (stored.artifact.bytes, stored.artifact.sha256.clone()),
+            "native document metadata changed while reading"
+        );
+        self.verify_source_metered(doc)?;
+        self.validate()?;
+        Ok(metadata)
+    }
+
     /// Verify artifact custody and exact coordinates of a nonempty reference.
     /// Reader delivery must be recorded separately before accepting a citation.
     pub fn validate_text_evidence(&self, evidence: &EvidenceRef) -> Result<()> {
@@ -1401,6 +1445,8 @@ fn validate_document_shape(doc: &RichDocument, budget: &ResourceBudget) -> Resul
         ensure!(
             if matches!(a.kind, ArtifactKind::Layout | ArtifactKind::MergedText) {
                 a.page.is_none()
+            } else if a.kind == ArtifactKind::NativeMetadata && a.page.is_none() {
+                doc.prepared.format != "plaintext"
             } else {
                 a.page.is_some()
             },
@@ -1507,6 +1553,7 @@ fn validate_document_shape(doc: &RichDocument, budget: &ResourceBudget) -> Resul
     if doc.prepared.format == "plaintext" {
         return validate_plaintext_shape(doc);
     }
+    document_metadata_artifact(doc)?;
     for (i, page) in doc.pages.iter().enumerate() {
         ensure!(
             page.number as usize == i + 1
@@ -1858,6 +1905,117 @@ struct NativeCoveragePage {
     page_width: f32,
     page_height: f32,
     text_items: SequenceCount,
+    #[serde(default)]
+    page_label: Option<String>,
+}
+
+fn document_metadata_artifact(doc: &RichDocument) -> Result<Option<&StoredArtifact>> {
+    let mut metadata = doc
+        .artifacts
+        .iter()
+        .filter(|a| a.artifact.kind == ArtifactKind::NativeMetadata && a.artifact.page.is_none());
+    let first = metadata.next();
+    ensure!(
+        metadata.next().is_none(),
+        "duplicate complete document metadata artifact"
+    );
+    let mut v5_pages = 0;
+    for page in &doc.pages {
+        match page.capabilities.get("native_recipe") {
+            None => {}
+            Some(gptgrep_parse::FeatureState::Present(recipe))
+                if recipe == gptgrep_parse::DOCUMENT_METADATA_NATIVE_RECIPE =>
+            {
+                v5_pages += 1
+            }
+            _ => anyhow::bail!("unknown native document metadata recipe"),
+        }
+    }
+    if v5_pages == 0 {
+        ensure!(
+            first.is_none(),
+            "legacy native recipe has unassigned document metadata"
+        );
+        return Ok(None);
+    }
+    ensure!(
+        v5_pages == doc.pages.len() && first.is_some(),
+        "v5 requires exactly one complete document metadata artifact"
+    );
+    let stored = first.expect("checked complete document metadata");
+    for page in &doc.pages {
+        ensure!(
+            matches!(page.capabilities.get("document_metadata"),
+            Some(gptgrep_parse::FeatureState::Present(id)) if id == &stored.parser_artifact_id),
+            "native document metadata artifact assignment mismatch"
+        );
+    }
+    Ok(Some(stored))
+}
+
+fn admit_document_metadata_validation(
+    artifact: &ArtifactRef,
+    budget: &ResourceBudget,
+) -> Result<()> {
+    ensure!(
+        artifact.bytes <= budget.document_metadata_bytes
+            && artifact
+                .bytes
+                .checked_mul(32)
+                .is_some_and(|bytes| bytes <= budget.owned_working_bytes),
+        "resource_limit: native document metadata validation working admission"
+    );
+    Ok(())
+}
+
+fn validate_document_metadata_binding(
+    doc: &RichDocument,
+    stored: &StoredArtifact,
+    metadata: &gptgrep_parse::NativeDocumentMetadata,
+    budget: &ResourceBudget,
+) -> Result<()> {
+    gptgrep_parse::validate_native_document_metadata(
+        metadata,
+        &doc.prepared,
+        doc.pages.len() as u32,
+        budget,
+    )?;
+    ensure!(
+        doc.native_profile_sha256
+            == gptgrep_parse::document_metadata_native_profile_digest(
+                &doc.prepared,
+                metadata.native_dpi,
+                metadata.native_render_pages
+            )?,
+        "native document metadata v5 profile mismatch"
+    );
+    for (page, label) in doc.pages.iter().zip(&metadata.page_labels) {
+        ensure!(
+            serde_json::to_value(&page.label)? == serde_json::to_value(&label.label)?,
+            "native document metadata physical display label mismatch"
+        );
+        let expected = match &metadata.bookmarks {
+            gptgrep_parse::FeatureState::Present(_) => {
+                gptgrep_parse::FeatureState::Present(stored.parser_artifact_id.clone())
+            }
+            gptgrep_parse::FeatureState::Absent => gptgrep_parse::FeatureState::Absent,
+            _ => anyhow::bail!("native document metadata outline state invalid"),
+        };
+        ensure!(
+            serde_json::to_value(page.capabilities.get("bookmarks"))?
+                == serde_json::to_value(Some(&expected))?,
+            "native document metadata outline assignment mismatch"
+        );
+        ensure!(
+            !metadata.native_render_pages || !page.renditions.is_empty(),
+            "native document metadata rendering recipe omitted rendition"
+        );
+        ensure!(
+            metadata.native_render_pages || page.renditions.is_empty(),
+            "native document metadata rendering recipe has unexpected rendition"
+        );
+    }
+    Ok(())
 }
 #[derive(Deserialize)]
 struct NativeImageRect {
@@ -1965,6 +2123,22 @@ fn verify_document(
     if doc.prepared.format == "plaintext" {
         return verify_plaintext(root, dir, doc, budget);
     }
+    let document_metadata = if let Some(stored) = document_metadata_artifact(doc)? {
+        admit_document_metadata_validation(&stored.artifact, budget)?;
+        let bytes = bounded_read(
+            &owned_path(dir, &stored.artifact.relative_path)?,
+            stored.artifact.bytes,
+        )?;
+        ensure!(
+            bytes.len() as u64 == stored.artifact.bytes && digest(&bytes) == stored.artifact.sha256,
+            "native document metadata changed while reading"
+        );
+        let metadata: gptgrep_parse::NativeDocumentMetadata = serde_json::from_slice(&bytes)?;
+        validate_document_metadata_binding(doc, stored, &metadata, budget)?;
+        Some(metadata)
+    } else {
+        None
+    };
     for page in &doc.pages {
         ensure!(
             page.metadata_artifact
@@ -1979,6 +2153,16 @@ fn verify_document(
         )?;
         let metadata: NativeCoverageMetadata = serde_json::from_slice(&bytes)
             .context("rebuild_required: retained native coverage metadata missing or invalid")?;
+        if document_metadata.is_some() {
+            ensure!(
+                metadata.page.page_label.as_deref()
+                    == match &page.label {
+                        gptgrep_parse::FeatureState::Present(label) => Some(label.as_str()),
+                        _ => None,
+                    },
+                "native retained page label differs from document metadata"
+            );
+        }
         ensure!(
             metadata.page.page_number == page.number as usize
                 && f64::from(metadata.page.page_width) == page.width_points
@@ -2274,6 +2458,7 @@ fn artifact_limit(a: &ArtifactRef, b: &ResourceBudget) -> u64 {
     match a.kind {
         ArtifactKind::Rendition => b.image_file_bytes,
         ArtifactKind::OcrText | ArtifactKind::OcrRegions => b.ocr_result_bytes,
+        ArtifactKind::NativeMetadata if a.page.is_none() => b.document_metadata_bytes,
         ArtifactKind::NativeText | ArtifactKind::NativeMetadata => b.page_layout_bytes,
         ArtifactKind::Layout | ArtifactKind::MergedText => b.document_metadata_bytes,
     }

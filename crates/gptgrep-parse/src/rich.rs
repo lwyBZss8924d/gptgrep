@@ -198,6 +198,8 @@ pub struct NativeCandidate {
     pub(crate) execution_budget: ResourceBudget,
     pub(crate) frozen_integrity_sha256: String,
     pub(crate) annotation_counts: Vec<u32>,
+    pub(crate) document_metadata: Option<crate::NativeDocumentMetadata>,
+    pub(crate) document_metadata_artifact: Option<ArtifactRef>,
 }
 
 impl NativeCandidate {
@@ -215,6 +217,9 @@ impl NativeCandidate {
     }
     pub fn native_profile_sha256(&self) -> &str {
         &self.native_profile_sha256
+    }
+    pub fn document_metadata(&self) -> Option<&crate::NativeDocumentMetadata> {
+        self.document_metadata.as_ref()
     }
 
     pub(crate) fn integrity_digest(&self) -> Result<String> {
@@ -235,7 +240,11 @@ impl NativeCandidate {
                 self.native_owned_upper,
                 self.metadata_admitted_upper,
                 &self.execution_budget,
-                &self.annotation_counts,
+                &(
+                    &self.annotation_counts,
+                    &self.document_metadata,
+                    &self.document_metadata_artifact,
+                ),
             ),
             self.execution_budget.owned_working_bytes,
         )
@@ -292,9 +301,41 @@ impl NativeCandidate {
             verify_artifact(&self.prepared.staging_root, artifact)?;
         }
         let mut expected_artifacts = BTreeSet::new();
+        let document_metadata = self
+            .document_metadata
+            .as_ref()
+            .context("native document metadata missing")?;
+        crate::validate_native_document_metadata(
+            document_metadata,
+            &self.summary,
+            self.pages.len() as u32,
+            budget,
+        )?;
+        let document_artifact = self
+            .document_metadata_artifact
+            .as_ref()
+            .context("native document metadata artifact missing")?;
+        ensure!(
+            document_artifact.kind == ArtifactKind::NativeMetadata
+                && document_artifact.page.is_none()
+                && json_sha256(document_metadata, budget.document_metadata_bytes)?
+                    == document_artifact.sha256,
+            "native document metadata artifact/content mismatch"
+        );
+        verify_registered_artifact(document_artifact, &registered, &mut expected_artifacts)?;
         let mut required_tasks = BTreeSet::new();
         let mut expected_blockers = Vec::new();
         for (index, (page, raw)) in self.pages.iter().zip(&self.raw_pages).enumerate() {
+            ensure!(
+                serde_json::to_value(&page.label)?
+                    == serde_json::to_value(&document_metadata.page_labels[index].label)?
+                    && raw.page_label.as_deref()
+                        == match &page.label {
+                            FeatureState::Present(label) => Some(label.as_str()),
+                            _ => None,
+                        },
+                "native document/page label binding mismatch"
+            );
             ensure!(
                 page.number as usize == index + 1
                     && raw.page_number == index + 1
@@ -709,16 +750,11 @@ pub(crate) fn extract_sync(
     if prepared.summary.format == "plaintext" {
         return crate::rich_text::extract(prepared, budget);
     }
-    let native_profile_sha256 = sha256(&serde_json::to_vec(&(
-        "gptgrep.native.count-admitted.v4-metadata-classifier-geometry-binding",
-        RICH_PARSER,
-        crate::LITEPARSE_REVISION,
-        &prepared.summary.preparation_profile_sha256,
+    let native_profile_sha256 = crate::document_metadata_native_profile_digest(
+        &prepared.summary,
         options.dpi,
         options.render_pages,
-        "image-0.25.10/png-default-rgba8",
-        "owned-liteparse-pdfium-1.11.0/annotation-count-v1; initial-render-cleared; display-render-into-flags=0x01; forms-off",
-    ))?);
+    )?;
     let mut raw_pages = Vec::new();
     let mut pages = Vec::new();
     let mut artifacts = Vec::new();
@@ -734,19 +770,49 @@ pub(crate) fn extract_sync(
             .context("prepared path is not UTF-8")?
             .into(),
     );
-    let total = {
+    let (total, document_metadata) = {
         let lib = stages::Library::init();
         let doc = stages::open(&lib, &input, None, &[])?;
         ensure!(
             doc.xfa_packet_count() == 0 && doc.form_type() == 0,
             "capability_unavailable: XFA/AcroForm preparation needs a bounded packet/appearance adapter"
         );
-        doc.page_count()
+        let total = doc.page_count();
+        ensure!(
+            total > 0 && total as u32 <= crate::MAX_NATIVE_PAGES,
+            "native page count is outside supported complete-document limits"
+        );
+        let metadata = crate::document_metadata::extract(
+            &doc,
+            &prepared.summary,
+            total as u32,
+            &options,
+            &budget,
+            &mut |bytes| {
+                admit_native_estimate(&mut metadata_used, &mut owned_upper, bytes, &budget)
+            },
+        )?;
+        (total, metadata)
     };
     ensure!(
         total > 0 && total as u32 <= crate::MAX_NATIVE_PAGES,
         "native page count is outside supported complete-document limits"
     );
+    let document_metadata_size = encoded_size(&document_metadata, budget.document_metadata_bytes)?;
+    admit_staging(&mut staged, document_metadata_size, &budget)?;
+    let document_metadata_artifact = write_json(
+        &prepared.staging_root,
+        &format!("{}-document-native.json", prepared.summary.source_sha256),
+        ArtifactBinding {
+            source: &prepared.summary.source_sha256,
+            profile: &native_profile_sha256,
+            kind: ArtifactKind::NativeMetadata,
+            page: None,
+        },
+        &document_metadata,
+        budget.document_metadata_bytes,
+    )?;
+    artifacts.push(document_metadata_artifact.clone());
     for start in (0..total as usize).step_by(options.page_window) {
         // This scope ends before the async extraction function returns. No
         // Document, Page, TextPage, Bitmap or Library appears in a public DTO.
@@ -818,8 +884,13 @@ pub(crate) fn extract_sync(
                 "resource_limit: native object count rejected before object allocation"
             );
             let mut object_bound = object_count as u64 * 2048;
+            let label_bound = match &document_metadata.page_labels[index].label {
+                FeatureState::Present(label) => label.len() as u64 * 12,
+                _ => 1024,
+            };
             ensure!(
-                object_bound + glyph_bound + annotation_bound + 16_384 <= budget.page_layout_bytes,
+                object_bound + glyph_bound + annotation_bound + label_bound + 16_384
+                    <= budget.page_layout_bytes,
                 "resource_limit: page char/object admission"
             );
             admit_native_estimate(
@@ -849,7 +920,7 @@ pub(crate) fn extract_sync(
                         .checked_add(children as u64 * 2048)
                         .context("resource_limit: nested object count overflow")?;
                     ensure!(
-                        object_bound + glyph_bound + annotation_bound + 16_384
+                        object_bound + glyph_bound + annotation_bound + label_bound + 16_384
                             <= budget.page_layout_bytes,
                         "resource_limit: nested object admission"
                     );
@@ -871,7 +942,7 @@ pub(crate) fn extract_sync(
                         .checked_add(segments as u64 * 256)
                         .context("resource_limit: path segment count overflow")?;
                     ensure!(
-                        object_bound + glyph_bound + annotation_bound + 16_384
+                        object_bound + glyph_bound + annotation_bound + label_bound + 16_384
                             <= budget.page_layout_bytes,
                         "resource_limit: path segment count rejected before allocation"
                     );
@@ -990,7 +1061,10 @@ pub(crate) fn extract_sync(
             }
             let raw = Page {
                 page_number: number as usize,
-                page_label: None,
+                page_label: match &document_metadata.page_labels[index].label {
+                    FeatureState::Present(label) => Some(label.clone()),
+                    _ => None,
+                },
                 page_width: width,
                 page_height: height,
                 content_bounds: None,
@@ -1045,8 +1119,6 @@ pub(crate) fn extract_sync(
                 "tagged_structure",
                 "annotations",
                 "form_fields",
-                "bookmarks",
-                "document_metadata",
                 "xfa_packets",
             ] {
                 capabilities.insert(
@@ -1054,6 +1126,24 @@ pub(crate) fn extract_sync(
                     FeatureState::Unsupported("bounded length/count getter adapter pending".into()),
                 );
             }
+            capabilities.insert(
+                "native_recipe".into(),
+                FeatureState::Present(crate::DOCUMENT_METADATA_NATIVE_RECIPE.into()),
+            );
+            capabilities.insert(
+                "document_metadata".into(),
+                FeatureState::Present(document_metadata_artifact.id.clone()),
+            );
+            capabilities.insert(
+                "bookmarks".into(),
+                match &document_metadata.bookmarks {
+                    FeatureState::Absent => FeatureState::Absent,
+                    FeatureState::Present(_) => {
+                        FeatureState::Present(document_metadata_artifact.id.clone())
+                    }
+                    _ => unreachable!("validated native outline"),
+                },
+            );
             capabilities.insert(
                 "annotation_count".into(),
                 FeatureState::Present(annotation_count.to_string()),
@@ -1087,7 +1177,12 @@ pub(crate) fn extract_sync(
                 budget.page_layout_bytes,
             )?;
             ensure!(
-                object_bound + glyph_bound + annotation_bound + 16_384 + binding_bytes
+                object_bound
+                    + glyph_bound
+                    + annotation_bound
+                    + label_bound
+                    + 16_384
+                    + binding_bytes
                     <= budget.page_layout_bytes,
                 "resource_limit: native metadata classifier/frame binding admission"
             );
@@ -1247,7 +1342,7 @@ pub(crate) fn extract_sync(
             artifacts.push(metadata_artifact.clone());
             pages.push(NativePage {
                 number,
-                label: FeatureState::Unsupported("bounded page-label getter pending".into()),
+                label: document_metadata.page_labels[index].label.clone(),
                 width_points: width.into(),
                 height_points: height.into(),
                 geometry,
@@ -1294,6 +1389,8 @@ pub(crate) fn extract_sync(
         execution_budget: budget,
         frozen_integrity_sha256: String::new(),
         annotation_counts,
+        document_metadata: Some(document_metadata),
+        document_metadata_artifact: Some(document_metadata_artifact),
     };
     candidate.frozen_integrity_sha256 = candidate.integrity_digest()?;
     Ok(candidate)
@@ -1603,7 +1700,33 @@ pub fn finalize_document(
             text: page.text.clone(),
         })
         .collect::<Vec<_>>();
-    let document = from_pages("prepared document", &inputs, &headings, &[], RICH_PARSER)?;
+    let bookmarks = candidate
+        .document_metadata
+        .as_ref()
+        .and_then(|metadata| match &metadata.bookmarks {
+            FeatureState::Present(bookmarks) => Some(bookmarks.as_slice()),
+            _ => None,
+        })
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|bookmark| match &bookmark.destination {
+            FeatureState::Present(dest) if !bookmark.title.trim().is_empty() => {
+                Some(gptgrep_pageindex::Bookmark {
+                    title: bookmark.title.clone(),
+                    level: u32::from(bookmark.depth),
+                    page: dest.physical_page,
+                })
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let document = from_pages(
+        "prepared document",
+        &inputs,
+        &headings,
+        &bookmarks,
+        RICH_PARSER,
+    )?;
     let mut segments = Vec::new();
     let mut unmapped = 0usize;
     for page in &document.pages {

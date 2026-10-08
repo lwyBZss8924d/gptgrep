@@ -1,6 +1,36 @@
 use super::*;
 use std::collections::BTreeSet;
 
+fn assert_only_prepared_and_valid_document_metadata(
+    prepared: &PreparedDocument,
+    budget: &ResourceBudget,
+    physical_pages: u32,
+) {
+    let retained = std::fs::read_dir(prepared.staging_root())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(retained.len(), 2);
+    assert!(retained.iter().any(|path| path == prepared.prepared_path()));
+    let document_path = retained
+        .iter()
+        .find(|path| *path != prepared.prepared_path())
+        .unwrap();
+    assert!(
+        document_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with("-document-native.json")
+    );
+    let length = std::fs::metadata(document_path).unwrap().len();
+    assert!(length > 0 && length <= budget.document_metadata_bytes);
+    let bytes = std::fs::read(document_path).unwrap();
+    let metadata: crate::NativeDocumentMetadata = serde_json::from_slice(&bytes).unwrap();
+    crate::validate_native_document_metadata(&metadata, prepared.summary(), physical_pages, budget)
+        .unwrap();
+}
+
 fn complete_result(task: &OcrTask, text: &str) -> OcrPageResult {
     OcrPageResult {
         schema_version: "gptgrep.ocr.result.v1".into(),
@@ -325,10 +355,9 @@ async fn vector_paths_require_ocr_and_count_admission_precedes_materialization()
             .to_string()
             .contains("page char/object admission")
     );
-    assert_eq!(
-        std::fs::read_dir(prepared.staging_root()).unwrap().count(),
-        1
-    );
+    // Document metadata is independently admitted before page materialization.
+    // A page-count refusal may retain that snapshot, never a page/raster output.
+    assert_only_prepared_and_valid_document_metadata(&prepared, &small, 1);
 }
 
 #[cfg(unix)]
@@ -418,10 +447,9 @@ async fn char_and_raster_limits_reject_before_their_output_artifacts() {
             .to_string()
             .contains("char count rejected before")
     );
-    assert_eq!(
-        std::fs::read_dir(prepared.staging_root()).unwrap().count(),
-        1
-    );
+    // Document metadata is independently admitted before page materialization.
+    // A page-count refusal may retain that snapshot, never a page/raster output.
+    assert_only_prepared_and_valid_document_metadata(&prepared, &budget, 2);
     let mut pixels = ResourceBudget::default();
     pixels.image_pixels = 10;
     let prepared = prepare_document(

@@ -86,28 +86,53 @@ fn fixed_public_native_pdf_indexes_through_normal_rich_cli_and_batch() {
     assert_eq!(decoded(&result)["items"][0]["status"], "ok");
 }
 #[test]
-fn explicit_off_and_unsupported_office_are_truthful_blockers() {
+fn explicit_ocr_off_blocks_required_pages_without_publication() {
     let tmp = tempfile::tempdir().unwrap();
     fixture(tmp.path(), "rich-scan.png");
     let output = invoke(tmp.path(), &["--ocr", "off"]);
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(decoded(&output)["status"], "blocked_unpublished");
+    assert!(!tmp.path().join(".gptgrep/CURRENT.json").exists());
+}
+#[test]
+#[cfg(unix)]
+fn failed_office_conversion_has_structured_error_and_preserves_current() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    fixture(tmp.path(), "rich-native.pdf");
+    assert!(invoke(tmp.path(), &["--ocr", "off"]).status.success());
+    let current = tmp.path().join(".gptgrep/CURRENT.json");
+    let before = fs::read(&current).unwrap();
+    fs::write(tmp.path().join("failure.docx"), b"mock Office source").unwrap();
+    let tools = tempfile::tempdir().unwrap();
+    let converter = tools.path().join("libreoffice");
+    // Exercise normal converter discovery with a deterministic local failure.
     fs::write(
-        tmp.path().join("unsupported.docx"),
-        b"unsupported format fixture",
+        &converter,
+        b"#!/bin/sh\nprintf 'private child diagnostic\\n' >&2\nexit 23\n",
     )
     .unwrap();
-    let output = invoke(tmp.path(), &["--ocr", "auto", "--plan-only"]);
+    fs::set_permissions(&converter, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_gptgrep"))
+        .arg("index")
+        .arg(tmp.path())
+        .args(["--ocr", "auto", "--plan-only", "--json"])
+        .env("PATH", tools.path())
+        .env_remove("OPENROUTER_API_KEY")
+        .env_remove("CODEX_HOME")
+        .output()
+        .unwrap();
     assert_eq!(output.status.code(), Some(2));
     let report = decoded(&output);
-    assert!(
-        report["blockers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|x| x.as_str().unwrap().contains("Office/other formats"))
-    );
-    assert!(!tmp.path().join(".gptgrep/CURRENT.json").exists());
+    assert_eq!(report["schema_version"], "gptgrep.error.v1");
+    assert_eq!(report["ok"], false);
+    assert_eq!(report["code"], "gptgrep_error");
+    assert_eq!(report["error"], "Office conversion failed");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("private child diagnostic"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("private child diagnostic"));
+    assert_eq!(fs::read(current).unwrap(), before);
+    assert!(!tmp.path().join(".gptgrep/ingest-runs").exists());
 }
 #[test]
 fn legacy_index_stays_local_and_live_auto_refuses_missing_runtime_before_clock() {

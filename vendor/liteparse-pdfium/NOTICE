@@ -5,3 +5,6 @@ Package: liteparse-pdfium 1.11.0, Apache License 2.0 (see LICENSE).
 GPTgrep modifications expose an allocation-free annotation count and adapt the
 manifest to a standalone pinned dependency. Original source hashes and changes
 are recorded in UPSTREAM.json. Upstream reference checkouts are not modified.
+GPTgrep also adds length-admitted Info and page-label getters and a count/depth-
+bounded outline reader with cycle and destination validation. Legacy getters
+are retained; the admitted readers do not initialize forms or run actions.

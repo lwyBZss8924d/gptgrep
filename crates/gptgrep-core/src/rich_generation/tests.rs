@@ -551,6 +551,178 @@ fn native_pdf_fixture() -> Vec<u8> {
     pdf.into_bytes()
 }
 
+fn document_metadata_pdf_fixture() -> Vec<u8> {
+    let body = format!(
+        "BT /F1 8 Tf 20 180 Td {} ET",
+        "(Native document metadata accompanies ordinary readable source text.) Tj 0 -12 Td "
+            .repeat(12)
+    );
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R /Outlines 8 0 R /PageLabels 12 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 500 200] /Resources << /Font << /F1 7 0 R >> >> /Contents 4 0 R >>".into(),
+        format!("<< /Length {} >>\nstream\n{body}\nendstream", body.len()),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 500 200] /Resources << /Font << /F1 7 0 R >> >> /Contents 6 0 R >>".into(),
+        format!("<< /Length {} >>\nstream\n{body}\nendstream", body.len()),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+        "<< /Type /Outlines /First 9 0 R /Last 9 0 R /Count 2 >>".into(),
+        "<< /Title (Opening section) /Parent 8 0 R /First 10 0 R /Last 10 0 R /Count 1 /Dest [3 0 R /XYZ null 180 null] >>".into(),
+        "<< /Title (Details section) /Parent 9 0 R /Dest [5 0 R /Fit] >>".into(),
+        "<< /Title (Bounded metadata) /Author (Synthetic author) >>".into(),
+        "<< /Nums [0 << /S /r >> 1 << /P (Sec-) /S /D /St 7 >>] >>".into(),
+    ];
+    let mut pdf = String::from("%PDF-1.4\n");
+    let mut offsets = vec![0];
+    for (i, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.push_str(&format!("{} 0 obj\n{object}\nendobj\n", i + 1));
+    }
+    let xref = pdf.len();
+    pdf.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len()));
+    for offset in offsets.iter().skip(1) {
+        pdf.push_str(&format!("{offset:010} 00000 n \n"));
+    }
+    pdf.push_str(&format!(
+        "trailer\n<< /Size {} /Root 1 0 R /Info 11 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+        offsets.len()
+    ));
+    pdf.into_bytes()
+}
+
+async fn completed_document_metadata(
+    root: &Path,
+    budget: &ResourceBudget,
+) -> Result<(gptgrep_parse::PreparedDocument, RichParsedDocument)> {
+    fs::write(
+        root.join("metadata-source.pdf"),
+        document_metadata_pdf_fixture(),
+    )?;
+    let prepared = gptgrep_parse::prepare_document(
+        &root.join("metadata-source.pdf"),
+        &root.join("metadata-staging"),
+        &gptgrep_parse::PreparationOptions,
+        budget,
+    )
+    .await?;
+    let candidate = gptgrep_parse::extract_native(
+        &prepared,
+        &gptgrep_parse::NativeOptions {
+            render_pages: false,
+            ..Default::default()
+        },
+        budget,
+    )
+    .await?;
+    ensure!(
+        candidate
+            .pages()
+            .iter()
+            .all(|p| p.coverage == CoverageState::Native),
+        "fixture must have complete native coverage"
+    );
+    let parsed =
+        gptgrep_parse::finalize_document(candidate, vec![], gptgrep_parse::OcrMode::Auto, budget)?;
+    Ok((prepared, parsed))
+}
+
+#[tokio::test]
+async fn native_document_metadata_publication_read_and_freshness() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    let budget = ResourceBudget::default();
+    let (prepared, parsed) = completed_document_metadata(&root, &budget).await?;
+    assert!(
+        parsed
+            .document
+            .nodes
+            .iter()
+            .any(|n| n.title == "Details section" && n.page_start == 2)
+    );
+    let staged = budget.staging_used();
+    let mut writer = RichGenerationWriter::begin(&root, budget.clone())?;
+    writer.add_document("metadata-source.pdf", prepared.staging_root(), parsed)?;
+    assert!(budget.staging_used() > staged);
+    let pin = writer.publish()?;
+    let pointer = fs::read(root.join(STATE).join("CURRENT.json"))?;
+    let reader = RichGenerationReader::open_pinned(&root, &pin)?;
+    reader.verify_all()?;
+    let doc = &reader.manifest()?.documents[0];
+    let metadata = reader.read_document_metadata(&doc.document.id)?;
+    assert!(
+        matches!(&metadata.info["Title"], FeatureState::Present(title) if title == "Bounded metadata")
+    );
+    assert!(
+        matches!(&metadata.page_labels[1].label, FeatureState::Present(label) if label == "Sec-7")
+    );
+    assert!(
+        matches!(&metadata.bookmarks, FeatureState::Present(bookmarks) if bookmarks.len() == 2)
+    );
+    let stored = document_metadata_artifact(doc)?.unwrap();
+    for case in 0..3 {
+        let mut invalid = metadata.clone();
+        match case {
+            0 => invalid.prepared_sha256 = "0".repeat(64),
+            1 => {
+                if let FeatureState::Present(bookmarks) = &mut invalid.bookmarks {
+                    bookmarks[1].destination =
+                        FeatureState::Present(gptgrep_parse::NativeBookmarkDestination {
+                            physical_page: 99,
+                            source_y: FeatureState::Unsupported(
+                                "pdfium_non_xyz_or_missing_y_or_getter_failure".into(),
+                            ),
+                        });
+                }
+            }
+            2 => invalid.native_dpi = 72.0,
+            _ => unreachable!(),
+        }
+        assert!(validate_document_metadata_binding(doc, stored, &invalid, &budget).is_err());
+    }
+    let artifact_path = reader.dir.join(&stored.artifact.relative_path);
+    let retained = fs::read(&artifact_path)?;
+    fs::write(&artifact_path, b"changed metadata")?;
+    assert!(reader.read_document_metadata(&doc.document.id).is_err());
+    fs::write(&artifact_path, retained)?;
+    fs::write(root.join("metadata-source.pdf"), b"changed original source")?;
+    assert!(reader.read_document_metadata(&doc.document.id).is_err());
+    assert_eq!(fs::read(root.join(STATE).join("CURRENT.json"))?, pointer);
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_document_metadata_invalid_assignment_preserves_current() -> Result<()> {
+    for case in 0..3 {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().canonicalize()?;
+        let prior = publish(&root, &["prior publication\n"])?;
+        let pointer = fs::read(root.join(STATE).join("CURRENT.json"))?;
+        let budget = ResourceBudget::default();
+        let (prepared, mut parsed) = completed_document_metadata(&root, &budget).await?;
+        match case {
+            0 => parsed
+                .artifacts
+                .retain(|a| !(a.kind == ArtifactKind::NativeMetadata && a.page.is_none())),
+            1 => parsed.pages[0].label = FeatureState::Present("wrong physical label".into()),
+            2 => {
+                parsed.pages[0].capabilities.insert(
+                    "native_recipe".into(),
+                    FeatureState::Present("unknown recipe".into()),
+                );
+            }
+            _ => unreachable!(),
+        }
+        let mut writer = RichGenerationWriter::begin(&root, budget)?;
+        assert!(
+            writer
+                .add_document("metadata-source.pdf", prepared.staging_root(), parsed)
+                .is_err()
+        );
+        assert_eq!(fs::read(root.join(STATE).join("CURRENT.json"))?, pointer);
+        assert_eq!(RichGenerationReader::open(&root)?.pin(), prior);
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn real_native_pdf_and_offline_ocr_preserve_raw_artifact_citations() -> Result<()> {
     use gptgrep_parse::*;

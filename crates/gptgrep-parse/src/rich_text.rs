@@ -123,6 +123,8 @@ pub(crate) fn extract(
         raw_pages: Vec::new(),
         execution_budget: budget,
         frozen_integrity_sha256: String::new(),
+        document_metadata: None,
+        document_metadata_artifact: None,
         annotation_counts: Vec::new(),
     };
     candidate.frozen_integrity_sha256 = candidate.integrity_digest()?;
