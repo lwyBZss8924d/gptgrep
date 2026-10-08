@@ -165,12 +165,22 @@ fn context(limit: u32) -> Result<ExecutionContext> {
         limit,
     )
 }
+struct MockRequest {
+    body: Vec<u8>,
+    parsed: Value,
+}
+impl std::ops::Deref for MockRequest {
+    type Target = Value;
+    fn deref(&self) -> &Self::Target {
+        &self.parsed
+    }
+}
 async fn mock_with_score(
     count: usize,
     action: Arc<dyn Fn(usize) -> Result<()> + Send + Sync>,
     fail_second: bool,
     score: f64,
-) -> Result<(String, tokio::task::JoinHandle<Result<Vec<Value>>>)> {
+) -> Result<(String, tokio::task::JoinHandle<Result<Vec<MockRequest>>>)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("http://{}/decisions", listener.local_addr()?);
     let task = tokio::spawn(async move {
@@ -227,7 +237,10 @@ async fn mock_with_score(
             )?;
             socket.write_all(format!("HTTP/1.1 {status} Synthetic\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).as_bytes()).await?;
             socket.write_all(&body).await?;
-            requests.push(request);
+            requests.push(MockRequest {
+                body: bytes[header_end..header_end + length].to_vec(),
+                parsed: request,
+            });
         }
         Ok(requests)
     });
@@ -237,7 +250,7 @@ async fn mock(
     count: usize,
     action: Arc<dyn Fn(usize) -> Result<()> + Send + Sync>,
     fail_second: bool,
-) -> Result<(String, tokio::task::JoinHandle<Result<Vec<Value>>>)> {
+) -> Result<(String, tokio::task::JoinHandle<Result<Vec<MockRequest>>>)> {
     mock_with_score(count, action, fail_second, 3.0).await
 }
 fn client(endpoint: &str, context: ExecutionContext) -> Result<JevClient> {
@@ -822,8 +835,20 @@ async fn bounded_documents_artifacts_union_and_submitted_question_order_are_expl
         matches!(binding(&p.window).page, 1 | 2) && p.window.text != "ordinary three\n"
     }));
     let full_bytes = prepared.full_pool_request_bytes();
+    let planned_route = prepared.routing_request().canonical_body().to_vec();
+    let planned_pool: Value =
+        serde_json::from_slice(prepared.rerank_pool_request().canonical_body())?;
+    assert_eq!(
+        crate::digest(&planned_route),
+        prepared.routing_request().body_sha256()
+    );
+    assert_eq!(
+        prepared.rerank_pool_request().canonical_body().len(),
+        full_bytes
+    );
     let initial = prepared.execute().await?;
     let requests = server.await??;
+    assert_eq!(requests[0].body, planned_route);
     assert_eq!(initial.report().coverage.scoped_documents, 10);
     assert_eq!(initial.report().coverage.routed_documents, 8);
     assert_eq!(initial.report().coverage.selected_documents, 4);
@@ -853,6 +878,22 @@ async fn bounded_documents_artifacts_union_and_submitted_question_order_are_expl
         })
         .collect();
     assert!(positions.windows(2).all(|p| p[0] < p[1]));
+    // The actual dependent request only deletes source candidates and renumbers
+    // them; shared query, rubric, source text, model and provider stay unchanged.
+    let mut expected_rerank = planned_pool.clone();
+    expected_rerank["questions"] = Value::Object(
+        positions
+            .iter()
+            .enumerate()
+            .map(|(new_index, old_index)| {
+                (
+                    format!("candidate_{new_index}"),
+                    planned_pool["questions"][format!("candidate_{old_index}")].clone(),
+                )
+            })
+            .collect(),
+    );
+    assert_eq!(requests[1].body, serde_json::to_vec(&expected_rerank)?);
     Ok(())
 }
 

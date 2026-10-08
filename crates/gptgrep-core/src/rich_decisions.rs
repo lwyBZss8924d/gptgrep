@@ -197,7 +197,7 @@ pub struct PreparedRichTextSearch {
     pool: Vec<PoolWindow>,
     routing: Vec<(String, usize)>,
     route_request: Option<PreparedRerank>,
-    full_pool_bytes: usize,
+    full_pool_request: PreparedRerank,
     output_reserved: usize,
     report: RichTextSearchReport,
     started: Instant,
@@ -455,7 +455,6 @@ pub fn prepare_rich_text_search(
     );
     let full_candidates: Vec<_> = pool.iter().map(|p| p.candidate.clone()).collect();
     let full_request = client.prepare_rerank(query, &full_candidates)?;
-    let full_pool_bytes = full_request.body_bytes();
     let route_request = client.prepare_rerank(query, &route_candidates)?;
     // Fixed overhead covers query/options hash, run binding, scalar rank fields,
     // up to three meter intervals and two complete bounded attempt projections.
@@ -523,7 +522,6 @@ pub fn prepare_rich_text_search(
     };
     validate_pool(&reader, &client, &pool)?;
     context.check_deadline()?;
-    drop(full_request);
     Ok(PreparedRichTextSearch {
         reader,
         client,
@@ -531,7 +529,7 @@ pub fn prepare_rich_text_search(
         pool,
         routing,
         route_request: Some(route_request),
-        full_pool_bytes,
+        full_pool_request: full_request,
         output_reserved,
         report,
         started,
@@ -546,7 +544,20 @@ impl PreparedRichTextSearch {
         self.output_reserved
     }
     pub fn full_pool_request_bytes(&self) -> usize {
-        self.full_pool_bytes
+        self.full_pool_request.body_bytes()
+    }
+    /// Exact first-stage request; inspection neither charges nor submits it.
+    /// Contains source text, so callers must not publish the body as telemetry.
+    pub fn routing_request(&self) -> &PreparedRerank {
+        self.route_request
+            .as_ref()
+            .expect("one prepared routing request")
+    }
+    /// Complete source-derived rerank pool in stable candidate_N order.
+    /// Execution selects an ordered subset after routing; this is a conservative
+    /// request bound, not a claim that the entire pool will be sent.
+    pub fn rerank_pool_request(&self) -> &PreparedRerank {
+        &self.full_pool_request
     }
     fn finalize_logical_accounting(&mut self) {
         self.report.accounting_complete = self.report.logical_calls_attempted != 0
@@ -649,7 +660,7 @@ impl PreparedRichTextSearch {
             .collect();
         self.report.coverage.union_windows = candidates.len();
         let prepared = match self.client.prepare_rerank(&self.report.query, &candidates) {
-            Ok(request) if request.body_bytes() <= self.full_pool_bytes => request,
+            Ok(request) if request.body_bytes() <= self.full_pool_request.body_bytes() => request,
             _ => {
                 return Err(self.failure(
                     "evidence_reranking",

@@ -145,6 +145,13 @@ pub struct PreparedDecision {
 }
 
 impl PreparedDecision {
+    /// Exact source-bearing wire bytes, without authorization headers.
+    /// Borrowing them performs no submission and grants no replay authority.
+    /// Callers must keep document contents out of public logs and receipts.
+    pub fn canonical_body(&self) -> &[u8] {
+        &self.body
+    }
+
     pub fn body_bytes(&self) -> usize {
         self.body.len()
     }
@@ -171,6 +178,12 @@ pub struct PreparedRerank {
     ids: Vec<String>,
 }
 impl PreparedRerank {
+    /// Exact source-bearing wire bytes for explicit request-budget inspection.
+    /// This borrow does not clone the client-bound submission capability.
+    pub fn canonical_body(&self) -> &[u8] {
+        self.request.canonical_body()
+    }
+
     pub fn body_bytes(&self) -> usize {
         self.request.body_bytes()
     }
