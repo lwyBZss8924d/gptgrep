@@ -3,6 +3,34 @@ use super::super::super::tests::Fixture;
 use super::*;
 
 const RAW: &str = r#"{"equivalent":false,"abstained":false,"reason":""}"#;
+#[test]
+fn static_failure_diagnostic_never_copies_unknown_text_or_error_chains() -> Result<()> {
+    for message in [
+        "app_rpc_error: mock-private-provider-text".to_owned(),
+        "mock-private-home/credential/MOCK_SECRET".to_owned(),
+        "{\"error\":\"app_rpc_error\",\"private\":\"MOCK_SECRET\"}".to_owned(),
+        "app_not_a_defined_internal_code".to_owned(),
+        "app_rpc_error\n".to_owned(),
+        "x".repeat(65_536),
+    ] {
+        let error = anyhow::anyhow!(message);
+        let code = static_failure_code(&error);
+        assert_eq!(code, "unknown_internal_failure");
+        assert_eq!(
+            serde_json::to_string(&code)?,
+            "\"unknown_internal_failure\""
+        );
+    }
+    let error = anyhow::anyhow!("app_rpc_error").context("mock-private-outer-context");
+    assert_eq!(static_failure_code(&error), "unknown_internal_failure");
+    let error = anyhow::anyhow!("mock-private-inner-provider-text").context("app_rpc_error");
+    assert_eq!(static_failure_code(&error), "app_rpc_error");
+    for code in STATIC_FAILURE_CODES {
+        assert!(code.starts_with("app_") && code.len() <= STATIC_FAILURE_CODE_CAP);
+        assert_eq!(static_failure_code(&anyhow::anyhow!(*code)), *code);
+    }
+    Ok(())
+}
 fn automatic(method: &str, params: Value) -> Value {
     json!({"method":method,"params":params})
 }
@@ -927,6 +955,7 @@ fn actual_bidirectional_mock_child_captures_native_ids_not_served_profile() -> R
         serde_json::to_string(&r)?
     );
     assert!(r.publication_sha256.is_some() && r.report.base.verdict.is_some());
+    assert!(r.report.internal_failure_code.is_none());
     assert_eq!(
         r.report.base.observations.native_turn_id.as_deref(),
         Some("native-turn")
@@ -962,7 +991,15 @@ fn mock_rpc_error_retains_only_numeric_code_and_permanent_claim() -> Result<()> 
     let r = f.run("error", Duration::from_secs(3))?;
     assert!(r.report.base.verdict.is_none());
     assert_eq!(r.report.protocol.rpc_error_code, Some(-32001));
+    assert_eq!(r.report.internal_failure_code, Some("app_rpc_error"));
+    assert_eq!(r.report.base.failure_code, Some("app_unavailable_no_retry"));
+    assert_eq!(r.report.base.status, "completion_unknown_quarantined");
+    assert!(r.no_retry && !r.report.base.reward_emitted);
     assert!(!serde_json::to_string(&r)?.contains("mock-secret"));
+    let receipt = fs::read(f.output.join("app-server-observation.json"))?;
+    assert!(!String::from_utf8_lossy(&receipt).contains("mock-secret"));
+    let receipt: Value = strict(&receipt)?;
+    assert_eq!(receipt["internal_failure_code"], "app_rpc_error");
     assert!(f.claims.join("mock-app.claim.json").exists());
     Ok(())
 }

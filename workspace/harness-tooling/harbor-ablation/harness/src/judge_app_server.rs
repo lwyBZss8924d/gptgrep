@@ -13,6 +13,96 @@ const ITEMS_MAX: usize = 64;
 const OUTGOING_MAX: usize = 6 * (REQUEST_MAX + ARTIFACT_MAX) + 16_384;
 const MAPPING: &str = "official-0.161-dto-with-bounded-native-metadata-source-only";
 
+// Match only complete internal literals. Never publish formatted error chains or provider text.
+const STATIC_FAILURE_CODE_CAP: usize = 64;
+const STATIC_FAILURE_CODES: &[&str] = &[
+    "app_agent_phase",
+    "app_approval_or_input_observed",
+    "app_async_or_question_rejected",
+    "app_automatic_metadata_limit",
+    "app_automatic_metadata_server_request",
+    "app_configured_profile_mismatch",
+    "app_deadline",
+    "app_delta_shape",
+    "app_duplicate_final",
+    "app_duplicate_or_changed_item",
+    "app_duplicate_response_id",
+    "app_duplicate_turn",
+    "app_early_limit",
+    "app_empty_frame",
+    "app_event_count",
+    "app_exit_failure",
+    "app_field_shape",
+    "app_final_limit",
+    "app_final_missing",
+    "app_final_shape",
+    "app_frame_limit",
+    "app_id_shape",
+    "app_incomplete_items",
+    "app_incomplete_terminal",
+    "app_initialize_shape",
+    "app_invalid_automatic_metadata",
+    "app_invalid_json",
+    "app_item_delta_kind",
+    "app_item_limit",
+    "app_item_not_started",
+    "app_item_order",
+    "app_lifecycle_publication_unknown_no_retry",
+    "app_method_shape",
+    "app_native_chatgpt_auth_required",
+    "app_native_id_mismatch",
+    "app_notification_order",
+    "app_notification_rejected",
+    "app_object_shape",
+    "app_outgoing_count",
+    "app_outgoing_limit",
+    "app_pipe",
+    "app_pipe_failure",
+    "app_post_terminal_activity",
+    "app_prompt_limit",
+    "app_publication_unknown_no_retry",
+    "app_reason_limit",
+    "app_receipt_allowance",
+    "app_receipt_limit_no_retry",
+    "app_recipe_mismatch",
+    "app_remote_control_not_disabled",
+    "app_rpc_envelope",
+    "app_rpc_error",
+    "app_rpc_id",
+    "app_rpc_order",
+    "app_server_request_rejected",
+    "app_stale_or_deadline_no_retry",
+    "app_stderr_limit",
+    "app_stdin_closed",
+    "app_stdin_failure",
+    "app_stdout_limit",
+    "app_summary_final_mismatch",
+    "app_summary_mismatch",
+    "app_summary_shape",
+    "app_thread_missing",
+    "app_thread_started_order",
+    "app_thread_status_rejected",
+    "app_tool_or_item_rejected",
+    "app_turn_ack_status",
+    "app_turn_missing",
+    "app_turn_not_started",
+    "app_turn_status",
+    "app_turn_terminal_status",
+    "app_unavailable_no_retry",
+    "app_unsent_request",
+    "app_usage_shape",
+    "app_user_input_mismatch",
+    "app_user_input_shape",
+];
+fn static_failure_code(error: &anyhow::Error) -> &'static str {
+    let message = error.to_string();
+    STATIC_FAILURE_CODES
+        .iter()
+        .copied()
+        .find(|code| *code == message)
+        .unwrap_or("unknown_internal_failure")
+}
+
 struct Seed<'a> {
     nodes: &'a Cell<usize>,
     depth: usize,
@@ -356,6 +446,7 @@ struct ProtocolObservations {
 struct AppReport {
     #[serde(flatten)]
     base: Report,
+    internal_failure_code: Option<&'static str>,
     protocol: ProtocolObservations,
 }
 #[derive(Serialize)]
@@ -1235,6 +1326,7 @@ fn report(a: &Admission, origin: &'static str) -> AppReport {
     base.schema_version = "gptgrep.judge.app-server-observation.v1";
     AppReport {
         base,
+        internal_failure_code: None,
         protocol: ProtocolObservations {
             mapping_source: MAPPING,
             configured_ack: None,
@@ -1254,6 +1346,7 @@ fn reserve_receipt(a: &Admission) -> Result<()> {
     let mut worst = serde_json::to_value(report(a, "source_only_no_effects"))?;
     worst["status"] = json!("typed_sequence_unpublished_unavailable");
     worst["failure_code"] = json!("app_publication_unknown_no_retry");
+    worst["internal_failure_code"] = json!("x".repeat(STATIC_FAILURE_CODE_CAP));
     worst["raw_final_sha256"] = json!("f".repeat(64));
     for name in [
         "transport_thread_id",
@@ -1425,7 +1518,8 @@ fn execute(a: &Admission, permit: ExecutionPermit) -> Result<AppOutcome> {
     } else {
         "consumed_failed_no_spawn_observed"
     };
-    if result.is_err() {
+    if let Err(error) = &result {
+        report.internal_failure_code = Some(static_failure_code(error));
         report.base.failure_code = Some("app_unavailable_no_retry");
         report.base.verdict = None;
         final_bytes = None;
