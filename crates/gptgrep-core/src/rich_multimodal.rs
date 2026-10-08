@@ -242,6 +242,7 @@ pub struct PreparedRichMultimodalSearch {
     route_batches: Vec<Batch>,
     pool_batches: Vec<Batch>,
     output_reserved: usize,
+    working_reserved: u64,
     report: RichMultimodalSearchReport,
     started: Instant,
     last_meter: ReaderReadMetrics,
@@ -820,6 +821,11 @@ pub fn prepare_rich_multimodal_search(
         route_batches,
         pool_batches,
         output_reserved,
+        working_reserved: encoded * 8
+            + metadata as u64 * 6
+            + (text_count * options.window_bytes * 6) as u64
+            + body_bytes as u64 * 2
+            + 1_048_576,
         report,
         started,
         last_meter: after,
@@ -832,6 +838,12 @@ impl PreparedRichMultimodalSearch {
     }
     pub fn reserved_output_bytes(&self) -> usize {
         self.output_reserved
+    }
+    /// Conservative retained source/content/request bound for batch composition.
+    /// Transient decoding and active response work keep their separate per-search
+    /// admission. Native allocations, reader cache and RSS are not this counter.
+    pub(crate) fn working_bytes_bound(&self) -> u64 {
+        self.working_reserved
     }
     /// All potential seed references, including visual documents outside routing.
     /// Borrowed metadata grants no delivery/citation or initial-pass authority.

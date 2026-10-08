@@ -92,6 +92,12 @@ typed native/OCR evidence and source checks. Search cursors cover a bounded
 `max_hits` result window, so callers must inspect truncation and exhaustion.
 The response is always JSON, with exit status 2 for an item or global failure.
 Reader byte counters describe partial API reads rather than complete physical I/O.
+Explicit `search_multimodal` also supports mandatory document routing and mixed
+text/visual reranking on that same retained reader and finite Decisions context.
+All complete output/call shares are admitted before submission; no paid cursor
+or fallback is provided. `budget.max_decisions_submissions` defaults to8 and
+never resets the parent allowance. See [rich batch composition](docs/rich-batch.md)
+for options, ordered failures, bounded telemetry, and observation limits.
 The ordinary `index` command currently publishes the original generation format.
 
 The Rust core provides `DerivedVisualCache` for PNG crops obtained from a

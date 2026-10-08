@@ -66,6 +66,9 @@ const requests = {
   batch: z.object({
     root,
     rich: z.boolean().default(false).describe('Use the opt-in v2 rich batch contract'),
+    model: z.string().min(1).max(128).optional().describe('Decisions model for explicit paid rich operations'),
+    multimodalTimeout: z.number().int().min(1).max(900).optional(),
+    decisionsBudget,
     batch: z.record(z.string(), z.unknown()).describe('Native batch request object; native validation owns its versioned operation schema'),
   }).strict(),
   status: z.object({ root }).strict(),
@@ -124,7 +127,10 @@ const argumentsFor = {
   index: (r) => ['index', ...(r.optimizeMerge ? ['--optimize-merge'] : []), '--json', '--', r.root],
   tree: (r) => ['tree', `--root=${r.root}`, '--json', '--', r.file],
   read: (r) => ['read', `--root=${r.root}`, '--offset', String(r.offset), '--max-bytes', String(r.maxBytes), '--json', '--', r.nodeId],
-  batch: (r) => ['batch', `--root=${r.root}`, '--input=-', ...(r.rich ? ['--rich'] : []), '--json'],
+  batch: (r) => ['batch', `--root=${r.root}`, '--input=-', ...(r.rich ? ['--rich'] : []),
+    ...(r.model === undefined ? [] : [`--model=${r.model}`]),
+    ...(r.multimodalTimeout === undefined ? [] : [`--multimodal-timeout=${r.multimodalTimeout}`]),
+    ...budgetArguments(r), '--json'],
   status: (r) => ['status', '--json', '--', r.root],
   doctor: () => ['doctor', '--json'],
   ask: (r) => ['ask', ...hostArguments(r), ...budgetArguments(r), ...multimodalArguments(r), ...(r.minScore === undefined ? [] : [`--min-score=${r.minScore}`]), '--json', '--', r.question, r.root],
@@ -157,8 +163,10 @@ for (const [name, schema] of Object.entries(requests)) {
         const raw = JSON.parse(c.options.request)
         request = schema.parse(raw)
         const visualKeys = Object.keys(multimodal).filter((key) => key !== 'multimodal')
-        if (!request.multimodal && [...visualKeys, 'maxCitations', ...(name === 'ask' ? ['minScore'] : [])].some((key) => Object.hasOwn(raw, key)))
+        if (['search', 'ask'].includes(name) && !request.multimodal && [...visualKeys, 'maxCitations', ...(name === 'ask' ? ['minScore'] : [])].some((key) => Object.hasOwn(raw, key)))
           throw new Error('Multimodal bounds require multimodal:true.')
+        if (name === 'batch' && !request.rich && ['model', 'multimodalTimeout'].some((key) => Object.hasOwn(raw, key)))
+          throw new Error('Paid batch options require rich:true.')
         if (name === 'search' && request.multimodal && (request.mode !== 'hybrid'
             || ['limit', 'context', 'ignoreCase', 'fixedStrings'].some((key) => Object.hasOwn(raw, key))))
           throw new Error('Multimodal search requires hybrid mode and cannot combine legacy grep/window options.')

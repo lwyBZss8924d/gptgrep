@@ -1,4 +1,4 @@
-//! Local deterministic batch operations over one retained v2 generation.
+//! Local and explicitly paid batch operations over one retained v2 generation.
 //! Inspection returns indexed metadata, not fresh source evidence. Native/OCR
 //! text windows preserve the reader's typed evidence and freshness checks.
 //! Empty EOF windows contain no citeable bytes; evidence consumers still use
@@ -31,6 +31,13 @@ pub const MAX_RICH_BATCH_CURSOR_BYTES: usize = 16_384;
 const ENVELOPE_RESERVE: usize = 4096;
 const MIN_ITEM_OUTPUT: usize = 1536;
 
+mod paid;
+pub use paid::{
+    PreparedRichBatch, RichBatchDecisionsMetrics, RichBatchItemDecisions,
+    dispatch_rich_batch_with_client, dispatch_rich_batch_with_reader_and_client,
+    prepare_rich_batch_with_reader,
+};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RichBatchRequest {
@@ -40,6 +47,13 @@ pub struct RichBatchRequest {
     #[serde(default)]
     pub budget: RichBatchBudget,
     pub operations: Vec<RichBatchOperation>,
+}
+impl RichBatchRequest {
+    pub fn requires_model(&self) -> bool {
+        self.operations
+            .iter()
+            .any(|op| matches!(op, RichBatchOperation::SearchMultimodal { .. }))
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -64,6 +78,8 @@ pub struct RichBatchBudget {
     pub max_operations: usize,
     pub max_output_bytes: usize,
     pub cache: ReaderCacheBudget,
+    /// Whole-batch worst-case logical calls. Does not reset the parent context.
+    pub max_decisions_submissions: u32,
 }
 impl Default for RichBatchBudget {
     fn default() -> Self {
@@ -71,6 +87,7 @@ impl Default for RichBatchBudget {
             max_operations: 64,
             max_output_bytes: MAX_RICH_BATCH_OUTPUT_BYTES,
             cache: ReaderCacheBudget::default(),
+            max_decisions_submissions: 8,
         }
     }
 }
@@ -154,6 +171,34 @@ pub enum RichBatchOperation {
     },
     /// One complete locally verified rendition, never a partial image window.
     ReadVisual { id: String, rendition_id: String },
+    /// Required document routing and source-bound text/visual reranking.
+    /// No inference cursor or implicit reference to another operation.
+    SearchMultimodal {
+        id: String,
+        query: String,
+        #[serde(default)]
+        document: Option<String>,
+        #[serde(default = "default_multimodal_window")]
+        window_bytes: usize,
+        #[serde(default = "default_multimodal_visual")]
+        max_visual_candidates: usize,
+        #[serde(default = "default_multimodal_concurrency")]
+        max_concurrent_batches: usize,
+        #[serde(default = "default_multimodal_score")]
+        min_score: f64,
+    },
+}
+fn default_multimodal_window() -> usize {
+    1024
+}
+fn default_multimodal_visual() -> usize {
+    8
+}
+fn default_multimodal_concurrency() -> usize {
+    4
+}
+fn default_multimodal_score() -> f64 {
+    0.5
 }
 impl RichBatchOperation {
     pub fn id(&self) -> &str {
@@ -163,7 +208,8 @@ impl RichBatchOperation {
             | Self::ReadArtifact { id, .. }
             | Self::SearchArtifacts { id, .. }
             | Self::InspectVisual { id, .. }
-            | Self::ReadVisual { id, .. } => id,
+            | Self::ReadVisual { id, .. }
+            | Self::SearchMultimodal { id, .. } => id,
         }
     }
     fn binding(&self) -> (&str, &str, Value, Option<&str>) {
@@ -219,9 +265,9 @@ impl RichBatchOperation {
                 cursor.as_deref(),
             ),
             // These operations never use the text/metadata cursor codec.
-            Self::InspectVisual { .. } | Self::ReadVisual { .. } => {
-                ("visual", "visual", Value::Null, None)
-            }
+            Self::InspectVisual { .. }
+            | Self::ReadVisual { .. }
+            | Self::SearchMultimodal { .. } => ("visual", "visual", Value::Null, None),
         }
     }
 }
@@ -242,6 +288,11 @@ pub enum RichBatchErrorCode {
     SharedIntegrity,
     OutputBudgetInsufficient,
     NotExecuted,
+    ModelContextRequired,
+    SubmissionBudgetInsufficient,
+    ProviderFailure,
+    PaidSearchFailure,
+    DeadlineExceeded,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RichBatchError {
@@ -292,6 +343,8 @@ pub struct RichBatchItem {
     pub coverage: RichBatchItemCoverage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_metrics: Option<ReaderReadMetrics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decisions: Option<paid::RichBatchItemDecisions>,
 }
 impl RichBatchItem {
     fn failed(id: &str, quota: usize, failure: RichBatchError) -> Self {
@@ -303,6 +356,7 @@ impl RichBatchItem {
             error: Some(failure),
             coverage: Default::default(),
             read_metrics: None,
+            decisions: None,
         }
     }
     fn pending(id: &str, quota: usize) -> Self {
@@ -321,13 +375,23 @@ impl RichBatchItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RichBatchExecution {
     pub scope: String,
-    pub model_submissions: u32,
+    /// None when exact batch-attributable submissions are unavailable.
+    pub model_submissions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_before: Option<gptgrep_jev::ExecutionSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_after: Option<gptgrep_jev::ExecutionSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_observation_scope: Option<String>,
 }
 impl Default for RichBatchExecution {
     fn default() -> Self {
         Self {
             scope: "local_deterministic_no_model_context".into(),
-            model_submissions: 0,
+            model_submissions: Some(0),
+            context_before: None,
+            context_after: None,
+            context_observation_scope: None,
         }
     }
 }
@@ -343,9 +407,11 @@ pub struct RichBatchMetrics {
     pub elapsed_ms: u128,
     pub shared_reader: bool,
     pub physical_bytes: Option<u64>,
-    pub model_submissions: u32,
+    pub model_submissions: Option<u32>,
     pub read_metrics: Option<ReaderReadMetrics>,
     pub cache_status: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decisions: Option<paid::RichBatchDecisionsMetrics>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RichBatchResponse {
@@ -364,6 +430,8 @@ pub struct RichBatchFailure {
     pub error: RichBatchError,
     pub items: Vec<RichBatchItem>,
     pub read_metrics: Option<ReaderReadMetrics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decisions: Option<paid::RichBatchDecisionsMetrics>,
 }
 impl std::fmt::Display for RichBatchFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -383,6 +451,7 @@ fn failure(
         error: e,
         items,
         read_metrics: None,
+        decisions: None,
     })
 }
 
@@ -468,7 +537,17 @@ pub fn parse_rich_batch_request(bytes: &[u8]) -> Result<RichBatchRequest, Box<Ri
             vec![],
         ));
     }
-    let request: RichBatchRequest = serde_json::from_slice(bytes).map_err(|_| {
+    let value = gptgrep_jev::parse_unique_json(bytes).map_err(|_| {
+        failure(
+            error(
+                RichBatchErrorCode::InvalidRequest,
+                "Rich batch JSON schema is invalid",
+            ),
+            None,
+            vec![],
+        )
+    })?;
+    let request: RichBatchRequest = serde_json::from_value(value).map_err(|_| {
         failure(
             error(
                 RichBatchErrorCode::InvalidRequest,
@@ -488,6 +567,7 @@ fn validate_request(request: &RichBatchRequest) -> Result<(), RichBatchError> {
         || !(1..=64).contains(&request.budget.max_operations)
         || request.operations.len() > request.budget.max_operations
         || request.budget.max_output_bytes > MAX_RICH_BATCH_OUTPUT_BYTES
+        || request.budget.max_decisions_submissions > gptgrep_jev::MAX_SUBMISSIONS
         || request.budget.cache.max_bytes == 0
         || request.budget.cache.max_bytes > crate::MAX_READER_CACHE_BYTES
         || request.budget.cache.max_entries == 0
@@ -759,6 +839,28 @@ fn preflight(pin: &GenerationPin, op: &RichBatchOperation) -> Result<usize, Rich
             }
             return Ok(0);
         }
+        RichBatchOperation::SearchMultimodal {
+            query,
+            document,
+            window_bytes,
+            max_visual_candidates,
+            max_concurrent_batches,
+            min_score,
+            ..
+        } => {
+            if query.trim().is_empty()
+                || query.len() > 8192
+                || document.as_deref().is_some_and(|s| !valid_path(s))
+                || !(4..=2048).contains(window_bytes)
+                || !(1..=16).contains(max_visual_candidates)
+                || !(1..=4).contains(max_concurrent_batches)
+                || !min_score.is_finite()
+                || !(0.0..=1.0).contains(min_score)
+            {
+                return Err(bad());
+            }
+            return Ok(0);
+        }
     }
     let cursor_bound = Cursor {
         body: cursor_body(pin, op, usize::MAX),
@@ -815,6 +917,10 @@ fn preflight_resource(
     match op {
         RichBatchOperation::InspectPages { document, .. }
         | RichBatchOperation::SearchArtifacts {
+            document: Some(document),
+            ..
+        }
+        | RichBatchOperation::SearchMultimodal {
             document: Some(document),
             ..
         } => {
@@ -1306,7 +1412,16 @@ pub fn dispatch_rich_batch(
     root: &Path,
     request: RichBatchRequest,
 ) -> Result<RichBatchResponse, Box<RichBatchFailure>> {
-    validate_request(&request).map_err(|e| failure(e, None, vec![]))?;
+    let reader = open_rich_batch_reader(root, &request)?;
+    dispatch_with_baseline(&reader, request, ReaderReadMetrics::default())
+}
+
+/// Resolves CURRENT once or opens the exact pin, without reading credentials.
+pub fn open_rich_batch_reader(
+    root: &Path,
+    request: &RichBatchRequest,
+) -> Result<RichGenerationReader, Box<RichBatchFailure>> {
+    validate_request(request).map_err(|e| failure(e, None, vec![]))?;
     let reader = match &request.generation {
         RichBatchGeneration::Current(_) => {
             RichGenerationReader::open_with_cache_budget(root, &request.budget.cache)
@@ -1325,7 +1440,7 @@ pub fn dispatch_rich_batch(
             vec![],
         )
     })?;
-    dispatch_with_baseline(&reader, request, ReaderReadMetrics::default())
+    Ok(reader)
 }
 pub fn dispatch_rich_batch_with_reader(
     reader: &RichGenerationReader,
@@ -1507,9 +1622,10 @@ fn dispatch_inner(
             elapsed_ms: started.elapsed().as_millis(),
             shared_reader: true,
             physical_bytes: None,
-            model_submissions: 0,
+            model_submissions: Some(0),
             read_metrics: None,
             cache_status: reader.cache_status().ok(),
+            decisions: None,
         },
     })
 }
@@ -1577,6 +1693,7 @@ fn successful_with_error<T: Serialize>(
         error: failure,
         coverage,
         read_metrics: Some(metrics),
+        decisions: None,
     })
 }
 fn coverage(
@@ -1935,6 +2052,10 @@ fn execute(
     before: &ReaderReadMetrics,
 ) -> Result<RichBatchItem, RichBatchError> {
     match op {
+        RichBatchOperation::SearchMultimodal { .. } => Err(error(
+            RichBatchErrorCode::ModelContextRequired,
+            "Paid rich operations require the explicit asynchronous client frontdoor",
+        )),
         RichBatchOperation::InspectVisual { .. } | RichBatchOperation::ReadVisual { .. } => {
             execute_visual(reader, op, quota, before)
         }

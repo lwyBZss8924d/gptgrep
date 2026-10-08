@@ -121,8 +121,18 @@ fn discovery_describes_rich_schema_and_bounded_search_window() {
     let schema: Value = serde_json::from_slice(&output.stdout).unwrap();
     let rich = &schema["commands"]["batch"]["rich"];
     assert_eq!(rich["request_schema"], "gptgrep.batch.rich.request.v1");
-    assert_eq!(rich["network"], false);
-    assert_eq!(rich["model_submissions"], 0);
+    assert!(
+        rich["network"]
+            .as_str()
+            .unwrap()
+            .contains("search_multimodal")
+    );
+    assert!(
+        rich["model_submissions"]
+            .as_str()
+            .unwrap()
+            .contains("paid:null")
+    );
     assert!(
         rich["operations"]
             .as_array()
@@ -163,4 +173,31 @@ fn discovery_describes_rich_schema_and_bounded_search_window() {
     assert!(help.contains("batch --rich"));
     assert!(help.contains("inspect_visual") && help.contains("read_visual"));
     assert!(help.contains("citation_authority=false"));
+}
+
+#[test]
+fn paid_operation_uses_rich_schema_and_rejects_ambiguous_input_before_io() {
+    let root = tempfile::tempdir().unwrap();
+    let input = serde_json::to_vec(&json!({
+        "schema_version":"gptgrep.batch.rich.request.v1",
+        "operations":[{"id":"rank","op":"search_multimodal","query":"ordinary source evidence"}]
+    }))
+    .unwrap();
+    assert_eq!(
+        error(&invoke(root.path(), &input))["error"]["code"],
+        "shared_integrity"
+    );
+    let input=br#"{"schema_version":"gptgrep.batch.rich.request.v1","operations":[{"id":"rank","op":"search_multimodal","query":"first","query":"second"}]}"#;
+    assert_eq!(
+        error(&invoke(root.path(), input))["error"]["code"],
+        "invalid_request"
+    );
+    let input=serde_json::to_vec(&json!({
+        "schema_version":"gptgrep.batch.rich.request.v1",
+        "operations":[{"id":"rank","op":"search_multimodal","query":"ordinary","cursor":"forbidden"}]
+    })).unwrap();
+    assert_eq!(
+        error(&invoke(root.path(), &input))["error"]["code"],
+        "invalid_request"
+    );
 }

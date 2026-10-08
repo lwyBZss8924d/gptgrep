@@ -149,7 +149,7 @@ fn candidate(root: &Path, texts: &[&str]) -> Result<(tempfile::TempDir, RichPars
     ))
 }
 
-fn publish(root: &Path, texts: &[&str]) -> Result<GenerationPin> {
+pub(super) fn publish(root: &Path, texts: &[&str]) -> Result<GenerationPin> {
     let (staging, parsed) = candidate(root, texts)?;
     let mut writer = RichGenerationWriter::begin(root, ResourceBudget::default())?;
     writer.add_document("source.pdf", &staging.path().canonicalize()?, parsed)?;
@@ -192,7 +192,7 @@ fn visual_png(value: u8) -> Vec<u8> {
     png
 }
 
-fn publish_visual(root: &Path, pages: usize) -> Result<(GenerationPin, Vec<Vec<u8>>)> {
+pub(super) fn publish_visual(root: &Path, pages: usize) -> Result<(GenerationPin, Vec<Vec<u8>>)> {
     let texts = vec!["synthetic visual source text\n"; pages];
     let (staging, mut parsed) = candidate(root, &texts)?;
     let mut images = Vec::new();
@@ -360,7 +360,7 @@ fn visual_read_is_exact_complete_local_observation_with_shared_metrics() -> Resu
             .observed_rust_read_bytes
             >= item_reads
     );
-    assert_eq!(response.metrics.model_submissions, 0);
+    assert_eq!(response.metrics.model_submissions, Some(0));
     assert!(response.metrics.physical_bytes.is_none());
     Ok(())
 }
@@ -517,7 +517,7 @@ fn rich_batch_schema_rejects_invalid_envelopes() {
     assert!(parse_rich_batch_request(b"{}").is_err());
 }
 
-fn request(ops: Value) -> RichBatchRequest {
+pub(super) fn request(ops: Value) -> RichBatchRequest {
     parse_rich_batch_request(
         &serde_json::to_vec(&json!({"schema_version":RICH_BATCH_REQUEST_SCHEMA,"operations":ops}))
             .unwrap(),
@@ -558,7 +558,7 @@ fn strict_rich_schema_all_ids_and_declarations_preflight_before_io() -> Result<(
         RichBatchErrorCode::InvalidRegex
     );
     assert_eq!(response.items[2].status, RichBatchStatus::Ok);
-    assert_eq!(response.metrics.model_submissions, 0);
+    assert_eq!(response.metrics.model_submissions, Some(0));
     assert!(response.metrics.physical_bytes.is_none());
     Ok(())
 }
@@ -997,7 +997,7 @@ async fn native_and_offline_ocr_search_read_keep_distinct_evidence_receipts() ->
         crate::EvidenceRef::OcrText { .. }
     ));
     reader.validate_text_evidence(&retained.evidence)?;
-    assert_eq!(response.metrics.model_submissions, 0);
+    assert_eq!(response.metrics.model_submissions, Some(0));
     Ok(())
 }
 

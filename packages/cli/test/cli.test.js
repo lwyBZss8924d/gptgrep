@@ -332,3 +332,18 @@ test('incompatible multimodal controls reject before spawning the native executa
   await assert.rejects(run(['ask', '--request', '{"question":"Explain","maxCitations":4}', '--json'], '/missing/native'),
     (error) => /INVALID_REQUEST/.test(error.stdout))
 })
+
+
+test('paid rich batch preserves exact request and explicit original-budget arguments', async () => {
+  const batch = {schema_version: 'gptgrep.batch.rich.request.v1', budget: {max_decisions_submissions: 2},
+    operations: [{id: 'paid', op: 'search_multimodal', query: 'ordinary source question'}, {id: 'local', op: 'inspect_documents'}]}
+  const request = {root: '/documents', rich: true, model: 'openai/gpt-6-luna-decisions',
+    multimodalTimeout: 30, decisionsBudget: '/private-budget.json', batch}
+  const result = JSON.parse((await run(['batch', '--request', JSON.stringify(request), '--json'])).stdout)
+  assert.deepEqual(result.args, ['batch', '--root=/documents', '--input=-', '--rich',
+    '--model=openai/gpt-6-luna-decisions', '--multimodal-timeout=30', '--decisions-budget=/private-budget.json', '--json'])
+  assert.deepEqual(result.request, batch)
+  for (const option of [{model:'openai/gpt-6-luna-decisions'}, {multimodalTimeout:30}])
+    await assert.rejects(run(['batch','--request',JSON.stringify({batch,...option}),'--json'], '/missing/native'),
+      (error) => /INVALID_REQUEST/.test(error.stdout) && !/NATIVE_ERROR/.test(error.stdout))
+})
