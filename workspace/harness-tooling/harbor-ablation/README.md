@@ -601,6 +601,63 @@ completion remain separate gates.
 
 ### Native judge runner source foundation
 
+The explicit app-server path additionally admits a root-prepared
+`gptgrep.judge.native-control.v2` through:
+
+```sh
+gptgrep-harbor-judge-request execute-app-server \
+  --control verifier-control-v2.json --control-sha256 CONTROL_SHA256
+# A separately adopted finite phase selects the intentional effect frontdoor:
+gptgrep-harbor-judge-request execute-app-server \
+  --control verifier-control-v2.json --control-sha256 CONTROL_SHA256 --run
+```
+
+V2 adds `phase.binding={path,sha256}`. The phase binds the run/invocation/trial/task
+and arm, actual prepared manifest/request/source/reference/answer/schema hashes,
+original source revision and unchanged formatter, pinned runtime/schema/recipe,
+one child/turn, zero retries/fallbacks and a child timeout of at most 120000 ms.
+`control_projection_sha256` hashes the serialized control with `phase` omitted;
+this avoids a circular phase/control digest. The execution-policy digest equals
+the exact phase-file hash. The origin-receipt digest equals the selected origin
+file hash. Origin binds the same run, the original serialized `RunClockAnchor`
+and its SHA/UTC deadline, plus physical CODEX/SQLite/log directory identities.
+Control, phase and origin files are private `0600`; selected native directories
+and the permanent claim root are `0700`. No credential or account file is read
+by admission.
+
+Preflight samples no clock and opens no native home. `--run` joins the original
+anchor, samples its process timer before the original remaining-time check and
+keeps both guards through claim, spawn, transport and publication. It never
+recaptures or renews a clock. V2 final JSON is bounded to 8192 bytes and its full
+worst-case receipt is admitted before claim or native work. Permanent claims and
+separate started/finished observations retain uncertain outcomes; interruption
+or publication failure grants no retry. Automatic account/rate/disabled-remote
+metadata is DTO-validated and discarded under one 32-notification counter across
+all phases. Requests for tools, warnings, reroutes and unknown methods remain
+refused. The actual private verdict reason stays in `native-final.json`; the
+result projection contains only its hash and verdict booleans. Configured profile
+acknowledgment remains distinct from unavailable served identity, usage and cost.
+
+The optional Harbor 0.24 custom verifier is selected explicitly as
+`gptgrep_harbor_verifier:OriginalNativeJudgeVerifier` with `phase_map` and
+`phase_map_sha256` kwargs. Its finite map pins the broker and at most eight exact
+trial/task/step entries with control and collected-answer/reference hashes.
+It resolves only the successfully collected main-service artifact
+`/app/answer.json` with destination `answer.json`, uses the active step's artifact
+and evaluator tests paths, and validates them against the prepared phase. It
+never takes an agent message as the answer or transfers gold to a reader.
+Only a matched, published native completed verdict yields reward 0 or 1 from
+`equivalent`; `abstained` is independent. Missing preparation, unknown completion,
+changed inputs or unavailable output returns `rewards=None`.
+
+This pilot is explicitly two-phase: collect reader outputs, then root freezes
+their exact evaluator request/phase and invokes the native judge. The custom
+verifier can replay that already bound evaluator step; it cannot create a live
+phase before answers exist. Automatic end-to-end Harbor preparation, real native
+judge parity and physical reader/gold isolation remain separate runtime gates.
+The default package verifier is unchanged and unavailable. Source/mock checks
+do not qualify model semantics, native egress, subscription identity or release.
+
 The verifier-only judge request tool adds a structural preflight front door:
 
 ```sh
@@ -617,10 +674,10 @@ permission. Preflight holds and rechecks the declared input files and streams th
 binary hash. It creates no claim, output, formatter child, native process, home,
 clock, or ledger. The explicitly selected control snapshot is read to decode its
 fields. Before opening nested request-root, Python, or binary inputs, preflight
-rejects their lexical namespace overlap with configured HOME, CODEX_HOME, sqlite
-and log roots. `environment.home` names the selected isolated actor HOME, not the
-entire ordinary physical user workspace; source/runtime executables may remain
-in that workspace outside the configured actor namespaces. Shared TMPDIR is
+rejects their lexical namespace overlap with configured CODEX_HOME, sqlite
+and log roots. `environment.home` binds the real OS HOME namespace without
+excluding all source/runtime/output paths beneath it. Selected private native
+state, claim, output and input namespaces remain separate. Shared TMPDIR is
 allowed. It reads only selected control/source
 inputs and performs no native config, authentication or state discovery. Private
 input, tool, home/account authorization and actual runtime qualification remain
@@ -629,13 +686,13 @@ change. This preflight checks structure
 and bindings; it does not reconstruct the original formatter or establish judge
 parity.
 
-Adding `--run` currently fails with `native_execution_policy_unavailable` before
+Adding `--run` to legacy v1 or standard exec fails with `native_execution_policy_unavailable` before
 any child or durable claim. There is no caller-selected command, permit boolean,
 formatter, fallback, retry, or default verifier promotion. Original phase/clock,
 tool, home, runtime and response-identity qualification need separate admission.
 The generated Harbor verifier remains unavailable and emits no reward.
 
-The private runner has no production permit constructor. Only test code can admit
+The legacy exec runner has no production permit constructor. Only test code can admit
 self-authored isolated mock children. Under that test permit, it reconstructs the
 request with the fixed embedded formatter before consuming an exclusive, durable
 claim. It then uses a fixed direct argv recipe, a cleared explicit environment,

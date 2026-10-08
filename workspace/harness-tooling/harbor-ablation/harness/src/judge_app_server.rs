@@ -1,4 +1,4 @@
-//! One-turn app-server transport. The production permit remains unavailable.
+//! One-turn app-server transport with explicitly bound v2 execution admission.
 //! Tool rejection observes an event; it does not attest prevention or remote cleanup.
 use super::*;
 use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
@@ -11,7 +11,7 @@ const JSON_NODES_MAX: usize = 4096;
 const ITEMS_MAX: usize = 64;
 // Separate from the incoming event cap: JSON escaping of the original bounded prompt/schema.
 const OUTGOING_MAX: usize = 6 * (REQUEST_MAX + ARTIFACT_MAX) + 16_384;
-const MAPPING: &str = "87be737b664508d48402f08f57d09aba48e5f17a-local-source-not-latest-qualified";
+const MAPPING: &str = "official-0.161-dto-with-bounded-native-metadata-source-only";
 
 struct Seed<'a> {
     nodes: &'a Cell<usize>,
@@ -123,7 +123,7 @@ fn same_id(v: &Value, expected: &str) -> Result<()> {
 }
 
 fn fixed_argv(a: &Admission) -> Result<Vec<String>> {
-    Ok(vec![
+    let mut argv = vec![
         "-c".into(),
         format!(
             "sqlite_home={}",
@@ -133,11 +133,63 @@ fn fixed_argv(a: &Admission) -> Result<Vec<String>> {
         format!("log_dir={}", toml_path(&a.control.environment.log_dir)?),
         "-c".into(),
         "web_search=\"disabled\"".into(),
+    ];
+    // Fixed official configuration projection; no OCR instructions/model descriptor.
+    for key in [
+        "shell_tool",
+        "view_image",
+        "sleep_tool",
+        "code_mode_only",
+        "code_mode_prewarm",
+        "memories",
+        "hooks",
+        "multi_agent_v2",
+        "apps",
+        "plugins",
+        "tool_suggest",
+        "image_generation",
+        "goals",
+        "token_budget",
+        "browser_use",
+        "browser_use_external",
+        "computer_use",
+        "in_app_browser",
+        "artifact",
+        "realtime_conversation",
+        "send_message_to_user_async",
+        "current_time_reminder",
+        "deferred_executor",
+        "request_permissions_tool",
+    ] {
+        argv.extend(["-c".into(), format!("features.{key}=false")]);
+    }
+    for value in [
+        "agents.enabled=false",
+        "features.code_mode.enabled=false",
+        "features.code_mode_host.enabled=false",
+        "orchestrator.mcp.enabled=false",
+        "cloud.skills.enabled=false",
+        "tools.update_plan.enabled=false",
+        "tools.experimental_request_user_input.enabled=false",
+        "analytics.enabled=false",
+        "project_doc_max_bytes=0",
+        "notify=[]",
+        "mcp_servers={}",
+        "approval_policy=\"never\"",
+        "sandbox_mode=\"read-only\"",
+        "model_reasoning_effort=\"max\"",
+        "service_tier=\"fast\"",
+        "features.fast_mode=true",
+    ] {
+        argv.extend(["-c".into(), value.into()]);
+    }
+    argv.extend([
         "app-server".into(),
         "--listen".into(),
         "stdio://".into(),
         "--strict-config".into(),
-    ])
+    ]);
+    Ok(argv)
 }
 fn initialize() -> Value {
     json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"gptgrep-original-judge","version":"1"},"capabilities":{"experimentalApi":false}}})
@@ -196,7 +248,7 @@ fn frame(v: &Value) -> Result<Vec<u8>> {
     b.push(b'\n');
     Ok(b)
 }
-fn recipe(a: &Admission) -> Result<String> {
+pub(super) fn recipe(a: &Admission) -> Result<String> {
     Ok(digest(&json_bytes(
         &json!({
             "schema_version":"gptgrep.judge.app-server-recipe.v1", "mapping_source":MAPPING,
@@ -294,6 +346,7 @@ struct ProtocolObservations {
     raw_response_usage: Option<TokenUsage>,
     rpc_error_code: Option<i64>,
     events_observed: usize,
+    automatic_metadata_notifications: usize,
     tools_observed_and_rejected: bool,
     tool_prevention_qualified: bool,
     served_profile_qualified: bool,
@@ -326,6 +379,195 @@ enum Stage {
     Running,
     Complete,
 }
+#[derive(Default)]
+struct AutomaticMetadata {
+    notifications: usize,
+}
+
+impl AutomaticMetadata {
+    fn observe(&mut self, message: &Value) -> Result<bool> {
+        let method = message["method"].as_str();
+        if !matches!(
+            method,
+            Some("account/updated" | "account/rateLimits/updated" | "remoteControl/status/changed")
+        ) {
+            return Ok(false);
+        }
+        ensure!(
+            message.get("id").is_none(),
+            "app_automatic_metadata_server_request"
+        );
+        ensure!(self.notifications < 32, "app_automatic_metadata_limit");
+        let params = &message["params"];
+        match method {
+            Some("account/updated") => {
+                metadata_object(params, &["authMode"], &["authMode", "planType"])?;
+                ensure!(
+                    params["authMode"] == "chatgpt",
+                    "app_native_chatgpt_auth_required"
+                );
+                ensure!(
+                    nullable_enum(&params["planType"], PLAN_TYPES),
+                    "app_invalid_automatic_metadata"
+                );
+            }
+            Some("remoteControl/status/changed") => {
+                metadata_object(
+                    params,
+                    &["installationId", "serverName", "status"],
+                    &["installationId", "serverName", "status", "environmentId"],
+                )?;
+                ensure!(
+                    params["installationId"].is_string()
+                        && params["serverName"].is_string()
+                        && nullable_string(&params["environmentId"]),
+                    "app_invalid_automatic_metadata"
+                );
+                ensure!(
+                    params["status"] == "disabled",
+                    "app_remote_control_not_disabled"
+                );
+            }
+            Some("account/rateLimits/updated") => validate_rate_metadata(params)?,
+            _ => unreachable!(),
+        }
+        self.notifications += 1;
+        Ok(true)
+    }
+}
+
+// Public enum values from the installed official AccountUpdatedNotification and
+// AccountRateLimitsUpdatedNotification DTOs. These are syntax, not entitlement.
+const PLAN_TYPES: &[&str] = &[
+    "free",
+    "go",
+    "plus",
+    "pro",
+    "prolite",
+    "promax",
+    "team",
+    "self_serve_business_prolite",
+    "self_serve_business_usage_based",
+    "business",
+    "ent26",
+    "enterprise_cbp_automation",
+    "enterprise_cbp_usage_based",
+    "enterprise",
+    "edu",
+    "edu_plus",
+    "edu_pro",
+    "unknown",
+];
+const RATE_REACHED_TYPES: &[&str] = &[
+    "rate_limit_reached",
+    "workspace_owner_credits_depleted",
+    "workspace_member_credits_depleted",
+    "workspace_owner_usage_limit_reached",
+    "workspace_member_usage_limit_reached",
+];
+
+fn metadata_object<'a>(
+    value: &'a Value,
+    required: &[&str],
+    allowed: &[&str],
+) -> Result<&'a serde_json::Map<String, Value>> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("app_invalid_automatic_metadata"))?;
+    ensure!(
+        required.iter().all(|key| object.contains_key(*key))
+            && object.keys().all(|key| allowed.contains(&key.as_str())),
+        "app_invalid_automatic_metadata"
+    );
+    Ok(object)
+}
+fn nullable_string(value: &Value) -> bool {
+    value.is_null() || value.is_string()
+}
+fn nullable_enum(value: &Value, allowed: &[&str]) -> bool {
+    value.is_null() || value.as_str().is_some_and(|name| allowed.contains(&name))
+}
+fn metadata_i32(value: &Value) -> bool {
+    value.as_i64().is_some_and(|n| i32::try_from(n).is_ok())
+}
+fn validate_rate_metadata(params: &Value) -> Result<()> {
+    metadata_object(params, &["rateLimits"], &["rateLimits"])?;
+    let rates = &params["rateLimits"];
+    metadata_object(
+        rates,
+        &[],
+        &[
+            "credits",
+            "individualLimit",
+            "limitId",
+            "limitName",
+            "normalModelSlug",
+            "planType",
+            "primary",
+            "rateLimitReachedType",
+            "secondary",
+            "spendControlReached",
+        ],
+    )?;
+    ensure!(
+        ["limitId", "limitName", "normalModelSlug"]
+            .iter()
+            .all(|key| nullable_string(&rates[*key]))
+            && nullable_enum(&rates["planType"], PLAN_TYPES)
+            && nullable_enum(&rates["rateLimitReachedType"], RATE_REACHED_TYPES)
+            && (rates["spendControlReached"].is_null()
+                || rates["spendControlReached"].is_boolean()),
+        "app_invalid_automatic_metadata"
+    );
+    for name in ["primary", "secondary"] {
+        let window = &rates[name];
+        if !window.is_null() {
+            metadata_object(
+                window,
+                &["usedPercent"],
+                &["usedPercent", "resetsAt", "windowDurationMins"],
+            )?;
+            ensure!(
+                metadata_i32(&window["usedPercent"])
+                    && ["resetsAt", "windowDurationMins"]
+                        .iter()
+                        .all(|key| window[*key].is_null() || window[*key].is_i64()),
+                "app_invalid_automatic_metadata"
+            );
+        }
+    }
+    let credits = &rates["credits"];
+    if !credits.is_null() {
+        metadata_object(
+            credits,
+            &["hasCredits", "unlimited"],
+            &["hasCredits", "unlimited", "balance"],
+        )?;
+        ensure!(
+            credits["hasCredits"].is_boolean()
+                && credits["unlimited"].is_boolean()
+                && nullable_string(&credits["balance"]),
+            "app_invalid_automatic_metadata"
+        );
+    }
+    let limit = &rates["individualLimit"];
+    if !limit.is_null() {
+        metadata_object(
+            limit,
+            &["limit", "used", "remainingPercent", "resetsAt"],
+            &["limit", "used", "remainingPercent", "resetsAt"],
+        )?;
+        ensure!(
+            limit["limit"].is_string()
+                && limit["used"].is_string()
+                && metadata_i32(&limit["remainingPercent"])
+                && limit["resetsAt"].is_i64(),
+            "app_invalid_automatic_metadata"
+        );
+    }
+    Ok(())
+}
+
 struct Session<'a> {
     prompt: &'a str,
     schema: &'a Value,
@@ -345,6 +587,7 @@ struct Session<'a> {
     early: Vec<Vec<u8>>,
     early_bytes: usize,
     protocol: ProtocolObservations,
+    metadata: AutomaticMetadata,
 }
 impl<'a> Session<'a> {
     fn new(prompt: &'a str, schema: &'a Value, cwd: &'a str) -> Result<Self> {
@@ -376,6 +619,7 @@ impl<'a> Session<'a> {
             response_id: None,
             early: Vec::new(),
             early_bytes: 0,
+            metadata: AutomaticMetadata::default(),
             protocol: ProtocolObservations {
                 mapping_source: MAPPING,
                 configured_ack: None,
@@ -383,6 +627,7 @@ impl<'a> Session<'a> {
                 raw_response_usage: None,
                 rpc_error_code: None,
                 events_observed: 0,
+                automatic_metadata_notifications: 0,
                 tools_observed_and_rejected: false,
                 tool_prevention_qualified: false,
                 served_profile_qualified: false,
@@ -453,6 +698,10 @@ impl<'a> Session<'a> {
                 bail!("app_server_request_rejected");
             }
             ensure!(o.len() == 2 && o.contains_key("params"), "app_rpc_envelope");
+            if self.metadata.observe(&v)? {
+                self.protocol.automatic_metadata_notifications = self.metadata.notifications;
+                return Ok(());
+            }
             if self.stage == Stage::Turn {
                 // Real turn events may precede turn/start's RPC response. Hold bounded original
                 // bytes, not provisional IDs; replay after binding the returned native turn ID.
@@ -797,6 +1046,12 @@ pub(super) fn dispatch(path: &Path, sha: &str, run: bool) -> Result<String> {
     let a = Admission::load(path, sha)?;
     let actual_recipe = recipe(&a)?;
     reserve_receipt(&a)?;
+    if a.phase.is_some() {
+        ensure!(
+            actual_recipe == a.control.runtime.recipe_sha256,
+            "app_recipe_mismatch"
+        );
+    }
     if !run {
         return String::from_utf8(json_bytes(&json!({
             "schema_version":"gptgrep.judge.app-server-preflight.v1","status":"preflight_no_effects",
@@ -810,8 +1065,11 @@ pub(super) fn dispatch(path: &Path, sha: &str, run: bool) -> Result<String> {
             "original_formatter_reconstruction":"not_replayed_by_app_server_preflight"
         }),a.control.limits.receipt_bytes)?).map_err(Into::into);
     }
-    // The existing authority constructor always fails, before reconstruction, claim or spawn.
-    let permit = authorize(&a)?;
+    ensure!(
+        actual_recipe == a.control.runtime.recipe_sha256,
+        "app_recipe_mismatch"
+    );
+    let permit = authorize_app_server(&a)?;
     let outcome = execute(&a, permit)?;
     String::from_utf8(json_bytes(&outcome, a.control.limits.receipt_bytes)?).map_err(Into::into)
 }
@@ -865,11 +1123,15 @@ fn pump<W: Write, R: Read, E: Read>(
     deadline: Instant,
     exit: &mut dyn FnMut() -> Result<Option<bool>>,
     facts: &mut PumpFacts,
+    original_clock: Option<&gptgrep_jev::RunClockAnchor>,
 ) -> Result<()> {
     let mut scratch = [0u8; 4096];
     let mut line = Vec::new();
     line.try_reserve_exact(limits.event_bytes)?;
     loop {
+        if let Some(clock) = original_clock {
+            clock.remaining()?;
+        }
         ensure!(Instant::now() < deadline, "app_deadline");
         if session.stage == Stage::Complete {
             io.input = None;
@@ -972,6 +1234,7 @@ fn report(a: &Admission, origin: &'static str) -> AppReport {
             raw_response_usage: None,
             rpc_error_code: None,
             events_observed: 0,
+            automatic_metadata_notifications: 0,
             tools_observed_and_rejected: false,
             tool_prevention_qualified: false,
             served_profile_qualified: false,
@@ -1003,7 +1266,12 @@ fn reserve_receipt(a: &Admission) -> Result<()> {
     worst["protocol"]["raw_response_usage"] = usage;
     // A low receipt budget may intentionally reject before claim. Retaining verdict is optional
     // for a low budget, but unknown observations must fit even without a typed verdict.
-    worst["verdict"] = Value::Null;
+    worst["verdict"] = if a.phase.is_some() {
+        json!({"equivalent":true,"abstained":true,"reason":"\u{1}".repeat(a.control.limits.final_bytes)})
+    } else {
+        Value::Null
+    };
+    worst["protocol"]["automatic_metadata_notifications"] = json!(32);
     outcome_allowance(&worst, a.control.limits.receipt_bytes).context("app_receipt_allowance")
 }
 fn execute(a: &Admission, permit: ExecutionPermit) -> Result<AppOutcome> {
@@ -1017,6 +1285,7 @@ fn execute(a: &Admission, permit: ExecutionPermit) -> Result<AppOutcome> {
         "app_recipe_mismatch"
     );
     reserve_receipt(a)?;
+    permit.check()?;
     a.prepared.reconstruct(
         a.control.output_root.parent().context("output_parent")?,
         permit.deadline,
@@ -1026,7 +1295,7 @@ fn execute(a: &Admission, permit: ExecutionPermit) -> Result<AppOutcome> {
     let mut report = report(a, permit.observation_origin);
     let mut final_bytes = None;
     let result: Result<()> = (|| {
-        ensure!(Instant::now() < permit.deadline, "app_deadline");
+        permit.check()?;
         let staging = private_tempdir(
             a.control.output_root.parent().context("output_parent")?,
             ".judge-app-server-",
@@ -1045,7 +1314,7 @@ fn execute(a: &Admission, permit: ExecutionPermit) -> Result<AppOutcome> {
             &permit.argv
         };
         a.fresh()?;
-        ensure!(Instant::now() < permit.deadline, "app_deadline");
+        permit.check()?;
         let mut command = Command::new(&a.binary.path);
         command
             .args(argv)
@@ -1053,6 +1322,7 @@ fn execute(a: &Admission, permit: ExecutionPermit) -> Result<AppOutcome> {
             .env("PATH", &a.control.environment.path)
             .env("HOME", &a.control.environment.home)
             .env("CODEX_HOME", &a.control.environment.codex_home)
+            .env("CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED", "1")
             .env("TMPDIR", &a.control.environment.tmpdir)
             .env("LANG", "C.UTF-8")
             .env("LC_ALL", "C.UTF-8")
@@ -1070,11 +1340,21 @@ fn execute(a: &Admission, permit: ExecutionPermit) -> Result<AppOutcome> {
                 Ok(())
             });
         }
-        ensure!(Instant::now() < permit.deadline, "app_deadline");
+        permit.check()?;
         let mut child = command.spawn()?;
         report.base.observations.wrapper_spawned = true;
         let mut facts = PumpFacts::new();
         let process_result: Result<()> = (|| {
+            if a.phase.is_some() {
+                permit.check()?;
+                let mut event = private_file(
+                    &claim_root,
+                    &format!("{}.started.json", a.control.invocation_id),
+                )?;
+                event.write_all(&json_bytes(&json!({"schema_version":"gptgrep.judge.native-lifecycle.v1","state":"owned_child_spawn_observed","control_sha256":a.control_snapshot.sha256,"actual_provider_calls":null}),RECEIPT_CAP)?)?;
+                event.sync_all()?;
+                claim_root.sync_all()?;
+            }
             let mut io = Pipes {
                 input: Some(child.stdin.take().context("app_pipe")?),
                 stdout: child.stdout.take().context("app_pipe")?,
@@ -1090,6 +1370,7 @@ fn execute(a: &Admission, permit: ExecutionPermit) -> Result<AppOutcome> {
                 permit.deadline,
                 &mut || Ok(child.try_wait()?.map(|s| s.success())),
                 &mut facts,
+                permit.original_clock.as_ref(),
             )
         })();
         report.base.observations.wrapper_leader_reaped = facts.leader_exit.is_some();
@@ -1126,7 +1407,11 @@ fn execute(a: &Admission, permit: ExecutionPermit) -> Result<AppOutcome> {
         Ok(())
     })();
     report.base.status = if result.is_ok() {
-        "typed_structural_unqualified"
+        if permit.observation_origin == "native_app_server_v2" {
+            "completed_actual"
+        } else {
+            "typed_structural_unqualified"
+        }
     } else if report.base.observations.wrapper_spawned {
         "completion_unknown_quarantined"
     } else {
@@ -1136,6 +1421,33 @@ fn execute(a: &Admission, permit: ExecutionPermit) -> Result<AppOutcome> {
         report.base.failure_code = Some("app_unavailable_no_retry");
         report.base.verdict = None;
         final_bytes = None;
+    }
+    if a.phase.is_some() {
+        let recorded = (|| -> Result<()> {
+            if result.is_ok() {
+                permit.check()?;
+            }
+            let mut event = private_file(
+                &claim_root,
+                &format!("{}.finished.json", a.control.invocation_id),
+            )?;
+            event.write_all(&json_bytes(&json!({"schema_version":"gptgrep.judge.native-lifecycle.v1","state":if result.is_ok(){"owned_terminal_sequence_and_pipe_eof_observed"}else{"completion_unknown_no_retry"},"control_sha256":a.control_snapshot.sha256,"owned_leader_reaped":report.base.observations.wrapper_leader_reaped,"actual_provider_calls":null}),RECEIPT_CAP)?)?;
+            event.sync_all()?;
+            claim_root.sync_all()?;
+            Ok(())
+        })();
+        if recorded.is_err() {
+            report.base.status = "completion_unknown_quarantined";
+            report.base.failure_code = Some("app_lifecycle_publication_unknown_no_retry");
+            report.base.verdict = None;
+            final_bytes = None;
+        }
+    }
+    if report.base.verdict.is_some() && permit.observation_origin == "native_app_server_v2" {
+        report.base.judge_status = "completed";
+        if let Some(verdict) = &mut report.base.verdict {
+            verdict.reason.clear();
+        }
     }
     let receipt = match outcome_allowance(&report, a.control.limits.receipt_bytes)
         .and_then(|()| json_bytes(&report, a.control.limits.receipt_bytes))
@@ -1158,13 +1470,13 @@ fn execute(a: &Admission, permit: ExecutionPermit) -> Result<AppOutcome> {
         report,
     };
     let fresh = || -> Result<()> {
-        ensure!(Instant::now() < permit.deadline, "app_deadline");
+        permit.check()?;
         a.fresh()?;
         ensure!(
             identity(&open_held(&a.control.invocation_root, true)?)? == claim_id,
             "native_claim_root_changed"
         );
-        ensure!(Instant::now() < permit.deadline, "app_deadline");
+        permit.check()?;
         Ok(())
     };
     if fresh().is_err() {
@@ -1175,6 +1487,10 @@ fn execute(a: &Admission, permit: ExecutionPermit) -> Result<AppOutcome> {
     }
     let mut snapshots = a.prepared.snapshots().to_vec();
     snapshots.push(&a.control_snapshot);
+    if let Some(phase) = &a.phase {
+        snapshots.push(&phase.phase);
+        snapshots.push(&phase.origin);
+    }
     let mut files = vec![("app-server-observation.json", receipt.as_slice())];
     if let Some(bytes) = final_bytes.as_ref() {
         files.push(("native-final.json", bytes.as_slice()));

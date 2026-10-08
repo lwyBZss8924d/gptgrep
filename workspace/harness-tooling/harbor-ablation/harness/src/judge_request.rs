@@ -29,7 +29,7 @@ const QUALIFICATION: &str = "source_structure_only_original_judge_unqualified";
 
 #[derive(Parser)]
 #[command(
-    about = "Verifier-only original judge requests; native execution policy unavailable; no rewards"
+    about = "Verifier-only original judge requests with explicitly bound v2 app-server execution"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -37,7 +37,7 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Operation {
-    /// Admit the fixed app-server broker recipe. --run refuses before effects.
+    /// Validate the app-server recipe; --run requires a fresh bound v2 execution phase.
     ExecuteAppServer {
         #[arg(long)]
         control: PathBuf,

@@ -40,6 +40,197 @@ for event in events:
     sys.stdout.write(json.dumps(event,ensure_ascii=False,separators=(',',':')) + '\n')
 sys.stdout.flush()
 "#;
+
+fn v2_fixture() -> Result<MockFixture> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut f = MockFixture::new()?;
+    let mut c: Control = strict(&fs::read(&f.control)?)?;
+    // OS HOME is a namespace, not a ban on all input/output beneath it.
+    c.environment.home = f.fixture.root.clone();
+    c.limits.final_bytes = 8192;
+    let bytes = json_bytes(&c, CONTROL_MAX)?;
+    fs::write(&f.control, &bytes)?;
+    c.runtime.recipe_sha256 = app_server::recipe(&Admission::load(&f.control, &digest(&bytes))?)?;
+    let clock: gptgrep_jev::RunClockAnchor = serde_json::from_value(json!({
+        "schema":"gptgrep.run-clock-anchor.v1","deadline_unix_ms":9999999999999u64,
+        "clock_kind":"synthetic-test-only","boot_identity":"invented-test-boot",
+        "clock_namespace":null,"monotonic_started_ns":1,"monotonic_deadline_ns":2
+    }))?;
+    let mut ids = Vec::new();
+    for dir in [
+        &c.environment.codex_home,
+        &c.environment.sqlite_home,
+        &c.environment.log_dir,
+    ] {
+        fs::create_dir(dir)?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        ids.push(identity(&open_held(dir, true)?)?);
+    }
+    let origin = f.fixture.root.join("origin.json");
+    let value = PhaseOrigin {
+        schema_version: "gptgrep.judge.native-origin.v1".into(),
+        run_id: "test-fresh-run".into(),
+        original_clock_sha256: digest(&serde_json::to_vec(&clock)?),
+        deadline_unix_ms: clock.deadline_unix_ms(),
+        original_clock: clock,
+        codex_identity: ids[0],
+        sqlite_identity: ids[1],
+        log_identity: ids[2],
+    };
+    let bytes = json_bytes(&value, CONTROL_MAX)?;
+    fs::write(&origin, &bytes)?;
+    fs::set_permissions(&origin, fs::Permissions::from_mode(0o600))?;
+    c.schema_version = "gptgrep.judge.native-control.v2".into();
+    let prepared = PreparedRequest::load(
+        &c.request.root,
+        &c.request.manifest_sha256,
+        f.fixture.python()?,
+    )?;
+    let m: Manifest = strict(&prepared.manifest.bytes)?;
+    let phase = NativePhase {
+        schema_version: "gptgrep.judge.native-phase.v1".into(),
+        role: "verifier_only".into(),
+        run_id: "test-fresh-run".into(),
+        invocation_id: c.invocation_id.clone(),
+        trial_id: "test-trial".into(),
+        task_id: "test-task".into(),
+        arm: "qualification".into(),
+        control_projection_sha256: control_projection(&c)?,
+        request_manifest_sha256: prepared.manifest.sha256.clone(),
+        request_sha256: prepared.saved.sha256.clone(),
+        judge_source_sha256: prepared.source.sha256.clone(),
+        reference_sha256: prepared.reference.sha256.clone(),
+        answer_sha256: prepared.answer.sha256.clone(),
+        schema_sha256: prepared.decoded.formatted.verdict_schema_sha256.clone(),
+        runtime_sha256: c.runtime.binary_sha256.clone(),
+        runtime_schema_sha256: "8".repeat(64),
+        formatter_sha256: digest(FORMATTER.as_bytes()),
+        original_revision: m.original_revision,
+        recipe_sha256: c.runtime.recipe_sha256.clone(),
+        origin: PhaseFile {
+            path: origin,
+            sha256: digest(&bytes),
+        },
+        child_timeout_ms: 120000,
+        child_count: 1,
+        turn_count: 1,
+        retry_count: 0,
+        fallback_count: 0,
+    };
+    let phase_path = f.fixture.root.join("phase.json");
+    let bytes = json_bytes(&phase, CONTROL_MAX)?;
+    fs::write(&phase_path, &bytes)?;
+    fs::set_permissions(&phase_path, fs::Permissions::from_mode(0o600))?;
+    c.phase.origin_receipt_sha256 = phase.origin.sha256;
+    c.phase.execution_policy_sha256 = digest(&bytes);
+    c.phase.binding = Some(PhaseFile {
+        path: phase_path,
+        sha256: digest(&bytes),
+    });
+    let bytes = json_bytes(&c, CONTROL_MAX)?;
+    fs::write(&f.control, &bytes)?;
+    fs::set_permissions(&f.control, fs::Permissions::from_mode(0o600))?;
+    f.control_sha = digest(&bytes);
+    Ok(f)
+}
+
+#[test]
+fn explicit_v2_phase_preserves_original_anchor_without_clock_capture_or_exec_permission()
+-> Result<()> {
+    let f = v2_fixture()?;
+    let a = f.admit()?;
+    let preflight: Value =
+        strict(dispatch_app_server(&f.control, &f.control_sha, false)?.as_bytes())?;
+    assert_eq!(preflight["recipe_matches"], true);
+    assert_eq!(preflight["effect_count"], 0);
+    let phase = a.phase.as_ref().unwrap();
+    let permit = app_permit(&a, |clock| {
+        assert!(clock == &phase.clock.original_clock);
+        Ok(Duration::from_secs(5))
+    })?;
+    assert!(permit.deadline <= Instant::now() + Duration::from_secs(5));
+    assert!(permit.original_clock.as_ref() == Some(&phase.clock.original_clock));
+    assert!(permit.argv.is_empty());
+    assert!(authorize(&a).is_err()); // Legacy standard exec stays closed even for v2.
+    assert!(!f.claim_exists() && !f.output.exists());
+    Ok(())
+}
+
+#[test]
+fn v2_wrong_binding_role_count_or_tampered_inputs_refuse_before_claim() -> Result<()> {
+    let mut f = v2_fixture()?;
+    let original: Control = strict(&fs::read(&f.control)?)?;
+    let phase_path = &original.phase.binding.as_ref().unwrap().path;
+    let phase: Value = strict(&fs::read(phase_path)?)?;
+    for (key, value) in [
+        ("role", json!("reader")),
+        ("run_id", json!("")),
+        ("invocation_id", json!("other")),
+        ("request_manifest_sha256", json!("0".repeat(64))),
+        ("runtime_sha256", json!("0".repeat(64))),
+        ("control_projection_sha256", json!("0".repeat(64))),
+        ("answer_sha256", json!("0".repeat(64))),
+        ("reference_sha256", json!("0".repeat(64))),
+        ("judge_source_sha256", json!("0".repeat(64))),
+        ("schema_sha256", json!("0".repeat(64))),
+        ("formatter_sha256", json!("0".repeat(64))),
+        ("original_revision", json!("0".repeat(40))),
+        ("child_count", json!(2)),
+        ("turn_count", json!(2)),
+        ("retry_count", json!(1)),
+        ("fallback_count", json!(1)),
+        ("child_timeout_ms", json!(120001)),
+    ] {
+        let mut bad = phase.clone();
+        bad[key] = value;
+        let bytes = json_bytes(&bad, CONTROL_MAX)?;
+        fs::write(phase_path, &bytes)?;
+        let mut c: Control = strict(&fs::read(&f.control)?)?;
+        c.phase.execution_policy_sha256 = digest(&bytes);
+        c.phase.binding.as_mut().unwrap().sha256 = digest(&bytes);
+        let bytes = json_bytes(&c, CONTROL_MAX)?;
+        fs::write(&f.control, &bytes)?;
+        f.control_sha = digest(&bytes);
+        assert!(f.admit().is_err(), "{key}");
+        assert!(!f.claim_exists() && !f.output.exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn v2_expired_or_changed_clock_and_home_namespace_fail_without_effects() -> Result<()> {
+    let f = v2_fixture()?;
+    let a = f.admit()?;
+    assert!(app_permit(&a, |_| bail!("synthetic_expired_original_clock")).is_err());
+    assert!(app_permit(&a, |_| bail!("synthetic_different_boot_or_namespace")).is_err());
+    assert!(app_permit(&a, |_| Ok(Duration::ZERO)).is_err());
+    fs::rename(
+        &a.control.environment.codex_home,
+        f.fixture.root.join("old-codex"),
+    )?;
+    fs::create_dir(&a.control.environment.codex_home)?;
+    assert!(app_permit(&a, |_| Ok(Duration::from_secs(5))).is_err());
+    assert!(!f.claim_exists() && !f.output.exists());
+    Ok(())
+}
+
+#[test]
+fn os_home_namespace_allows_regular_inputs_and_output_but_selected_state_is_excluded() -> Result<()>
+{
+    let f = MockFixture::new()?;
+    let mut c: Control = strict(&fs::read(&f.control)?)?;
+    c.environment.home = f.fixture.root.clone();
+    let bytes = json_bytes(&c, CONTROL_MAX)?;
+    fs::write(&f.control, &bytes)?;
+    let a = Admission::load(&f.control, &digest(&bytes))?;
+    a.fresh_output()?;
+    c.output_root = c.environment.codex_home.join("output");
+    let bytes = json_bytes(&c, CONTROL_MAX)?;
+    fs::write(&f.control, &bytes)?;
+    assert!(Admission::load(&f.control, &digest(&bytes)).is_err());
+    assert!(!f.claim_exists() && !f.output.exists());
+    Ok(())
+}
 struct MockFixture {
     fixture: Fixture,
     control: PathBuf,
@@ -86,6 +277,7 @@ impl MockFixture {
             phase: PhaseReferences {
                 origin_receipt_sha256: "3".repeat(64),
                 execution_policy_sha256: "4".repeat(64),
+                binding: None,
             },
             invocation_root: claim_root.clone(),
             output_root: output.clone(),
@@ -118,6 +310,7 @@ impl MockFixture {
             control_sha256: admitted.control_snapshot.sha256.clone(),
             deadline: Instant::now() + wall,
             observation_origin: "mock_child_fixture",
+            original_clock: None,
             argv: vec![
                 "-I".into(),
                 "-S".into(),
@@ -465,7 +658,6 @@ fn nested_native_home_state_overlap_is_rejected_before_open_and_tmpdir_remains_a
     let original: Value = strict(&fs::read(&f.control)?)?;
     assert!(f.admit().is_ok()); // All selected inputs may share the explicitly admitted TMPDIR.
     for (state, input) in [
-        ("home", "root"),
         ("codex_home", "python"),
         ("sqlite_home", "binary"),
         ("log_dir", "binary"),

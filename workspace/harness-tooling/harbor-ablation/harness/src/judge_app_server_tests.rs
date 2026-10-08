@@ -3,6 +3,130 @@ use super::super::super::tests::Fixture;
 use super::*;
 
 const RAW: &str = r#"{"equivalent":false,"abstained":false,"reason":""}"#;
+fn automatic(method: &str, params: Value) -> Value {
+    json!({"method":method,"params":params})
+}
+#[test]
+fn automatic_metadata_uses_one_discard_counter_across_all_phases() -> Result<()> {
+    let sc = schema();
+    let mut s = Session::new("generic", &sc, "/mock")?;
+    let account = automatic(
+        "account/updated",
+        json!({"authMode":"chatgpt","planType":"pro"}),
+    );
+    let rates = automatic(
+        "account/rateLimits/updated",
+        json!({"rateLimits":{"primary":{"usedPercent":0,"resetsAt":null},"credits":null}}),
+    );
+    let remote = automatic(
+        "remoteControl/status/changed",
+        json!({"installationId":"private-discarded","serverName":"private-discarded","status":"disabled","environmentId":null}),
+    );
+    for stage in [
+        Stage::SendInit,
+        Stage::Init,
+        Stage::SendThread,
+        Stage::Thread,
+        Stage::ThreadStarted,
+        Stage::SendTurn,
+        Stage::Turn,
+        Stage::Running,
+        Stage::Complete,
+    ] {
+        s.stage = stage;
+        for event in [&account, &rates, &remote] {
+            emit(&mut s, event.clone())?;
+        }
+    }
+    assert_eq!(s.metadata.notifications, 27);
+    assert!(s.early.is_empty());
+    for _ in 0..5 {
+        emit(&mut s, account.clone())?;
+    }
+    assert_eq!(s.protocol.automatic_metadata_notifications, 32);
+    assert!(emit(&mut s, account).is_err());
+    let receipt = serde_json::to_string(&s.protocol)?;
+    assert!(
+        !receipt.contains("private-discarded")
+            && !receipt.contains("planType")
+            && !receipt.contains("usedPercent")
+    );
+    Ok(())
+}
+#[test]
+fn automatic_metadata_invalid_shapes_requests_and_other_methods_stay_refused() -> Result<()> {
+    let sc = schema();
+    for event in [
+        automatic("account/updated", json!({"authMode":null})),
+        automatic("account/updated", json!({"authMode":"apiKey"})),
+        automatic(
+            "account/updated",
+            json!({"authMode":"chatgpt","planType":"invented"}),
+        ),
+        automatic(
+            "account/updated",
+            json!({"authMode":"chatgpt","extra":true}),
+        ),
+        automatic("account/rateLimits/updated", json!({"rateLimits":null})),
+        automatic(
+            "account/rateLimits/updated",
+            json!({"rateLimits":{"primary":{"usedPercent":null}}}),
+        ),
+        automatic(
+            "account/rateLimits/updated",
+            json!({"rateLimits":{"primary":{"usedPercent":2147483648u64}}}),
+        ),
+        automatic(
+            "account/rateLimits/updated",
+            json!({"rateLimits":{"credits":{"hasCredits":1,"unlimited":false}}}),
+        ),
+        automatic(
+            "remoteControl/status/changed",
+            json!({"installationId":"x","serverName":"x","status":"enabled"}),
+        ),
+        automatic(
+            "remoteControl/status/changed",
+            json!({"installationId":"x","serverName":"x","status":"disabled","environmentId":1}),
+        ),
+        json!({"id":9,"method":"account/updated","params":{"authMode":"chatgpt"}}),
+        automatic("warning", json!({})),
+        automatic("model/rerouted", json!({})),
+        automatic("unknown", json!({})),
+    ] {
+        let mut s = Session::new("generic", &sc, "/mock")?;
+        assert!(emit(&mut s, event).is_err());
+        assert_eq!(s.metadata.notifications, 0);
+    }
+    Ok(())
+}
+#[test]
+fn automatic_metadata_does_not_change_completed_native_ids_or_absent_usage() -> Result<()> {
+    let sc = schema();
+    let mut s = Session::new("generic", &sc, "/mock")?;
+    emit(
+        &mut s,
+        automatic("account/updated", json!({"authMode":"chatgpt"})),
+    )?;
+    start(&mut s)?;
+    emit(
+        &mut s,
+        automatic(
+            "remoteControl/status/changed",
+            json!({"installationId":"discard","serverName":"discard","status":"disabled"}),
+        ),
+    )?;
+    final_items(&mut s)?;
+    emit(&mut s, terminal())?;
+    emit(
+        &mut s,
+        automatic("account/rateLimits/updated", json!({"rateLimits":{}})),
+    )?;
+    assert_eq!(s.thread_id.as_deref(), Some("native-thread"));
+    assert_eq!(s.turn_id.as_deref(), Some("native-turn"));
+    assert!(s.protocol.thread_usage.is_none() && s.response_id.is_none());
+    assert_eq!(s.metadata.notifications, 3);
+    Ok(())
+}
 fn schema() -> Value {
     json!({"type":"object","additionalProperties":false,"required":["equivalent","abstained","reason"],"properties":{"equivalent":{"type":"boolean"},"abstained":{"type":"boolean"},"reason":{"type":"string"}}})
 }
@@ -490,6 +614,7 @@ fn borrowed_stream_pump_drains_stderr_and_eof_without_retaining_diagnostics() ->
         Instant::now() + Duration::from_secs(1),
         &mut || Ok(Some(true)),
         &mut facts,
+        None,
     )?;
     assert!(s.stage == Stage::Complete && facts.stdout_eof && facts.stderr_eof);
     assert_eq!(facts.stdout_bytes, stdout.len());
@@ -527,7 +652,8 @@ fn expired_original_deadline_and_unsent_response_fail_before_any_write() -> Resu
             &limits(),
             Instant::now(),
             &mut || Ok(None),
-            &mut PumpFacts::new()
+            &mut PumpFacts::new(),
+            None,
         )
         .is_err()
     );
@@ -545,7 +671,8 @@ fn expired_original_deadline_and_unsent_response_fail_before_any_write() -> Resu
             &limits(),
             Instant::now() + Duration::from_secs(1),
             &mut || Ok(None),
-            &mut PumpFacts::new()
+            &mut PumpFacts::new(),
+            None,
         )
         .is_err()
     );
@@ -629,6 +756,7 @@ impl MockFixture {
             phase: PhaseReferences {
                 origin_receipt_sha256: "3".repeat(64),
                 execution_policy_sha256: "4".repeat(64),
+                binding: None,
             },
             invocation_root: claims.clone(),
             output_root: output.clone(),
@@ -662,6 +790,7 @@ impl MockFixture {
                     mode.into(),
                 ],
                 observation_origin: "mock_app_server_child",
+                original_clock: None,
             },
         )
     }
@@ -679,6 +808,7 @@ fn app_preflight_and_run_refusal_do_not_create_claim_home_or_output() -> Result<
         deadline: Instant::now(),
         argv: Vec::new(),
         observation_origin: "pure_expired_mock_permit",
+        original_clock: None,
     };
     assert!(consume(&a, &expired).is_err());
     assert!(!f.output.exists());

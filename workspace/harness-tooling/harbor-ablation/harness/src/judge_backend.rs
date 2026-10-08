@@ -1,5 +1,4 @@
-//! Native verifier source foundation. Production execution authority is unavailable.
-//! The private runner is exercised only with test-only mock permits. No rewards.
+//! Explicit once-only native app-server verifier admission. Legacy exec stays closed.
 use super::*;
 use std::os::fd::AsRawFd;
 
@@ -61,6 +60,173 @@ struct Environment {
 struct PhaseReferences {
     origin_receipt_sha256: String,
     execution_policy_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    binding: Option<PhaseFile>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PhaseFile {
+    path: PathBuf,
+    sha256: String,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativePhase {
+    schema_version: String,
+    role: String,
+    run_id: String,
+    invocation_id: String,
+    trial_id: String,
+    task_id: String,
+    arm: String,
+    control_projection_sha256: String,
+    request_manifest_sha256: String,
+    request_sha256: String,
+    judge_source_sha256: String,
+    reference_sha256: String,
+    answer_sha256: String,
+    schema_sha256: String,
+    runtime_sha256: String,
+    runtime_schema_sha256: String,
+    formatter_sha256: String,
+    original_revision: String,
+    recipe_sha256: String,
+    origin: PhaseFile,
+    child_timeout_ms: u64,
+    child_count: u8,
+    turn_count: u8,
+    retry_count: u8,
+    fallback_count: u8,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PhaseOrigin {
+    schema_version: String,
+    run_id: String,
+    original_clock: gptgrep_jev::RunClockAnchor,
+    original_clock_sha256: String,
+    deadline_unix_ms: u64,
+    // Physical directory identities, never account/auth contents.
+    codex_identity: (u64, u64),
+    sqlite_identity: (u64, u64),
+    log_identity: (u64, u64),
+}
+struct BoundPhase {
+    phase: Snapshot,
+    origin: Snapshot,
+    decoded: NativePhase,
+    clock: PhaseOrigin,
+}
+fn control_projection(control: &Control) -> Result<String> {
+    let mut value = serde_json::to_value(control)?;
+    value
+        .as_object_mut()
+        .context("native_control_contract")?
+        .remove("phase");
+    Ok(digest(&json_bytes(&value, CONTROL_MAX)?))
+}
+impl BoundPhase {
+    fn load(a: &Admission) -> Result<Option<Self>> {
+        let Some(binding) = &a.control.phase.binding else {
+            return Ok(None);
+        };
+        ensure!(
+            binding.sha256 == a.control.phase.execution_policy_sha256,
+            "native_phase_digest"
+        );
+        let state = [
+            &a.control.environment.codex_home,
+            &a.control.environment.sqlite_home,
+            &a.control.environment.log_dir,
+        ];
+        let check_path = |path: &Path| -> Result<()> {
+            let path = absolute(path)?;
+            for native in state {
+                let native = absolute(native)?;
+                ensure!(
+                    !path.starts_with(&native) && !native.starts_with(&path),
+                    "native_input_native_state_overlap"
+                );
+            }
+            let claim = absolute(&a.control.invocation_root)?;
+            ensure!(
+                !path.starts_with(&claim) && !claim.starts_with(&path),
+                "native_claim_input_overlap"
+            );
+            fresh_output(&a.control.output_root, &[&path])?;
+            Ok(())
+        };
+        check_path(&binding.path)?;
+        let phase = Snapshot::load(&binding.path, &binding.sha256, CONTROL_MAX)?;
+        let decoded: NativePhase = strict(&phase.bytes)?;
+        let manifest: Manifest = strict(&a.prepared.manifest.bytes)?;
+        ensure!(
+            decoded.schema_version == "gptgrep.judge.native-phase.v1"
+                && decoded.role == "verifier_only"
+                && intent(&decoded.run_id)
+                && decoded.invocation_id == a.control.invocation_id
+                && intent(&decoded.trial_id)
+                && intent(&decoded.task_id)
+                && matches!(
+                    decoded.arm.as_str(),
+                    "control" | "gptgrep" | "qualification"
+                )
+                && decoded.control_projection_sha256 == control_projection(&a.control)?
+                && decoded.request_manifest_sha256 == a.prepared.manifest.sha256
+                && decoded.request_sha256 == a.prepared.saved.sha256
+                && decoded.judge_source_sha256 == a.prepared.source.sha256
+                && decoded.reference_sha256 == a.prepared.reference.sha256
+                && decoded.answer_sha256 == a.prepared.answer.sha256
+                && decoded.schema_sha256 == a.prepared.decoded.formatted.verdict_schema_sha256
+                && decoded.formatter_sha256 == digest(FORMATTER.as_bytes())
+                && decoded.original_revision == manifest.original_revision
+                && decoded.runtime_sha256 == a.binary.sha256
+                && hex(&decoded.runtime_schema_sha256, 64)
+                && decoded.recipe_sha256 == a.control.runtime.recipe_sha256
+                && decoded.origin.sha256 == a.control.phase.origin_receipt_sha256
+                && decoded.child_count == 1
+                && decoded.turn_count == 1
+                && decoded.retry_count == 0
+                && decoded.fallback_count == 0
+                && (1..=120_000).contains(&decoded.child_timeout_ms),
+            "native_phase_binding"
+        );
+        check_path(&decoded.origin.path)?;
+        let origin = Snapshot::load(&decoded.origin.path, &decoded.origin.sha256, CONTROL_MAX)?;
+        use std::os::unix::fs::PermissionsExt;
+        ensure!(
+            [&phase.file, &origin.file, &a.control_snapshot.file]
+                .iter()
+                .all(|file| file
+                    .metadata()
+                    .is_ok_and(|m| m.permissions().mode() & 0o777 == 0o600)),
+            "native_phase_private_mode"
+        );
+        let clock: PhaseOrigin = strict(&origin.bytes)?;
+        ensure!(
+            clock.schema_version == "gptgrep.judge.native-origin.v1"
+                && clock.run_id == decoded.run_id
+                && clock.deadline_unix_ms == clock.original_clock.deadline_unix_ms()
+                && clock.original_clock_sha256
+                    == digest(&serde_json::to_vec(&clock.original_clock)?),
+            "native_origin_binding"
+        );
+        let mut inputs = a.prepared.snapshots().to_vec();
+        inputs.push(&a.control_snapshot);
+        ensure!(
+            phase.id != origin.id
+                && phase.id != a.binary.id
+                && origin.id != a.binary.id
+                && inputs.iter().all(|s| s.id != phase.id && s.id != origin.id),
+            "input_alias"
+        );
+        Ok(Some(Self {
+            phase,
+            origin,
+            decoded,
+            clock,
+        }))
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -157,14 +323,17 @@ struct Admission {
     control: Control,
     prepared: PreparedRequest,
     binary: Executable,
+    phase: Option<BoundPhase>,
 }
 impl Admission {
     fn load(path: &Path, sha: &str) -> Result<Self> {
         let control_snapshot = Snapshot::load(path, sha, CONTROL_MAX)?;
         let control: Control = strict(&control_snapshot.bytes)?;
         ensure!(
-            control.schema_version == "gptgrep.judge.native-control.v1"
-                && control.role == "verifier_only"
+            matches!(
+                control.schema_version.as_str(),
+                "gptgrep.judge.native-control.v1" | "gptgrep.judge.native-control.v2"
+            ) && control.role == "verifier_only"
                 && intent(&control.invocation_id)
                 && hex(&control.runtime.source_revision, 40)
                 && hex(&control.runtime.recipe_sha256, 64)
@@ -173,6 +342,13 @@ impl Admission {
             "native_control_contract"
         );
         control.limits.validate()?;
+        ensure!(
+            (control.schema_version.ends_with(".v2")
+                && control.phase.binding.is_some()
+                && control.limits.final_bytes <= 8192)
+                || (control.schema_version.ends_with(".v1") && control.phase.binding.is_none()),
+            "native_phase_version_contract"
+        );
         // These are portable path strings only. Do not inspect homes, claims or phase ledgers.
         for p in [
             &control.environment.home,
@@ -211,7 +387,6 @@ impl Admission {
         ] {
             let input = absolute(input)?;
             for native_state in [
-                &control.environment.home,
                 &control.environment.codex_home,
                 &control.environment.sqlite_home,
                 &control.environment.log_dir,
@@ -250,25 +425,37 @@ impl Admission {
         ];
         inputs.extend([
             control.invocation_root.as_path(),
-            control.environment.home.as_path(),
             control.environment.codex_home.as_path(),
             control.environment.sqlite_home.as_path(),
             control.environment.log_dir.as_path(),
         ]);
         fresh_output(&control.output_root, &inputs)?;
         let invocation = absolute(&control.invocation_root)?;
+        for state in [
+            &control.environment.codex_home,
+            &control.environment.sqlite_home,
+            &control.environment.log_dir,
+        ] {
+            let state = absolute(state)?;
+            ensure!(
+                !invocation.starts_with(&state) && !state.starts_with(&invocation),
+                "native_claim_state_overlap"
+            );
+        }
         ensure!(
             inputs[..4]
                 .iter()
                 .all(|p| !p.starts_with(&invocation) && !invocation.starts_with(p)),
             "native_claim_input_overlap"
         );
-        let value = Self {
+        let mut value = Self {
             control_snapshot,
             control,
             prepared,
             binary,
+            phase: None,
         };
+        value.phase = BoundPhase::load(&value)?;
         value.fresh()?;
         receipt_admission(
             &value,
@@ -286,18 +473,25 @@ impl Admission {
                 &self.binary.path,
                 &self.prepared.python.path,
                 &c.invocation_root,
-                &c.environment.home,
                 &c.environment.codex_home,
                 &c.environment.sqlite_home,
                 &c.environment.log_dir,
             ],
         )?;
+        if let Some(phase) = &self.phase {
+            fresh_output(&c.output_root, &[&phase.phase.path, &phase.origin.path])?;
+        }
         Ok(())
     }
     fn fresh(&self) -> Result<()> {
         self.control_snapshot.fresh()?;
         self.prepared.fresh()?;
-        self.binary.fresh()
+        self.binary.fresh()?;
+        if let Some(phase) = &self.phase {
+            phase.phase.fresh()?;
+            phase.origin.fresh()?;
+        }
+        Ok(())
     }
 }
 fn intent(value: &str) -> bool {
@@ -344,9 +538,70 @@ struct ExecutionPermit {
     // Immutable direct argv set only by an authority constructor, never Control input.
     argv: Vec<String>,
     observation_origin: &'static str,
+    original_clock: Option<gptgrep_jev::RunClockAnchor>,
+}
+impl ExecutionPermit {
+    fn check(&self) -> Result<()> {
+        ensure!(Instant::now() < self.deadline, "native_phase_expired");
+        if let Some(clock) = &self.original_clock {
+            clock.remaining()?;
+        }
+        Ok(())
+    }
 }
 fn authorize(_: &Admission) -> Result<ExecutionPermit> {
     bail!("native_execution_policy_unavailable")
+}
+fn authorize_app_server(a: &Admission) -> Result<ExecutionPermit> {
+    app_permit(a, gptgrep_jev::RunClockAnchor::remaining)
+}
+fn app_permit(
+    a: &Admission,
+    remaining: impl FnOnce(&gptgrep_jev::RunClockAnchor) -> Result<Duration>,
+) -> Result<ExecutionPermit> {
+    let phase = a
+        .phase
+        .as_ref()
+        .context("native_execution_policy_unavailable")?;
+    // Sample the process timer before any original-anchor or filesystem work.
+    let sampled = Instant::now();
+    let duration = remaining(&phase.clock.original_clock)?
+        .min(Duration::from_millis(phase.decoded.child_timeout_ms));
+    let deadline = sampled
+        .checked_add(duration)
+        .context("native_phase_deadline")?;
+    for (path, expected) in [
+        (
+            &a.control.environment.codex_home,
+            phase.clock.codex_identity,
+        ),
+        (
+            &a.control.environment.sqlite_home,
+            phase.clock.sqlite_identity,
+        ),
+        (&a.control.environment.log_dir, phase.clock.log_identity),
+    ] {
+        let directory = open_held(path, true)?;
+        ensure!(
+            identity(&directory)? == expected,
+            "native_home_namespace_changed"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        ensure!(
+            directory.metadata()?.permissions().mode() & 0o777 == 0o700,
+            "native_home_private_mode"
+        );
+    }
+    a.fresh()?;
+    a.fresh_output()?;
+    ensure!(Instant::now() < deadline, "native_phase_expired");
+    Ok(ExecutionPermit {
+        control_sha256: a.control_snapshot.sha256.clone(),
+        deadline,
+        argv: Vec::new(),
+        observation_origin: "native_app_server_v2",
+        original_clock: Some(phase.clock.original_clock.clone()),
+    })
 }
 fn toml_path(path: &Path) -> Result<String> {
     let s = path.to_str().context("native_path_contract")?;
@@ -423,6 +678,7 @@ fn consume(a: &Admission, permit: &ExecutionPermit) -> Result<File> {
         permit.control_sha256 == a.control_snapshot.sha256 && Instant::now() < permit.deadline,
         "native_execution_policy_unavailable"
     );
+    permit.check()?;
     a.fresh()?;
     a.fresh_output()?;
     let root = open_held(&a.control.invocation_root, true)?;
@@ -449,6 +705,7 @@ fn consume(a: &Admission, permit: &ExecutionPermit) -> Result<File> {
         Instant::now() < permit.deadline,
         "native_execution_policy_unavailable"
     );
+    permit.check()?;
     let mut claim = private_file(&root, &format!("{}.claim.json", a.control.invocation_id))?;
     claim.write_all(&claim_bytes)?;
     claim.sync_all()?;
