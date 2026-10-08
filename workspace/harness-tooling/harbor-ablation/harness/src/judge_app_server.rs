@@ -557,11 +557,16 @@ struct AutomaticMetadata {
 }
 
 impl AutomaticMetadata {
-    fn observe(&mut self, message: &Value) -> Result<bool> {
+    fn observe(&mut self, message: &Value, thread_id: Option<&str>) -> Result<bool> {
         let method = message["method"].as_str();
         if !matches!(
             method,
-            Some("account/updated" | "account/rateLimits/updated" | "remoteControl/status/changed")
+            Some(
+                "account/updated"
+                    | "account/rateLimits/updated"
+                    | "remoteControl/status/changed"
+                    | "warning"
+            )
         ) {
             return Ok(false);
         }
@@ -572,6 +577,21 @@ impl AutomaticMetadata {
         ensure!(self.notifications < 32, "app_automatic_metadata_limit");
         let params = &message["params"];
         match method {
+            Some("warning") => {
+                // Official WarningNotification is informational, with no turn target.
+                // Discard its bounded message; any specific thread target must be ours.
+                metadata_object(params, &["message"], &["message", "threadId"])?;
+                ensure!(
+                    params["message"].is_string(),
+                    "app_invalid_automatic_metadata"
+                );
+                if !params["threadId"].is_null() {
+                    same_id(
+                        &params["threadId"],
+                        thread_id.context("app_thread_missing")?,
+                    )?;
+                }
+            }
             Some("account/updated") => {
                 metadata_object(params, &["authMode"], &["authMode", "planType"])?;
                 ensure!(
@@ -881,7 +901,7 @@ impl<'a> Session<'a> {
                         .is_none_or(|value| value.as_i64().is_some()),
                 "app_rpc_envelope"
             );
-            if self.metadata.observe(&v)? {
+            if self.metadata.observe(&v, self.thread_id.as_deref())? {
                 self.protocol.automatic_metadata_notifications = self.metadata.notifications;
                 return Ok(());
             }

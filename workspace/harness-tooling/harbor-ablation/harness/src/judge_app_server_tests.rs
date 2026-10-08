@@ -35,6 +35,147 @@ fn automatic(method: &str, params: Value) -> Value {
     json!({"method":method,"params":params})
 }
 #[test]
+fn warning_metadata_is_bounded_and_independent_of_turn_lifecycle() -> Result<()> {
+    let sc = schema();
+    for stage in [
+        Stage::SendInit,
+        Stage::Init,
+        Stage::SendThread,
+        Stage::Thread,
+        Stage::ThreadStarted,
+        Stage::SendTurn,
+        Stage::Turn,
+        Stage::Running,
+        Stage::Complete,
+    ] {
+        for target in [None, Some(Value::Null), Some(json!("native-thread"))] {
+            let mut s = Session::new("generic", &sc, "/mock")?;
+            s.stage = stage;
+            s.thread_id = Some("native-thread".into());
+            let mut params = json!({"message":"MOCK-private-warning-text"});
+            if let Some(target) = target {
+                params["threadId"] = target;
+            }
+            let outgoing = s.outgoing.clone();
+            emit(&mut s, automatic("warning", params))?;
+            assert!(s.stage == stage && !s.started && s.final_text.is_none());
+            assert_eq!(s.thread_id.as_deref(), Some("native-thread"));
+            assert!(s.turn_id.is_none() && s.early.is_empty());
+            assert_eq!(s.outgoing, outgoing);
+            assert_eq!(s.protocol.automatic_metadata_notifications, 1);
+            assert!(s.protocol.failing_notification_category.is_none());
+            let receipt = serde_json::to_string(&s.protocol)?;
+            assert!(!receipt.contains("MOCK-private") && !receipt.contains("native-thread"));
+        }
+    }
+    Ok(())
+}
+#[test]
+fn warning_metadata_rejects_bad_shapes_foreign_targets_and_server_requests() -> Result<()> {
+    let sc = schema();
+    for params in [
+        json!({}),
+        json!({"message":null}),
+        json!({"message":true}),
+        json!({"message":{}}),
+        json!({"message":"MOCK-private","threadId":false}),
+        json!({"message":"MOCK-private","threadId":"foreign-thread"}),
+        json!({"message":"MOCK-private","threadId":""}),
+        json!({"message":"MOCK-private","turnId":"native-turn"}),
+        json!({"message":"MOCK-private","extra":null}),
+        json!([]),
+    ] {
+        let mut s = Session::new("generic", &sc, "/mock")?;
+        s.thread_id = Some("native-thread".into());
+        assert!(emit(&mut s, automatic("warning", params)).is_err());
+        assert_eq!(s.metadata.notifications, 0);
+    }
+    let mut s = Session::new("generic", &sc, "/mock")?;
+    assert!(
+        emit(
+            &mut s,
+            automatic(
+                "warning",
+                json!({"message":"MOCK-private","threadId":"native-thread"})
+            )
+        )
+        .is_err()
+    );
+    assert_eq!(s.metadata.notifications, 0);
+    for event in [
+        json!({"id":9,"method":"warning","params":{"message":"MOCK-private"}}),
+        automatic("configWarning", json!({"summary":"MOCK-private"})),
+    ] {
+        let mut s = Session::new("generic", &sc, "/mock")?;
+        assert!(emit(&mut s, event).is_err());
+        assert_eq!(s.metadata.notifications, 0);
+    }
+    Ok(())
+}
+#[test]
+fn warning_metadata_shares_discard_limit_and_retains_raw_frame_guards() -> Result<()> {
+    let sc = schema();
+    let mut s = Session::new("generic", &sc, "/mock")?;
+    for _ in 0..16 {
+        emit(
+            &mut s,
+            automatic("warning", json!({"message":"MOCK-private"})),
+        )?;
+        emit(
+            &mut s,
+            automatic("account/updated", json!({"authMode":"chatgpt"})),
+        )?;
+    }
+    assert_eq!(s.protocol.automatic_metadata_notifications, 32);
+    let error = emit(
+        &mut s,
+        automatic("warning", json!({"message":"MOCK-private"})),
+    )
+    .unwrap_err();
+    assert_eq!(static_failure_code(&error), "app_automatic_metadata_limit");
+    assert_eq!(s.metadata.notifications, 32);
+    for raw in [
+        br#"{"method":"warning","params":{"message":"x","message":"y"}}"#.as_slice(),
+        br#"{"method":"warning","params":{"message":"x"},"emittedAtMs":null}"#.as_slice(),
+        br#"{"method":"warning","params":{"message":"x"},"jsonrpc":"2.0"}"#.as_slice(),
+    ] {
+        let mut s = Session::new("generic", &sc, "/mock")?;
+        assert!(s.line(raw, &limits()).is_err());
+        assert_eq!(s.metadata.notifications, 0);
+    }
+    let mut s = Session::new("generic", &sc, "/mock")?;
+    let raw = frame(&automatic(
+        "warning",
+        json!({"message":"x".repeat(limits().event_bytes)}),
+    ))?;
+    assert!(s.line(&raw, &limits()).is_err());
+    assert_eq!(s.metadata.notifications, 0);
+    Ok(())
+}
+#[test]
+fn warning_metadata_does_not_mark_turn_started_or_admit_other_events() -> Result<()> {
+    let sc = schema();
+    for method in [
+        "error",
+        "thread/tokenUsage/updated",
+        "item/started",
+        "turn/completed",
+    ] {
+        let mut s = Session::new("generic", &sc, "/mock")?;
+        s.stage = Stage::Running;
+        emit(
+            &mut s,
+            automatic("warning", json!({"message":"MOCK-private"})),
+        )?;
+        let error = emit(&mut s, automatic(method, json!({}))).unwrap_err();
+        assert_eq!(static_failure_code(&error), "app_turn_not_started");
+        assert!(!s.started && s.final_text.is_none());
+        assert!(s.protocol.thread_usage.is_none() && s.protocol.raw_response_usage.is_none());
+        assert_eq!(s.protocol.failing_notification_category, Some(method));
+    }
+    Ok(())
+}
+#[test]
 fn notification_failure_category_does_not_admit_prestarted_events_or_unknown_names() -> Result<()> {
     let sc = schema();
     for (method, expected) in [
@@ -899,10 +1040,12 @@ def send(x):
 def read():
     x=json.loads(sys.stdin.buffer.readline());assert 'jsonrpc' not in x;return x
 init=read();assert init['method']=='initialize'
+if mode=='warning':send({'method':'warning','params':{'message':'MOCK-private-warning-init'}})
 send({'id':init['id'],'result':{'userAgent':'mock','codexHome':'not-retained','platformFamily':'mock','platformOs':'mock'}})
 assert read()['method']=='initialized'
 t=read();assert t['params']['approvalPolicy']=='never' and t['params']['sandbox']=='read-only' and t['params']['ephemeral'] is True
 send({'id':t['id'],'result':{'thread':{'id':'native-thread'},'model':'gpt-6-luna','modelProvider':'configured-only','serviceTier':'priority'}})
+if mode=='warning':send({'method':'warning','params':{'message':'MOCK-private-warning-thread','threadId':'native-thread'}})
 send({'method':'thread/started','params':{'thread':{'id':'native-thread'}}})
 t=read();assert t['params']['threadId']=='native-thread' and t['params']['effort']=='max' and t['params']['serviceTier']=='fast'
 assert t['params']['input'][0]['text_elements']==[] and t['params']['outputSchema']['additionalProperties'] is False
@@ -911,13 +1054,18 @@ if mode=='flood':sys.stdout.write('x'*8192);sys.stdout.flush();time.sleep(10)
 if mode=='server':send({'id':9,'method':'account/chatgptAuthTokens/refresh','params':{'secret':'mock-secret'}});time.sleep(10)
 if mode=='error':send({'id':t['id'],'error':{'code':-32001,'message':'mock-secret-home-prompt','data':{'private':'never-retain'}}});sys.exit(1)
 if mode=='prestarted':send({'id':t['id'],'result':{'turn':{'id':'native-turn','status':'inProgress'}}});send({'method':'error','params':{'threadId':'native-thread','turnId':'native-turn','willRetry':False,'error':{'message':'mock-secret-native-error','additionalDetails':'mock-secret-details','codexErrorInfo':{'httpConnectionFailed':{'httpStatusCode':400}}}}});sys.exit(1)
+if mode=='warning':
+    send({'method':'warning','params':{'message':'MOCK-private-warning-before-ack','threadId':'native-thread'}})
+    send({'id':t['id'],'result':{'turn':{'id':'native-turn','status':'inProgress'}}})
+    send({'method':'warning','params':{'message':'MOCK-private-warning-before-started','threadId':'native-thread'}})
 send({'method':'turn/started','params':{'threadId':'native-thread','turn':{'id':'native-turn','status':'inProgress'}}})
-send({'id':t['id'],'result':{'turn':{'id':'native-turn','status':'inProgress'}}})
+if mode!='warning':send({'id':t['id'],'result':{'turn':{'id':'native-turn','status':'inProgress'}}})
 i={'type':'agentMessage','id':'native-item','phase':'final_answer','text':''}
 send({'method':'item/started','params':{'threadId':'native-thread','turnId':'native-turn','item':i}})
 i['text']=json.dumps({'equivalent':False,'abstained':False,'reason':''},separators=(',',':'))
 send({'method':'item/completed','params':{'threadId':'native-thread','turnId':'native-turn','item':i}})
 send({'method':'turn/completed','params':{'threadId':'native-thread','turn':{'id':'native-turn','status':'completed','error':None,'items':[],'itemsView':'notLoaded'}}})
+if mode=='warning':send({'method':'warning','params':{'message':'MOCK-private-warning-complete','threadId':None}})
 assert sys.stdin.buffer.read()==b''
 sys.stderr.write('mock-private-stderr-never-retain');sys.stderr.flush()
 "#;
@@ -1072,6 +1220,36 @@ fn actual_bidirectional_mock_child_captures_native_ids_not_served_profile() -> R
         assert_eq!(p?.metadata()?.permissions().mode() & 0o777, 0o600);
     }
     assert!(f.run("good", Duration::from_secs(3)).is_err());
+    Ok(())
+}
+#[test]
+fn mock_warning_notifications_preserve_complete_turn_and_discard_private_text() -> Result<()> {
+    let f = MockFixture::new()?;
+    let r = f.run("warning", Duration::from_secs(3))?;
+    assert_eq!(r.report.base.status, "typed_structural_unqualified");
+    assert!(r.report.base.verdict.is_some() && r.publication_sha256.is_some());
+    assert!(r.report.internal_failure_code.is_none());
+    assert!(r.report.protocol.failing_notification_category.is_none());
+    assert!(r.report.protocol.native_error_category.is_none());
+    assert!(r.report.protocol.native_error_will_retry.is_none());
+    assert_eq!(r.report.protocol.automatic_metadata_notifications, 5);
+    assert_eq!(r.report.protocol.outbound_frames.len(), 4);
+    assert!(
+        r.report
+            .protocol
+            .outbound_frames
+            .iter()
+            .all(|f| f.full_write_observed)
+    );
+    assert!(
+        r.report.base.observations.wrapper_leader_reaped
+            && r.report.base.observations.pipe_eof_observed
+    );
+    assert!(!r.report.base.reward_emitted && r.no_retry);
+    assert!(!serde_json::to_string(&r)?.contains("MOCK-private"));
+    let receipt = fs::read(f.output.join("app-server-observation.json"))?;
+    assert!(!String::from_utf8_lossy(&receipt).contains("MOCK-private"));
+    assert!(f.run("warning", Duration::from_secs(3)).is_err());
     Ok(())
 }
 #[test]
