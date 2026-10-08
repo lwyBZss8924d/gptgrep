@@ -1033,12 +1033,33 @@ fn treatment_tool_events_project_pinned_search_and_read_without_raw_contents() {
         .line(&serde_json::to_vec(&json!({"type":"item.completed","item":item})).unwrap())
         .unwrap();
     let projection: Value = serde_json::from_slice(&events.projected).unwrap();
+    assert_eq!(
+        projection["tool_use"],
+        json!({
+            "schema_version":"gptgrep.harbor.tool_use_item.v1",
+            "scope":"native_command_event_and_typed_output_observation_only",
+            "raw_root_sha256":sha(b"/app/groups/group-a/raw"), "generation":pin,
+            "command_sha256":sha(command.as_bytes()),
+            "output_sha256":sha(response.to_string().as_bytes()),
+            "native_text_reads":1, "native_text_searches":1, "native_text_windows":2
+        })
+    );
     assert_eq!(projection["tool_use"]["native_text_searches"], 1);
     assert_eq!(projection["tool_use"]["native_text_reads"], 1);
     assert_eq!(projection["tool_use"]["native_text_windows"], 2);
     assert_eq!(
         projection["tool_use"]["output_sha256"],
         sha(response.to_string().as_bytes())
+    );
+    assert_eq!(projection["item_observation"]["lifecycle"], "completed");
+    assert_eq!(
+        projection["item_observation"]["command"]["classification"],
+        "pinned_batch_direct"
+    );
+    assert!(projection["item_observation"]["command"]["rejection_reason"].is_null());
+    assert_eq!(
+        projection["item_observation"]["command"]["output_sha256"],
+        projection["tool_use"]["output_sha256"]
     );
     let serialized = String::from_utf8(events.projected).unwrap();
     assert!(!serialized.contains(command));
@@ -1111,4 +1132,224 @@ fn tool_observation_never_promotes_baseline_failure_foreign_pin_or_metadata() {
     metadata["items"][0]["coverage"]["unit"] = json!("objects");
     bad["aggregated_output"] = json!(metadata.to_string());
     assert!(tool_projection(&bad, &context).is_none());
+}
+
+fn tool_diagnostic_fixture() -> (ToolContext, Value, Value) {
+    let pin = gptgrep_core::GenerationPin {
+        generation: "generic-generation".into(),
+        manifest_sha256: "a".repeat(64),
+    };
+    let context = ToolContext {
+        root: "/app/groups/group-a/raw".into(),
+        pin: pin.clone(),
+    };
+    let response = json!({"schema_version":"gptgrep.batch.rich.response.v1","generation":pin,"execution":{"scope":"local_deterministic_no_model_context","model_submissions":0},"items":[{"status":"ok","coverage":{"unit":"bounded_search_hits"},"result":{"hits":[]}}]});
+    let item = json!({"id":"private-item","type":"command_execution","status":"completed","exit_code":0,"command":"/app/tool/gptgrep batch --rich --root /app/groups/group-a/raw --input /app/request.json","aggregated_output":response.to_string()});
+    (context, item, response)
+}
+
+fn tool_diagnostic_event(context: Option<ToolContext>, event: &str, item: Value) -> Value {
+    let mut events = Events {
+        tool_context: context,
+        ..Events::default()
+    };
+    events
+        .line(&serde_json::to_vec(&json!({"type":event,"item":item})).unwrap())
+        .unwrap();
+    serde_json::from_slice(&events.projected).unwrap()
+}
+
+#[test]
+fn tool_diagnostics_classify_failed_unsupported_and_invalid_outputs_without_promoting() {
+    let (context, item, response) = tool_diagnostic_fixture();
+    let mut cases = vec![];
+    for (key, value, reason) in [
+        ("status", json!("failed"), "not_completed_status"),
+        ("exit_code", json!(7), "nonzero_exit"),
+        ("exit_code", json!(false), "exit_code_missing_or_invalid"),
+        (
+            "command",
+            json!("echo SECRET_COMMAND"),
+            "unsupported_command",
+        ),
+        (
+            "aggregated_output",
+            Value::Null,
+            "output_missing_or_invalid",
+        ),
+        (
+            "aggregated_output",
+            json!("SECRET_MALFORMED"),
+            "output_json_invalid",
+        ),
+        (
+            "aggregated_output",
+            json!("x".repeat(1_048_577)),
+            "output_oversized",
+        ),
+    ] {
+        let mut changed = item.clone();
+        changed[key] = value;
+        cases.push((changed, reason));
+    }
+    for (key, value, reason) in [
+        (
+            "schema_version",
+            json!("unrecognized"),
+            "output_schema_mismatch",
+        ),
+        ("generation", json!(null), "generation_mismatch"),
+        (
+            "execution",
+            json!({"model_submissions":1}),
+            "execution_scope_mismatch",
+        ),
+        ("items", json!(null), "items_missing_or_invalid"),
+        ("items", json!([]), "item_count_invalid"),
+        (
+            "items",
+            json!([{"status":"ok","coverage":{"unit":"objects"}}]),
+            "no_valid_native_retrieval",
+        ),
+    ] {
+        let mut changed_response = response.clone();
+        changed_response[key] = value;
+        let mut changed = item.clone();
+        changed["aggregated_output"] = json!(changed_response.to_string());
+        cases.push((changed, reason));
+    }
+    for (changed, reason) in cases {
+        assert!(tool_projection(&changed, &context).is_none());
+        let projected = tool_diagnostic_event(Some(context.clone()), "item.completed", changed);
+        assert!(projected["tool_use"].is_null());
+        assert_eq!(
+            projected["item_observation"]["command"]["rejection_reason"],
+            reason
+        );
+        let safe = projected.to_string();
+        for secret in [
+            "SECRET_COMMAND",
+            "SECRET_MALFORMED",
+            "private-item",
+            "/app/request.json",
+        ] {
+            assert!(!safe.contains(secret));
+        }
+        if reason == "output_oversized" {
+            assert_eq!(
+                projected["item_observation"]["command"]["output_bytes"],
+                1_048_577
+            );
+            assert!(projected["item_observation"]["command"]["output_sha256"].is_null());
+        }
+    }
+    let baseline = tool_diagnostic_event(None, "item.completed", item);
+    assert!(baseline["tool_use"].is_null());
+    assert_eq!(
+        baseline["item_observation"]["command"]["rejection_reason"],
+        "context_unavailable"
+    );
+}
+
+#[test]
+fn tool_diagnostics_preserve_exact_shell_recognizer_and_lifecycle_gate() {
+    let (context, item, _) = tool_diagnostic_fixture();
+    let command = item["command"].as_str().unwrap();
+    for (changed_command, classification, accepted) in [
+        (command.to_owned(), "pinned_batch_direct", true),
+        (
+            format!("/bin/bash -lc '{command}'"),
+            "pinned_batch_shell",
+            true,
+        ),
+        (
+            format!("/bin/bash -x -lc '{command}'"),
+            "unsupported_wrapper",
+            false,
+        ),
+        (
+            format!("{command}; echo SECRET"),
+            "unsupported_syntax",
+            false,
+        ),
+        (format!("echo '{command}'"), "unrecognized_command", false),
+        ("x".repeat(8193), "oversized_command", false),
+    ] {
+        let mut changed = item.clone();
+        changed["command"] = json!(changed_command);
+        let projected =
+            tool_diagnostic_event(Some(context.clone()), "item.completed", changed.clone());
+        assert_eq!(
+            projected["item_observation"]["command"]["classification"],
+            classification
+        );
+        assert_eq!(!projected["tool_use"].is_null(), accepted);
+        if accepted {
+            assert_eq!(
+                projected["tool_use"],
+                tool_projection(&changed, &context).unwrap()
+            );
+        }
+        for (event, lifecycle) in [("item.started", "started"), ("item.updated", "updated")] {
+            let projected = tool_diagnostic_event(Some(context.clone()), event, changed.clone());
+            assert!(projected["tool_use"].is_null());
+            assert_eq!(projected["item_observation"]["lifecycle"], lifecycle);
+            assert_eq!(
+                projected["item_observation"]["command"]["rejection_reason"],
+                "not_completed_event"
+            );
+        }
+    }
+}
+
+#[test]
+fn tool_diagnostics_close_unknown_fields_and_preserve_absence_and_signed_exit() {
+    let (context, item, _) = tool_diagnostic_fixture();
+    for (exit, expected) in [
+        (json!(-9), json!(-9)),
+        (json!(false), Value::Null),
+        (json!(i64::MAX), Value::Null),
+        (Value::Null, Value::Null),
+    ] {
+        let mut changed = item.clone();
+        changed["exit_code"] = exit;
+        changed["aggregated_output"] = json!("SECRET_UTF8_字");
+        let projected = tool_diagnostic_event(Some(context.clone()), "item.completed", changed);
+        let observation = &projected["item_observation"]["command"];
+        assert_eq!(observation["exit_code"], expected);
+        assert_eq!(observation["output_bytes"], "SECRET_UTF8_字".len());
+        assert_eq!(
+            observation["output_sha256"],
+            sha("SECRET_UTF8_字".as_bytes())
+        );
+        assert!(!projected.to_string().contains("SECRET_UTF8"));
+    }
+    for kind in [
+        "agent_message",
+        "reasoning",
+        "file_change",
+        "mcp_tool_call",
+        "web_search",
+        "todo_list",
+        "error",
+        "SECRET_UNKNOWN_KIND",
+    ] {
+        let projected = tool_diagnostic_event(
+            Some(context.clone()),
+            "item.completed",
+            json!({"id":"private-item", "type":kind,"status":"SECRET_UNKNOWN_STATUS","text":"SECRET_TEXT","command":"SECRET_COMMAND"}),
+        );
+        assert_eq!(
+            projected["item_observation"]["item_kind"],
+            if kind == "SECRET_UNKNOWN_KIND" {
+                "unknown"
+            } else {
+                kind
+            }
+        );
+        assert_eq!(projected["item_observation"]["status"], "unknown");
+        assert!(projected["item_observation"]["command"].is_null());
+        assert!(projected["tool_use"].is_null());
+        assert!(!projected.to_string().contains("SECRET"));
+    }
 }

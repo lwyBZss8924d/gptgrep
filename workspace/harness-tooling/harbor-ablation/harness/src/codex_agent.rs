@@ -308,6 +308,7 @@ struct Admitted {
     tool_context: Option<ToolContext>,
 }
 
+#[derive(Clone)]
 struct ToolContext {
     root: String,
     pin: gptgrep_core::GenerationPin,
@@ -988,33 +989,183 @@ fn pinned_batch_command(command: &str, root: &str) -> bool {
             .all(|v| matches!(v, Component::RootDir | Component::Normal(_)))
 }
 
-fn tool_projection(item: &Value, context: &ToolContext) -> Option<Value> {
-    if item["type"] != "command_execution"
-        || item["status"] != "completed"
-        || item["exit_code"].as_i64() != Some(0)
-    {
-        return None;
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ToolRejection {
+    NotCompletedEvent,
+    NotCommandExecution,
+    NotCompletedStatus,
+    ExitCodeMissingOrInvalid,
+    NonzeroExit,
+    ContextUnavailable,
+    UnsupportedCommand,
+    OutputMissingOrInvalid,
+    OutputOversized,
+    OutputJsonInvalid,
+    OutputSchemaMismatch,
+    GenerationMismatch,
+    ExecutionScopeMismatch,
+    ItemsMissingOrInvalid,
+    ItemCountInvalid,
+    NoValidNativeRetrieval,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CommandClassification {
+    PinnedBatchDirect,
+    PinnedBatchShell,
+    MissingCommand,
+    OversizedCommand,
+    UnsupportedSyntax,
+    UnsupportedWrapper,
+    UnrecognizedCommand,
+    ContextUnavailable,
+}
+
+#[derive(Serialize)]
+struct CommandObservation {
+    exit_code: Option<i32>,
+    classification: CommandClassification,
+    rejection_reason: Option<ToolRejection>,
+    output_bytes: Option<u64>,
+    output_sha256: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ItemObservation {
+    schema_version: &'static str,
+    scope: &'static str,
+    lifecycle: &'static str,
+    item_kind: &'static str,
+    status: &'static str,
+    command: Option<CommandObservation>,
+}
+
+fn command_classification(item: &Value, context: Option<&ToolContext>) -> CommandClassification {
+    let Some(command) = item["command"].as_str() else {
+        return CommandClassification::MissingCommand;
+    };
+    if command.len() > 8192 {
+        return CommandClassification::OversizedCommand;
     }
-    let command = item["command"].as_str()?;
+    let Some(words) = command_words(command) else {
+        return CommandClassification::UnsupportedSyntax;
+    };
+    let shell = words.first().is_some_and(|v| {
+        ["/bin/bash", "/bin/sh", "/bin/zsh", "bash", "sh", "zsh"].contains(&v.as_str())
+    });
+    if shell && (words.len() != 3 || !["-c", "-lc"].contains(&words[1].as_str())) {
+        return CommandClassification::UnsupportedWrapper;
+    }
+    let Some(context) = context else {
+        return CommandClassification::ContextUnavailable;
+    };
     if !pinned_batch_command(command, &context.root) {
-        return None;
+        return CommandClassification::UnrecognizedCommand;
     }
-    let output = item["aggregated_output"].as_str()?;
+    if shell {
+        CommandClassification::PinnedBatchShell
+    } else {
+        CommandClassification::PinnedBatchDirect
+    }
+}
+
+fn item_observation(
+    item: &Value,
+    lifecycle: &'static str,
+    context: Option<&ToolContext>,
+    rejection_reason: Option<ToolRejection>,
+) -> ItemObservation {
+    let item_kind = match item["type"].as_str() {
+        Some("command_execution") => "command_execution",
+        Some("agent_message") => "agent_message",
+        Some("reasoning") => "reasoning",
+        Some("file_change") => "file_change",
+        Some("mcp_tool_call") => "mcp_tool_call",
+        Some("web_search") => "web_search",
+        Some("todo_list") => "todo_list",
+        Some("error") => "error",
+        _ => "unknown",
+    };
+    let status = match item["status"].as_str() {
+        Some("in_progress") => "in_progress",
+        Some("completed") => "completed",
+        Some("failed") => "failed",
+        Some("declined") => "declined",
+        _ => "unknown",
+    };
+    ItemObservation {
+        schema_version: "gptgrep.harbor.native_item_observation.v1",
+        scope: "native_event_projection_only_not_execution_attestation",
+        lifecycle,
+        item_kind,
+        status,
+        command: (item_kind == "command_execution").then(|| {
+            let output = item["aggregated_output"].as_str();
+            CommandObservation {
+                exit_code: item["exit_code"]
+                    .as_i64()
+                    .and_then(|v| i32::try_from(v).ok()),
+                classification: command_classification(item, context),
+                rejection_reason,
+                output_bytes: output.map(|v| v.len() as u64),
+                output_sha256: output
+                    .filter(|v| v.len() <= 1_048_576)
+                    .map(|v| sha(v.as_bytes())),
+            }
+        }),
+    }
+}
+
+fn checked_tool_projection(
+    item: &Value,
+    context: Option<&ToolContext>,
+) -> std::result::Result<Value, ToolRejection> {
+    if item["type"] != "command_execution" {
+        return Err(ToolRejection::NotCommandExecution);
+    }
+    if item["status"] != "completed" {
+        return Err(ToolRejection::NotCompletedStatus);
+    }
+    let exit = item["exit_code"]
+        .as_i64()
+        .ok_or(ToolRejection::ExitCodeMissingOrInvalid)?;
+    if exit != 0 {
+        return Err(ToolRejection::NonzeroExit);
+    }
+    let context = context.ok_or(ToolRejection::ContextUnavailable)?;
+    let command = item["command"]
+        .as_str()
+        .ok_or(ToolRejection::UnsupportedCommand)?;
+    if !pinned_batch_command(command, &context.root) {
+        return Err(ToolRejection::UnsupportedCommand);
+    }
+    let output = item["aggregated_output"]
+        .as_str()
+        .ok_or(ToolRejection::OutputMissingOrInvalid)?;
     if output.len() > 1_048_576 {
-        return None;
+        return Err(ToolRejection::OutputOversized);
     }
-    let value: Value = serde_json::from_str(output).ok()?;
-    let pin = serde_json::to_value(&context.pin).ok()?;
-    if value["schema_version"] != "gptgrep.batch.rich.response.v1"
-        || value["generation"] != pin
-        || value["execution"]
-            != json!({"scope":"local_deterministic_no_model_context","model_submissions":0})
+    let value: Value =
+        serde_json::from_str(output).map_err(|_| ToolRejection::OutputJsonInvalid)?;
+    let pin = json!(context.pin);
+    if value["schema_version"] != "gptgrep.batch.rich.response.v1" {
+        return Err(ToolRejection::OutputSchemaMismatch);
+    }
+    if value["generation"] != pin {
+        return Err(ToolRejection::GenerationMismatch);
+    }
+    if value["execution"]
+        != json!({"scope":"local_deterministic_no_model_context","model_submissions":0})
     {
-        return None;
+        return Err(ToolRejection::ExecutionScopeMismatch);
     }
-    let items = value["items"].as_array()?;
+    let items = value["items"]
+        .as_array()
+        .ok_or(ToolRejection::ItemsMissingOrInvalid)?;
     if items.is_empty() || items.len() > 64 {
-        return None;
+        return Err(ToolRejection::ItemCountInvalid);
     }
     let window = |w: &Value| {
         w["text"].is_string()
@@ -1049,13 +1200,18 @@ fn tool_projection(item: &Value, context: &ToolContext) -> Option<Value> {
         }
     }
     if reads + searches == 0 {
-        return None;
+        return Err(ToolRejection::NoValidNativeRetrieval);
     }
-    Some(json!({"schema_version":"gptgrep.harbor.tool_use_item.v1",
+    Ok(json!({"schema_version":"gptgrep.harbor.tool_use_item.v1",
         "scope":"native_command_event_and_typed_output_observation_only",
         "raw_root_sha256":sha(context.root.as_bytes()),"generation":context.pin,
         "command_sha256":sha(command.as_bytes()),"output_sha256":sha(output.as_bytes()),
         "native_text_reads":reads,"native_text_searches":searches,"native_text_windows":windows}))
+}
+
+#[cfg(test)]
+fn tool_projection(item: &Value, context: &ToolContext) -> Option<Value> {
+    checked_tool_projection(item, Some(context)).ok()
 }
 
 impl Events {
@@ -1135,14 +1291,29 @@ impl Events {
                 self.item_ids.insert(id.to_owned());
                 self.observations.unique_items = self.item_ids.len();
                 projection["item_id_sha256"] = Value::String(sha(id.as_bytes()));
-                if kind == "item.completed"
-                    && let Some(tool) = self
-                        .tool_context
-                        .as_ref()
-                        .and_then(|context| tool_projection(&value["item"], context))
-                {
-                    projection["tool_use"] = tool;
-                }
+                let lifecycle = match kind {
+                    "item.started" => "started",
+                    "item.updated" => "updated",
+                    _ => "completed",
+                };
+                let rejection = if lifecycle == "completed" {
+                    match checked_tool_projection(&value["item"], self.tool_context.as_ref()) {
+                        Ok(tool) => {
+                            projection["tool_use"] = tool;
+                            None
+                        }
+                        Err(reason) => Some(reason),
+                    }
+                } else {
+                    Some(ToolRejection::NotCompletedEvent)
+                };
+                projection["item_observation"] = serde_json::to_value(item_observation(
+                    &value["item"],
+                    lifecycle,
+                    self.tool_context.as_ref(),
+                    rejection,
+                ))
+                .map_err(|_| "projection")?;
             }
             "turn.failed" | "error" => {
                 self.failed = true;
