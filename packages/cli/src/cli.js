@@ -14,10 +14,22 @@ if (argv.some((value) => ['--mcp', 'mcp', 'skills', '--update', '--incur-update-
 
 const root = z.string().min(1).default('.').describe('Document corpus root')
 const document = z.string().min(1).optional().describe('Exact indexed source-relative document path')
+const decisionsBudget = z.string().min(1).optional().describe('Join an existing original-clock Decisions budget; native validation owns ledger admission')
+const multimodal = {
+  multimodal: z.boolean().default(false).describe('Source-bound v2 text/image routing and reranking; no legacy fallback'),
+  multimodalTimeout: z.number().int().min(1).max(900).optional(),
+  windowBytes: z.number().int().min(4).max(2048).optional(),
+  maxVisualCandidates: z.number().int().min(1).max(16).optional(),
+  maxConcurrentBatches: z.number().int().min(1).max(4).optional(),
+  maxOutputBytes: z.number().int().min(1).max(1048576).optional(),
+  maxMetadataBytes: z.number().int().min(1).max(524288).optional(),
+  maxImageBytes: z.number().int().min(1).max(1048576).optional(),
+  maxImagePixels: z.number().int().min(1).max(8000000).optional(),
+}
 const host = {
   codexBin: z.string().min(1).default('codex'),
   codexHome: z.string().min(1).optional().describe('Existing account home; native CODEX_HOME default applies when omitted'),
-  model: z.string().min(1).max(128).default('gpt-5.6-luna').describe('Codex reasoning model; separate from the Jev Decisions model'),
+  model: z.string().min(1).max(128).default('gpt-6-luna').describe('Codex reasoning model; separate from the Jev Decisions model'),
   jevModel: z.string().min(1).max(128).optional().describe('Jev Decisions model; native default applies when omitted'),
   document,
   reasoningEffort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']).default('max'),
@@ -37,6 +49,8 @@ const requests = {
     minScore: z.number().min(0).max(1).default(0.5).describe('Jev relevance rubric floor; not calibrated confidence'),
     ignoreCase: z.boolean().default(false),
     fixedStrings: z.boolean().default(false),
+    decisionsBudget,
+    ...multimodal,
   }).strict(),
   index: z.object({ root, optimizeMerge: z.boolean().default(false) }).strict(),
   tree: z.object({
@@ -60,6 +74,10 @@ const requests = {
     question: z.string().min(1).max(8192),
     root,
     ...host,
+    decisionsBudget,
+    ...multimodal,
+    maxCitations: z.number().int().min(1).max(8).optional(),
+    minScore: z.number().min(0).max(1).optional(),
   }).strict(),
   summarize: z.object({
     nodeId: z.string().min(1).describe('Verified DOCUMENT_ID:NODE_ID from native search/tree output'),
@@ -88,8 +106,17 @@ const hostArguments = (r) => [
   ...(r.jevModel === undefined ? [] : [`--jev-model=${r.jevModel}`]),
   ...(r.document === undefined ? [] : [`--document=${r.document}`]),
 ]
+const budgetArguments = (r) => r.decisionsBudget === undefined ? [] : [`--decisions-budget=${r.decisionsBudget}`]
+const multimodalArguments = (r) => [
+  ...(r.multimodal ? ['--multimodal'] : []),
+  ...Object.entries({multimodalTimeout: 'multimodal-timeout', windowBytes: 'window-bytes',
+    maxVisualCandidates: 'max-visual-candidates', maxConcurrentBatches: 'max-concurrent-batches',
+    maxOutputBytes: 'max-output-bytes', maxMetadataBytes: 'max-metadata-bytes',
+    maxImageBytes: 'max-image-bytes', maxImagePixels: 'max-image-pixels', maxCitations: 'max-citations'})
+    .flatMap(([field, flag]) => r[field] === undefined ? [] : [`--${flag}=${r[field]}`]),
+]
 const argumentsFor = {
-  search: (r) => ['search', '--mode', r.mode, '--limit', String(r.limit), '--context', String(r.context), '--min-score', String(r.minScore),
+  search: (r) => ['search', '--mode', r.mode, ...(r.multimodal ? [] : ['--limit', String(r.limit), '--context', String(r.context)]), '--min-score', String(r.minScore), ...budgetArguments(r), ...multimodalArguments(r),
     ...(r.ignoreCase ? ['--ignore-case'] : []), ...(r.fixedStrings ? ['--fixed-strings'] : []),
     ...(r.model === undefined ? [] : [`--model=${r.model}`]),
     ...(r.document === undefined ? [] : [`--document=${r.document}`]),
@@ -100,7 +127,7 @@ const argumentsFor = {
   batch: (r) => ['batch', `--root=${r.root}`, '--input=-', ...(r.rich ? ['--rich'] : []), '--json'],
   status: (r) => ['status', '--json', '--', r.root],
   doctor: () => ['doctor', '--json'],
-  ask: (r) => ['ask', ...hostArguments(r), '--json', '--', r.question, r.root],
+  ask: (r) => ['ask', ...hostArguments(r), ...budgetArguments(r), ...multimodalArguments(r), ...(r.minScore === undefined ? [] : [`--min-score=${r.minScore}`]), '--json', '--', r.question, r.root],
   summarize: (r) => ['summarize', `--root=${r.root}`, ...hostArguments(r), '--json', '--', r.nodeId],
 }
 
@@ -127,7 +154,14 @@ for (const [name, schema] of Object.entries(requests)) {
     async run(c) {
       let request
       try {
-        request = schema.parse(JSON.parse(c.options.request))
+        const raw = JSON.parse(c.options.request)
+        request = schema.parse(raw)
+        const visualKeys = Object.keys(multimodal).filter((key) => key !== 'multimodal')
+        if (!request.multimodal && [...visualKeys, 'maxCitations', ...(name === 'ask' ? ['minScore'] : [])].some((key) => Object.hasOwn(raw, key)))
+          throw new Error('Multimodal bounds require multimodal:true.')
+        if (name === 'search' && request.multimodal && (request.mode !== 'hybrid'
+            || ['limit', 'context', 'ignoreCase', 'fixedStrings'].some((key) => Object.hasOwn(raw, key))))
+          throw new Error('Multimodal search requires hybrid mode and cannot combine legacy grep/window options.')
       } catch (error) {
         return c.error({ code: 'INVALID_REQUEST', message: error.message })
       }

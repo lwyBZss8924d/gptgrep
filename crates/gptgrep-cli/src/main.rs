@@ -169,6 +169,89 @@ impl HostArgs {
     }
 }
 
+/// Bounds for the explicit v2 text/visual workflow. Legacy options keep their
+/// original defaults and are never silently repurposed for this workflow.
+#[derive(Debug, Args)]
+struct MultimodalArgs {
+    #[arg(
+        long,
+        help = "Route and rerank source-bound v2 text and images; requires a rich generation"
+    )]
+    multimodal: bool,
+    #[arg(long, requires = "multimodal", value_parser = clap::value_parser!(u64).range(1..=900))]
+    multimodal_timeout: Option<u64>,
+    #[arg(long, requires = "multimodal")]
+    window_bytes: Option<usize>,
+    #[arg(long, requires = "multimodal")]
+    max_visual_candidates: Option<usize>,
+    #[arg(long, requires = "multimodal")]
+    max_concurrent_batches: Option<usize>,
+    #[arg(long, requires = "multimodal")]
+    max_output_bytes: Option<usize>,
+    #[arg(long, requires = "multimodal")]
+    max_metadata_bytes: Option<usize>,
+    #[arg(long, requires = "multimodal")]
+    max_image_bytes: Option<u64>,
+    #[arg(long, requires = "multimodal")]
+    max_image_pixels: Option<u64>,
+}
+
+impl MultimodalArgs {
+    fn options(
+        &self,
+        query: &str,
+        document: Option<String>,
+        min_score: f64,
+        shared: bool,
+    ) -> Result<gptgrep_core::RichMultimodalSearchOptions> {
+        let mut options = gptgrep_core::RichMultimodalSearchOptions {
+            document,
+            min_score,
+            require_shared_ledger: shared,
+            ..Default::default()
+        };
+        if let Some(value) = self.window_bytes {
+            options.window_bytes = value;
+        }
+        if let Some(value) = self.max_visual_candidates {
+            options.max_visual_candidates = value;
+        }
+        if let Some(value) = self.max_concurrent_batches {
+            options.max_concurrent_batches = value;
+        }
+        if let Some(value) = self.max_output_bytes {
+            options.max_output_bytes = value;
+        }
+        if let Some(value) = self.max_metadata_bytes {
+            options.max_metadata_bytes = value;
+        }
+        if let Some(value) = self.max_image_bytes {
+            options.resources.image_file_bytes = value;
+        }
+        if let Some(value) = self.max_image_pixels {
+            options.resources.image_pixels = value;
+        }
+        if query.trim().is_empty()
+            || query.len() > 8192
+            || !(4..=2048).contains(&options.window_bytes)
+            || !(1..=16).contains(&options.max_visual_candidates)
+            || !(1..=4).contains(&options.max_concurrent_batches)
+            || !(1..=1048576).contains(&options.max_output_bytes)
+            || !(1..=524288).contains(&options.max_metadata_bytes)
+            || !min_score.is_finite()
+            || !(0.0..=1.0).contains(&min_score)
+            || options
+                .document
+                .as_ref()
+                .is_some_and(|d| d.is_empty() || d.len() > 8192)
+        {
+            bail!("multimodal query or candidate/output options exceed their bounds");
+        }
+        options.resources.validate()?;
+        Ok(options)
+    }
+}
+
 #[derive(Debug, Args)]
 struct EnrichHostArgs {
     #[arg(long, default_value = "codex")]
@@ -305,17 +388,17 @@ enum Command {
             help = "Restrict retrieval to one exact indexed source-relative path"
         )]
         document: Option<String>,
-        #[arg(short = 'n', long, default_value_t = 20)]
+        #[arg(short = 'n', long, default_value_t = 20, conflicts_with = "multimodal")]
         limit: usize,
-        #[arg(short = 'C', long, default_value_t = 0)]
+        #[arg(short = 'C', long, default_value_t = 0, conflicts_with = "multimodal")]
         context: usize,
-        #[arg(short = 'i', long)]
+        #[arg(short = 'i', long, conflicts_with = "multimodal")]
         ignore_case: bool,
-        #[arg(short = 'F', long)]
+        #[arg(short = 'F', long, conflicts_with = "multimodal")]
         fixed_strings: bool,
-        #[arg(long, default_value_t = 24)]
+        #[arg(long, default_value_t = 24, conflicts_with = "multimodal")]
         max_candidates: usize,
-        #[arg(long, default_value_t = 32)]
+        #[arg(long, default_value_t = 32, conflicts_with = "multimodal")]
         routing_docs: usize,
         #[arg(
             long,
@@ -328,6 +411,8 @@ enum Command {
             help = "Model relevance rubric floor (0..1); not calibrated confidence"
         )]
         min_score: f64,
+        #[command(flatten)]
+        visual: MultimodalArgs,
     },
     /// Inspect document tree nodes and their source coordinates.
     Tree {
@@ -412,6 +497,12 @@ enum Command {
             help = "Experimental: add source-bound Jev evidence-role judgments to planned retrieval"
         )]
         experimental_evidence_roles: bool,
+        #[command(flatten)]
+        visual: MultimodalArgs,
+        #[arg(long, requires = "multimodal")]
+        max_citations: Option<usize>,
+        #[arg(long, requires = "multimodal")]
+        min_score: Option<f64>,
         #[command(flatten)]
         host: HostArgs,
     },
@@ -542,11 +633,63 @@ fn contract() -> Value {
         {"input":{"text":[{"source":{"source_id":"string","unit_id":"string","source_sha256":"sha256"},"text":"literal string"}],
             "images":[{"source":{"source_id":"string","unit_id":"string","source_sha256":"sha256"},"path":"local PNG/JPEG path"}]},
         "questions":"Choice/Noul/Score map"}],"control_bytes":65536});
+    let multimodal = json!({"type":"boolean","default":false,
+        "generation":"v2 only; CURRENT resolved once and retained",
+        "routing":"mandatory document routing plus text/independent visual union reranking",
+        "decisions_model":gptgrep_jev::DEFAULT_MODEL,
+        "limits":{"query_utf8_bytes":8192,"text_candidates":24,"routing_documents":8,
+            "visual_candidates":16,"concurrent_batches":4,"images_per_request":4,
+            "request_image_pixels":24000000,"request_bytes":8388608},
+        "coverage":"bounded candidate pool; inspect omitted pages/artifacts and truncation; not exhaustive semantic recall",
+        "search_schema":"gptgrep.rich_multimodal_search.v1","ask_schema":"gptgrep.rich_multimodal.host.v1",
+        "output":"one complete typed JSON report, including without --json",
+        "qualification":"implementation with offline mock checks; actual model image influence/native runtime qualification pending"});
+    for command in ["search", "ask"] {
+        contract["commands"][command]["options"]["multimodal"] = multimodal.clone();
+        for (name, minimum, maximum, default) in [
+            ("multimodal-timeout", 1, 900, 180),
+            ("window-bytes", 4, 2048, 1024),
+            ("max-visual-candidates", 1, 16, 8),
+            ("max-concurrent-batches", 1, 4, 4),
+            ("max-output-bytes", 1, 1048576, 1048576),
+            ("max-metadata-bytes", 1, 524288, 524288),
+            ("max-image-bytes", 1, 1048576, 1048576),
+            ("max-image-pixels", 1, 8000000, 8000000),
+        ] {
+            contract["commands"][command]["options"][name] = json!({"type":"integer","minimum":minimum,"maximum":maximum,"default":default,"requires":"multimodal"});
+        }
+    }
+    contract["commands"]["search"]["options"]["multimodal"]["conflicts"] = json!([
+        "mode other than hybrid",
+        "limit",
+        "context",
+        "ignore-case",
+        "fixed-strings",
+        "max-candidates",
+        "routing-docs"
+    ]);
+    contract["commands"]["search"]["options"]["multimodal"]["citation_authority"] = json!(false);
+    contract["commands"]["ask"]["options"]["multimodal"]["conflicts"] = json!([
+        "experimental-query-plan",
+        "experimental-source-continuation",
+        "experimental-evidence-roles",
+        "navigation options",
+        "planner-model",
+        "native profile other than gpt-6-luna/max/fast"
+    ]);
+    contract["commands"]["ask"]["options"]["multimodal"]["citation_authority"] = json!(
+        "only a complete actual reader RPC write+flush and fresh source/coordinate binding; Decisions image exposure grants none"
+    );
+    contract["commands"]["ask"]["options"]["max-citations"] =
+        json!({"type":"integer","minimum":1,"maximum":8,"default":8,"requires":"multimodal"});
+    contract["commands"]["ask"]["options"]["min-score"] =
+        json!({"type":"number","minimum":0,"maximum":1,"default":0.5,"requires":"multimodal"});
+    contract["commands"]["ask"]["options"]["multimodal"]["host_bounds"] = json!({"rerank_report_bytes":524288,"candidate_metadata_bytes":32768,"image_result_frame_bytes":1048576,"complete_output_reserved_before_calls":true});
     contract
 }
 
 fn llms() -> &'static str {
-    "# GPTgrep\n\nLocal vectorless retrieval helper for agents. No MCP server.\n\n1. gptgrep index ./docs --json\n1r. gptgrep index ./documents --ocr auto --plan-only --json\n1n. gptgrep index ./native-documents --ocr off --json\n1a. gptgrep enrich ./docs --ledger-path /path/to/private/enrich.jsonl --max-builder-calls 100 --max-jev-calls 100 --plan-only --json\n2. gptgrep search 'concept in natural language' ./docs --json\n3. gptgrep search 'pattern' ./docs --mode regex --json\n4. gptgrep tree manual.pdf --root ./docs --json\n5. gptgrep read DOCUMENT_ID:NODE_ID --root ./docs --json\n6. gptgrep batch --root ./docs --input operations.json --json\n7. gptgrep batch --rich --root ./docs --input rich-operations.json\n\nBatch accepts gptgrep.batch.request.v1 JSON, pins one generation and preserves operation order. Local search/catalog/tree/read operations share bounded output reservations. Batch hybrid/semantic are currently rejected before provider work; inspect each item status and coverage.\n\nFor a separately published v2 generation, batch --rich accepts gptgrep.batch.rich.request.v1 with inspect_documents, inspect_pages, read_artifact, search_artifacts, inspect_visual and read_visual. Text inspection returns indexed metadata only. Text read/search preserve typed native/OCR evidence; their cursors bind generation and operation options. Search pages cover a bounded max_hits window; inspect truncation and exhaustion. Opt-in inspect_visual takes scope (document_ids, first_page, last_page), query, max_candidates and its own cursor; use result.next_cursor and retain the batch output budget and per-item reservation when continuing. read_visual takes rendition_id and returns complete image_base64 plus pinned candidate metadata; no image byte windows, truncation or cursor. Both visual operations reuse the generation resource budget and report actual_image_delivery=false and citation_authority=false. They establish local observations, not model delivery or citation rights. This route is local and performs zero model submissions.\n\nJev routing/reranking is required by default search, ask and summarize. OPENROUTER_API_KEY must be supplied for model-assisted runs; failures never silently downgrade to local retrieval. Explicit regex/lexical and enrich --plan-only remain offline. Enrich is an explicit Codex/Jev step that creates non-citable navigation hints after local indexing. Use --document RELATIVE_PATH to scope before candidate budgets. The default Decisions model is openai/gpt-6-luna-decisions; native Codex defaults separately to gpt-6-luna/max/fast. Hybrid/semantic and judge send bounded data to OpenRouter Decisions. Judge input accepts state/questions or typed input.text/input.images with explicit source bindings and local PNG/JPEG paths. --decisions-budget FILE joins an existing original-clock shared budget; it never initializes or resets a ledger. Without the file, paid calls share their single-invocation bounded client context. Explicit --model typesafe/jev-1.13 remains text-only. Inspect coverage, source_fresh, coordinate_system and text_truncated before citing evidence. The main agent performs reasoning and controls follow-up reads. New files require reindexing. --schema provides the command contract.\n"
+    "# GPTgrep\n\nLocal vectorless retrieval helper for agents. No MCP server.\n\n1. gptgrep index ./docs --json\n1r. gptgrep index ./documents --ocr auto --plan-only --json\n1n. gptgrep index ./native-documents --ocr off --json\n1a. gptgrep enrich ./docs --ledger-path /path/to/private/enrich.jsonl --max-builder-calls 100 --max-jev-calls 100 --plan-only --json\n2. gptgrep search 'concept in natural language' ./docs --json\n3. gptgrep search 'pattern' ./docs --mode regex --json\n4. gptgrep tree manual.pdf --root ./docs --json\n5. gptgrep read DOCUMENT_ID:NODE_ID --root ./docs --json\n6. gptgrep batch --root ./docs --input operations.json --json\n7. gptgrep batch --rich --root ./docs --input rich-operations.json\n\nBatch accepts gptgrep.batch.request.v1 JSON, pins one generation and preserves operation order. Local search/catalog/tree/read operations share bounded output reservations. Batch hybrid/semantic are currently rejected before provider work; inspect each item status and coverage.\n\nFor a separately published v2 generation, batch --rich accepts gptgrep.batch.rich.request.v1 with inspect_documents, inspect_pages, read_artifact, search_artifacts, inspect_visual and read_visual. Text inspection returns indexed metadata only. Text read/search preserve typed native/OCR evidence; their cursors bind generation and operation options. Search pages cover a bounded max_hits window; inspect truncation and exhaustion. Opt-in inspect_visual takes scope (document_ids, first_page, last_page), query, max_candidates and its own cursor; use result.next_cursor and retain the batch output budget and per-item reservation when continuing. read_visual takes rendition_id and returns complete image_base64 plus pinned candidate metadata; no image byte windows, truncation or cursor. Both visual operations reuse the generation resource budget and report actual_image_delivery=false and citation_authority=false. They establish local observations, not model delivery or citation rights. This route is local and performs zero model submissions.\n\nJev routing/reranking is required by default search, ask and summarize. OPENROUTER_API_KEY must be supplied for model-assisted runs; failures never silently downgrade to local retrieval. Explicit regex/lexical and enrich --plan-only remain offline. Enrich is an explicit Codex/Jev step that creates non-citable navigation hints after local indexing. Use --document RELATIVE_PATH to scope before candidate budgets. The default Decisions model is openai/gpt-6-luna-decisions; native Codex defaults separately to gpt-6-luna/max/fast. Hybrid/semantic and judge send bounded data to OpenRouter Decisions. Judge input accepts state/questions or typed input.text/input.images with explicit source bindings and local PNG/JPEG paths. --decisions-budget FILE joins an existing original-clock shared budget; it never initializes or resets a ledger. Without the file, paid calls share their single-invocation bounded client context. Explicit --model typesafe/jev-1.13 remains text-only. Inspect coverage, source_fresh, coordinate_system and text_truncated before citing evidence. The main agent performs reasoning and controls follow-up reads. Use search QUERY ROOT --multimodal or ask QUESTION ROOT --multimodal on a published v2 rich generation. Both retain one generation and one finite Decisions context, perform mandatory document routing, and rerank a union of text and independent visual candidates. Scope with --document PATH; bound --window-bytes, --max-visual-candidates, --max-concurrent-batches, --max-image-bytes, --max-image-pixels, --max-metadata-bytes and --max-output-bytes. --multimodal-timeout limits the same invocation and never extends an existing shared deadline. Search returns gptgrep.rich_multimodal_search.v1 JSON with model-exposure-only evidence and no citation rights. Ask uses native gpt-6-luna/max/fast, accepts --max-citations 1..8, and issues typed text/image citations only after actual complete reader delivery and freshness checks. Inspect coverage/truncation and actual observations; implementation and offline mocks do not qualify actual image influence/native runtime. No legacy generation, regex/lexical, grep-window or planning fallback is allowed. Rich ingestion currently qualifies PDF, PNG and restricted baseline JPEG frontdoors; Office/full JPEG family remain unavailable. New files require reindexing. --schema provides the command contract.\n"
 }
 
 fn emit(value: &Value) -> Result<()> {
@@ -566,6 +709,38 @@ fn decisions_context(
 ) -> Result<Option<gptgrep_jev::ExecutionContext>> {
     path.map(gptgrep_jev::ExecutionContext::from_budget_file)
         .transpose()
+}
+
+fn multimodal_client(
+    reader: &gptgrep_core::RichGenerationReader,
+    model: Option<&str>,
+    budget: Option<&std::path::Path>,
+    timeout: u64,
+) -> Result<gptgrep_jev::JevClient> {
+    let selected = model.unwrap_or(gptgrep_jev::DEFAULT_MODEL);
+    if !matches!(
+        selected,
+        gptgrep_jev::DEFAULT_MODEL | "openai/gpt-6-luna-decisions-20261006"
+    ) {
+        bail!("multimodal retrieval requires the supported Luna Decisions image profile");
+    }
+    if !(1..=900).contains(&timeout) {
+        bail!("multimodal timeout must be 1 to 900 seconds");
+    }
+    let execution = match decisions_context(budget)? {
+        Some(context) => context,
+        None => gptgrep_jev::ExecutionContext::new(
+            "gptgrep.cli.multimodal.invocation",
+            &reader.pin().manifest_sha256,
+            std::time::SystemTime::now() + std::time::Duration::from_secs(timeout),
+            gptgrep_jev::MAX_SUBMISSIONS,
+        )?,
+    };
+    // The existing shared deadline is never extended. Search's explicit
+    // invocation cap also narrows shared contexts, without changing their ledger.
+    let execution = execution
+        .with_deadline(std::time::Instant::now() + std::time::Duration::from_secs(timeout))?;
+    Ok(gptgrep_jev::JevClient::from_env(Some(selected))?.with_execution_context(execution))
 }
 
 fn require_keys(value: &Value, allowed: &[&str]) -> Result<()> {
@@ -1014,7 +1189,32 @@ async fn run(cli: Cli) -> Result<i32> {
             routing_docs,
             model,
             min_score,
+            visual,
         } => {
+            if visual.multimodal {
+                if !matches!(mode, Mode::Hybrid) {
+                    bail!(
+                        "--multimodal uses mandatory rich routing/reranking; --mode must be hybrid"
+                    );
+                }
+                let options =
+                    visual.options(&query, document, min_score, cli.decisions_budget.is_some())?;
+                let reader = gptgrep_core::RichGenerationReader::open(&root)?;
+                let client = multimodal_client(
+                    &reader,
+                    model.as_deref(),
+                    cli.decisions_budget.as_deref(),
+                    visual.multimodal_timeout.unwrap_or(180),
+                )?;
+                let prepared =
+                    gptgrep_core::prepare_rich_multimodal_search(reader, client, &query, &options)?;
+                let report = prepared.execute().await?.into_report();
+                let code = if report.hits.is_empty() { 1 } else { 0 };
+                // A typed JSON report is required to preserve image identities,
+                // coverage, accounting and exposure-only citation status.
+                emit(&serde_json::to_value(report)?)?;
+                return Ok(code);
+            }
             if (fixed_strings || context > 0 || ignore_case) && !matches!(mode, Mode::Regex) {
                 bail!("--fixed-strings, --ignore-case and --context require --mode regex");
             }
@@ -1137,7 +1337,67 @@ async fn run(cli: Cli) -> Result<i32> {
             navigation_max_request_bytes,
             planner_model,
             experimental_evidence_roles,
+            visual,
+            max_citations,
+            min_score,
         } => {
+            if visual.multimodal {
+                if experimental_query_plan
+                    || experimental_source_continuation
+                    || experimental_evidence_roles
+                    || navigation_overlay_sha256.is_some()
+                    || navigation_max_jev_calls.is_some()
+                    || navigation_max_request_bytes.is_some()
+                    || planner_model.is_some()
+                {
+                    bail!(
+                        "--multimodal cannot combine with legacy query planning, navigation or source continuation"
+                    );
+                }
+                if host.model != "gpt-6-luna"
+                    || host.reasoning_effort != "max"
+                    || host.service_tier != "fast"
+                {
+                    bail!("--multimodal ask requires the native gpt-6-luna/max/fast profile");
+                }
+                let citations = max_citations.unwrap_or(8);
+                if !(1..=8).contains(&citations) {
+                    bail!("multimodal citations must be 1 to 8");
+                }
+                let retrieval = visual.options(
+                    &question,
+                    document.clone(),
+                    min_score.unwrap_or(0.5),
+                    cli.decisions_budget.is_some(),
+                )?;
+                let timeout = visual
+                    .multimodal_timeout
+                    .unwrap_or(host.timeout)
+                    .min(host.timeout);
+                let reader = gptgrep_core::RichGenerationReader::open(&root)?;
+                let client = multimodal_client(
+                    &reader,
+                    jev_model.as_deref(),
+                    cli.decisions_budget.as_deref(),
+                    timeout,
+                )?;
+                let mut config = host.config();
+                config.document = document;
+                config.timeout_secs = timeout;
+                // The explicit client already owns the selected model/context.
+                // The host retains and consumes its genuine initial pass once.
+                let options = gptgrep_host::RichMultimodalHostOptions {
+                    max_output_bytes: retrieval.max_output_bytes,
+                    max_citations: citations,
+                    retrieval,
+                };
+                let prepared = gptgrep_host::prepare_rich_multimodal_host(
+                    reader, client, &question, &config, &options,
+                )?;
+                let report = prepared.execute(&|_| Ok(())).await?;
+                emit(&serde_json::to_value(report)?)?;
+                return Ok(0);
+            }
             let mut config = host.config();
             config.jev_model = jev_model;
             config.decisions_execution = decisions_context(cli.decisions_budget.as_deref())?;
@@ -1213,7 +1473,25 @@ async fn run(cli: Cli) -> Result<i32> {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    let as_json = cli.json;
+    let as_json = cli.json
+        || matches!(
+            &cli.command,
+            Some(
+                Command::Search {
+                    visual: MultimodalArgs {
+                        multimodal: true,
+                        ..
+                    },
+                    ..
+                } | Command::Ask {
+                    visual: MultimodalArgs {
+                        multimodal: true,
+                        ..
+                    },
+                    ..
+                }
+            )
+        );
     let host_operation = matches!(
         cli.command,
         Some(Command::Ask { .. } | Command::Summarize { .. } | Command::HostComplete { .. })
@@ -1261,6 +1539,14 @@ async fn main() {
                             error.downcast_ref::<gptgrep_host::HostProtocolError>()
                         {
                             protocol.code()
+                        } else if let Some(partial) =
+                            error.downcast_ref::<gptgrep_host::RichMultimodalHostError>()
+                        {
+                            partial.code
+                        } else if let Some(partial) =
+                            error.downcast_ref::<gptgrep_core::RichMultimodalSearchError>()
+                        {
+                            partial.code
                         } else if error.is::<gptgrep_core::JevSearchError>() {
                             "jev_search_failed"
                         } else if error.is::<gptgrep_host::HostCapabilityError>() {
@@ -1278,6 +1564,17 @@ async fn main() {
                 }
                 if let Some(protocol) = error.downcast_ref::<gptgrep_host::HostProtocolError>() {
                     report["host_protocol"] = serde_json::to_value(protocol).unwrap_or(Value::Null);
+                }
+                if let Some(partial) =
+                    error.downcast_ref::<gptgrep_core::RichMultimodalSearchError>()
+                {
+                    report["multimodal_retrieval"] =
+                        serde_json::to_value(partial).unwrap_or(Value::Null);
+                }
+                if let Some(partial) = error.downcast_ref::<gptgrep_host::RichMultimodalHostError>()
+                {
+                    report["multimodal_host"] =
+                        serde_json::to_value(partial).unwrap_or(Value::Null);
                 }
                 let _ = emit(&report);
             } else {
@@ -1785,6 +2082,105 @@ mod query_plan_cli_tests {
         assert_eq!(
             schema["commands"]["enrich"]["options"]["support-retries"]["maximum"],
             2
+        );
+    }
+}
+
+#[cfg(test)]
+mod multimodal_cli_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_workflow_maps_tighter_bounds_and_preserves_legacy_defaults() {
+        let cli = Cli::try_parse_from([
+            "gptgrep",
+            "search",
+            "图表",
+            "--multimodal",
+            "--document",
+            "report.pdf",
+            "--window-bytes",
+            "512",
+            "--max-visual-candidates",
+            "3",
+            "--max-concurrent-batches",
+            "2",
+            "--max-output-bytes",
+            "900000",
+            "--max-metadata-bytes",
+            "32000",
+            "--max-image-bytes",
+            "500000",
+            "--max-image-pixels",
+            "4000000",
+            "--min-score",
+            "0.7",
+        ])
+        .unwrap();
+        let Some(Command::Search {
+            query,
+            document,
+            min_score,
+            visual,
+            ..
+        }) = cli.command
+        else {
+            panic!("search");
+        };
+        let options = visual.options(&query, document, min_score, true).unwrap();
+        assert!(options.require_shared_ledger);
+        assert_eq!(options.document.as_deref(), Some("report.pdf"));
+        assert_eq!(
+            (
+                options.window_bytes,
+                options.max_visual_candidates,
+                options.max_concurrent_batches
+            ),
+            (512, 3, 2)
+        );
+        assert_eq!(
+            (options.max_output_bytes, options.max_metadata_bytes),
+            (900000, 32000)
+        );
+        assert_eq!(
+            (
+                options.resources.image_file_bytes,
+                options.resources.image_pixels
+            ),
+            (500000, 4000000)
+        );
+        assert_eq!(options.min_score, 0.7);
+        let legacy = Cli::try_parse_from(["gptgrep", "search", "text"]).unwrap();
+        assert!(matches!(
+            legacy.command,
+            Some(Command::Search {
+                visual: MultimodalArgs {
+                    multimodal: false,
+                    ..
+                },
+                limit: 20,
+                context: 0,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn legacy_candidate_options_and_unselected_visual_controls_do_not_silently_change_workflow() {
+        for flag in ["--limit", "--context", "--max-candidates", "--routing-docs"] {
+            assert!(
+                Cli::try_parse_from(["gptgrep", "search", "chart", "--multimodal", flag, "1"])
+                    .is_err()
+            );
+        }
+        for flag in ["--ignore-case", "--fixed-strings"] {
+            assert!(
+                Cli::try_parse_from(["gptgrep", "search", "chart", "--multimodal", flag]).is_err()
+            );
+        }
+        assert!(Cli::try_parse_from(["gptgrep", "ask", "chart", "--max-citations", "2"]).is_err());
+        assert!(
+            Cli::try_parse_from(["gptgrep", "search", "chart", "--window-bytes", "100"]).is_err()
         );
     }
 }

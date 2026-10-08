@@ -40,11 +40,11 @@ node src/cli.js read --request '{"nodeId":"DOCUMENT_ID:NODE_ID","root":"./docs",
 node src/cli.js batch --request '{"root":"./docs","rich":true,"batch":{"schema_version":"gptgrep.batch.rich.request.v1","operations":[{"id":"visual","op":"inspect_visual","max_candidates":2}]}}' --json
 ```
 
-`ask` and `summarize` invoke the native local Codex host, using the existing account environment. Their host settings are `codexBin` (default `codex`), optional `codexHome`, `model` (the Codex model, default `gpt-5.6-luna`), `reasoningEffort` (default `max`), `serviceTier` (default `fast`), `timeout` (1–900 seconds; default 180), and `maxToolCalls` (1–64; default 12). Their separate `jevModel` field forwards `--jev-model`; omitting it preserves the native Jev default. The optional `document` scope forwards `--document`. For `summarize`, that path must match the selected node's source document; the native host rejects a conflict. The wrapper preserves the distinction between Codex and Jev model settings. Native citation verification and host receipts are preserved in its structured response.
+`ask` and `summarize` invoke the native local Codex host, using the existing account environment. Their host settings are `codexBin` (default `codex`), optional `codexHome`, `model` (the Codex model, default `gpt-6-luna`), `reasoningEffort` (default `max`), `serviceTier` (default `fast`), `timeout` (1–900 seconds; default 180), and `maxToolCalls` (1–64; default 12). Their separate `jevModel` field forwards `--jev-model`; omitting it preserves the native Jev default. The optional `document` scope forwards `--document`. For `summarize`, that path must match the selected node's source document; the native host rejects a conflict. The wrapper preserves the distinction between Codex and Jev model settings. Native citation verification and host receipts are preserved in its structured response.
 
 ```sh
 node src/cli.js ask --request '{"question":"How is recovery verified?","root":"./docs","document":"manual.pdf","jevModel":"typesafe/jev-1.13"}' --json
-node src/cli.js summarize --request '{"nodeId":"DOCUMENT_ID:NODE_ID","root":"./docs","document":"manual.pdf","model":"gpt-5.6-luna","jevModel":"typesafe/jev-1.13"}' --json
+node src/cli.js summarize --request '{"nodeId":"DOCUMENT_ID:NODE_ID","root":"./docs","document":"manual.pdf","model":"gpt-6-luna","jevModel":"typesafe/jev-1.13"}' --json
 ```
 
 Use `--format json`, `--format jsonl`, `--format toon`, `--format yaml`, or `--format md` for incur presentation. `--full-output` requests its envelope. The native response is preserved as structured data; the wrapper does not infer an answer, alter rankings, or claim that a fallback used an index.
@@ -56,3 +56,13 @@ Recognized `gptgrep.error.v1` failures retain their native structured report, in
 MCP entry points are rejected before incur handles argv. The wrapper does not expose `fetch`, register MCP, sync generated skills, or perform wrapper updates. Incur's standalone binary builder embeds Bun; it does not build or bundle the native Rust executable. Native release packaging is managed by the repository's Rust workflow.
 
 Run `pnpm test` for wrapper parsing, native forwarding, error and no-MCP tests. These tests use an explicit local fixture executable; combined native retrieval tests belong to the Rust workspace and a real-binary smoke test.
+
+
+For ordinary source-bound v2 retrieval, set `multimodal:true` in `search` or `ask`. The wrapper forwards the native workflow and its typed reports; it does not provide a fallback or issue citations. Multimodal search admits only hybrid mode and rejects explicit legacy `limit`, `context`, `ignoreCase` and `fixedStrings` fields. Multimodal-only bounds require the flag: `multimodalTimeout`, `windowBytes`, `maxVisualCandidates`, `maxConcurrentBatches`, `maxImageBytes`, `maxImagePixels`, `maxMetadataBytes`, and `maxOutputBytes`. Ask also accepts `maxCitations` and `minScore`. Native preflight owns generation integrity, remaining resource budgets and actual reader delivery checks.
+
+```sh
+node src/cli.js search --request '{"query":"What does the chart show?","root":"./documents","multimodal":true,"maxVisualCandidates":8,"decisionsBudget":"/path/to/existing-budget.json"}' --json
+node src/cli.js ask --request '{"question":"Explain this chart.","root":"./documents","multimodal":true,"maxCitations":4}' --json
+```
+
+The optional `decisionsBudget` on search/ask forwards the existing `--decisions-budget` contract; it never initializes a ledger. The native model default is now `gpt-6-luna/max/fast`, matching the native CLI. Multimodal ask rejects other native profiles. Model exposure in search is noncitable, while ask requires complete actual reader delivery and fresh source/coordinate bindings. Offline wrapper checks do not qualify real provider image influence or native model availability.

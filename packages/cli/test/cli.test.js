@@ -186,13 +186,13 @@ test('schema discovery is local and exposes the JSON request contract', async ()
 })
 
 test('explicit Codex host commands preserve model settings and flag-like data', async () => {
-  const defaults = ['--codex-bin=codex', '--model=gpt-5.6-luna', '--reasoning-effort=max', '--service-tier=fast', '--timeout', '180', '--max-tool-calls', '12']
+  const defaults = ['--codex-bin=codex', '--model=gpt-6-luna', '--reasoning-effort=max', '--service-tier=fast', '--timeout', '180', '--max-tool-calls', '12']
   const ask = JSON.parse((await run(['ask', '--request', '{"question":"--mcp","root":"/docs space"}', '--json'])).stdout)
   assert.deepEqual(ask.args, ['ask', ...defaults, '--json', '--', '--mcp', '/docs space'])
   const summary = JSON.parse((await run(['summarize', '--request', '{"nodeId":"document:node","root":"/docs","codexHome":"/account space"}', '--json'])).stdout)
   assert.deepEqual(summary.args, ['summarize', '--root=/docs', ...defaults, '--codex-home=/account space', '--json', '--', 'document:node'])
   const schema = JSON.parse((await run(['request-schema', 'ask', '--json'])).stdout)
-  assert.equal(schema.properties.model.default, 'gpt-5.6-luna')
+  assert.equal(schema.properties.model.default, 'gpt-6-luna')
   assert.equal(schema.properties.reasoningEffort.default, 'max')
   assert.equal(schema.properties.serviceTier.default, 'fast')
   assert.equal(schema.properties.jevModel.type, 'string')
@@ -291,4 +291,44 @@ test('stale exit-2 search keeps its report while invalid typed failures remain g
   })
   await assert.rejects(run(['search', '--request', '{"query":"invalid-typed-failure"}', '--json']),
     (error) => error.code !== 0 && /NATIVE_ERROR/.test(error.stdout))
+})
+
+
+test('multimodal normal workflow forwards bounds and shared context without legacy window flags', async () => {
+  const request = {query: '--chart $(touch sentinel)', root: '/docs space', multimodal: true,
+    decisionsBudget: '/budget space/existing.json', document: 'report.pdf', multimodalTimeout: 120,
+    windowBytes: 512, maxVisualCandidates: 3, maxConcurrentBatches: 2,
+    maxOutputBytes: 900000, maxMetadataBytes: 32000, maxImageBytes: 500000, maxImagePixels: 4000000}
+  const result = JSON.parse((await run(['search', '--request', JSON.stringify(request), '--json'])).stdout)
+  assert.deepEqual(result.args, ['search', '--mode', 'hybrid', '--min-score', '0.5',
+    '--decisions-budget=/budget space/existing.json', '--multimodal', '--multimodal-timeout=120',
+    '--window-bytes=512', '--max-visual-candidates=3', '--max-concurrent-batches=2',
+    '--max-output-bytes=900000', '--max-metadata-bytes=32000', '--max-image-bytes=500000', '--max-image-pixels=4000000',
+    '--document=report.pdf', '--json', '--', request.query, request.root])
+  const ask = JSON.parse((await run(['ask', '--request', JSON.stringify({question: 'Explain', multimodal: true,
+    decisionsBudget: 'budget.json', maxCitations: 4, minScore: 0.7}), '--json'])).stdout)
+  assert.ok(ask.args.includes('--model=gpt-6-luna'))
+  assert.ok(ask.args.includes('--multimodal'))
+  assert.ok(ask.args.includes('--decisions-budget=budget.json'))
+  assert.ok(ask.args.includes('--max-citations=4'))
+  assert.ok(ask.args.includes('--min-score=0.7'))
+  const schema = JSON.parse((await run(['request-schema', 'search', '--json'], '/missing/native')).stdout)
+  assert.equal(schema.properties.multimodal.default, false)
+  assert.equal(schema.properties.maxVisualCandidates.maximum, 16)
+  assert.equal(schema.properties.maxImagePixels.maximum, 8000000)
+})
+
+test('incompatible multimodal controls reject before spawning the native executable', async () => {
+  for (const request of [
+    {query: 'chart', maxVisualCandidates: 2},
+    {query: 'chart', multimodal: true, mode: 'regex'},
+    {query: 'chart', multimodal: true, mode: 'semantic'},
+    {query: 'chart', multimodal: true, limit: 20},
+    {query: 'chart', multimodal: true, context: 0},
+    {query: 'chart', multimodal: true, fixedStrings: false},
+    {query: 'chart', multimodal: true, maxImagePixels: 8000001},
+  ]) await assert.rejects(run(['search', '--request', JSON.stringify(request), '--json'], '/missing/native'),
+    (error) => /INVALID_REQUEST/.test(error.stdout) && !/NATIVE_ERROR/.test(error.stdout))
+  await assert.rejects(run(['ask', '--request', '{"question":"Explain","maxCitations":4}', '--json'], '/missing/native'),
+    (error) => /INVALID_REQUEST/.test(error.stdout))
 })

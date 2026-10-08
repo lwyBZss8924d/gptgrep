@@ -337,3 +337,21 @@ Routing, reranking and follow-up host clients share the same context. Without th
 option, calls use a bounded single-invocation context. Regex/lexical, schema,
 doctor and enrich `--plan-only` do not open the budget file. Numeric usage and cost
 remain reported provider metadata; absent fields remain unavailable.
+
+
+`search --multimodal` and `ask --multimodal` connect the v2 rich generation to the normal Decisions and native reader workflows:
+
+```sh
+gptgrep search 'What does the chart show?' ./documents --multimodal --max-visual-candidates 8 --json
+gptgrep ask 'Explain the chart and supporting text.' ./documents --multimodal --document report.pdf --max-citations 4 --json
+```
+
+Both commands resolve `CURRENT` once, retain that source-bound generation and one finite Decisions execution context, and perform mandatory document routing followed by reranking of text and independent visual candidates. The visual lane can include pages without a literal query match. The default Decisions model is `openai/gpt-6-luna-decisions`; multimodal retrieval also accepts its observed canonical `openai/gpt-6-luna-decisions-20261006` identifier. Multimodal ask requires the separate native `gpt-6-luna/max/fast` profile. Explicit legacy Jev remains available on the text workflow.
+
+Multimodal output is always one typed JSON report, including when `--json` is omitted. Search returns `gptgrep.rich_multimodal_search.v1`; its image exposure grants no citation rights. Ask returns `gptgrep.rich_multimodal.host.v1` and retains the initial retrieval report. Text and image citations require complete actual native reader delivery followed by source, hash and coordinate checks. Partial failures preserve observed retrieval/accounting in the existing `gptgrep.error.v1` envelope and exit 2.
+
+Bounds are configurable with `--window-bytes` (4–2048), `--max-visual-candidates` (1–16), `--max-concurrent-batches` (1–4), `--max-image-bytes` (up to 1 MiB), `--max-image-pixels` (up to 8 million), `--max-metadata-bytes` (up to 512 KiB), and `--max-output-bytes` (up to 1 MiB). Ask additionally admits 1–8 `--max-citations` and applies the host's 32 KiB candidate metadata and 512 KiB initial-report caps. Tight budgets may refuse preparation before a model call. Reports distinguish inspected/omitted candidates, truncation and incomplete semantic coverage. These limits describe owned buffers and transport; they are not whole-process RSS or exhaustive recall guarantees.
+
+`--multimodal-timeout` admits 1–900 seconds, default 180 for search; ask uses the smaller of this value and its existing `--timeout`. `--decisions-budget FILE` joins the same existing original-clock shared context for routing, reranking and host Decisions tools, without initializing or resetting its ledger. Without that file, the command creates one finite invocation context whose plan identity binds the retained generation manifest; it is not a portable campaign claim.
+
+A v1 generation, regex/lexical/semantic mode selection, legacy grep/window/candidate options, or ask's experimental planning/navigation/continuation options are rejected for this workflow. There is no text or regex fallback. Omitting `--multimodal` preserves the legacy paths and output. The rich ingestion frontdoor currently supports PDF, PNG and restricted strict baseline JPEG; Office and the wider JPEG family remain unavailable. CLI composition and offline mock checks establish implementation behavior. Actual provider image influence, native runtime availability and the live comparison/release gates remain pending.
