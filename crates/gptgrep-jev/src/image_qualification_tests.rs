@@ -75,6 +75,78 @@ fn assert_no_admission(client: &JevClient) {
 }
 
 #[test]
+fn qualification_wire_matches_canonical_value_bytes_at_every_object_depth() {
+    let client = client();
+    let mut input = input();
+    input.text[0].text = "literal \"quotes\"\\line\n中".into();
+    input.images.push(
+        ImageEvidence::from_bytes(binding("jpeg"), encoded(ImageFormat::Jpeg, [71, 83, 97]))
+            .unwrap(),
+    );
+    let questions = questions();
+    let mut state = vec![json!(input.text[0].text)];
+    for image in &input.images {
+        state.push(json!({
+            "type": "image_url",
+            "image_url": {"url": format!("data:{};base64,{}",
+                image.media_type(), STANDARD.encode(&image.bytes))}
+        }));
+    }
+    // Value encoding orders every object's keys, including question definitions,
+    // Choice criteria, the provider policy and the image_url wrapper.
+    let expected = json!({
+        "state": state,
+        "questions": questions,
+        "provider": {"allow_fallbacks": false},
+        "model": "openai/gpt-6-luna-decisions"
+    });
+    let canonical = serde_json::to_vec(&expected).unwrap();
+    let prepared = client
+        .prepare_image_qualification(input, questions, MAX_RESPONSE_BYTES)
+        .unwrap();
+    assert_eq!(prepared.request().body, canonical);
+    let parsed: Value = serde_json::from_slice(&prepared.request().body).unwrap();
+    assert_eq!(serde_json::to_vec(&parsed).unwrap(), canonical);
+    assert_eq!(
+        prepared.request().body_sha256(),
+        format!("{:x}", Sha256::digest(&canonical))
+    );
+    assert!(canonical.len() <= MAX_MULTIMODAL_REQUEST_BYTES);
+    assert_no_admission(&client);
+}
+
+#[test]
+fn canonical_envelope_and_image_body_preserve_exact_writer_caps() {
+    let client = client();
+    let input = input();
+    let questions = questions();
+    for include_images in [false, true] {
+        let mut writer = BoundedWriter::buffered(MAX_MULTIMODAL_REQUEST_BYTES);
+        serialize_qualification(&client, &input, &questions, include_images, &mut writer).unwrap();
+        let value: Value = serde_json::from_slice(&writer.bytes).unwrap();
+        let canonical = serde_json::to_vec(&value).unwrap();
+        assert_eq!(writer.bytes, canonical);
+        let limit = canonical.len();
+        let mut exact = BoundedWriter::buffered(limit);
+        serialize_qualification(&client, &input, &questions, include_images, &mut exact).unwrap();
+        assert_eq!(exact.bytes, canonical);
+        let mut tight = BoundedWriter::buffered(limit - 1);
+        assert!(
+            serialize_qualification(&client, &input, &questions, include_images, &mut tight)
+                .is_err()
+        );
+        assert!(tight.len < limit);
+        assert!(tight.bytes.len() < limit);
+        let mut count = BoundedWriter::counting(limit);
+        serialize_qualification(&client, &input, &questions, include_images, &mut count).unwrap();
+        assert_eq!(count.len, limit);
+        assert!(count.bytes.is_empty());
+    }
+    assert_eq!(MAX_MULTIMODAL_REQUEST_BYTES, 8 * 1024 * 1024);
+    assert_no_admission(&client);
+}
+
+#[test]
 fn png_and_jpeg_wire_is_flat_and_decodes_to_exact_admitted_bytes() {
     let png = encoded(ImageFormat::Png, [11, 27, 39]);
     let jpeg = encoded(ImageFormat::Jpeg, [71, 83, 97]);

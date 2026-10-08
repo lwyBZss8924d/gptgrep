@@ -261,7 +261,8 @@ impl JevClient {
     /// are admitted. Text is serialized literally; source metadata stays in the
     /// wrapper. PNG/JPEG bytes become direct image_url data URLs, without detail.
     /// The escaped text/questions transport envelope has a stricter 64 KiB cap;
-    /// the full image-bearing body remains bounded by 8 MiB. No request is sent.
+    /// the full image-bearing body remains bounded by 8 MiB. Object keys match
+    /// canonical serde_json::Value encoding. No request is sent.
     pub fn prepare_image_qualification(
         &self,
         input: DecisionInput,
@@ -337,10 +338,11 @@ impl JevClient {
 
 #[derive(Serialize)]
 struct QualificationBody<'a> {
+    // Keep typed object keys in the order used by serde_json::Value objects.
     model: &'a str,
-    state: QualificationState<'a>,
-    questions: &'a Value,
     provider: NoFallbacks,
+    questions: &'a Value,
+    state: QualificationState<'a>,
 }
 
 #[derive(Serialize)]
@@ -379,9 +381,10 @@ impl Serialize for QualificationImage<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         #[derive(Serialize)]
         struct ImagePart<'a> {
+            // The renamed key "type" sorts after "image_url".
+            image_url: ImageUrl<'a>,
             #[serde(rename = "type")]
             kind: &'static str,
-            image_url: ImageUrl<'a>,
         }
         #[derive(Serialize)]
         struct ImageUrl<'a> {
@@ -403,8 +406,8 @@ impl Serialize for QualificationImage<'_> {
         url.push_str(prefix);
         STANDARD.encode_string(&image.bytes, &mut url);
         ImagePart {
-            kind: "image_url",
             image_url: ImageUrl { url: &url },
+            kind: "image_url",
         }
         .serialize(serializer)
     }
@@ -421,13 +424,13 @@ fn serialize_qualification(
         writer,
         &QualificationBody {
             model: &client.model,
+            provider: NoFallbacks {
+                allow_fallbacks: false,
+            },
+            questions,
             state: QualificationState {
                 input,
                 include_images,
-            },
-            questions,
-            provider: NoFallbacks {
-                allow_fallbacks: false,
             },
         },
     )
