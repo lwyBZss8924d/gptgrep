@@ -136,7 +136,7 @@ async fn preparation_and_complete_projection_are_window_invariant() {
         assert!((roundtrip.0 - source.0).abs() < 0.001 && (roundtrip.1 - source.1).abs() < 0.001);
         assert!(matches!(
             page.capabilities["font_names"],
-            FeatureState::Unsupported(_)
+            FeatureState::Present(_) | FeatureState::Unsupported(_)
         ));
     }
     let first = finalize_document(first, vec![], OcrMode::Off, &budget).unwrap();

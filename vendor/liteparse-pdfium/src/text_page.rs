@@ -286,6 +286,27 @@ impl TextChar<'_> {
         self.font_info().map(|(name, _)| name)
     }
 
+    /// Count/length-admitted counterpart of `font_info`. The returned name
+    /// bytes are exact (without the native terminator), never decoded lossily.
+    /// Zero length is ambiguous between unavailable data and getter failure.
+    /// Callers choose a typed encoding/availability policy. A changed write
+    /// length or malformed terminator fails rather than truncating.
+    pub fn font_info_admitted<E: From<crate::PdfiumError>>(
+        &self,
+        max_name_bytes: u64,
+        admit: &mut impl FnMut(u64) -> Result<(), E>,
+    ) -> Result<Option<(Vec<u8>, i32)>, E> {
+        read_font_info_admitted(max_name_bytes, admit, |buffer, length, flags| unsafe {
+            ffi!(FPDFText_GetFontInfo(
+                self.text_page.handle,
+                self.index,
+                buffer.cast(),
+                length as _,
+                flags,
+            )) as u64
+        })
+    }
+
     /// Angle in radians. Returns -1 on error.
     pub fn angle(&self) -> f32 {
         unsafe { ffi!(FPDFText_GetCharAngle(self.text_page.handle, self.index)) }
@@ -478,6 +499,41 @@ impl TextChar<'_> {
     }
 }
 
+fn read_font_info_admitted<E: From<crate::PdfiumError>>(
+    max_name_bytes: u64,
+    admit: &mut impl FnMut(u64) -> Result<(), E>,
+    mut getter: impl FnMut(*mut u8, u64, &mut i32) -> u64,
+) -> Result<Option<(Vec<u8>, i32)>, E> {
+    let mut flags = 0;
+    let length = getter(std::ptr::null_mut(), 0, &mut flags);
+    if length == 0 {
+        return Ok(None);
+    }
+    if length - 1 > max_name_bytes || length > u32::MAX as u64 {
+        return Err(crate::PdfiumError::OperationFailed.into());
+    }
+    // Raw data, strict decoded name, retained glyph/run copies and worst-case
+    // escaped/byte-array JSON (raw bytes plus typed name, glyph and run names)
+    // are covered before the raw buffer is allocated.
+    let upper = length
+        .checked_mul(24)
+        .and_then(|n| n.checked_add(256))
+        .ok_or(crate::PdfiumError::OperationFailed)?;
+    admit(upper)?;
+    let length = usize::try_from(length).map_err(|_| crate::PdfiumError::OperationFailed)?;
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(length)
+        .map_err(|_| crate::PdfiumError::OperationFailed)?;
+    buffer.resize(length, 0xff);
+    let written = getter(buffer.as_mut_ptr(), length as u64, &mut flags);
+    if written != length as u64 || buffer.last() != Some(&0) || buffer[..length - 1].contains(&0) {
+        return Err(crate::PdfiumError::OperationFailed.into());
+    }
+    buffer.pop();
+    Ok(Some((buffer, flags)))
+}
+
 // -- TextCharIter --
 
 pub struct TextCharIter<'tp> {
@@ -509,3 +565,93 @@ impl<'tp> Iterator for TextCharIter<'tp> {
 }
 
 impl ExactSizeIterator for TextCharIter<'_> {}
+
+#[cfg(test)]
+mod font_admission_tests {
+    use super::*;
+    use crate::PdfiumError;
+
+    #[test]
+    fn font_length_refusal_never_calls_write_getter() {
+        let mut writes = 0;
+        let result = read_font_info_admitted::<PdfiumError>(4, &mut |_| Ok(()), |buffer, _, _| {
+            if !buffer.is_null() {
+                writes += 1;
+            }
+            10
+        });
+        assert!(result.is_err());
+        assert_eq!(writes, 0);
+        let result = read_font_info_admitted::<PdfiumError>(
+            64,
+            &mut |_| Err(PdfiumError::OperationFailed),
+            |buffer, _, _| {
+                if !buffer.is_null() {
+                    writes += 1;
+                }
+                10
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(writes, 0);
+    }
+
+    #[test]
+    fn font_exact_bytes_flags_and_empty_ambiguity_are_preserved() {
+        for bytes in [b"Helvetica\0".as_slice(), b"\xff\xfe\0", b"\0"] {
+            let mut admitted = 0;
+            let result = read_font_info_admitted::<PdfiumError>(
+                64,
+                &mut |n| {
+                    admitted += n;
+                    Ok(())
+                },
+                |buffer, _, flags| {
+                    *flags = 32;
+                    if !buffer.is_null() {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, bytes.len());
+                        }
+                    }
+                    bytes.len() as u64
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(result.0, bytes[..bytes.len() - 1]);
+            assert_eq!(result.1, 32);
+            assert!(admitted >= bytes.len() as u64 * 16);
+        }
+        assert!(
+            read_font_info_admitted::<PdfiumError>(
+                64,
+                &mut |_| panic!("no allocation"),
+                |_, _, _| 0
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn font_changed_write_and_missing_terminator_fail() {
+        for (written, bytes) in [
+            (3, b"abc\0".as_slice()),
+            (4, b"abcd"),
+            (4, b"a\0b\0"),
+            (0, b"abc\0"),
+        ] {
+            let result =
+                read_font_info_admitted::<PdfiumError>(64, &mut |_| Ok(()), |buffer, _, _| {
+                    if buffer.is_null() {
+                        return 4;
+                    }
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, bytes.len());
+                    }
+                    written
+                });
+            assert!(result.is_err());
+        }
+    }
+}

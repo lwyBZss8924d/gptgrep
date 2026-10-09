@@ -24,6 +24,7 @@
   "modifications": [
     "Standalone Cargo manifest with the original pinned pdfium-sys dependency",
     "Allocation-free Page::annotation_count accessor for conservative coverage admission",
-    "Count/length-admitted document Info/page-label/outline getters with exact UTF-16 write validation and bounded cycle-safe traversal; legacy getters unchanged"
+    "Count/length-admitted document Info/page-label/outline getters with exact UTF-16 write validation and bounded cycle-safe traversal; legacy getters unchanged",
+    "Length-admitted TextChar::font_info_admitted with exact raw bytes/flags and native write/NUL validation; legacy font getters unchanged"
   ]
 }

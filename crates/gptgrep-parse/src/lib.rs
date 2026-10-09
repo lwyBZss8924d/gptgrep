@@ -49,6 +49,9 @@ pub use ocr_compat::{
 };
 pub use office::{is_office_extension, office_preparation_profile_digest};
 pub use resource::ResourceBudget;
+pub use rich::native_text_metadata::{
+    NATIVE_FONT_WORD_RECIPE, native_font_word_profile_digest, validate_native_text_metadata,
+};
 pub use rich::{
     ConversionIdentity, CoverageState, NativeCandidate, NativeOptions, NativePage, OcrMode,
     OcrPlan, PreparationOptions, PreparedDocument, PreparedImageGeometry, PreparedSummary,

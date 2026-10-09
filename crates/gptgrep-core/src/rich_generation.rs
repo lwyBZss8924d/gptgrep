@@ -738,7 +738,7 @@ impl RichGenerationReader {
         Ok(window)
     }
 
-    /// Read a v5 document's bound native Info/labels/outline snapshot. This is
+    /// Read a versioned document's bound native Info/labels/outline snapshot. This is
     /// structural metadata, not text/image delivery or citation authority.
     /// Source, manifest and artifact freshness are rechecked on every read.
     pub fn read_document_metadata(
@@ -1919,19 +1919,26 @@ fn document_metadata_artifact(doc: &RichDocument) -> Result<Option<&StoredArtifa
         metadata.next().is_none(),
         "duplicate complete document metadata artifact"
     );
-    let mut v5_pages = 0;
+    let mut versioned_pages = 0;
+    let mut selected_recipe: Option<&str> = None;
     for page in &doc.pages {
         match page.capabilities.get("native_recipe") {
             None => {}
             Some(gptgrep_parse::FeatureState::Present(recipe))
-                if recipe == gptgrep_parse::DOCUMENT_METADATA_NATIVE_RECIPE =>
+                if recipe == gptgrep_parse::DOCUMENT_METADATA_NATIVE_RECIPE
+                    || recipe == gptgrep_parse::NATIVE_FONT_WORD_RECIPE =>
             {
-                v5_pages += 1
+                ensure!(
+                    selected_recipe.is_none_or(|selected| selected == recipe),
+                    "mixed native document metadata recipes"
+                );
+                selected_recipe = Some(recipe);
+                versioned_pages += 1;
             }
             _ => anyhow::bail!("unknown native document metadata recipe"),
         }
     }
-    if v5_pages == 0 {
+    if versioned_pages == 0 {
         ensure!(
             first.is_none(),
             "legacy native recipe has unassigned document metadata"
@@ -1939,8 +1946,8 @@ fn document_metadata_artifact(doc: &RichDocument) -> Result<Option<&StoredArtifa
         return Ok(None);
     }
     ensure!(
-        v5_pages == doc.pages.len() && first.is_some(),
-        "v5 requires exactly one complete document metadata artifact"
+        versioned_pages == doc.pages.len() && first.is_some(),
+        "versioned native recipe requires exactly one complete document metadata artifact"
     );
     let stored = first.expect("checked complete document metadata");
     for page in &doc.pages {
@@ -1980,14 +1987,34 @@ fn validate_document_metadata_binding(
         doc.pages.len() as u32,
         budget,
     )?;
-    ensure!(
-        doc.native_profile_sha256
-            == gptgrep_parse::document_metadata_native_profile_digest(
+    let profile = match doc
+        .pages
+        .first()
+        .and_then(|p| p.capabilities.get("native_recipe"))
+    {
+        Some(gptgrep_parse::FeatureState::Present(recipe))
+            if recipe == gptgrep_parse::DOCUMENT_METADATA_NATIVE_RECIPE =>
+        {
+            gptgrep_parse::document_metadata_native_profile_digest(
                 &doc.prepared,
                 metadata.native_dpi,
-                metadata.native_render_pages
-            )?,
-        "native document metadata v5 profile mismatch"
+                metadata.native_render_pages,
+            )?
+        }
+        Some(gptgrep_parse::FeatureState::Present(recipe))
+            if recipe == gptgrep_parse::NATIVE_FONT_WORD_RECIPE =>
+        {
+            gptgrep_parse::native_font_word_profile_digest(
+                &doc.prepared,
+                metadata.native_dpi,
+                metadata.native_render_pages,
+            )?
+        }
+        _ => anyhow::bail!("unknown native document metadata profile recipe"),
+    };
+    ensure!(
+        doc.native_profile_sha256 == profile,
+        "native document metadata profile mismatch"
     );
     for (page, label) in doc.pages.iter().zip(&metadata.page_labels) {
         ensure!(
@@ -2151,6 +2178,21 @@ fn verify_document(
             &owned_path(dir, &page.metadata_artifact.relative_path)?,
             budget.page_layout_bytes,
         )?;
+        if matches!(page.capabilities.get("native_recipe"),
+            Some(gptgrep_parse::FeatureState::Present(recipe)) if recipe == gptgrep_parse::NATIVE_FONT_WORD_RECIPE)
+        {
+            ensure!(
+                bytes.len() as u64 == page.metadata_artifact.bytes
+                    && digest(&bytes) == page.metadata_artifact.sha256,
+                "native font/word artifact changed while reading"
+            );
+            gptgrep_parse::validate_native_text_metadata(
+                &bytes,
+                &doc.prepared,
+                page.number,
+                budget,
+            )?;
+        }
         let metadata: NativeCoverageMetadata = serde_json::from_slice(&bytes)
             .context("rebuild_required: retained native coverage metadata missing or invalid")?;
         if document_metadata.is_some() {

@@ -27,6 +27,9 @@ use crate::ocr::{
 };
 use crate::resource::{LimitedWriter, ResourceBudget, encoded_size};
 
+#[path = "native_text_metadata.rs"]
+pub(crate) mod native_text_metadata;
+
 pub const RICH_PARSER: &str = "liteparse-2.15.1/rich-v1";
 static PREPARATION_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -311,6 +314,15 @@ impl NativeCandidate {
             self.pages.len() as u32,
             budget,
         )?;
+        ensure!(
+            self.native_profile_sha256
+                == native_text_metadata::native_font_word_profile_digest(
+                    &self.summary,
+                    document_metadata.native_dpi,
+                    document_metadata.native_render_pages
+                )?,
+            "native font/word profile mismatch"
+        );
         let document_artifact = self
             .document_metadata_artifact
             .as_ref()
@@ -367,6 +379,43 @@ impl NativeCandidate {
                 );
                 verify_registered_artifact(artifact, &registered, &mut expected_artifacts)?;
             }
+            ensure!(
+                matches!(page.capabilities.get("native_recipe"),
+                Some(FeatureState::Present(recipe)) if recipe == native_text_metadata::NATIVE_FONT_WORD_RECIPE),
+                "native font/word recipe missing"
+            );
+            ensure!(
+                self.native_owned_upper
+                    .checked_add(
+                        page.metadata_artifact
+                            .bytes
+                            .checked_mul(64)
+                            .context("resource_limit: native font/word validation overflow")?
+                    )
+                    .is_some_and(|n| n <= budget.owned_working_bytes),
+                "resource_limit: held native candidate plus font/word validation"
+            );
+            let bytes = read_bounded(
+                &self
+                    .prepared
+                    .staging_root
+                    .join(&page.metadata_artifact.relative_path),
+                page.metadata_artifact.bytes,
+                &page.metadata_artifact.sha256,
+            )?;
+            native_text_metadata::validate_native_text_metadata(
+                &bytes,
+                &self.summary,
+                page.number,
+                budget,
+            )?;
+            let retained: NativeMetadata = serde_json::from_slice(&bytes)?;
+            ensure!(
+                serde_json::to_vec(&retained.page)? == serde_json::to_vec(raw)?
+                    && serde_json::to_value(&retained.capabilities)?
+                        == serde_json::to_value(&page.capabilities)?,
+                "native font/word retained candidate mismatch"
+            );
             for image in &page.renditions {
                 ensure!(
                     image.artifact.kind == ArtifactKind::Rendition
@@ -701,6 +750,7 @@ struct NativeMetadata {
     complexity: stages::PageComplexityStats,
     image_rects: Vec<liteparse::types::Rect>,
     geometry: PageGeometry,
+    native_text_metadata: native_text_metadata::NativeTextMetadata,
 }
 
 pub(crate) fn admit_staging(used: &mut u64, bytes: u64, budget: &ResourceBudget) -> Result<()> {
@@ -750,7 +800,7 @@ pub(crate) fn extract_sync(
     if prepared.summary.format == "plaintext" {
         return crate::rich_text::extract(prepared, budget);
     }
-    let native_profile_sha256 = crate::document_metadata_native_profile_digest(
+    let native_profile_sha256 = native_text_metadata::native_font_word_profile_digest(
         &prepared.summary,
         options.dpi,
         options.render_pages,
@@ -864,8 +914,9 @@ pub(crate) fn extract_sync(
             let text_page = page_obj.text()?;
             let count = text_page.char_count();
             ensure!(count >= 0, "PDFium char count failed");
-            // Per-glyph numeric DTOs have a fixed serialized/owned bound. This
-            // adapter deliberately omits opaque variable-length font getters.
+            // Count admission covers every native character, including all
+            // geometryless whitespace/controls, plus run/word numeric DTOs.
+            // Variable font bytes are length-admitted before allocation.
             let glyph_bound = (count as u64)
                 .checked_mul(2048)
                 .context("resource_limit: native char bound overflow")?;
@@ -1003,62 +1054,67 @@ pub(crate) fn extract_sync(
                     objects.push(serde_json::json!({"kind":"image","width":image.width,"height":image.height,"bits_per_pixel":image.bits_per_pixel,"depth":depth}));
                 }
             }
-            let mut items: Vec<TextItem> = Vec::with_capacity(count as usize);
-            for ordinal in 0..count {
-                let glyph = text_page.char_at_unchecked(ordinal);
-                let unicode = glyph.unicode();
-                let character = char::from_u32(unicode).unwrap_or('\u{fffd}');
-                if character == '\r' || character == '\n' {
-                    continue;
-                }
-                let Some(box_) = glyph.char_box() else {
-                    ensure!(character.is_whitespace(), "native glyph missing geometry");
-                    if let Some(previous) = items.last_mut() {
-                        previous.text.push(character);
-                    }
-                    continue;
-                };
-                let (x1, y1) = native_transform.transform_point(box_.left as f32, box_.top as f32);
-                let (x2, y2) =
-                    native_transform.transform_point(box_.right as f32, box_.bottom as f32);
-                let x = x1.min(x2);
-                let y = y1.min(y2);
-                let w = (x2 - x1).abs();
-                let h = (y2 - y1).abs();
-                ensure!(
-                    [x, y, w, h].iter().all(|value| value.is_finite())
-                        && x >= -1.0
-                        && y >= -1.0
-                        && x + w <= width + 1.0
-                        && y + h <= height + 1.0,
-                    "capability_unavailable: native glyph geometry outside viewport"
-                );
-                if w == 0.0 || h == 0.0 {
-                    ensure!(
-                        character.is_whitespace(),
-                        "native glyph has zero-area bounds"
-                    );
-                    if let Some(previous) = items.last_mut() {
-                        previous.text.push(character);
-                    }
-                    continue;
-                }
-                let font = glyph.font_size() as f32;
-                ensure!(font.is_finite() && font > 0.0, "invalid native font size");
-                items.push(TextItem {
-                    text: character.to_string(),
-                    x,
-                    y,
-                    width: w,
-                    height: h,
-                    font_size: Some(font),
-                    font_weight: Some(glyph.font_weight()),
-                    has_unicode_map_error: glyph.has_unicode_map_error(),
-                    char_codes: vec![glyph.char_code()],
-                    trailing_space_generated: glyph.is_generated(),
-                    ..Default::default()
-                });
-            }
+            let mut font_bound = 0u64;
+            let characters = native_text_metadata::collect_characters(
+                count as u32,
+                width,
+                height,
+                &budget,
+                |ordinal| {
+                    let glyph = text_page.char_at_unchecked(ordinal as i32);
+                    let bounds = glyph.char_box().map(|box_| {
+                        let (x1, y1) =
+                            native_transform.transform_point(box_.left as f32, box_.top as f32);
+                        let (x2, y2) =
+                            native_transform.transform_point(box_.right as f32, box_.bottom as f32);
+                        native_text_metadata::NativeBounds {
+                            x: x1.min(x2),
+                            y: y1.min(y2),
+                            width: (x2 - x1).abs(),
+                            height: (y2 - y1).abs(),
+                        }
+                    });
+                    // Every admitted character, including geometryless spaces
+                    // and actual/generated controls, reaches the same retained
+                    // source stream. Font allocation remains separately bounded.
+                    let font_info = glyph.font_info_admitted(
+                        budget.native_layout_input_bytes,
+                        &mut |bytes| -> Result<()> {
+                            let next = font_bound
+                                .checked_add(bytes)
+                                .context("resource_limit: page font metadata sum overflow")?;
+                            ensure!(
+                                object_bound
+                                    + glyph_bound
+                                    + annotation_bound
+                                    + label_bound
+                                    + 16_384
+                                    + next
+                                    <= budget.page_layout_bytes,
+                                "resource_limit: page font metadata admission"
+                            );
+                            admit_native_estimate(
+                                &mut metadata_used,
+                                &mut owned_upper,
+                                bytes,
+                                &budget,
+                            )?;
+                            font_bound = next;
+                            Ok(())
+                        },
+                    )?;
+                    Ok(native_text_metadata::NativeCharacterObservation {
+                        unicode: glyph.unicode(),
+                        char_code: glyph.char_code(),
+                        has_unicode_map_error: glyph.has_unicode_map_error(),
+                        generated: glyph.is_generated(),
+                        bounds,
+                        font_size: glyph.font_size(),
+                        font_weight: glyph.font_weight(),
+                        font: native_text_metadata::font_state(font_info),
+                    })
+                },
+            )?;
             let raw = Page {
                 page_number: number as usize,
                 page_label: match &document_metadata.page_labels[index].label {
@@ -1068,7 +1124,7 @@ pub(crate) fn extract_sync(
                 page_width: width,
                 page_height: height,
                 content_bounds: None,
-                text_items: glyph_runs(items),
+                text_items: native_text_metadata::glyph_runs(&characters),
                 graphics: Vec::new(),
                 vector_graphics: None,
                 struct_nodes: Vec::new(),
@@ -1113,9 +1169,15 @@ pub(crate) fn extract_sync(
                 capabilities.insert("original_office_page_cell_mapping".into(), FeatureState::Unsupported("Original Office page/cell mapping is unavailable; geometry refers only to the retained normalized PDF".into()));
             }
 
+            let (font_capability, word_capability) =
+                native_text_metadata::capabilities(&characters);
+            capabilities.insert("font_names".into(), font_capability);
+            capabilities.insert("word_segmentation".into(), word_capability);
+            capabilities.insert(
+                "native_stream".into(),
+                FeatureState::Present(native_text_metadata::stream_recipe().into()),
+            );
             for feature in [
-                "font_names",
-                "word_segmentation",
                 "tagged_structure",
                 "annotations",
                 "form_fields",
@@ -1128,7 +1190,7 @@ pub(crate) fn extract_sync(
             }
             capabilities.insert(
                 "native_recipe".into(),
-                FeatureState::Present(crate::DOCUMENT_METADATA_NATIVE_RECIPE.into()),
+                FeatureState::Present(native_text_metadata::NATIVE_FONT_WORD_RECIPE.into()),
             );
             capabilities.insert(
                 "document_metadata".into(),
@@ -1183,6 +1245,7 @@ pub(crate) fn extract_sync(
                     + label_bound
                     + 16_384
                     + binding_bytes
+                    + font_bound
                     <= budget.page_layout_bytes,
                 "resource_limit: native metadata classifier/frame binding admission"
             );
@@ -1194,6 +1257,12 @@ pub(crate) fn extract_sync(
                 complexity: complexity.clone(),
                 image_rects,
                 geometry: geometry.clone(),
+                native_text_metadata: native_text_metadata::metadata(
+                    &prepared.summary,
+                    number,
+                    count as u32,
+                    characters,
+                ),
             };
             let metadata_size = encoded_size(&metadata, budget.page_layout_bytes)?;
             admit_staging(&mut staged, metadata_size, &budget)?;
@@ -1394,39 +1463,6 @@ pub(crate) fn extract_sync(
     };
     candidate.frozen_integrity_sha256 = candidate.integrity_digest()?;
     Ok(candidate)
-}
-
-/// Preserve adjacent glyph runs before word-oriented projection. Font changes,
-/// separate rows and large horizontal gaps retain independent layout items.
-fn glyph_runs(items: Vec<TextItem>) -> Vec<TextItem> {
-    let mut runs: Vec<TextItem> = Vec::with_capacity(items.len());
-    for item in items {
-        if let Some(last) = runs.last_mut() {
-            let font = last.font_size.unwrap_or(0.0);
-            let gap = item.x - (last.x + last.width);
-            if last.font_size == item.font_size
-                && last.font_weight == item.font_weight
-                && last.y < item.y + item.height
-                && item.y < last.y + last.height
-                && item.x >= last.x
-                && gap >= -font * 0.5
-                && gap <= font
-            {
-                last.text.push_str(&item.text);
-                last.char_codes.extend(item.char_codes);
-                last.has_unicode_map_error |= item.has_unicode_map_error;
-                last.trailing_space_generated = item.trailing_space_generated;
-                let right = (last.x + last.width).max(item.x + item.width);
-                let bottom = (last.y + last.height).max(item.y + item.height);
-                last.y = last.y.min(item.y);
-                last.width = right - last.x;
-                last.height = bottom - last.y;
-                continue;
-            }
-        }
-        runs.push(item);
-    }
-    runs
 }
 
 /// Conservative bound for the pinned pure projection's sparse-space output.

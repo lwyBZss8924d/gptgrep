@@ -1192,3 +1192,228 @@ fn rich_cache_warm_pin_does_not_follow_current_or_hide_mutation() -> Result<()> 
     assert!(failed.observed_rust_read_bytes >= 14);
     Ok(())
 }
+
+// A source-custody fixture for the previous v5 recipe, not a native extraction
+// acceptance claim. Its source/artifacts are authored locally just like the
+// legacy unversioned fixture above; the exact old profile API remains in use.
+fn legacy_v5_candidate(root: &Path) -> Result<(tempfile::TempDir, RichParsedDocument)> {
+    let (staging, mut parsed) = candidate(root, &["Original legacy recipe evidence\n"])?;
+    let no_value =
+        || FeatureState::Unsupported("pdfium_zero_length_no_value_or_getter_failure".into());
+    let metadata=gptgrep_parse::NativeDocumentMetadata {
+        schema_version:"gptgrep.native.document_metadata.v1".into(),
+        source_sha256:parsed.summary.source_sha256.clone(),
+        prepared_sha256:parsed.summary.prepared_sha256.clone(),
+        physical_page_count:1,native_dpi:96.0,native_render_pages:false,
+        info:["Title","Author","Subject","Keywords","Creator","Producer","CreationDate","ModDate"]
+            .into_iter().map(|tag|(tag.into(),no_value())).collect(),
+        page_labels:vec![gptgrep_parse::NativePageLabel {physical_page:1,label:no_value()}],
+        bookmarks:FeatureState::Absent,
+        capabilities:BTreeMap::from([
+            ("custom_info_keys".into(),FeatureState::Unsupported("bounded_dictionary_enumeration_unavailable".into())),
+            ("xmp_metadata".into(),FeatureState::Unsupported("bounded_xmp_getter_unavailable".into())),
+            ("getter_semantics".into(),FeatureState::Present("length_then_exact_write_utf16le; zero_and_empty_ambiguity_retained; null_outline_reports_no_tree; direct_local_destinations_only; destination_y_ambiguity_retained; no_actions".into())),
+        ]),
+    };
+    let profile =
+        gptgrep_parse::document_metadata_native_profile_digest(&parsed.summary, 96.0, false)?;
+    let bytes = serde_json::to_vec(&metadata)?;
+    let document_artifact = ArtifactRef {
+        id: gptgrep_parse::artifact_id(
+            &parsed.summary.source_sha256,
+            &profile,
+            &ArtifactKind::NativeMetadata,
+            None,
+            None,
+            &digest(&bytes),
+        )?,
+        kind: ArtifactKind::NativeMetadata,
+        relative_path: "document-native.json".into(),
+        sha256: digest(&bytes),
+        profile_sha256: profile.clone(),
+        bytes: bytes.len() as u64,
+        mime: "application/json".into(),
+        page: None,
+        region_id: None,
+    };
+    fs::write(staging.path().join(&document_artifact.relative_path), bytes)?;
+    let page = &mut parsed.pages[0];
+    page.label = no_value();
+    page.capabilities.insert(
+        "native_recipe".into(),
+        FeatureState::Present(gptgrep_parse::DOCUMENT_METADATA_NATIVE_RECIPE.into()),
+    );
+    page.capabilities.insert(
+        "document_metadata".into(),
+        FeatureState::Present(document_artifact.id.clone()),
+    );
+    page.capabilities
+        .insert("bookmarks".into(), FeatureState::Absent);
+    let old_text = page.native_text.id.clone();
+    let old_page_metadata = page.metadata_artifact.id.clone();
+    let mut ids = BTreeMap::new();
+    for artifact in &mut parsed.artifacts {
+        let old = artifact.id.clone();
+        if old == old_page_metadata {
+            let path = staging.path().join(&artifact.relative_path);
+            let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+            value["capabilities"] = serde_json::to_value(&page.capabilities)?;
+            let bytes = serde_json::to_vec(&value)?;
+            fs::write(path, &bytes)?;
+            artifact.sha256 = digest(&bytes);
+            artifact.bytes = bytes.len() as u64;
+        }
+        artifact.profile_sha256 = profile.clone();
+        artifact.id = gptgrep_parse::artifact_id(
+            &parsed.summary.source_sha256,
+            &profile,
+            &artifact.kind,
+            artifact.page,
+            artifact.region_id.as_deref(),
+            &artifact.sha256,
+        )?;
+        ids.insert(old, artifact.clone());
+    }
+    page.native_text = ids[&old_text].clone();
+    page.metadata_artifact = ids[&old_page_metadata].clone();
+    parsed.artifacts.push(document_artifact);
+    parsed.native_profile_sha256 = profile;
+    Ok((staging, parsed))
+}
+
+#[test]
+fn font_word_reader_preserves_unversioned_v4_and_exact_v5_reads() -> Result<()> {
+    for v5 in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().canonicalize()?;
+        let (staging, parsed) = if v5 {
+            legacy_v5_candidate(&root)?
+        } else {
+            candidate(&root, &["Unversioned native fixture\n"])?
+        };
+        let mut writer = RichGenerationWriter::begin(&root, ResourceBudget::default())?;
+        writer.add_document("source.pdf", &staging.path().canonicalize()?, parsed)?;
+        let pin = writer.publish()?;
+        let reader = RichGenerationReader::open_pinned(&root, &pin)?;
+        reader.verify_all()?;
+        let doc = &reader.manifest()?.documents[0];
+        if v5 {
+            assert_eq!(
+                reader
+                    .read_document_metadata(&doc.document.id)?
+                    .physical_page_count,
+                1
+            );
+        } else {
+            assert!(reader.read_document_metadata(&doc.document.id).is_err());
+        }
+        assert!(
+            reader
+                .search_artifacts("native|legacy", true, false, 10, None, MAX_OUTPUT_BYTES)?
+                .hits
+                .len()
+                == 1
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn font_word_v6_reader_preserves_exact_native_metadata_and_freshness() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    let budget = ResourceBudget::default();
+    let (prepared, parsed) = completed_document_metadata(&root, &budget).await?;
+    assert!(
+        parsed
+            .pages
+            .iter()
+            .all(|p| matches!(p.capabilities.get("native_recipe"),
+        Some(FeatureState::Present(r)) if r==gptgrep_parse::NATIVE_FONT_WORD_RECIPE))
+    );
+    let mut writer = RichGenerationWriter::begin(&root, budget.clone())?;
+    writer.add_document("metadata-source.pdf", prepared.staging_root(), parsed)?;
+    let pin = writer.publish()?;
+    let pointer = fs::read(root.join(STATE).join("CURRENT.json"))?;
+    let reader = RichGenerationReader::open_pinned(&root, &pin)?;
+    reader.verify_all()?;
+    let doc = &reader.manifest()?.documents[0];
+    let artifact = &doc.pages[0].metadata_artifact;
+    let bytes = fs::read(reader.dir.join(&artifact.relative_path))?;
+    gptgrep_parse::validate_native_text_metadata(&bytes, &doc.prepared, 1, &budget)?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(
+        value["native_text_metadata"]["source_sha256"],
+        doc.document.source_sha256
+    );
+    assert!(
+        value["native_text_metadata"]["characters"]
+            .as_array()
+            .is_some_and(|g| !g.is_empty())
+    );
+    assert!(
+        value["page"]["text_items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["font_name"].as_str() == Some("Helvetica")
+                && item["words"].as_array().is_some_and(|w| !w.is_empty()))
+    );
+    fs::write(root.join("metadata-source.pdf"), b"changed original source")?;
+    assert!(reader.verify_all().is_err());
+    assert_eq!(fs::read(root.join(STATE).join("CURRENT.json"))?, pointer);
+    Ok(())
+}
+
+#[tokio::test]
+async fn font_word_v6_forged_snapshot_and_recipe_cannot_publish_or_move_current() -> Result<()> {
+    for case in 0..3 {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().canonicalize()?;
+        let prior = publish(&root, &["Prior source publication\n"])?;
+        let pointer = fs::read(root.join(STATE).join("CURRENT.json"))?;
+        let budget = ResourceBudget::default();
+        let (prepared, mut parsed) = completed_document_metadata(&root, &budget).await?;
+        if case == 2 {
+            // A caller cannot strip the new recipe to avoid word validation.
+            parsed.pages[0].capabilities.insert(
+                "native_recipe".into(),
+                FeatureState::Present(gptgrep_parse::DOCUMENT_METADATA_NATIVE_RECIPE.into()),
+            );
+        } else {
+            let old = parsed.pages[0].metadata_artifact.id.clone();
+            let path = prepared
+                .staging_root()
+                .join(&parsed.pages[0].metadata_artifact.relative_path);
+            let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+            if case == 0 {
+                value["page"]["text_items"][0]["words"][0]["width"] = json!(99999);
+            } else {
+                value["native_text_metadata"]["characters"][0]["font"]["value"]["name"] =
+                    json!({"state":"present","value":"Forged font name"});
+            }
+            let bytes = serde_json::to_vec(&value)?;
+            fs::write(path, &bytes)?;
+            let artifact = &mut parsed.pages[0].metadata_artifact;
+            artifact.sha256 = digest(&bytes);
+            artifact.bytes = bytes.len() as u64;
+            artifact.id = gptgrep_parse::artifact_id(
+                &parsed.summary.source_sha256,
+                &artifact.profile_sha256,
+                &artifact.kind,
+                artifact.page,
+                artifact.region_id.as_deref(),
+                &artifact.sha256,
+            )?;
+            *parsed.artifacts.iter_mut().find(|a| a.id == old).unwrap() = artifact.clone();
+        }
+        let mut writer = RichGenerationWriter::begin(&root, budget)?;
+        let error = writer
+            .add_document("metadata-source.pdf", prepared.staging_root(), parsed)
+            .expect_err("forged metadata rejected");
+        assert!(error.to_string().contains("native"), "{error}");
+        assert_eq!(fs::read(root.join(STATE).join("CURRENT.json"))?, pointer);
+        assert_eq!(RichGenerationReader::open(&root)?.pin(), prior);
+    }
+    Ok(())
+}
