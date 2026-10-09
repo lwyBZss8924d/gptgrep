@@ -20,6 +20,7 @@ mod image_prepare;
 #[cfg(test)]
 mod image_prepare_tests;
 mod ocr;
+mod ocr_compat;
 mod office;
 mod resource;
 mod rich;
@@ -41,6 +42,10 @@ pub use ocr::{
     OcrRegionResult, OcrRegionStatus, OcrResultStatus, OcrTask, OcrTaskBudget, ocr_profile_digest,
     ocr_task_digest, validate_ocr_result, validate_ocr_result_metadata, validate_ocr_task,
     validate_ocr_task_metadata, validate_rendition, validate_rendition_metadata,
+};
+pub use ocr_compat::{
+    COMPATIBILITY_MODE, CompatibilityOcrRegion, CompatibilityOcrResult, CompatibilityOcrTask,
+    compatibility_task_digest, validate_compatibility_result,
 };
 pub use office::{is_office_extension, office_preparation_profile_digest};
 pub use resource::ResourceBudget;

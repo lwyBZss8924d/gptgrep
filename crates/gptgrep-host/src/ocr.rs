@@ -132,6 +132,8 @@ pub struct OcrHostConfig {
 pub struct OcrHostExecutor {
     config: OcrHostConfig,
     context: OcrExecutionContext,
+    service_roots: Option<std::sync::Arc<ServiceRoots>>,
+    service_secret: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -153,7 +155,12 @@ impl OcrHostExecutor {
             "ocr_native_viewer_hard_boundary_unavailable"
         );
         ensure!(!config.codex_bin.is_empty(), "ocr_codex_binary_missing");
-        Ok(Self { config, context })
+        Ok(Self {
+            config,
+            context,
+            service_roots: None,
+            service_secret: None,
+        })
     }
 
     /// Explicit qualification admission. This never promotes its result or profile.
@@ -162,7 +169,142 @@ impl OcrHostExecutor {
         self.execute_page(task, false).await
     }
 
+    #[cfg(test)]
+    pub(crate) fn service_admissions_for_test(&self) -> crate::OcrBudgetSnapshot {
+        self.context.snapshot().unwrap()
+    }
+    pub(crate) fn service_remaining(&self) -> Result<Duration> {
+        self.context.remaining()
+    }
+
+    pub(crate) fn runtime_profile_digest(&self) -> Result<String> {
+        self.config.runtime_profile.sha256()
+    }
+    pub(crate) fn with_service_roots(mut self, source_root: &Path) -> Result<Self> {
+        let source_path = source_root.canonicalize()?;
+        let image_path = self.config.prepared_root.canonicalize()?;
+        let raw_path = self.config.raw_results_dir.canonicalize()?;
+        self.service_roots = Some(std::sync::Arc::new(ServiceRoots {
+            source: open_directory(&source_path)?,
+            images: open_directory(&image_path)?,
+            source_path,
+            image_path,
+            raw: open_directory(&raw_path)?,
+            raw_path,
+            working: None,
+        }));
+        Ok(self)
+    }
+    pub(crate) fn with_service_working(
+        mut self,
+        working: crate::ocr_service::working::WorkingBudget,
+    ) -> Result<Self> {
+        let roots = self
+            .service_roots
+            .as_mut()
+            .and_then(std::sync::Arc::get_mut)
+            .ok_or_else(|| anyhow!("ocr_service_working_binding"))?;
+        roots.working = Some(working);
+        Ok(self)
+    }
+    pub(crate) fn with_service_secret(mut self, name: &str) -> Result<Self> {
+        crate::ocr_service::validate_token_env_name(name)?;
+        self.service_secret = Some(name.into());
+        Ok(self)
+    }
+    pub(crate) fn check_service_task(&self, task: &OcrTask) -> Result<()> {
+        let roots = self
+            .service_roots
+            .as_ref()
+            .ok_or_else(|| anyhow!("ocr_service_custody_missing"))?;
+        PreparedPage::new_service(task.clone(), roots)?.fresh()
+    }
+    pub async fn execute_cancellable(
+        &self,
+        task: OcrTask,
+        cancel: OcrCancellation,
+    ) -> Result<OcrPageResult> {
+        let executor = self.clone();
+        let worker_cancel = cancel.clone();
+        let worker = tokio::spawn(async move {
+            executor
+                .execute_native(task, true, Some(worker_cancel))
+                .await
+                .map(|value| value.result)
+        });
+        let guard = CancelWhenDropped(cancel);
+        let result = worker
+            .await
+            .map_err(|_| anyhow!("ocr_owned_execution_cleanup_unknown"))?;
+        drop(guard);
+        result
+    }
     async fn execute_page(&self, task: OcrTask, require_qualified: bool) -> Result<OcrProbeReport> {
+        self.execute_native(task, require_qualified, None).await
+    }
+    async fn execute_native(
+        &self,
+        task: OcrTask,
+        require_qualified: bool,
+        cancel: Option<OcrCancellation>,
+    ) -> Result<OcrProbeReport> {
+        let runtime_digest = self.config.runtime_profile.sha256()?;
+        let completed = self
+            .run_owned_page(
+                task,
+                require_qualified,
+                None,
+                runtime_digest.clone(),
+                cancel,
+            )
+            .await?;
+        let outcome = completed.outcome;
+        let raw_sha256 = hash(outcome.answer.as_bytes());
+        let wire: OcrWireResult = serde_json::from_str(&outcome.answer)
+            .map_err(|_| anyhow!("ocr_invalid_result_json"))?;
+        let result = OcrPageResult {
+            schema_version: wire.schema_version,
+            task_id: wire.task_id,
+            task_sha256: wire.task_sha256,
+            source_sha256: wire.source_sha256,
+            prepared_sha256: wire.prepared_sha256,
+            page: wire.page,
+            status: wire.status,
+            regions: wire.regions,
+            receipt: OcrReceipt {
+                model: DEFAULT_OCR_MODEL.into(),
+                profile_sha256: ocr_profile_digest(&outcome.page.task.profile)?,
+                runtime_profile_sha256: runtime_digest.clone(),
+                image_deliveries: outcome.page.delivery_events.clone(),
+                request_sha256: outcome.request_sha256,
+                response_sha256: raw_sha256,
+                usage: outcome.usage,
+                latency_ms: Some(completed.elapsed_ms),
+            },
+        };
+        validate_ocr_result_metadata(&outcome.page.task, &result)?;
+        Ok(OcrProbeReport {
+            result,
+            runtime_profile_sha256: runtime_digest,
+            image_qualification_accepted: self
+                .config
+                .runtime_profile
+                .accepted_image_qualification_sha256
+                .is_some(),
+            tool_calls: outcome.tool_calls,
+            image_deliveries: outcome.page.image_deliveries,
+            transport_bytes: outcome.transport_bytes,
+            server_retry_notifications: outcome.retries,
+        })
+    }
+    pub(crate) async fn run_owned_page(
+        &self,
+        task: OcrTask,
+        require_qualified: bool,
+        compatibility: Option<gptgrep_parse::CompatibilityOcrTask>,
+        runtime_digest: String,
+        cancel: Option<OcrCancellation>,
+    ) -> Result<CompletedOcrPage> {
         if require_qualified {
             ensure!(
                 self.config
@@ -172,25 +314,37 @@ impl OcrHostExecutor {
                 "ocr_runtime_image_qualification_required"
             );
         }
+        let owner = self.clone();
+        let (prepared, binary, home) = tokio::task::spawn_blocking(move || -> Result<_> {
+            owner.context.remaining()?;
+            let prepared = match &owner.service_roots {
+                Some(roots) => PreparedPage::new_service(task, roots)?,
+                None => PreparedPage::new(task, &owner.config.prepared_root)?,
+            };
+            let binary = resolve_binary(&owner.config.codex_bin)?;
+            ensure!(
+                hash_file(&binary, 2 * 1024 * 1024 * 1024)?
+                    == owner.config.runtime_profile.codex_binary_sha256,
+                "ocr_runtime_binary_changed"
+            );
+            let home = owner
+                .config
+                .codex_home
+                .canonicalize()
+                .map_err(|_| anyhow!("ocr_codex_home_unavailable"))?;
+            ensure!(home.is_dir(), "ocr_codex_home_unavailable");
+            Ok((prepared, binary, home))
+        })
+        .await
+        .map_err(|_| anyhow!("ocr_preparation_worker_failed"))??;
         self.context.remaining()?;
-        let prepared = PreparedPage::new(task, &self.config.prepared_root)?;
-        let runtime_digest = self.config.runtime_profile.sha256()?;
-        let binary = resolve_binary(&self.config.codex_bin)?;
-        ensure!(
-            hash_file(&binary, 2 * 1024 * 1024 * 1024)?
-                == self.config.runtime_profile.codex_binary_sha256,
-            "ocr_runtime_binary_changed"
-        );
-        let home = self
-            .config
-            .codex_home
-            .canonicalize()
-            .map_err(|_| anyhow!("ocr_codex_home_unavailable"))?;
-        ensure!(home.is_dir(), "ocr_codex_home_unavailable");
-        let mut admission = self
-            .context
-            .reserve(&prepared.task.task_sha256, &runtime_digest)
-            .await?;
+        let admitted_task = compatibility
+            .as_ref()
+            .map_or(&prepared.task.task_sha256, |task| &task.task_sha256);
+        let mut admission = tokio::select! {
+            _ = cancellation_wait(cancel.as_ref()) => return Err(anyhow!("ocr_cancelled_before_admission")),
+            admission = self.context.reserve(admitted_task, &runtime_digest) => admission?,
+        };
         let started = Instant::now();
         let deadline = tokio::time::Instant::now()
             + self.context.remaining()?.min(Duration::from_secs(u64::from(
@@ -205,7 +359,13 @@ impl OcrHostExecutor {
         descriptor.write_all(&serde_json::to_vec(&model_descriptor())?)?;
         descriptor.sync_all()?;
         admission.check_deadline(deadline)?;
+        if cancel.as_ref().is_some_and(OcrCancellation::is_cancelled) {
+            return Err(anyhow!("ocr_cancelled_before_spawn"));
+        }
         let mut command = ocr_command(&binary, cwd.path(), &home, &descriptor_path)?;
+        if let Some(name) = &self.service_secret {
+            strip_service_secret(&mut command, name)?;
+        }
         let mut child = command
             .spawn()
             .map_err(|_| anyhow!("ocr_runtime_spawn_failed"))?;
@@ -243,8 +403,9 @@ impl OcrHostExecutor {
         let outcome = tokio::time::timeout_at(deadline, async {
             tokio::select! {
                 biased;
+                _ = cancellation_wait(cancel.as_ref()) => Err(anyhow!("ocr_cancelled_completion_unknown")),
                 _ = transport.exceeded() => Err(anyhow!("ocr_total_transport_limit")),
-                result = ocr_protocol::run(
+                result = ocr_protocol::run_mode(
                     stdout,
                     stdin,
                     cwd.path(),
@@ -252,6 +413,7 @@ impl OcrHostExecutor {
                     &runtime_digest,
                     &mut admission,
                     ocr_protocol::OcrRunBudget { deadline, transport: transport.clone() },
+                    compatibility,
                 ) => result,
             }
         })
@@ -278,47 +440,25 @@ impl OcrHostExecutor {
         outcome.transport_bytes = transport.used();
         // The provider turn is terminal even when OCR completeness validation fails.
         let raw_sha256 = hash(outcome.answer.as_bytes());
-        retain_raw(
-            &self.config.raw_results_dir,
-            &raw_sha256,
-            outcome.answer.as_bytes(),
-        )?;
+        if let Some(roots) = &self.service_roots {
+            crate::ocr_service::retain_service_raw(
+                &roots.raw_path,
+                &roots.raw,
+                &raw_sha256,
+                outcome.answer.as_bytes(),
+                &outcome.page.task.budget.resources,
+            )?;
+        } else {
+            retain_raw(
+                &self.config.raw_results_dir,
+                &raw_sha256,
+                outcome.answer.as_bytes(),
+            )?;
+        }
         outcome.page.verify_delivery()?;
-        let wire: OcrWireResult = serde_json::from_str(&outcome.answer)
-            .map_err(|_| anyhow!("ocr_invalid_result_json"))?;
-        let result = OcrPageResult {
-            schema_version: wire.schema_version,
-            task_id: wire.task_id,
-            task_sha256: wire.task_sha256,
-            source_sha256: wire.source_sha256,
-            prepared_sha256: wire.prepared_sha256,
-            page: wire.page,
-            status: wire.status,
-            regions: wire.regions,
-            receipt: OcrReceipt {
-                model: DEFAULT_OCR_MODEL.into(),
-                profile_sha256: ocr_profile_digest(&outcome.page.task.profile)?,
-                runtime_profile_sha256: runtime_digest.clone(),
-                image_deliveries: outcome.page.delivery_events.clone(),
-                request_sha256: outcome.request_sha256,
-                response_sha256: raw_sha256,
-                usage: outcome.usage,
-                latency_ms: Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
-            },
-        };
-        validate_ocr_result_metadata(&outcome.page.task, &result)?;
-        Ok(OcrProbeReport {
-            result,
-            runtime_profile_sha256: runtime_digest,
-            image_qualification_accepted: self
-                .config
-                .runtime_profile
-                .accepted_image_qualification_sha256
-                .is_some(),
-            tool_calls: outcome.tool_calls,
-            image_deliveries: outcome.page.image_deliveries,
-            transport_bytes: outcome.transport_bytes,
-            server_retry_notifications: outcome.retries,
+        Ok(CompletedOcrPage {
+            outcome,
+            elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         })
     }
 }
@@ -349,16 +489,102 @@ impl OcrExecutor for OcrHostExecutor {
     }
 }
 
+#[derive(Clone, Default)]
+pub struct OcrCancellation(std::sync::Arc<CancelState>);
+#[derive(Default)]
+struct CancelState {
+    cancelled: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+impl OcrCancellation {
+    pub fn cancel(&self) {
+        self.0
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.0.notify.notify_waiters();
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.0.cancelled.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    pub(crate) async fn wait_service(&self) {
+        loop {
+            let wake = self.0.notify.notified();
+            tokio::pin!(wake);
+            wake.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            wake.await;
+        }
+    }
+}
+async fn cancellation_wait(cancel: Option<&OcrCancellation>) {
+    match cancel {
+        Some(value) => value.wait_service().await,
+        None => std::future::pending().await,
+    }
+}
+pub(crate) struct CancelWhenDropped(pub(crate) OcrCancellation);
+impl Drop for CancelWhenDropped {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+struct ServiceRoots {
+    raw_path: PathBuf,
+    raw: File,
+    source_path: PathBuf,
+    image_path: PathBuf,
+    source: File,
+    images: File,
+    working: Option<crate::ocr_service::working::WorkingBudget>,
+}
+pub(crate) struct CompletedOcrPage {
+    pub outcome: ocr_protocol::OcrOutcome,
+    pub elapsed_ms: u64,
+}
+fn hash_held_file(file: &File, limit: u64) -> Result<String> {
+    use std::io::{Seek, SeekFrom};
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file() && metadata.len() <= limit,
+        "ocr_source_file_admission"
+    );
+    let mut handle = file.try_clone()?;
+    handle.seek(SeekFrom::Start(0))?;
+    let mut digest = Sha256::new();
+    let mut total = 0u64;
+    let mut buffer = [0u8; 65536];
+    loop {
+        let n = handle.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        ensure!(total <= limit, "ocr_source_file_admission");
+        digest.update(&buffer[..n]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
 pub(crate) struct PreparedPage {
     pub task: OcrTask,
     root: PathBuf,
     root_handle: File,
+    source_file: Option<File>,
+    source_namespace: Option<(std::sync::Arc<ServiceRoots>, PathBuf)>,
     pub image_deliveries: usize,
     pub delivery_events: Vec<OcrImageDelivery>,
     delivered: BTreeSet<String>,
 }
 
 impl PreparedPage {
+    pub(crate) fn service_working(&self) -> Option<crate::ocr_service::working::WorkingBudget> {
+        self.source_namespace
+            .as_ref()
+            .and_then(|(roots, _)| roots.working.clone())
+    }
+
     pub fn new(task: OcrTask, root: &Path) -> Result<Self> {
         validate_ocr_task_metadata(&task)?;
         ensure!(
@@ -385,6 +611,8 @@ impl PreparedPage {
             task,
             root,
             root_handle,
+            source_file: None,
+            source_namespace: None,
             image_deliveries: 0,
             delivery_events: Vec::new(),
             delivered: BTreeSet::new(),
@@ -393,15 +621,63 @@ impl PreparedPage {
         Ok(page)
     }
 
+    pub(crate) fn validate_service_custody(
+        task: OcrTask,
+        source: &Path,
+        images: &Path,
+    ) -> Result<()> {
+        let roots = std::sync::Arc::new(ServiceRoots {
+            source_path: source.to_path_buf(),
+            image_path: images.to_path_buf(),
+            raw_path: images.to_path_buf(),
+            raw: open_directory(images)?,
+            source: open_directory(source)?,
+            images: open_directory(images)?,
+            working: None,
+        });
+        Self::new_service(task, &roots)?.fresh()
+    }
+    fn new_service(task: OcrTask, roots: &std::sync::Arc<ServiceRoots>) -> Result<Self> {
+        validate_ocr_task_metadata(&task)?;
+        let source_relative = task
+            .source_path
+            .strip_prefix(&roots.source_path)
+            .map_err(|_| anyhow!("ocr_source_root_binding"))?;
+        let source_relative = source_relative.to_path_buf();
+        let source_file = open_relative(&roots.source, &source_relative)?;
+        let page = Self {
+            task,
+            root: roots.image_path.clone(),
+            root_handle: roots.images.try_clone()?,
+            source_file: Some(source_file),
+            source_namespace: Some((roots.clone(), source_relative)),
+            image_deliveries: 0,
+            delivery_events: Vec::new(),
+            delivered: BTreeSet::new(),
+        };
+        page.fresh()?;
+        Ok(page)
+    }
     pub fn fresh(&self) -> Result<()> {
         validate_ocr_task_metadata(&self.task)?;
-        ensure!(
+        if let Some((roots, relative)) = &self.source_namespace {
+            verify_directory(&roots.source_path, &roots.source)?;
+            verify_directory(&roots.image_path, &roots.images)?;
+            let current = open_relative(&roots.source, relative)?;
+            ensure!(
+                same_file(&current, self.source_file.as_ref().expect("held source"))?,
+                "ocr_source_namespace_changed"
+            );
+        }
+        let source_sha = if let Some(file) = &self.source_file {
+            hash_held_file(file, self.task.budget.resources.document_staging_bytes)?
+        } else {
             hash_file(
                 &self.task.source_path,
-                self.task.budget.resources.document_staging_bytes
-            )? == self.task.source_sha256,
-            "ocr_source_changed"
-        );
+                self.task.budget.resources.document_staging_bytes,
+            )?
+        };
+        ensure!(source_sha == self.task.source_sha256, "ocr_source_changed");
         for image in &self.task.images {
             let _ = self.image_bytes(&image.artifact.id, &image.artifact.sha256)?;
         }
@@ -456,6 +732,18 @@ impl PreparedPage {
             "ocr_image_dimensions_mismatch"
         );
         budget.admit_image(dimensions.0, dimensions.1, length)?;
+        if self.source_namespace.is_some() {
+            let working = u64::from(image.width)
+                .checked_mul(u64::from(image.height))
+                .and_then(|p| p.checked_mul(8))
+                .and_then(|p| p.checked_add(budget.image_pixel_buffer_bytes))
+                .and_then(|p| p.checked_add(length.saturating_mul(3) + 65_536))
+                .ok_or_else(|| anyhow!("ocr_owned_working_admission"))?;
+            ensure!(
+                working <= budget.owned_working_bytes,
+                "ocr_owned_working_admission"
+            );
+        }
         let mut reader = ImageReader::with_format(Cursor::new(&bytes), format);
         let mut limits = Limits::default();
         limits.max_alloc = Some(budget.image_pixel_buffer_bytes);
@@ -674,13 +962,15 @@ fn hash_file(path: &Path, limit: u64) -> Result<String> {
         .map(|b| format!("{b:02x}"))
         .collect())
 }
-fn open_directory(path: &Path) -> Result<File> {
+pub(crate) fn open_directory(path: &Path) -> Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options.custom_flags(
+            libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        );
     }
     let directory = options
         .open(path)
@@ -693,7 +983,7 @@ fn open_directory(path: &Path) -> Result<File> {
 }
 
 #[cfg(unix)]
-fn open_relative(root: &File, relative: &Path) -> Result<File> {
+pub(crate) fn open_relative(root: &File, relative: &Path) -> Result<File> {
     use std::{
         ffi::CString,
         os::{
@@ -731,7 +1021,7 @@ fn open_relative(root: &File, relative: &Path) -> Result<File> {
     Ok(directory)
 }
 #[cfg(not(unix))]
-fn open_relative(_root: &File, _relative: &Path) -> Result<File> {
+pub(crate) fn open_relative(_root: &File, _relative: &Path) -> Result<File> {
     Err(anyhow!("ocr_atomic_root_confinement_unsupported"))
 }
 fn resolve_binary(name: &str) -> Result<PathBuf> {
@@ -768,6 +1058,14 @@ fn retain_raw(root: &Path, digest: &str, bytes: &[u8]) -> Result<()> {
     output.write_all(bytes)?;
     output.sync_all()?;
     File::open(root)?.sync_all()?;
+    Ok(())
+}
+
+pub(crate) fn strip_service_secret(command: &mut Command, name: &str) -> Result<()> {
+    crate::ocr_service::validate_token_env_name(name)?;
+    command
+        .env_remove(name)
+        .env_remove("GPTGREP_OCR_SERVE_TOKEN");
     Ok(())
 }
 
@@ -833,4 +1131,21 @@ pub(crate) fn model_descriptor() -> Value {
         "supports_experimental_context":false,"use_responses_lite":false,"node_repl_disabled":true,"tool_mode":"direct",
         "multi_agent_version":"disabled"
     }]})
+}
+
+#[cfg(unix)]
+pub(crate) fn same_file(a: &File, b: &File) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let a = a.metadata()?;
+    let b = b.metadata()?;
+    Ok(a.dev() == b.dev() && a.ino() == b.ino())
+}
+#[cfg(not(unix))]
+pub(crate) fn same_file(_a: &File, _b: &File) -> Result<bool> {
+    Err(anyhow!("ocr_atomic_root_confinement_unsupported"))
+}
+pub(crate) fn verify_directory(path: &Path, held: &File) -> Result<()> {
+    let current = open_directory(path)?;
+    ensure!(same_file(&current, held)?, "ocr_root_namespace_changed");
+    Ok(())
 }

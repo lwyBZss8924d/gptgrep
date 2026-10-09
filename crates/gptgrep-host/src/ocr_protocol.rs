@@ -26,7 +26,31 @@ pub(crate) struct OcrRunBudget {
     pub transport: TransportBudget,
 }
 
+#[cfg(test)]
 pub(crate) async fn run<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    stdout: R,
+    stdin: W,
+    cwd: &Path,
+    page: PreparedPage,
+    runtime_digest: &str,
+    admission: &mut OcrAdmission,
+    budget: OcrRunBudget,
+) -> Result<OcrOutcome> {
+    run_mode(
+        stdout,
+        stdin,
+        cwd,
+        page,
+        runtime_digest,
+        admission,
+        budget,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_mode<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: R,
     writer: W,
     cwd: &Path,
@@ -34,11 +58,13 @@ pub(crate) async fn run<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     runtime_sha256: &str,
     admission: &mut OcrAdmission,
     budget: OcrRunBudget,
+    compatibility: Option<gptgrep_parse::CompatibilityOcrTask>,
 ) -> Result<OcrOutcome> {
     let OcrRunBudget {
         deadline,
         transport,
     } = budget;
+    let working = page.service_working();
     let mut rpc = OcrRpc {
         reader: BufReader::new(BudgetedReader::new(reader, transport.clone())),
         writer,
@@ -47,6 +73,7 @@ pub(crate) async fn run<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         deadline,
         transport,
         metadata: AutomaticMetadata::default(),
+        working,
     };
     rpc.request(1, "initialize", json!({"clientInfo":{"name":"gptgrep_ocr","title":"GPTgrep bounded OCR","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true,"explicitGatewayOauth":true}})).await?;
     rpc.send(json!({"method":"initialized"})).await?;
@@ -81,11 +108,28 @@ pub(crate) async fn run<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let policy = crate::ocr::ocr_policy();
     let task = &page.task;
     let prompt = json!({"task_id":task.id,"task_sha256":task.task_sha256,"source_sha256":task.source_sha256,"prepared_sha256":task.prepared_sha256,"page":task.page,"page_width_points":task.page_width_points,"page_height_points":task.page_height_points,"regions":task.regions,"images":task.images});
+    let instructions = if compatibility.is_some() {
+        crate::ocr_compat::INSTRUCTIONS
+    } else {
+        OCR_BASE_INSTRUCTIONS
+    };
+    let mut prompt = prompt;
+    if let Some(compat) = &compatibility {
+        prompt["compatibility"] = json!({"task_sha256":compat.task_sha256,"language":compat.language,
+            "mode_policy_sha256":crate::ocr_compat::mode_policy_digest()?,"lineage":"submitted_image_only",
+            "confidence":"model_reported_uncalibrated","pixel_extent":[0,0,compat.image.width,compat.image.height]});
+    }
+    let output = match &compatibility {
+        Some(compat) => {
+            crate::ocr_compat::schema(compat, &crate::ocr_compat::mode_policy_digest()?)
+        }
+        None => output_schema(task),
+    };
     let thread = rpc.request(3, "thread/start", json!({
         "model":DEFAULT_OCR_MODEL,"modelProvider":"openai","allowProviderModelFallback":false,
         "serviceTier":"fast","cwd":cwd,"approvalPolicy":"never","sandbox":"read-only",
         "ephemeral":true,"environments":[],"runtimeWorkspaceRoots":[],"selectedCapabilityRoots":[],
-        "config":policy,"baseInstructions":OCR_BASE_INSTRUCTIONS,
+        "config":policy,"baseInstructions":instructions,
         "dynamicTools":tools()
     })).await?;
     let thread_id = identifier(&thread["thread"]["id"])?;
@@ -108,10 +152,11 @@ pub(crate) async fn run<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             || matches!(thread["serviceTier"].as_str(), Some("fast" | "priority")),
         "ocr_runtime_tier_changed"
     );
+    drop(thread);
     let turn = json!({"id":4,"method":"turn/start","params":{
         "threadId":thread_id,"model":DEFAULT_OCR_MODEL,"effort":"max","serviceTier":"fast",
         "approvalPolicy":"never","sandboxPolicy":{"type":"readOnly","networkAccess":false},
-        "input":[{"type":"text","text":prompt.to_string(),"text_elements":[]}],"outputSchema":output_schema(task)
+        "input":[{"type":"text","text":prompt.to_string(),"text_elements":[]}],"outputSchema":output
     }});
     let request_sha256 = hash(&serde_json::to_vec(
         &json!({"task_sha256":task.task_sha256,"runtime_profile_sha256":runtime_sha256,"model_descriptor":crate::ocr::model_descriptor(),"turn_request":turn}),
@@ -151,11 +196,13 @@ pub(crate) async fn run<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 params["namespace"] == NAMESPACE && params["tool"] == TOOL,
                 "ocr_unapproved_tool"
             );
+            // Count before cloning an arbitrary incoming tree.
+            crate::ocr_service::bounded_json(&params["arguments"], 4096)
+                .map_err(|_| anyhow!("ocr_tool_argument_limit"))?;
             let args = params["arguments"].clone();
-            ensure!(
-                serde_json::to_vec(&args)?.len() <= 4096,
-                "ocr_tool_argument_limit"
-            );
+            let id = id.clone();
+            // Release the incoming tree/lease before page.call image decode.
+            drop(message);
             let bound = page.call_size_bound(&args)?;
             ensure!(
                 bound <= rpc.frame_limit && bound <= rpc.transport.remaining(),
@@ -209,6 +256,10 @@ pub(crate) async fn run<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 same_thread(&message, &thread_id)?;
                 if message["params"].get("turnId").is_some() {
                     bind_turn(&mut turn_id, &message["params"]["turnId"])?;
+                }
+                if rpc.working.is_some() {
+                    crate::ocr_service::bounded_json(&message["params"]["tokenUsage"], 4096)
+                        .map_err(|_| anyhow!("ocr_service_usage_working_limit"))?;
                 }
                 usage = Some(message["params"]["tokenUsage"].clone());
             }
@@ -366,6 +417,26 @@ fn output_schema(task: &gptgrep_parse::OcrTask) -> Value {
 
 pub(crate) use crate::transport::{BudgetedReader, TransportBudget};
 
+struct Incoming {
+    value: Value,
+    _lease: Option<crate::ocr_service::working::WorkingLease>,
+}
+impl std::ops::Deref for Incoming {
+    type Target = Value;
+    fn deref(&self) -> &Value {
+        &self.value
+    }
+}
+impl std::fmt::Debug for Incoming {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.value.fmt(f)
+    }
+}
+impl PartialEq<Value> for Incoming {
+    fn eq(&self, other: &Value) -> bool {
+        self.value == *other
+    }
+}
 struct OcrRpc<R, W> {
     reader: R,
     writer: W,
@@ -374,6 +445,7 @@ struct OcrRpc<R, W> {
     deadline: tokio::time::Instant,
     transport: TransportBudget,
     metadata: AutomaticMetadata,
+    working: Option<crate::ocr_service::working::WorkingBudget>,
 }
 impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> OcrRpc<R, W> {
     async fn send(&mut self, value: Value) -> Result<()> {
@@ -399,7 +471,12 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> OcrRpc<R, W> {
             .map_err(|_| anyhow!("ocr_input_transport_closed"))?;
         Ok(())
     }
-    async fn receive(&mut self) -> Result<Value> {
+    async fn receive(&mut self) -> Result<Incoming> {
+        let mut lease = self
+            .working
+            .as_ref()
+            .map(|budget| budget.reserve(0))
+            .transpose()?;
         let mut line = Vec::new();
         loop {
             ensure!(
@@ -425,6 +502,16 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> OcrRpc<R, W> {
                 "ocr_incoming_frame_limit"
             );
             let complete = data[count - 1] == b'\n';
+            // 40x JSON tree allowance plus 2x raw capacity, admitted before
+            // buffer growth and before the unique JSON parser allocates.
+            if let Some(lease) = &mut lease {
+                lease.grow_to(
+                    ((line.len() + count) as u64)
+                        .checked_mul(42)
+                        .ok_or_else(|| anyhow!("ocr_service_frame_working_limit"))?,
+                )?;
+            }
+            line.try_reserve_exact(count)?;
             line.extend_from_slice(&data[..count]);
             self.reader.consume(count);
             if complete {
@@ -433,19 +520,31 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> OcrRpc<R, W> {
         }
         self.messages += 1;
         ensure!(self.messages <= 4096, "ocr_message_count_limit");
-        gptgrep_jev::parse_unique_json(&line).map_err(|_| anyhow!("ocr_invalid_protocol_json"))
+        let value = gptgrep_jev::parse_unique_json(&line)
+            .map_err(|_| anyhow!("ocr_invalid_protocol_json"))?;
+        let raw_len = line.len();
+        // Drop the raw buffer BEFORE making its charge available to another job.
+        drop(line);
+        if let Some(lease) = &mut lease {
+            lease.shrink_to(raw_len as u64 * 40)?;
+        }
+        Ok(Incoming {
+            value,
+            _lease: lease,
+        })
     }
     async fn deny(&mut self, id: Value) -> Result<()> {
         self.send(json!({"id":id,"error":{"code":-32601,"message":"OCR request not admitted"}}))
             .await
     }
-    async fn request(&mut self, id: u64, method: &str, params: Value) -> Result<Value> {
+    async fn request(&mut self, id: u64, method: &str, params: Value) -> Result<Incoming> {
         self.send(json!({"id":id,"method":method,"params":params}))
             .await?;
         loop {
-            let reply = self.receive().await?;
+            let mut reply = self.receive().await?;
             if reply.get("method").is_some() {
                 if let Some(server_id) = reply.get("id") {
+                    ensure!(valid_rpc_id(server_id), "ocr_invalid_server_request_id");
                     self.deny(server_id.clone()).await?;
                     return Err(anyhow!("ocr_unapproved_startup_request"));
                 }
@@ -465,10 +564,13 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> OcrRpc<R, W> {
                 reply["id"] == id && reply.get("error").is_none(),
                 "ocr_startup_response_mismatch"
             );
-            return reply
-                .get("result")
-                .cloned()
-                .ok_or_else(|| anyhow!("ocr_startup_result_missing"));
+            // Keep the incoming lease; move the result instead of cloning its tree.
+            reply.value = reply
+                .value
+                .as_object_mut()
+                .and_then(|object| object.remove("result"))
+                .ok_or_else(|| anyhow!("ocr_startup_result_missing"))?;
+            return Ok(reply);
         }
     }
 }
@@ -916,6 +1018,7 @@ mod metadata_tests {
                 deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(5),
                 transport: TransportBudget::new(1048576),
                 metadata: AutomaticMetadata::default(),
+                working: None,
             };
             assert_eq!(
                 rpc.request(1, "initialize", json!({}))
@@ -995,6 +1098,7 @@ mod tests {
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(5),
             transport: transport.clone(),
             metadata: AutomaticMetadata::default(),
+            working: None,
         };
         assert_eq!(
             rpc.send(json!({"text":"x".repeat(64)}))
@@ -1022,6 +1126,7 @@ mod tests {
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(5),
             transport: transport.clone(),
             metadata: AutomaticMetadata::default(),
+            working: None,
         };
         rpc.send(json!({"sent":"1234567890"})).await.unwrap();
         assert_eq!(
@@ -1049,6 +1154,7 @@ mod tests {
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(5),
             transport: transport.clone(),
             metadata: AutomaticMetadata::default(),
+            working: None,
         };
         assert_eq!(
             rpc.send(json!({"message":"x"}))
@@ -1061,5 +1167,158 @@ mod tests {
         transport.exceeded().await;
         assert!(stderr.read(&mut scratch).await.is_err());
         assert_eq!(transport.used(), 120);
+    }
+}
+
+#[cfg(test)]
+mod service_working_tests {
+    use super::*;
+    use crate::ocr_service::working::WorkingBudget;
+    fn rpc(
+        bytes: Vec<u8>,
+        budget: WorkingBudget,
+    ) -> OcrRpc<BufReader<std::io::Cursor<Vec<u8>>>, tokio::io::Sink> {
+        rpc_with_writer(bytes, budget, tokio::io::sink())
+    }
+    fn rpc_with_writer<W>(
+        bytes: Vec<u8>,
+        budget: WorkingBudget,
+        writer: W,
+    ) -> OcrRpc<BufReader<std::io::Cursor<Vec<u8>>>, W> {
+        OcrRpc {
+            reader: BufReader::new(std::io::Cursor::new(bytes)),
+            writer,
+            messages: 0,
+            frame_limit: 4_194_304,
+            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+            transport: TransportBudget::new(16_777_216),
+            metadata: AutomaticMetadata::default(),
+            working: Some(budget),
+        }
+    }
+    #[derive(Default)]
+    struct CapturedWriter {
+        bytes: Vec<u8>,
+    }
+    impl AsyncWrite for CapturedWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.get_mut().bytes.extend_from_slice(bytes);
+            std::task::Poll::Ready(Ok(bytes.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+    #[tokio::test]
+    async fn startup_malformed_ids_fail_before_denial_and_release_working() {
+        for id in [
+            json!(vec![false; 1024]),
+            json!({"nested":vec![false; 1024]}),
+            Value::Null,
+            json!("x".repeat(257)),
+        ] {
+            let bytes = format!("{}\n", json!({"id":id,"method":"unapproved"})).into_bytes();
+            let budget = WorkingBudget::new(bytes.len() as u64 * 42 + 4096);
+            let retained = budget.reserve(4096).unwrap();
+            let mut rpc = rpc_with_writer(bytes, budget.clone(), CapturedWriter::default());
+            assert_eq!(
+                rpc.request(2, "mock/read", json!({}))
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "ocr_invalid_server_request_id"
+            );
+            // Only the caller's initial request was sent: no denial Value/frame.
+            assert_eq!(
+                rpc.writer.bytes,
+                format!("{}\n", json!({"id":2,"method":"mock/read","params":{}})).into_bytes()
+            );
+            assert_eq!(rpc.messages, 1);
+            assert_eq!(budget.used(), 4096);
+            drop(retained);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+    #[tokio::test]
+    async fn startup_valid_scalar_ids_keep_denial_and_release_working() {
+        for id in [
+            json!(0),
+            json!(u64::MAX),
+            json!("selected"),
+            json!("x".repeat(256)),
+        ] {
+            let bytes = format!("{}\n", json!({"id":id,"method":"unapproved"})).into_bytes();
+            let budget = WorkingBudget::new(bytes.len() as u64 * 42 + 4096);
+            let retained = budget.reserve(4096).unwrap();
+            let mut rpc = rpc_with_writer(bytes, budget.clone(), CapturedWriter::default());
+            assert_eq!(
+                rpc.request(2, "mock/read", json!({}))
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "ocr_unapproved_startup_request"
+            );
+            let sent = rpc
+                .writer
+                .bytes
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| gptgrep_jev::parse_unique_json(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(sent.len(), 2);
+            assert_eq!(sent[0], json!({"id":2,"method":"mock/read","params":{}}));
+            assert_eq!(
+                sent[1],
+                json!({"id":id,"error":{"code":-32601,"message":"OCR request not admitted"}})
+            );
+            assert_eq!(rpc.messages, 1);
+            assert_eq!(budget.used(), 4096);
+            drop(retained);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+    #[tokio::test]
+    async fn arbitrary_frame_share_precedes_parse_and_follows_moved_result() {
+        let bytes =
+            format!("{}\n", json!({"id":2,"result":{"data":"x".repeat(3000)}})).into_bytes();
+        let budget = WorkingBudget::new(bytes.len() as u64 * 42 + 4096);
+        let retained = budget.reserve(4096).unwrap();
+        let mut rpc = rpc(bytes.clone(), budget.clone());
+        let result = rpc.request(2, "mock/read", json!({})).await.unwrap();
+        assert_eq!(result["data"].as_str().unwrap().len(), 3000);
+        assert_eq!(budget.used(), 4096 + bytes.len() as u64 * 40);
+        drop(result);
+        assert_eq!(budget.used(), 4096);
+        drop(retained);
+        assert_eq!(budget.used(), 0);
+        let tight = WorkingBudget::new(bytes.len() as u64 * 42 - 1);
+        let mut refused = self::rpc(bytes, tight.clone());
+        assert!(refused.receive().await.is_err());
+        assert_eq!(tight.used(), 0);
+        assert_eq!(refused.messages, 0); // unique JSON parser was never reached
+    }
+    #[test]
+    fn service_usage_and_tool_argument_counting_refuse_before_tree_clone() {
+        let ordinary =
+            json!({"total":{"inputTokens":12,"outputTokens":4},"last":{"inputTokens":12}});
+        assert!(crate::ocr_service::bounded_json(&ordinary, 4096).is_ok());
+        let excessive = json!({"arbitrary":"x".repeat(4096)});
+        assert!(crate::ocr_service::bounded_json(&excessive, 4096).is_err());
+        assert!(
+            crate::ocr_service::bounded_json(&json!({"argument":vec![false;4096]}), 4096).is_err()
+        );
     }
 }

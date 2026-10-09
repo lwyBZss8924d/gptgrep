@@ -14,13 +14,37 @@ pub const MAX_OCR_ADMISSIONS: usize = 24;
 pub const MAX_OCR_CONCURRENCY: usize = 2;
 const MAX_LEDGER_BYTES: u64 = 128 * 1024;
 
+/// Explicit finite product phase limits; legacy 24-admission journals stay v1.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OcrExecutionLimits {
+    pub max_admissions: usize,
+    pub max_concurrency: usize,
+    pub ledger_bytes: u64,
+}
+impl OcrExecutionLimits {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            (1..=1024).contains(&self.max_admissions)
+                && (1..=MAX_OCR_CONCURRENCY).contains(&self.max_concurrency)
+                && (8192..=1_048_576).contains(&self.ledger_bytes)
+                && 4096u64 + self.max_admissions as u64 * 512 <= self.ledger_bytes,
+            "ocr_phase_limits"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct OcrExecutionContext(Arc<Inner>);
 
 struct Inner {
     header: Header,
     ledger: Option<PathBuf>,
+    require_existing: bool,
     state: Mutex<State>,
+    #[cfg(test)]
+    test_remaining: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -33,6 +57,8 @@ struct Header {
     clock: RunClockAnchor,
     max_admissions: usize,
     max_concurrency: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    limits: Option<OcrExecutionLimits>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -110,6 +136,7 @@ impl OcrExecutionContext {
             clock,
             max_admissions,
             max_concurrency: MAX_OCR_CONCURRENCY,
+            limits: None,
         };
         Ok(Self(Arc::new(Inner {
             state: Mutex::new(State {
@@ -118,16 +145,142 @@ impl OcrExecutionContext {
             }),
             header,
             ledger: None,
+            require_existing: false,
+            #[cfg(test)]
+            test_remaining: None,
         })))
+    }
+
+    /// Construct a separately versioned finite phase from its original anchor.
+    /// This does not initialize a ledger or recapture a clock.
+    pub fn with_phase_limits(
+        run_id: &str,
+        plan_sha256: &str,
+        clock: RunClockAnchor,
+        limits: OcrExecutionLimits,
+    ) -> Result<Self> {
+        limits.validate()?;
+        let mut context = Self::with_clock_anchor(
+            run_id,
+            plan_sha256,
+            clock,
+            limits.max_admissions.min(MAX_OCR_ADMISSIONS),
+        )?;
+        let inner = Arc::get_mut(&mut context.0).expect("unshared constructor");
+        inner.header.schema_version = "gptgrep.ocr-budget.v2".into();
+        inner.header.max_admissions = limits.max_admissions;
+        inner.header.max_concurrency = limits.max_concurrency;
+        inner.header.limits = Some(limits);
+        inner
+            .state
+            .get_mut()
+            .map_err(|_| anyhow!("ocr_ledger_unavailable"))?
+            .header = inner.header.clone();
+        Ok(context)
+    }
+
+    /// Join a durable phase and require the complete original attachment anchor.
+    /// A mismatched adopted anchor is rejected; it is never reset or extended.
+    pub fn join_original_ledger(
+        self,
+        path: impl AsRef<Path>,
+        original: &RunClockAnchor,
+    ) -> Result<Self> {
+        require_original(&self.0.header.clock, original)?;
+        let context = self.attach_ledger(path.as_ref(), Some(original), true)?;
+        ensure!(
+            context.ledger_clock_anchor()?.as_ref() == Some(original),
+            "ocr_original_anchor_mismatch"
+        );
+        Ok(context)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pure_fixture(max_admissions: usize) -> Self {
+        // Synthetic test clock only: no OS sample, capture or real run ledger.
+        let clock:RunClockAnchor=serde_json::from_value(serde_json::json!({
+            "schema":"gptgrep.run-clock-anchor.v1","deadline_unix_ms":999999,
+            "clock_kind":"synthetic","boot_identity":"synthetic-not-an-observed-boot",
+            "clock_namespace":null,"monotonic_started_ns":1,"monotonic_deadline_ns":60000000001u64})).unwrap();
+        let limits = (max_admissions > 24).then_some(OcrExecutionLimits {
+            max_admissions,
+            max_concurrency: 2,
+            ledger_bytes: 1_048_576,
+        });
+        let header = Header {
+            schema_version: if limits.is_some() {
+                "gptgrep.ocr-budget.v2"
+            } else {
+                "gptgrep.ocr-budget.v1"
+            }
+            .into(),
+            run_id: "synthetic".into(),
+            plan_sha256: "a".repeat(64),
+            deadline_unix_ms: 999999,
+            clock,
+            max_admissions,
+            max_concurrency: 2,
+            limits,
+        };
+        Self(Arc::new(Inner {
+            state: Mutex::new(State {
+                header: header.clone(),
+                reservations: Vec::new(),
+            }),
+            header,
+            ledger: None,
+            require_existing: false,
+            test_remaining: Some(Arc::new(std::sync::atomic::AtomicU64::new(60000))),
+        }))
+    }
+    pub(crate) fn durable(&self) -> bool {
+        self.0.ledger.is_some() && self.0.require_existing
+    }
+    /// Join only an existing journal/lock pair, requiring the exact original
+    /// anchor. Missing state cannot initialize or reset a consumed phase.
+    pub fn join_existing_original_ledger(
+        self,
+        path: impl AsRef<Path>,
+        original: &RunClockAnchor,
+    ) -> Result<Self> {
+        require_original(&self.0.header.clock, original)?;
+        self.attach_ledger(path.as_ref(), Some(original), false)
+    }
+    pub(crate) fn phase_binding(&self) -> Result<(String, usize)> {
+        Ok((
+            crate::ocr::hash(&serde_json::to_vec(&self.0.header)?),
+            self.0.header.max_admissions,
+        ))
+    }
+    /// Read-only owned service allowance; no clock/state access or journal writes.
+    pub(crate) fn service_working_bound(&self) -> Result<u64> {
+        self.ledger_limit()
+            .checked_mul(40)
+            .and_then(|n| n.checked_add(65_536))
+            .ok_or_else(|| anyhow!("ocr_service_context_working_limit"))
+    }
+    fn ledger_limit(&self) -> u64 {
+        self.0
+            .header
+            .limits
+            .as_ref()
+            .map_or(MAX_LEDGER_BYTES, |v| v.ledger_bytes)
     }
 
     /// Join the same OCR pool before cloning. Qualification attempts use this pool too.
     pub fn with_ledger(self, path: impl AsRef<Path>) -> Result<Self> {
+        self.attach_ledger(path.as_ref(), None, true)
+    }
+    fn attach_ledger(
+        self,
+        path: &Path,
+        original: Option<&RunClockAnchor>,
+        create: bool,
+    ) -> Result<Self> {
         ensure!(
             Arc::strong_count(&self.0) == 1,
             "ocr_context_already_shared"
         );
-        let path = path.as_ref();
         let name = path
             .file_name()
             .ok_or_else(|| anyhow!("ocr_invalid_ledger_path"))?;
@@ -144,17 +297,53 @@ impl OcrExecutionContext {
         // Adopt the first immutable same-boot anchor. A freshly captured anchor must
         // never extend a durable run following wall-clock rollback or process restart.
         let existing_lock = lock_path(&path);
+        let mut new_pair = create;
+        if original.is_some() {
+            let journal = fs::symlink_metadata(&path);
+            let lock = fs::symlink_metadata(&existing_lock);
+            match (journal, lock) {
+                (Ok(journal), Ok(lock)) => {
+                    ensure!(
+                        journal.is_file()
+                            && lock.is_file()
+                            && !journal.file_type().is_symlink()
+                            && !lock.file_type().is_symlink(),
+                        "ocr_ledger_pair_invalid"
+                    );
+                    new_pair = false;
+                }
+                (Err(a), Err(b))
+                    if create
+                        && a.kind() == std::io::ErrorKind::NotFound
+                        && b.kind() == std::io::ErrorKind::NotFound => {}
+                _ => return Err(anyhow!("ocr_existing_ledger_pair_required")),
+            }
+        }
+        inner.require_existing = !new_pair;
         if existing_lock.exists() {
+            // A racing initializer may have created this pair after the absent
+            // precheck. Once observed, it must never be recreated by this join.
+            observe_existing_pair(&mut inner, original);
             let mut lock = open_no_follow(&existing_lock, false)?;
             lock.try_lock_exclusive()?;
-            let stored: Header = serde_json::from_slice(&read_bounded(&mut lock)?)
-                .map_err(|_| anyhow!("ocr_invalid_ledger_lock_header"))?;
+            let stored: Header = serde_json::from_slice(&read_bounded(
+                &mut lock,
+                inner
+                    .header
+                    .limits
+                    .as_ref()
+                    .map_or(MAX_LEDGER_BYTES, |v| v.ledger_bytes),
+            )?)
+            .map_err(|_| anyhow!("ocr_invalid_ledger_lock_header"))?;
             let mut comparable = inner.header.clone();
             comparable.clock = stored.clock.clone();
             ensure!(stored == comparable, "ocr_ledger_header_mismatch");
             stored
                 .clock
                 .verify_deadline(UNIX_EPOCH + Duration::from_millis(stored.deadline_unix_ms))?;
+            if let Some(original) = original {
+                require_original(&stored.clock, original)?;
+            }
             inner.header = stored;
         }
         let context = Self(Arc::new(Inner {
@@ -162,10 +351,22 @@ impl OcrExecutionContext {
             ..inner
         }));
         context.access(|_| Ok(()))?;
+        let mut context = context;
+        if original.is_some() {
+            Arc::get_mut(&mut context.0)
+                .expect("unshared attachment")
+                .require_existing = true;
+        }
         Ok(context)
     }
 
     pub fn remaining(&self) -> Result<Duration> {
+        #[cfg(test)]
+        if let Some(ms) = &self.0.test_remaining {
+            let ms = ms.load(std::sync::atomic::Ordering::SeqCst);
+            ensure!(ms > 0, "ocr_test_deadline_expired");
+            return Ok(Duration::from_millis(ms));
+        }
         self.0.header.clock.remaining()
     }
 
@@ -225,11 +426,19 @@ impl OcrExecutionContext {
                     .iter()
                     .filter(|r| r.status != Status::Terminal)
                     .count()
-                    >= MAX_OCR_CONCURRENCY
+                    >= state.header.max_concurrency
                 {
                     return Ok(None);
                 }
                 let id = state.reservations.len();
+                if state.header.limits.is_some() {
+                    ensure!(
+                        4096u64 + (state.reservations.len() as u64 + 1) * 512
+                            <= self.ledger_limit(),
+                        "ocr_ledger_size_limit"
+                    );
+                    state.reservations.try_reserve_exact(1)?;
+                }
                 state.reservations.push(Reservation {
                     id,
                     task_sha256: task.into(),
@@ -281,12 +490,16 @@ impl OcrExecutionContext {
         };
         let lock_path = lock_path(path);
         ensure!(!lock_path.is_symlink(), "ocr_ledger_lock_symlink");
-        let (mut lock, created) = match open_no_follow(&lock_path, true) {
-            Ok(file) => (file, true),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                (open_no_follow(&lock_path, false)?, false)
+        let (mut lock, created) = if self.0.require_existing {
+            (open_no_follow(&lock_path, false)?, false)
+        } else {
+            match open_no_follow(&lock_path, true) {
+                Ok(file) => (file, true),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    (open_no_follow(&lock_path, false)?, false)
+                }
+                Err(error) => return Err(error.into()),
             }
-            Err(error) => return Err(error.into()),
         };
         lock.try_lock_exclusive().map_err(|error| {
             if error.kind() == std::io::ErrorKind::WouldBlock {
@@ -302,8 +515,9 @@ impl OcrExecutionContext {
             lock.sync_all()?;
             File::open(path.parent().expect("canonical ledger parent"))?.sync_all()?;
         } else {
-            let stored: Header = serde_json::from_slice(&read_bounded(&mut lock)?)
-                .map_err(|_| anyhow!("ocr_invalid_ledger_lock_header"))?;
+            let stored: Header =
+                serde_json::from_slice(&read_bounded(&mut lock, self.ledger_limit())?)
+                    .map_err(|_| anyhow!("ocr_invalid_ledger_lock_header"))?;
             ensure!(stored == self.0.header, "ocr_ledger_header_mismatch");
         }
         let mut state = if created {
@@ -314,7 +528,7 @@ impl OcrExecutionContext {
         } else {
             ensure!(path.exists(), "ocr_ledger_journal_missing");
             let mut file = open_no_follow(path, false)?;
-            serde_json::from_slice::<State>(&read_bounded(&mut file)?)
+            serde_json::from_slice::<State>(&read_bounded(&mut file, self.ledger_limit())?)
                 .map_err(|_| anyhow!("ocr_invalid_ledger"))?
         };
         ensure!(state.header == self.0.header, "ocr_ledger_header_mismatch");
@@ -331,9 +545,18 @@ impl OcrExecutionContext {
             );
         }
         let result = change(&mut state)?;
+        if let Some(limits) = &state.header.limits {
+            limits.validate()?;
+            ensure!(
+                state.header.schema_version == "gptgrep.ocr-budget.v2"
+                    && state.header.max_admissions == limits.max_admissions
+                    && state.header.max_concurrency == limits.max_concurrency,
+                "ocr_phase_header_mismatch"
+            );
+        }
         let bytes = serde_json::to_vec(&state)?;
         ensure!(
-            bytes.len() as u64 <= MAX_LEDGER_BYTES,
+            bytes.len() as u64 <= self.ledger_limit(),
             "ocr_ledger_size_limit"
         );
         // tempfile creates a unique owned file with create_new; no predictable staging name.
@@ -418,22 +641,19 @@ fn open_no_follow(path: &Path, create: bool) -> std::io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
         options.mode(0o600);
     }
     options.open(path)
 }
-fn read_bounded(file: &mut File) -> Result<Vec<u8>> {
+fn read_bounded(file: &mut File, limit: u64) -> Result<Vec<u8>> {
     ensure!(
-        file.metadata()?.is_file() && file.metadata()?.len() <= MAX_LEDGER_BYTES,
+        file.metadata()?.is_file() && file.metadata()?.len() <= limit,
         "ocr_ledger_size_limit"
     );
     let mut bytes = Vec::new();
-    file.take(MAX_LEDGER_BYTES + 1).read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() as u64 <= MAX_LEDGER_BYTES,
-        "ocr_ledger_size_limit"
-    );
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() as u64 <= limit, "ocr_ledger_size_limit");
     Ok(bytes)
 }
 pub(crate) fn valid_digest(value: &str) -> bool {
@@ -574,5 +794,133 @@ mod tests {
                 .with_ledger(&path)
                 .is_err()
         );
+    }
+}
+
+fn observe_existing_pair(inner: &mut Inner, original: Option<&RunClockAnchor>) {
+    if original.is_some() {
+        inner.require_existing = true;
+    }
+}
+
+fn require_original(stored: &RunClockAnchor, original: &RunClockAnchor) -> Result<()> {
+    ensure!(stored == original, "ocr_original_anchor_mismatch");
+    Ok(())
+}
+#[cfg(test)]
+mod phase_tests {
+    use super::*;
+    const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    #[tokio::test]
+    async fn finite_phase_is_shared_and_unknowns_never_refund_or_reset() {
+        let context = OcrExecutionContext::pure_fixture(50);
+        for _ in 0..49 {
+            context
+                .clone()
+                .reserve(HASH, HASH)
+                .await
+                .unwrap()
+                .terminal()
+                .unwrap();
+        }
+        let mut last = context.reserve(HASH, HASH).await.unwrap();
+        last.submitted().unwrap();
+        drop(last);
+        let snapshot = context.snapshot().unwrap();
+        assert_eq!(snapshot.charged_admissions, 50);
+        assert_eq!(snapshot.quarantined_slots, 1);
+        assert!(context.clone().reserve(HASH, HASH).await.is_err());
+        assert_eq!(snapshot.max_admissions, 50);
+        assert_eq!(MAX_OCR_ADMISSIONS, 24);
+        assert!(context.ledger_clock_anchor().unwrap().is_none());
+    }
+    #[test]
+    fn legacy_serialization_and_complete_original_anchor_are_preserved() {
+        let context = OcrExecutionContext::pure_fixture(2);
+        let bytes = serde_json::to_vec(&context.0.header).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(value.get("limits").is_none());
+        let roundtrip: Header = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(bytes, serde_json::to_vec(&roundtrip).unwrap());
+        let mut changed = serde_json::to_value(&context.0.header.clock).unwrap();
+        changed["monotonic_started_ns"] = 2.into();
+        let different: RunClockAnchor = serde_json::from_value(changed).unwrap();
+        assert_eq!(
+            different.deadline_unix_ms(),
+            context.0.header.clock.deadline_unix_ms()
+        );
+        assert!(require_original(&different, &context.0.header.clock).is_err());
+        require_original(&context.0.header.clock, &context.0.header.clock).unwrap();
+        for limit in [
+            OcrExecutionLimits {
+                max_admissions: 1025,
+                max_concurrency: 2,
+                ledger_bytes: 1_048_576,
+            },
+            OcrExecutionLimits {
+                max_admissions: 1024,
+                max_concurrency: 2,
+                ledger_bytes: 8192,
+            },
+        ] {
+            assert!(limit.validate().is_err());
+        }
+    }
+    #[tokio::test]
+    async fn expiry_closes_future_admissions_but_retains_observed_unknown() {
+        let context = OcrExecutionContext::pure_fixture(2);
+        let mut admission = context.reserve(HASH, HASH).await.unwrap();
+        admission.submitted().unwrap();
+        context
+            .0
+            .test_remaining
+            .as_ref()
+            .unwrap()
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        drop(admission);
+        assert!(context.reserve(HASH, HASH).await.is_err());
+        assert_eq!(context.snapshot().unwrap().quarantined_slots, 1);
+    }
+    #[tokio::test]
+    async fn strict_joined_phase_never_recreates_a_removed_journal_or_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("phase.json");
+        let mut context = OcrExecutionContext::pure_fixture(50);
+        let inner = Arc::get_mut(&mut context.0).unwrap();
+        inner.ledger = Some(path.clone());
+        // The absent initial precheck permits creation. A separate synthetic
+        // initializer then publishes the same bound pair before attachment.
+        inner.require_existing = false;
+        fs::write(lock_path(&path), serde_json::to_vec(&inner.header).unwrap()).unwrap();
+        fs::write(
+            &path,
+            serde_json::to_vec(&State {
+                header: inner.header.clone(),
+                reservations: Vec::new(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let inner = Arc::get_mut(&mut context.0).unwrap();
+        let expected = inner.header.clock.clone();
+        observe_existing_pair(inner, Some(&expected));
+        assert!(inner.require_existing);
+        let original = context.ledger_clock_anchor().unwrap().unwrap();
+        let mut admission = context.reserve(HASH, HASH).await.unwrap();
+        admission.submitted().unwrap();
+        drop(admission);
+        assert_eq!(context.snapshot().unwrap().quarantined_slots, 1);
+        let bound: State = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(bound.header.schema_version, "gptgrep.ocr-budget.v2");
+        assert!(bound.header.clock == original);
+        assert_eq!(bound.header.max_admissions, 50);
+        let lock_bytes = fs::read(lock_path(&path)).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert!(context.snapshot().is_err());
+        assert!(!path.exists());
+        assert_eq!(fs::read(lock_path(&path)).unwrap(), lock_bytes);
+        fs::remove_file(lock_path(&path)).unwrap();
+        assert!(context.snapshot().is_err());
+        assert!(!path.exists() && !lock_path(&path).exists());
     }
 }

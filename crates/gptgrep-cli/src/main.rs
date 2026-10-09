@@ -288,7 +288,50 @@ impl EnrichHostArgs {
 }
 
 #[derive(Debug, Subcommand)]
+enum OcrCommand {
+    /// Explicit authenticated foreground loopback service; native CLI only.
+    Serve {
+        #[arg(
+            long,
+            value_name = "FILE",
+            help = "Bounded operator-owned gptgrep.ocr.serve.v1 control snapshot"
+        )]
+        config: PathBuf,
+        #[arg(
+            long,
+            default_value = "GPTGREP_OCR_SERVE_TOKEN",
+            help = "Selected bearer token environment variable name; value is never printed or inherited by OCR children"
+        )]
+        token_env: String,
+        #[arg(
+            long,
+            help = "Create only the supplied original-anchor ledger pair; existing state must match and is never reset"
+        )]
+        initialize_ledger: bool,
+        #[arg(
+            long,
+            help = "Require this exact SHA256 of the explicitly selected control snapshot"
+        )]
+        expected_control_sha256: Option<String>,
+    },
+}
+
+#[derive(Debug)]
+struct OcrServeError(&'static str);
+impl std::fmt::Display for OcrServeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+impl std::error::Error for OcrServeError {}
+
+#[derive(Debug, Subcommand)]
 enum Command {
+    /// Explicit foreground OCR; ordinary search never starts it.
+    Ocr {
+        #[command(subcommand)]
+        command: OcrCommand,
+    },
     /// Rerank exact source-bound v2 references; JSON output, no document routing.
     Rerank {
         #[arg(long, default_value = ".")]
@@ -589,6 +632,24 @@ fn contract() -> Value {
         "bounds":{"source_file_bytes":67108864,"jev_candidates":24,"semantic_routing_documents":32},
         "limitations":["No full PageIndex Flash parity claim", "OCR requires explicit rich ingestion and an accepted native runtime profile", "Office conversion requires LibreOffice", "Semantic routing and evidence snippets have explicit budgets", "Generative synthesis requires explicit local Codex host mode", "Relevance floor is operational policy, not calibrated confidence; hybrid exact-token anchors are retained"]
     });
+    contract["commands"]["ocr"] = json!({
+        "usage":"gptgrep ocr serve --config CONTROL_JSON [--token-env ENV_NAME] [--expected-control-sha256 SHA] [--initialize-ledger]",
+        "effect":"explicit foreground authenticated loopback HTTP service; qualified native OCR on admitted requests",
+        "native_cli_only":true,"control_schema":"gptgrep.ocr.serve.v1","phase_schema":"gptgrep.ocr.service-phase.v1",
+        "catalog_schema":"gptgrep.ocr.task-catalog.v1","default_bind":"127.0.0.1:8828",
+        "routes":{"/v1/ocr/tasks":"exact catalog-bound OcrTask; paths restored only from server custody",
+                  "/ocr":"separate PNG multipart image-only compatibility; no generation authority"},
+        "limits":{"control_bytes":16384,"phase_bytes":16384,"task_bytes":131072,"catalog_bytes":8388608,
+                  "compatibility_png_bytes":1048576,"multipart_overhead_bytes":16384,"response_bytes":262144,
+                  "connections":8,"native_concurrency":2,"phase_admissions_max":1024,"page_seconds_max":180},
+        "defaults":{"token_env":"GPTGREP_OCR_SERVE_TOKEN","native_model":"gpt-6-luna","reasoning_effort":"max","service_tier":"fast"},
+        "qualification":"separate exact full-task and compatibility-mode/runtime policy qualification is required; requested identity is not observed served identity",
+        "initialize_ledger":"create/join exact original-anchor namespace; never replace, reset, renew or retry unknown requests",
+        "compatibility_confidence":"actual model-reported uncalibrated numeric confidence; whole-image region only; fresh mode qualification required",
+        "output":"bounded JSON preparation/stopped lifecycle; errors always structured, token and private paths omitted",
+        "shutdown":"stop admissions and await owned native stop/reap/drain; unknown remote outcome stays charged/quarantined",
+        "limitations":"listener/native/image/compatibility qualification and OS/RSS/cancellation guarantees remain pending"
+    });
     contract["commands"]["enrich"]["options"] = json!({"rebuild-failed-window":{
         "type":"integer","requires":"resume","conflicts_with":"plan-only",
         "meaning":"Last finished failed builder/support call ID; rebuild its uncommitted raw window as a NEW builder sample and new support request",
@@ -722,7 +783,7 @@ fn contract() -> Value {
 }
 
 fn llms() -> &'static str {
-    "# GPTgrep\n\nLocal vectorless retrieval helper for agents. No MCP server.\n\n1. gptgrep index ./docs --json\n1r. gptgrep index ./documents --ocr auto --plan-only --json\n1n. gptgrep index ./native-documents --ocr off --json\n1a. gptgrep enrich ./docs --ledger-path /path/to/private/enrich.jsonl --max-builder-calls 100 --max-jev-calls 100 --plan-only --json\n2. gptgrep search 'concept in natural language' ./docs --json\n3. gptgrep search 'pattern' ./docs --mode regex --json\n4. gptgrep tree manual.pdf --root ./docs --json\n5. gptgrep read DOCUMENT_ID:NODE_ID --root ./docs --json\n6. gptgrep batch --root ./docs --input operations.json --json\n7. gptgrep batch --rich --root ./docs --input rich-operations.json\n\nBatch accepts gptgrep.batch.request.v1 JSON, pins one generation and preserves operation order. Local search/catalog/tree/read operations share bounded output reservations. Batch hybrid/semantic are currently rejected before provider work; inspect each item status and coverage.\n\nFor a separately published v2 generation, batch --rich accepts gptgrep.batch.rich.request.v1 with inspect_documents, inspect_pages, read_artifact, search_artifacts, inspect_visual, read_visual and explicit search_multimodal. Text inspection returns indexed metadata only. Text read/search preserve typed native/OCR evidence; their cursors bind generation and operation options. Search pages cover a bounded max_hits window; inspect truncation and exhaustion. Opt-in inspect_visual takes scope (document_ids, first_page, last_page), query, max_candidates and its own cursor; use result.next_cursor and retain the batch output budget and per-item reservation when continuing. read_visual takes rendition_id and returns complete image_base64 plus pinned candidate metadata; no image byte windows, truncation or cursor. Both visual operations reuse the generation resource budget and report actual_image_delivery=false and citation_authority=false. They establish local observations, not model delivery or citation rights. The six deterministic operations remain local and perform zero model submissions. search_multimodal requires mandatory document routing then source-bound text/visual reranking on the same finite Decisions context. All complete item output shares and worst-case call shares are prepared before the first submit. budget.max_decisions_submissions defaults to8 (hard cap200); no operation borrows a later share. Paid results have no inference cursor, preserve partial attempt receipts, and grant no reader citation rights. Required paid failure stops later paid items while independent local items may continue. model_submissions is null when exact batch attribution is unavailable; scheduled attempts and shared context snapshots are separate. Numeric cost telemetry is a labelled lossy finite_f64 projection with full usage SHA; missing cost remains null. Explicit rerank --root ROOT --input FILE_OR_DASH accepts gptgrep.rich_rerank.request.v1 with query and unique {id,evidence} candidates. It resolves exact pinned native/OCR text windows and visual refs, scores only that supplied pool using the same rubric, and creates neither routing-pass nor citation rights. The equivalent rich batch rerank operation shares the same prepaid output/call reservations. Caller text/image bytes/URLs, implicit dependencies and inference cursors are rejected.\n\nJev routing/reranking is required by default search, ask and summarize. OPENROUTER_API_KEY must be supplied for model-assisted runs; failures never silently downgrade to local retrieval. Explicit regex/lexical and enrich --plan-only remain offline. Enrich is an explicit Codex/Jev step that creates non-citable navigation hints after local indexing. Use --document RELATIVE_PATH to scope before candidate budgets. The default Decisions model is openai/gpt-6-luna-decisions; native Codex defaults separately to gpt-6-luna/max/fast. Hybrid/semantic and judge send bounded data to OpenRouter Decisions. Judge input accepts state/questions or typed input.text/input.images with explicit source bindings and local PNG/JPEG paths. --decisions-budget FILE joins an existing original-clock shared budget; it never initializes or resets a ledger. Without the file, paid calls share their single-invocation bounded client context. Explicit --model typesafe/jev-1.13 remains text-only. Inspect coverage, source_fresh, coordinate_system and text_truncated before citing evidence. The main agent performs reasoning and controls follow-up reads. Use search QUERY ROOT --multimodal or ask QUESTION ROOT --multimodal on a published v2 rich generation. Both retain one generation and one finite Decisions context, perform mandatory document routing, and rerank a union of text and independent visual candidates. Scope with --document PATH; bound --window-bytes, --max-visual-candidates, --max-concurrent-batches, --max-image-bytes, --max-image-pixels, --max-metadata-bytes and --max-output-bytes. --multimodal-timeout limits the same invocation and never extends an existing shared deadline. Search returns gptgrep.rich_multimodal_search.v1 JSON with model-exposure-only evidence and no citation rights. Ask uses native gpt-6-luna/max/fast, accepts --max-citations 1..8, and issues typed text/image citations only after actual complete reader delivery and freshness checks. Inspect coverage/truncation and actual observations; implementation and offline mocks do not qualify actual image influence/native runtime. No legacy generation, regex/lexical, grep-window or planning fallback is allowed. Rich ingestion supports lossless UTF-8 text/Markdown, PDF, PNG and restricted baseline JPEG. Office uses one bounded LibreOffice conversion; a working converter is required and real Office runtime qualification remains pending. The full JPEG family remains unsupported. New files require reindexing. --schema provides the command contract.\n"
+    "# GPTgrep\n\nLocal vectorless retrieval helper for agents. No MCP server.\n\n1. gptgrep index ./docs --json\n1r. gptgrep index ./documents --ocr auto --plan-only --json\n1n. gptgrep index ./native-documents --ocr off --json\n1a. gptgrep enrich ./docs --ledger-path /path/to/private/enrich.jsonl --max-builder-calls 100 --max-jev-calls 100 --plan-only --json\n2. gptgrep search 'concept in natural language' ./docs --json\n3. gptgrep search 'pattern' ./docs --mode regex --json\n4. gptgrep tree manual.pdf --root ./docs --json\n5. gptgrep read DOCUMENT_ID:NODE_ID --root ./docs --json\n6. gptgrep batch --root ./docs --input operations.json --json\n7. gptgrep batch --rich --root ./docs --input rich-operations.json\n\nBatch accepts gptgrep.batch.request.v1 JSON, pins one generation and preserves operation order. Local search/catalog/tree/read operations share bounded output reservations. Batch hybrid/semantic are currently rejected before provider work; inspect each item status and coverage.\n\nFor a separately published v2 generation, batch --rich accepts gptgrep.batch.rich.request.v1 with inspect_documents, inspect_pages, read_artifact, search_artifacts, inspect_visual, read_visual and explicit search_multimodal. Text inspection returns indexed metadata only. Text read/search preserve typed native/OCR evidence; their cursors bind generation and operation options. Search pages cover a bounded max_hits window; inspect truncation and exhaustion. Opt-in inspect_visual takes scope (document_ids, first_page, last_page), query, max_candidates and its own cursor; use result.next_cursor and retain the batch output budget and per-item reservation when continuing. read_visual takes rendition_id and returns complete image_base64 plus pinned candidate metadata; no image byte windows, truncation or cursor. Both visual operations reuse the generation resource budget and report actual_image_delivery=false and citation_authority=false. They establish local observations, not model delivery or citation rights. The six deterministic operations remain local and perform zero model submissions. search_multimodal requires mandatory document routing then source-bound text/visual reranking on the same finite Decisions context. All complete item output shares and worst-case call shares are prepared before the first submit. budget.max_decisions_submissions defaults to8 (hard cap200); no operation borrows a later share. Paid results have no inference cursor, preserve partial attempt receipts, and grant no reader citation rights. Required paid failure stops later paid items while independent local items may continue. model_submissions is null when exact batch attribution is unavailable; scheduled attempts and shared context snapshots are separate. Numeric cost telemetry is a labelled lossy finite_f64 projection with full usage SHA; missing cost remains null. Explicit rerank --root ROOT --input FILE_OR_DASH accepts gptgrep.rich_rerank.request.v1 with query and unique {id,evidence} candidates. It resolves exact pinned native/OCR text windows and visual refs, scores only that supplied pool using the same rubric, and creates neither routing-pass nor citation rights. The equivalent rich batch rerank operation shares the same prepaid output/call reservations. Caller text/image bytes/URLs, implicit dependencies and inference cursors are rejected.\n\nJev routing/reranking is required by default search, ask and summarize. OPENROUTER_API_KEY must be supplied for model-assisted runs; failures never silently downgrade to local retrieval. Explicit regex/lexical and enrich --plan-only remain offline. Enrich is an explicit Codex/Jev step that creates non-citable navigation hints after local indexing. Use --document RELATIVE_PATH to scope before candidate budgets. The default Decisions model is openai/gpt-6-luna-decisions; native Codex defaults separately to gpt-6-luna/max/fast. Hybrid/semantic and judge send bounded data to OpenRouter Decisions. Judge input accepts state/questions or typed input.text/input.images with explicit source bindings and local PNG/JPEG paths. --decisions-budget FILE joins an existing original-clock shared budget; it never initializes or resets a ledger. Without the file, paid calls share their single-invocation bounded client context. Explicit --model typesafe/jev-1.13 remains text-only. Inspect coverage, source_fresh, coordinate_system and text_truncated before citing evidence. The main agent performs reasoning and controls follow-up reads. Use search QUERY ROOT --multimodal or ask QUESTION ROOT --multimodal on a published v2 rich generation. Both retain one generation and one finite Decisions context, perform mandatory document routing, and rerank a union of text and independent visual candidates. Scope with --document PATH; bound --window-bytes, --max-visual-candidates, --max-concurrent-batches, --max-image-bytes, --max-image-pixels, --max-metadata-bytes and --max-output-bytes. --multimodal-timeout limits the same invocation and never extends an existing shared deadline. Search returns gptgrep.rich_multimodal_search.v1 JSON with model-exposure-only evidence and no citation rights. Ask uses native gpt-6-luna/max/fast, accepts --max-citations 1..8, and issues typed text/image citations only after actual complete reader delivery and freshness checks. Inspect coverage/truncation and actual observations; implementation and offline mocks do not qualify actual image influence/native runtime. No legacy generation, regex/lexical, grep-window or planning fallback is allowed. Foreground OCR is native-CLI-only: gptgrep ocr serve --config CONTROL_JSON --token-env GPTGREP_OCR_SERVE_TOKEN. It uses explicit server-held task custody, qualified native gpt-6-luna/max/fast, a finite original-anchor phase and authenticated loopback only. The optional --initialize-ledger creates or joins the exact namespace without reset or renewal. /ocr is separately qualified PNG multipart compatibility with model-reported uncalibrated confidence and no generation authority. Ordinary queries never start OCR; listener/native qualification remains pending. Rich ingestion supports lossless UTF-8 text/Markdown, PDF, PNG and restricted baseline JPEG. Office uses one bounded LibreOffice conversion; a working converter is required and real Office runtime qualification remains pending. The full JPEG family remains unsupported. New files require reindexing. --schema provides the command contract.\n"
 }
 
 fn emit(value: &Value) -> Result<()> {
@@ -997,6 +1058,12 @@ async fn run(cli: Cli) -> Result<i32> {
         return Ok(0);
     };
     match command {
+        Command::Ocr { command } => {
+            if cli.decisions_budget.is_some() {
+                return Err(OcrServeError("ocr_serve_incompatible_decisions_budget").into());
+            }
+            return run_ocr_serve(command).await;
+        }
         Command::Rerank {
             root,
             input,
@@ -1606,6 +1673,7 @@ async fn run(cli: Cli) -> Result<i32> {
 async fn main() {
     let cli = Cli::parse();
     let as_json = cli.json
+        || matches!(&cli.command, Some(Command::Ocr { .. }))
         || matches!(
             &cli.command,
             Some(
@@ -1660,34 +1728,44 @@ async fn main() {
             }
             if as_json {
                 let code = error
-                    .downcast_ref::<gptgrep_host::CompletionError>()
-                    .map(|e| e.code())
+                    .downcast_ref::<OcrServeError>()
+                    .map(|e| e.0)
                     .unwrap_or_else(|| {
-                        if let Some(partial) =
-                            error.downcast_ref::<gptgrep_host::HostRetrievalError>()
-                        {
-                            partial.code.as_str()
-                        } else if let Some(protocol) =
-                            error.downcast_ref::<gptgrep_host::HostProtocolError>()
-                        {
-                            protocol.code()
-                        } else if let Some(partial) =
-                            error.downcast_ref::<gptgrep_host::RichMultimodalHostError>()
-                        {
-                            partial.code
-                        } else if let Some(partial) =
-                            error.downcast_ref::<gptgrep_core::RichMultimodalSearchError>()
-                        {
-                            partial.code
-                        } else if error.is::<gptgrep_core::JevSearchError>() {
-                            "jev_search_failed"
-                        } else if error.is::<gptgrep_host::HostCapabilityError>() {
-                            "host_no_evidence_tools"
-                        } else {
-                            "gptgrep_error"
-                        }
+                        error
+                            .downcast_ref::<gptgrep_host::CompletionError>()
+                            .map(|e| e.code())
+                            .unwrap_or_else(|| {
+                                if let Some(partial) =
+                                    error.downcast_ref::<gptgrep_host::HostRetrievalError>()
+                                {
+                                    partial.code.as_str()
+                                } else if let Some(protocol) =
+                                    error.downcast_ref::<gptgrep_host::HostProtocolError>()
+                                {
+                                    protocol.code()
+                                } else if let Some(partial) =
+                                    error.downcast_ref::<gptgrep_host::RichMultimodalHostError>()
+                                {
+                                    partial.code
+                                } else if let Some(partial) =
+                                    error.downcast_ref::<gptgrep_core::RichMultimodalSearchError>()
+                                {
+                                    partial.code
+                                } else if error.is::<gptgrep_core::JevSearchError>() {
+                                    "jev_search_failed"
+                                } else if error.is::<gptgrep_host::HostCapabilityError>() {
+                                    "host_no_evidence_tools"
+                                } else {
+                                    "gptgrep_error"
+                                }
+                            })
                     });
-                let mut report = json!({"schema_version":"gptgrep.error.v1","ok":false,"code":code,"error":format!("{error:#}")});
+                let diagnostic = if error.is::<OcrServeError>() {
+                    "Foreground OCR failed; token values, private paths and native diagnostics are omitted.".into()
+                } else {
+                    format!("{error:#}")
+                };
+                let mut report = json!({"schema_version":"gptgrep.error.v1","ok":false,"code":code,"error":diagnostic});
                 if let Some(partial) = error.downcast_ref::<gptgrep_core::JevSearchError>() {
                     report["retrieval"] = serde_json::to_value(partial).unwrap_or(Value::Null);
                 }
@@ -1715,6 +1793,68 @@ async fn main() {
             std::process::exit(2);
         }
     }
+}
+
+async fn run_ocr_serve(command: OcrCommand) -> Result<i32> {
+    let OcrCommand::Serve {
+        config,
+        token_env,
+        initialize_ledger,
+        expected_control_sha256,
+    } = command;
+    gptgrep_host::validate_token_env_name(&token_env)
+        .map_err(|_| OcrServeError("ocr_serve_token_env_invalid"))?;
+    if expected_control_sha256.as_ref().is_some_and(|sha| {
+        sha.len() != 64
+            || !sha
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }) {
+        return Err(OcrServeError("ocr_serve_control_digest_invalid").into());
+    }
+    let control =
+        tokio::task::spawn_blocking(move || gptgrep_host::ForegroundOcrControl::load(&config))
+            .await
+            .map_err(|_| OcrServeError("ocr_serve_control_unavailable"))?
+            .map_err(|_| OcrServeError("ocr_serve_control_invalid"))?;
+    let digest = control.sha256().to_owned();
+    if expected_control_sha256
+        .as_ref()
+        .is_some_and(|expected| expected != &digest)
+    {
+        return Err(OcrServeError("ocr_serve_control_digest_mismatch").into());
+    }
+    let bind = control.bind();
+    let token =
+        std::env::var(&token_env).map_err(|_| OcrServeError("ocr_serve_token_unavailable"))?;
+    if !(32..=256).contains(&token.len()) || !token.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(OcrServeError("ocr_serve_token_invalid").into());
+    }
+    let service = tokio::task::spawn_blocking(move || {
+        control.prepare(token.as_bytes(), &token_env, initialize_ledger)
+    })
+    .await
+    .map_err(|_| OcrServeError("ocr_serve_prepare_unavailable"))?
+    .map_err(|_| OcrServeError("ocr_serve_prepare_failed"))?;
+    emit(
+        &json!({"schema_version":"gptgrep.ocr.serve.lifecycle.v1","status":"prepared","control_sha256":digest,
+        "bind":bind.to_string(),"listener_ready":false,"native_model_calls":0}),
+    )?;
+    let shutdown = gptgrep_host::OcrCancellation::default();
+    let signal = shutdown.clone();
+    let signal_task = tokio::spawn(async move {
+        shutdown_signal().await;
+        signal.cancel();
+    });
+    let result = service.serve(shutdown).await;
+    signal_task.abort();
+    let _ = signal_task.await;
+    result.map_err(|_| OcrServeError("ocr_serve_execution_failed"))?;
+    emit(
+        &json!({"schema_version":"gptgrep.ocr.serve.lifecycle.v1","status":"stopped","owned_cleanup_awaited":true,
+        "provider_usage":null,"remote_completion":"unavailable_unless_observed"}),
+    )?;
+    Ok(0)
 }
 
 async fn shutdown_signal() {

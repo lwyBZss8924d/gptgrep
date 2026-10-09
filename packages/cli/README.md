@@ -75,3 +75,5 @@ source references and budgets; the wrapper never adds candidate content.
 Structured native failures retain partial observations and a nonzero exit status.
 `request-schema rerank --json` describes this forwarding boundary. The equivalent
 rich batch `rerank` operation uses the same batch client and output/call shares.
+
+The foreground `gptgrep ocr serve` command is native-CLI-only. The one-shot Node wrapper rejects this long-running mode; invoke the native executable directly with its explicit control snapshot and token environment name.

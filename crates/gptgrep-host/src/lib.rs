@@ -15,7 +15,9 @@ pub use enrich::{
 pub use enrich_accounting::EnrichCallSummary;
 mod ocr;
 mod ocr_accounting;
+mod ocr_compat;
 mod ocr_protocol;
+mod ocr_service;
 #[cfg(test)]
 mod ocr_tests;
 mod process_group;
@@ -26,11 +28,19 @@ pub use completion::{
     complete_json,
 };
 pub use ocr::{
-    DEFAULT_OCR_MODEL, OcrHostConfig, OcrHostExecutor, OcrImageTransport, OcrProbeReport,
-    OcrRuntimeProfile,
+    DEFAULT_OCR_MODEL, OcrCancellation, OcrHostConfig, OcrHostExecutor, OcrImageTransport,
+    OcrProbeReport, OcrRuntimeProfile,
 };
 pub use ocr_accounting::{
     MAX_OCR_ADMISSIONS, MAX_OCR_CONCURRENCY, OcrBudgetSnapshot, OcrExecutionContext,
+    OcrExecutionLimits,
+};
+pub use ocr_compat::{
+    CompatibilityRuntimeProfile, mode_policy_digest as compatibility_mode_policy_digest,
+};
+pub use ocr_service::{
+    ForegroundOcrControl, ForegroundOcrOptions, PreparedForegroundOcr, PreparedOcrTaskCatalog,
+    prepare_foreground_ocr, validate_token_env_name,
 };
 mod jev_accounting;
 mod model_attempts;

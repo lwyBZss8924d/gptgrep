@@ -92,6 +92,23 @@ impl ResourceBudget {
             .map_err(|_| anyhow::anyhow!("resource_limit: shared run staging admission failed"))?;
         Ok(())
     }
+    /// Rehydrate a portable tighter budget onto the server's retained staging
+    /// counter. Serialized limits are preserved; only invocation custody changes.
+    pub fn adopt_shared_staging(&mut self, admitted: &Self) -> Result<()> {
+        self.validate()?;
+        admitted.validate()?;
+        let selected = serde_json::to_value(&*self)?;
+        let ceiling = serde_json::to_value(admitted)?;
+        for (field, value) in selected.as_object().expect("budget object") {
+            ensure!(
+                value.as_u64().expect("unsigned budget")
+                    <= ceiling[field].as_u64().expect("budget"),
+                "resource_limit: selected budget exceeds server admission"
+            );
+        }
+        self.staging_used = admitted.staging_used.clone();
+        Ok(())
+    }
     pub(crate) fn reserve_staging(&self, bytes: u64) -> Result<()> {
         self.reserve_retained_staging(bytes)
     }
