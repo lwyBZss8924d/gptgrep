@@ -304,8 +304,18 @@ impl PreparedRichTextHost {
             }
         };
         let _guard = AttemptGuard(accounting.clone());
+        if accounting
+            .bind_workflow(&self.question, self.options.retrieval.document.as_deref())
+            .is_err()
+        {
+            return Err(evidence.failure(
+                "host_rich_accounting_unavailable",
+                "reader_start",
+                accounting.model_attempts(),
+            ));
+        }
         let mut tracker =
-            match ModelAttemptTracker::reserve(&accounting, "rich_text_reader", &self.config) {
+            match ModelAttemptTracker::reserve(&accounting, "final_reader", &self.config) {
                 Ok(tracker) => tracker,
                 Err(_) => {
                     return Err(evidence.failure(

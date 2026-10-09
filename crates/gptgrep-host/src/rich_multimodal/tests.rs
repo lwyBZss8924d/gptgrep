@@ -151,6 +151,61 @@ async fn fixture(color: u8) -> Result<(tempfile::TempDir, RichEvidence, Vec<u8>,
     )?;
     Ok((temp, evidence, png, id))
 }
+
+#[tokio::test]
+async fn prepared_rich_multimodal_binds_workflow_and_reserves_final_reader_before_native_start()
+-> Result<()> {
+    let (temp, reader, _, _) = generation(19).await?;
+    let root = temp.path().canonicalize()?;
+    let generation = reader.pin().generation;
+    let execution = crate::rich_text::tests::context(2)?;
+    let (endpoint, server) = crate::rich_text::tests::mock(2, Arc::new(|_| Ok(())), false).await?;
+    let question = "Describe the source statement and illustration.";
+    let config = HostConfig {
+        document: Some("source.pdf".into()),
+        codex_home: root.join("missing-owned-codex-home"),
+        codex_bin: root
+            .join("missing-owned-runtime")
+            .to_string_lossy()
+            .into_owned(),
+        ..config()
+    };
+    let mut options = RichMultimodalHostOptions::default();
+    options.retrieval.document = config.document.clone();
+    options.retrieval.require_shared_ledger = false;
+    assert!(!config.codex_home.exists());
+    let prepared = prepare_rich_multimodal_host(
+        reader,
+        crate::rich_text::tests::client(&endpoint, execution.clone())?,
+        question,
+        &config,
+        &options,
+    )?;
+    // No native child or real provider: the synthetic Decisions responses lead
+    // to final-reader reservation, then the owned absent home stops execution.
+    let error = prepared
+        .execute(&|_| Ok(()))
+        .await
+        .err()
+        .context("absent home")?;
+    assert_eq!(server.await??.len(), 2);
+    assert_eq!(error.code, "host_rich_reader_failed");
+    assert_eq!(error.stage, "reader");
+    assert_eq!(error.model_attempts.len(), 1);
+    assert_eq!(error.model_attempts[0].role, "final_reader");
+    assert_eq!(error.model_attempts[0].status, "failed");
+    assert!(error.model_attempts[0].thread_id.is_none());
+    assert!(error.model_attempts[0].turn_id.is_none());
+    assert!(!config.codex_home.exists());
+    assert_eq!(execution.snapshot()?.submission_observations, 2);
+    crate::rich_text::tests::assert_final_reader_reservation(
+        &root,
+        &generation,
+        question,
+        config.document.as_deref(),
+    )
+}
+
 async fn line(reader: &mut (impl tokio::io::AsyncBufRead + Unpin)) -> Result<Value> {
     let mut s = String::new();
     ensure!(reader.read_line(&mut s).await? > 0, "fixture closed");

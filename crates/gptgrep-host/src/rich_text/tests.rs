@@ -274,6 +274,104 @@ async fn prepared_fixture() -> Result<(
     )?;
     Ok((dir, prepared, execution, server))
 }
+
+pub(crate) fn assert_final_reader_reservation(
+    root: &Path,
+    generation: &str,
+    question: &str,
+    document_scope: Option<&str>,
+) -> Result<()> {
+    let ledgers =
+        fs::read_dir(root.join(".gptgrep/host-attempts"))?.collect::<std::io::Result<Vec<_>>>()?;
+    assert_eq!(ledgers.len(), 1);
+    let rows = fs::read_to_string(ledgers[0].path())?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    let bound = rows
+        .iter()
+        .position(|row| row["event"] == "workflow_bound")
+        .context("rich reader workflow must be bound")?;
+    let reserved = rows
+        .iter()
+        .position(|row| row["event"] == "model_attempt_reserved")
+        .context("rich reader model attempt must be reserved")?;
+    assert!(bound < reserved);
+    let workflow = json!({"query_sha256":hash(question.as_bytes()),
+        "document_scope":document_scope,"generation":generation});
+    assert_eq!(rows[bound]["workflow"], workflow);
+    assert_eq!(rows[reserved]["workflow"], workflow);
+    assert_eq!(rows[reserved]["model_attempt_limit"], 1);
+    assert_eq!(
+        rows[reserved]["model_attempts"].as_array().unwrap().len(),
+        1
+    );
+    let attempt = &rows[reserved]["receipt"]["model_attempt"];
+    assert_eq!(attempt["attempt_id"], "final_reader-1");
+    assert_eq!(attempt["role"], "final_reader");
+    assert_eq!(attempt["status"], "reserved");
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row["event"] == "model_attempt_reserved")
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn prepared_rich_text_binds_workflow_and_reserves_final_reader_before_native_start()
+-> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    let generation = publish(&root, &["alpha\r\n中 tail\n"]).await?;
+    let execution = context(2)?;
+    let (endpoint, server) = mock(2, Arc::new(|_| Ok(())), false).await?;
+    let question = "Describe the source statement.";
+    let config = HostConfig {
+        document: Some("source.pdf".into()),
+        codex_home: root.join("missing-owned-codex-home"),
+        codex_bin: root
+            .join("missing-owned-runtime")
+            .to_string_lossy()
+            .into_owned(),
+        ..Default::default()
+    };
+    let mut options = RichTextHostOptions::default();
+    options.retrieval.document = config.document.clone();
+    assert!(!config.codex_home.exists());
+    let prepared = prepare_rich_text_host(
+        RichGenerationReader::open(&root)?,
+        client(&endpoint, execution.clone())?,
+        question,
+        &config,
+        &options,
+    )?;
+    // Real rich execution crosses accounting admission, then the owned absent
+    // home fails before native command construction. Only the local mock runs.
+    let error = prepared
+        .execute(&|_| Ok(()))
+        .await
+        .err()
+        .context("absent home")?;
+    assert_eq!(server.await??.len(), 2);
+    assert_eq!(error.code, "host_rich_reader_failed");
+    assert_eq!(error.stage, "reader");
+    assert_eq!(error.model_attempts.len(), 1);
+    assert_eq!(error.model_attempts[0].role, "final_reader");
+    assert_eq!(error.model_attempts[0].status, "failed");
+    assert!(error.model_attempts[0].thread_id.is_none());
+    assert!(error.model_attempts[0].turn_id.is_none());
+    assert!(!config.codex_home.exists());
+    assert_eq!(execution.snapshot()?.submission_observations, 2);
+    assert_final_reader_reservation(
+        &root,
+        &generation.generation,
+        question,
+        config.document.as_deref(),
+    )
+}
+
 async fn genuine(prepared: PreparedRichTextHost) -> Result<RichEvidence> {
     let initial = prepared.bootstrap.execute().await?;
     Ok(RichEvidence::from_initial(
