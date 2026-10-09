@@ -122,6 +122,9 @@ impl OcrRuntimeProfile {
 pub struct OcrHostConfig {
     pub codex_bin: String,
     pub codex_home: PathBuf,
+    /// Optional canonical existing state directory with an existing logs child.
+    /// Authentication continues to use codex_home.
+    pub codex_state_dir: Option<PathBuf>,
     pub prepared_root: PathBuf,
     pub raw_results_dir: PathBuf,
     pub runtime_profile: OcrRuntimeProfile,
@@ -150,6 +153,7 @@ pub struct OcrProbeReport {
 impl OcrHostExecutor {
     pub fn new(config: OcrHostConfig, context: OcrExecutionContext) -> Result<Self> {
         config.runtime_profile.validate()?;
+        crate::native_state_paths(config.codex_state_dir.as_deref())?;
         ensure!(
             config.transport == OcrImageTransport::DynamicImages,
             "ocr_native_viewer_hard_boundary_unavailable"
@@ -362,7 +366,13 @@ impl OcrHostExecutor {
         if cancel.as_ref().is_some_and(OcrCancellation::is_cancelled) {
             return Err(anyhow!("ocr_cancelled_before_spawn"));
         }
-        let mut command = ocr_command(&binary, cwd.path(), &home, &descriptor_path)?;
+        let mut command = ocr_command(
+            &binary,
+            cwd.path(),
+            &home,
+            self.config.codex_state_dir.as_deref(),
+            &descriptor_path,
+        )?;
         if let Some(name) = &self.service_secret {
             strip_service_secret(&mut command, name)?;
         }
@@ -1069,7 +1079,14 @@ pub(crate) fn strip_service_secret(command: &mut Command, name: &str) -> Result<
     Ok(())
 }
 
-fn ocr_command(binary: &Path, cwd: &Path, home: &Path, descriptor: &Path) -> Result<Command> {
+pub(crate) fn ocr_command(
+    binary: &Path,
+    cwd: &Path,
+    home: &Path,
+    state: Option<&Path>,
+    descriptor: &Path,
+) -> Result<Command> {
+    let state = crate::native_state_paths(state)?;
     let mut command = Command::new(binary);
     crate::process_group::configure(&mut command);
     command
@@ -1096,7 +1113,11 @@ fn ocr_command(binary: &Path, cwd: &Path, home: &Path, descriptor: &Path) -> Res
     }
     let mut policy = ocr_policy();
     policy["model_catalog_json"] = serde_json::to_value(descriptor)?;
-    policy["sqlite_home"] = serde_json::to_value(home)?;
+    let sqlite = state.as_ref().map_or(home, |(state, _)| state.as_path());
+    policy["sqlite_home"] = serde_json::to_value(sqlite)?;
+    if let Some((_, logs)) = state {
+        policy["log_dir"] = serde_json::to_value(logs)?;
+    }
     for (key, value) in policy.as_object().expect("policy object") {
         command
             .arg("-c")

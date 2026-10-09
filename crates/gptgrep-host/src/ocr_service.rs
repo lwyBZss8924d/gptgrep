@@ -265,9 +265,13 @@ pub fn prepare_foreground_ocr(
     let claim_parent = PrivateDirectory::existing(&options.claim_root)?;
     let actor_home = config.codex_home.canonicalize()?;
     let raw = PrivateDirectory::existing(&config.raw_results_dir)?;
-    // New private retained writes cannot overlap source/native-account namespaces.
+    let native_state = crate::native_state_paths(config.codex_state_dir.as_deref())?;
+    // New private retained writes cannot overlap source/native-account/state namespaces.
     for path in [&spool.path, &claim_parent.path, &raw.path] {
-        for reserved in [&catalog.source_root, &catalog.prepared_root, &actor_home] {
+        for reserved in [&catalog.source_root, &catalog.prepared_root, &actor_home]
+            .into_iter()
+            .chain(native_state.as_ref().map(|(state, _)| state))
+        {
             ensure!(
                 !path.starts_with(reserved) && !reserved.starts_with(path),
                 "ocr_service_namespace_overlap"

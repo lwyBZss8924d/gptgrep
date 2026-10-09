@@ -41,3 +41,9 @@ One service-owned aggregate logical working budget admits catalog JSON from regu
 Startup emits bounded `gptgrep.ocr.serve.lifecycle.v1` with status `prepared` and `listener_ready:false`; it is not proof of a successful bind. Errors always use bounded JSON stage codes and omit token values, private paths and arbitrary native diagnostics. Every claimed fresh or cached request is registered as one permit-owning worker before its first asynchronous custody check. Interrupted HTTP requests request cooperative cancellation; blocking custody/hash/image work retains capacity, and shutdown awaits that same owner and any native cleanup. Local stop/reap/drain is awaited, while an unknown remote completion remains unknown and quarantined. Blocking source/hash operations are bounded and awaited on workers; hard preemption and remote cancellation are unqualified.
 
 Offline tests cover in-memory HTTP/protocol behavior, strict phase state, confidence and custody bindings, token inheritance removal, and CLI pre-effect failures. They launch no listener, native Codex, provider call or actual phase. Actual loopback availability, native model/image influence, fresh confidence calibration/semantics and operating-system guarantees require distinct runtime qualification.
+
+The optional control field `codex_state_dir` selects an existing canonical directory
+with an existing `logs` child. The runtime uses it for `sqlite_home` and `log_dir`;
+`codex_home` still selects authentication and profiles. Missing or symlinked state
+paths fail before native admission. Omission preserves the original home binding.
+Rich ingestion exposes the same setting as `--ocr-codex-state-dir`.

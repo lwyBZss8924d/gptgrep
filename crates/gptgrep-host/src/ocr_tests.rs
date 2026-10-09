@@ -1,6 +1,6 @@
 //! Offline adversarial replay: these tests never launch a provider or a Codex runtime.
 use crate::{
-    ocr::{PreparedPage, hash},
+    ocr::{PreparedPage, hash, ocr_command},
     ocr_accounting::OcrExecutionContext,
     ocr_protocol,
 };
@@ -1237,6 +1237,7 @@ for line in sys.stdin:
         crate::OcrHostConfig {
             codex_bin: script.to_string_lossy().into_owned(),
             codex_home: home,
+            codex_state_dir: None,
             prepared_root: fixture.dir.path().into(),
             raw_results_dir: fixture.dir.path().join("raw"),
             runtime_profile: crate::OcrRuntimeProfile {
@@ -1667,4 +1668,67 @@ fn official_runtime_policy_omits_obsolete_flag_and_preserves_restrictions() {
         policy["features.code_mode.direct_only_tool_namespaces"],
         json!(["gptgrep"])
     );
+}
+
+#[test]
+fn ocr_explicit_state_keeps_auth_home_and_refuses_missing_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let home = root.join("home");
+    let state = root.join("state");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::create_dir(&state).unwrap();
+    std::fs::create_dir(state.join("logs")).unwrap();
+    let descriptor = root.join("model-catalog.json");
+    let binary = Path::new("unused-native-binary");
+    let command = ocr_command(binary, &root, &home, Some(&state), &descriptor).unwrap();
+    let command = command.as_std();
+    let args: Vec<_> = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy())
+        .collect();
+    assert!(
+        args.contains(&format!("sqlite_home={}", serde_json::to_string(&state).unwrap()).into())
+    );
+    assert!(
+        args.contains(
+            &format!(
+                "log_dir={}",
+                serde_json::to_string(&state.join("logs")).unwrap()
+            )
+            .into()
+        )
+    );
+    assert!(
+        command
+            .get_envs()
+            .any(|(name, value)| name == "CODEX_HOME" && value == Some(home.as_os_str()))
+    );
+    assert!(
+        command
+            .get_envs()
+            .any(|(name, value)| name == "CODEX_SQLITE_HOME" && value.is_none())
+    );
+    let legacy = ocr_command(binary, &root, &home, None, &descriptor).unwrap();
+    let args: Vec<_> = legacy
+        .as_std()
+        .get_args()
+        .map(|arg| arg.to_string_lossy())
+        .collect();
+    assert!(
+        args.contains(&format!("sqlite_home={}", serde_json::to_string(&home).unwrap()).into())
+    );
+    assert!(!args.iter().any(|arg| arg.starts_with("log_dir=")));
+    assert!(
+        ocr_command(
+            binary,
+            &root,
+            &home,
+            Some(&root.join("missing")),
+            &descriptor
+        )
+        .is_err()
+    );
+    std::fs::remove_dir(state.join("logs")).unwrap();
+    assert!(ocr_command(binary, &root, &home, Some(&state), &descriptor).is_err());
 }

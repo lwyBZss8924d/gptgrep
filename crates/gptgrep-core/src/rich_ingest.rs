@@ -115,6 +115,11 @@ impl PreparedRichIngest {
     pub fn staging_root(&self) -> &Path {
         &self.staging_root
     }
+    /// Borrow the bounded raw-document-derived tasks for explicit executor custody.
+    /// The caller can freeze task/path bindings before publication; no task is changed.
+    pub fn ocr_tasks(&self) -> impl ExactSizeIterator<Item = &OcrTask> {
+        self.tasks.values()
+    }
     /// Exact task hash -> parser-owned root. The native host resolves image
     /// relative paths inside this document root, never the corpus ancestor.
     pub fn ocr_staging_roots(&self) -> BTreeMap<String, PathBuf> {

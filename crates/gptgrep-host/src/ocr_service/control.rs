@@ -16,6 +16,7 @@ struct Control {
     claim_root: PathBuf,
     raw_results_dir: PathBuf,
     codex_home: PathBuf,
+    codex_state_dir: Option<PathBuf>,
     #[serde(default = "default_binary")]
     codex_bin: String,
     runtime_profile: PathBuf,
@@ -96,6 +97,9 @@ impl ForegroundOcrControl {
             !control.codex_bin.is_empty() && control.codex_bin.len() <= 4096,
             "ocr_serve_binary_shape"
         );
+        if let Some(path) = &control.codex_state_dir {
+            path_shape(path)?;
+        }
         for path in [
             &control.source_root,
             &control.prepared_root,
@@ -275,6 +279,11 @@ impl ForegroundOcrControl {
                 control.codex_bin
             },
             codex_home: resolve(&base, &control.codex_home)?,
+            codex_state_dir: control
+                .codex_state_dir
+                .as_ref()
+                .map(|path| resolve(&base, path))
+                .transpose()?,
             prepared_root: prepared,
             raw_results_dir: resolve(&base, &control.raw_results_dir)?,
             runtime_profile: runtime,

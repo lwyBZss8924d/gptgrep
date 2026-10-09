@@ -14,6 +14,89 @@ fn private_root() -> tempfile::TempDir {
 fn runtime() -> OcrRuntimeProfile {
     OcrRuntimeProfile::unqualified("a".repeat(40), HASH.into(), HASH.into()).unwrap()
 }
+#[test]
+fn foreground_native_state_overlap_refuses_before_request_journal_or_admission() {
+    for selected in 0..3 {
+        for relation in ["equal", "ancestor", "descendant", "disjoint"] {
+            let dir = private_root();
+            let root = dir.path().canonicalize().unwrap();
+            let source = root.join("source");
+            let prepared = root.join("prepared");
+            let actor = root.join("actor");
+            let mut outputs = [root.join("spool"), root.join("claims"), root.join("raw")];
+            let state = match relation {
+                "equal" => outputs[selected].clone(),
+                "ancestor" => {
+                    let state = root.join("native-state");
+                    outputs[selected] = state.join("output");
+                    state
+                }
+                "descendant" => outputs[selected].join("native-state"),
+                _ => root.join("native-state"),
+            };
+            for path in [&source, &prepared, &actor, &state]
+                .into_iter()
+                .chain(outputs.iter())
+            {
+                fs::create_dir_all(path).unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+                }
+            }
+            fs::create_dir(state.join("logs")).unwrap();
+            let clock =
+                RunClockAnchor::capture(std::time::SystemTime::now() + Duration::from_secs(60))
+                    .unwrap();
+            let context = OcrExecutionContext::with_phase_limits(
+                "state-overlap-test",
+                HASH,
+                clock.clone(),
+                crate::OcrExecutionLimits {
+                    max_admissions: 2,
+                    max_concurrency: 2,
+                    ledger_bytes: 8192,
+                },
+            )
+            .unwrap()
+            .join_original_ledger(root.join("ocr-ledger.json"), &clock)
+            .unwrap();
+            let options =
+                ForegroundOcrOptions::new(source.clone(), outputs[0].clone(), outputs[1].clone());
+            let catalog =
+                PreparedOcrTaskCatalog::prepare(&source, &prepared, Vec::new(), &options.resources)
+                    .unwrap();
+            let result = prepare_foreground_ocr(
+                options,
+                OcrHostConfig {
+                    codex_bin: "must-not-launch".into(),
+                    codex_home: actor,
+                    codex_state_dir: Some(state),
+                    prepared_root: prepared,
+                    raw_results_dir: outputs[2].clone(),
+                    runtime_profile: runtime(),
+                    transport: OcrImageTransport::DynamicImages,
+                },
+                context.clone(),
+                &clock,
+                catalog,
+                b"12345678901234567890123456789012",
+            );
+            if relation == "disjoint" {
+                assert!(result.is_ok(), "disjoint state must remain supported");
+            } else {
+                assert_eq!(
+                    result.err().expect("state alias was admitted").to_string(),
+                    "ocr_service_namespace_overlap",
+                    "output {selected}, relation {relation}"
+                );
+                assert!(!outputs[1].join("claims.json").exists());
+            }
+            assert_eq!(context.snapshot().unwrap().charged_admissions, 0);
+        }
+    }
+}
 fn service(root: &Path) -> Arc<Service> {
     let claims = root.join("claims");
     let spool = root.join("spool");
@@ -32,6 +115,7 @@ fn service(root: &Path) -> Arc<Service> {
         OcrHostConfig {
             codex_bin: "not-a-runtime".into(),
             codex_home: root.join("actor"),
+            codex_state_dir: None,
             prepared_root: root.into(),
             raw_results_dir: root.join("raw"),
             runtime_profile: runtime(),
@@ -401,6 +485,7 @@ fn full_task_rehydrates_only_bound_catalog_paths_and_detects_namespace_mutation(
         OcrHostConfig {
             codex_bin: "not-a-runtime".into(),
             codex_home: source.path().join("actor"),
+            codex_state_dir: None,
             prepared_root: prepared.path().into(),
             raw_results_dir: prepared.path().join("raw"),
             runtime_profile: runtime(),
