@@ -171,6 +171,77 @@ async fn terminal_error_keeps_only_typed_metadata_and_observed_partial_usage() {
 }
 
 #[tokio::test]
+async fn other_terminal_error_projects_schema_diagnostics_without_private_payloads_or_retry() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("trace.jsonl");
+    let mut message = notification(json!(false), json!("other"));
+    message["params"]["error"]["message"] = json!(format!(
+        "unexpected status 400 Bad Request: {}, url: https://private-url-sentinel.invalid/private-path-sentinel, request id: private-request-id-sentinel",
+        json!({"error":{"type":"invalid_request_error","code":"invalid_json_schema",
+            "param":"text.format.schema.private-property-sentinel","message":"private-provider-body-sentinel"},
+            "headers":{"authorization":"private-credential-sentinel"},"request_id":"private-request-id-sentinel"})
+    ));
+    let error = complete_with(vec![message], Some(&path))
+        .await
+        .err()
+        .unwrap();
+    let typed = error.downcast_ref::<HostProtocolError>().unwrap();
+    assert_eq!(typed.kind, HostProtocolErrorKind::TerminalError);
+    assert_eq!(typed.codex_error_info, Some(CodexErrorInfo::Other));
+    assert_eq!(typed.server_retry_notifications, 0);
+    assert_eq!(typed.will_retry, Some(false));
+    assert!(typed.usage.is_none());
+    let diagnostics = typed.diagnostics.as_ref().unwrap();
+    assert_eq!(diagnostics["classification"], "output_schema");
+    assert_eq!(diagnostics["conflicting_evidence"], false);
+    assert_eq!(
+        diagnostics["evidence"][0]["basis"],
+        "native_http_error_envelope"
+    );
+    assert_eq!(diagnostics["evidence"][0]["code"], "invalid_json_schema");
+    assert_eq!(
+        diagnostics["evidence"][0]["parameter_family"],
+        "text.format"
+    );
+    assert_eq!(diagnostics["evidence"][0]["http_status_code"], 400);
+    let trace = std::fs::read_to_string(path).unwrap();
+    let last: Value = serde_json::from_str(trace.lines().last().unwrap()).unwrap();
+    assert_eq!(&last["error_diagnostics"], diagnostics);
+    for output in [
+        trace,
+        serde_json::to_string(typed).unwrap(),
+        format!("{error:?}"),
+        error.to_string(),
+    ] {
+        assert!(
+            !output.contains("private-"),
+            "private provider content escaped its projection"
+        );
+    }
+}
+
+#[tokio::test]
+async fn other_failed_turn_uses_the_same_closed_message_signature_projection() {
+    let mut message = completed("failed");
+    message["params"]["turn"]["error"] = json!({"codexErrorInfo":"other",
+        "message":"Invalid schema for function 'private-function-name': private-schema-details"});
+    let error = complete_with(vec![message], None).await.err().unwrap();
+    let typed = error.downcast_ref::<HostProtocolError>().unwrap();
+    assert_eq!(typed.kind, HostProtocolErrorKind::FailedTurn);
+    let diagnostics = typed.diagnostics.as_ref().unwrap();
+    assert_eq!(diagnostics["classification"], "tool_definition");
+    assert_eq!(
+        diagnostics["evidence"][0]["basis"],
+        "anchored_message_signature"
+    );
+    assert_eq!(
+        diagnostics["evidence"][0]["signature"],
+        "invalid_function_schema"
+    );
+    assert!(!serde_json::to_string(typed).unwrap().contains("private-"));
+}
+
+#[tokio::test]
 async fn malformed_retry_flags_and_error_shapes_fail_closed() {
     let mut messages = vec![];
     for flag in [Value::Null, json!("true"), json!(1), json!({})] {

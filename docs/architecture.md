@@ -57,6 +57,31 @@ An optional `--codex-state-dir` selects a separate existing canonical directory
 for native SQLite state and its existing `logs` child for logs. Authentication
 continues to use `--codex-home`; callers route temporary and protocol trace files separately.
 
+Active-turn failures retain `host_protocol.diagnostics` (also available inside a
+model-attempt protocol error) and matching private-trace `error_diagnostics`.
+`gptgrep.codex.error-diagnostics.v1` distinguishes typed native variants, fixed
+allowlisted error codes/types/parameter families from structured provider errors,
+and explicitly labelled anchored message signatures. It can identify tool
+definitions, output schemas, model selection, authentication, transport and
+server failures when the observed error supplies that evidence. Classifications
+describe the observed error evidence; they are not independently verified root
+causes. Conflicting or unrecognized evidence remains `unknown`.
+
+The projection never stores arbitrary error text, header values, URLs, request
+bodies, model names from error strings, or rejected property names. It records
+field shape and byte length, plus SHA256 only when the entire string is at most
+16 KiB. Oversized fields are neither scanned nor hashed. The only text grammars
+are complete JSON errors, a bounded `unexpected status` HTTP error envelope, and
+fixed anchored error signatures. An HTTP envelope permits an empty suffix or
+`, url: ` followed by one whitespace-free HTTP(S) URL of at most 2,048 bytes,
+optionally followed by `, request id: ` and a 1–128-character ASCII identifier
+containing only letters, digits, underscores or hyphens. Quotes, backslashes,
+JSON braces and angle brackets are rejected in the URL; any other suffix or
+second JSON value leaves the error unknown. It performs no arbitrary substring JSON or
+keyword search. Native retry handling, the original deadline, tool limits and
+unknown usage accounting are unchanged. These diagnostics cannot recover the
+cause of an earlier run whose error content was already discarded.
+
 ## Ingestion and snapshot consistency
 
 The corpus root is explicit. Normal ignore rules apply even outside a Git repo;

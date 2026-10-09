@@ -76,6 +76,7 @@ impl Trace {
             "advertised_tools":tools,
             "codex_error_info":error.as_ref().and_then(|error|error.info),
             "will_retry":if message["method"] == "error" { params["willRetry"].as_bool() } else { None },
+            "error_diagnostics":error.as_ref().and_then(|error|error.diagnostics.as_ref()),
             "http_status_code":error.and_then(|error|error.http_status_code)
         });
         let mut line = serde_json::to_vec(&entry)?;

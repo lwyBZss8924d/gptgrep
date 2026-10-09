@@ -101,7 +101,7 @@ impl Backend for Mock {
             return Err(crate::HostProtocolError { kind: crate::HostProtocolErrorKind::TerminalError,
                 codex_error_info: Some(crate::CodexErrorInfo::ServerOverloaded), will_retry: Some(false), http_status_code: Some(503),
                 server_retry_notifications: 1, usage: Some(json!({"total":{"inputTokens":12,"outputTokens":5,"totalTokens":17},"PRIVATE":"not-retained"})),
-                accounting_complete: false, tool_budget: None }.into());
+                accounting_complete: false, diagnostics: None, tool_budget: None }.into());
         }
         if let Some(path) = &self.mutate_source {
             fs::write(path, "Changed source after planning.")?;
@@ -910,6 +910,7 @@ fn enrich_failure_taxonomy_uses_safe_owner_metadata_without_provider_text() {
             server_retry_notifications: 2,
             usage: None,
             accounting_complete: false,
+            diagnostics: None,
             tool_budget: None,
         };
         let failure = failure_info(&error.into(), CallKind::Builder);

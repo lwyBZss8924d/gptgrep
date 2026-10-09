@@ -68,6 +68,21 @@ exec /bin/sleep 30
     assert_eq!(report["host_protocol"]["server_retry_notifications"], 1);
     assert_eq!(report["host_protocol"]["usage"]["total"]["totalTokens"], 42);
     assert_eq!(report["host_protocol"]["accounting_complete"], false);
+    assert_eq!(
+        report["host_protocol"]["diagnostics"]["classification"],
+        "transport"
+    );
+    assert_eq!(
+        report["host_protocol"]["diagnostics"]["message"]["shape"],
+        "string"
+    );
+    assert_eq!(
+        report["host_protocol"]["diagnostics"]["message"]["sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
     assert!(report.get("value").is_none());
     for content in [
         String::from_utf8(output.stdout).unwrap(),

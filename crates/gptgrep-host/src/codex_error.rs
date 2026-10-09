@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::fmt;
 
+#[path = "codex_error_diagnostics.rs"]
+mod diagnostics;
+
 /// Safe app-server error variants. Provider messages and details are never retained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -73,6 +76,9 @@ pub struct HostProtocolError {
     pub server_retry_notifications: usize,
     pub usage: Option<Value>,
     pub accounting_complete: bool,
+    /// Closed classifications and bounded fingerprints; never provider text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_budget: Option<ToolBudgetDiagnostics>,
 }
@@ -105,6 +111,7 @@ impl HostProtocolError {
             server_retry_notifications,
             usage: usage.and_then(observed_usage),
             accounting_complete: false,
+            diagnostics: error.diagnostics.clone(),
             tool_budget,
         }
     }
@@ -172,6 +179,7 @@ pub(crate) struct ParsedError {
     pub info: Option<CodexErrorInfo>,
     pub http_status_code: Option<u16>,
     pub valid: bool,
+    pub diagnostics: Option<Value>,
 }
 impl ParsedError {
     /// Narrow native recovery observation, without retaining provider strings.
@@ -251,6 +259,7 @@ impl ParsedError {
             }
             _ => result.valid = false,
         }
+        result.diagnostics = diagnostics::project(error, result.info, result.valid);
         result
     }
 }
