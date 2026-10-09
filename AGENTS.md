@@ -8,6 +8,15 @@ Use workspace/harness-config for portable specs and templates, and workspace/har
 Task results and handoffs belong in their declared local workspace locations.
 Do not treat a checkpoint, successful process or generated artifact as acceptance.
 
+Before downloads, dependency installation, builds, tests, browser/model acquisition
+or container work, follow [development storage](workspace/harness-config/development-storage.md)
+and the environments-harness-self owner's verified storage entrypoint. Resolve the
+private project/worktree registry and use a separate checked run for each worker.
+Missing admission, volume identity, physical-path or peak-space evidence denies
+the workload; never fall back to internal caches or a default temporary directory.
+Record startup, phase, handoff and terminal storage receipts. Frozen worktrees keep
+their historical source bytes and remain nonconsumers until explicitly admitted.
+
 The project mandate authorizes routine development, tests, CI, releases and delivery.
 Reserve major requirement, product/domain and research changes for Human discussion.
 Use the smallest useful team; independent review is required before release.
@@ -30,8 +39,9 @@ Private evidence and exact native provenance belong under .local/ or workspace/h
 Keep docs/research/ local-only, ignored and untracked; preserve its files locally.
 Keep workspace/exec-plans/ and workspace/issues/ local-only, ignored and untracked too.
 Every completed code round requires a commit and verified refs/notes/commits PoUW.
-Back up Git history and notes to a local verified bundle under .local/backups/;
-push source and tags to the authorized origin when release checks pass. Do not push
+Back up Git history and notes to a verified bundle on registered external owner
+storage; keep only a small ignored locator under .local/backups/ and retain prior bundles.
+Push source and tags to the authorized origin when release checks pass. Do not push
 private PoUW notes or runtime evidence. No global configuration, toolchain or service
 changes are implied by project ownership.
 
