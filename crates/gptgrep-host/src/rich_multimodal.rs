@@ -31,6 +31,9 @@ use std::time::Duration;
 
 const MAX_OUTPUT: usize = 1_048_576;
 const MAX_METADATA: usize = 32768;
+// Bootstrap admission covers the whole candidate pool; seed and citation
+// metadata retain their separate per-candidate limit above.
+const MAX_BOOTSTRAP_METADATA: usize = 524288;
 const MAX_TEXT: usize = 2048;
 const MAX_CITATIONS: usize = 8;
 const SEED_HITS: usize = 3;
@@ -166,7 +169,7 @@ pub fn prepare_rich_multimodal_host(
     );
     let mut core_options = options.retrieval.clone();
     core_options.max_output_bytes = core_options.max_output_bytes.min(524288);
-    core_options.max_metadata_bytes = core_options.max_metadata_bytes.min(MAX_METADATA);
+    core_options.max_metadata_bytes = core_options.max_metadata_bytes.min(MAX_BOOTSTRAP_METADATA);
     core_options.window_bytes = core_options.window_bytes.min(MAX_TEXT);
     let bootstrap =
         prepare_rich_multimodal_search(reader.clone(), client.clone(), question, &core_options)?;

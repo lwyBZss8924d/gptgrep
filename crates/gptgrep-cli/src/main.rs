@@ -804,7 +804,7 @@ fn contract() -> Value {
         json!({"type":"integer","minimum":1,"maximum":8,"default":8,"requires":"multimodal"});
     contract["commands"]["ask"]["options"]["min-score"] =
         json!({"type":"number","minimum":0,"maximum":1,"default":0.5,"requires":"multimodal"});
-    contract["commands"]["ask"]["options"]["multimodal"]["host_bounds"] = json!({"rerank_report_bytes":524288,"candidate_metadata_bytes":32768,"image_result_frame_bytes":1048576,"complete_output_reserved_before_calls":true});
+    contract["commands"]["ask"]["options"]["multimodal"]["host_bounds"] = json!({"rerank_report_bytes":524288,"candidate_metadata_bytes":32768,"bootstrap_candidate_metadata_bytes":524288,"image_result_frame_bytes":1048576,"complete_output_reserved_before_calls":true});
     for command in ["ask", "summarize", "host-complete", "enrich"] {
         contract["commands"][command]["options"]["codex-state-dir"] = json!({
             "type":"path","default":null,

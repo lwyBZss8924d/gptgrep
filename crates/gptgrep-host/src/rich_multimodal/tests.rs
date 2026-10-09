@@ -22,10 +22,15 @@ fn config() -> HostConfig {
 async fn generation(
     color: u8,
 ) -> Result<(tempfile::TempDir, RichGenerationReader, Vec<u8>, String)> {
+    generation_with_text(color, "alpha\r\n中 tail\n").await
+}
+async fn generation_with_text(
+    color: u8,
+    text: &str,
+) -> Result<(tempfile::TempDir, RichGenerationReader, Vec<u8>, String)> {
     let temp = tempfile::tempdir()?;
     let root = temp.path().canonicalize()?;
-    let (staging, mut parsed) =
-        crate::rich_text::tests::candidate(&root, &["alpha\r\n中 tail\n"]).await?;
+    let (staging, mut parsed) = crate::rich_text::tests::candidate(&root, &[text]).await?;
     let stage = staging.path().canonicalize()?;
     let mut png = vec![];
     image::codecs::png::PngEncoder::new(&mut png).write_image(
@@ -79,6 +84,48 @@ async fn generation(
         .id
         .clone();
     Ok((temp, reader, png, id))
+}
+#[tokio::test]
+async fn aggregate_bootstrap_metadata_is_separate_from_per_candidate_bounds() -> Result<()> {
+    let text = format!("{}cedar\n", "filler ".repeat(18)).repeat(18);
+    let (_temp, reader, _, _) = generation_with_text(19, &text).await?;
+    let context = crate::rich_text::tests::context(4)?;
+    let client =
+        JevClient::new("unused-preparation-only", None)?.with_execution_context(context.clone());
+    let before = context.snapshot()?;
+    let options = RichMultimodalHostOptions::default();
+    let prepared =
+        prepare_rich_multimodal_host(reader.clone(), client.clone(), "cedar", &config(), &options)?;
+    assert!(prepared.bootstrap.candidate_scope().count() >= 6);
+    assert!(prepared.reserved_output_bytes() <= options.max_output_bytes);
+    let mut small_metadata = options.clone();
+    small_metadata.retrieval.max_metadata_bytes = 32768;
+    let mut small_output = options.clone();
+    small_output.max_output_bytes = 65536;
+    for (limits, expected) in [
+        (
+            small_metadata,
+            "rich_multimodal_metadata_budget_insufficient",
+        ),
+        (small_output, "host_rich_output_budget"),
+    ] {
+        let error = prepare_rich_multimodal_host(
+            reader.clone(),
+            client.clone(),
+            "cedar",
+            &config(),
+            &limits,
+        )
+        .err()
+        .context("insufficient budget must fail before execution")?;
+        assert_eq!(error.to_string(), expected);
+    }
+    let after = context.snapshot()?;
+    assert_eq!(before.logical_reservations, 0);
+    assert_eq!(before.submission_observations, 0);
+    assert_eq!(after.logical_reservations, 0);
+    assert_eq!(after.submission_observations, 0);
+    Ok(())
 }
 async fn fixture(color: u8) -> Result<(tempfile::TempDir, RichEvidence, Vec<u8>, String)> {
     let (temp, reader, png, id) = generation(color).await?;
