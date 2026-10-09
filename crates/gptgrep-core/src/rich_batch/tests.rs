@@ -673,7 +673,7 @@ fn read_artifact_utf8_continuation_replays_exact_source_bound_windows() -> Resul
         let item = &response.items[0];
         assert_eq!(item.status, RichBatchStatus::Ok);
         let window: crate::ArtifactTextWindow =
-            serde_json::from_value(item.result.clone().unwrap())?;
+            serde_json::from_value(serde_json::to_value(item.result.as_ref().unwrap())?)?;
         reader.validate_text_evidence(&window.evidence)?;
         assert!(matches!(
             window.evidence,
@@ -989,8 +989,9 @@ async fn native_and_offline_ocr_search_read_keep_distinct_evidence_receipts() ->
         );
         reader.validate_text_evidence(&hit.evidence)?;
     }
-    let retained: crate::ArtifactTextWindow =
-        serde_json::from_value(response.items[2].result.clone().unwrap())?;
+    let retained: crate::ArtifactTextWindow = serde_json::from_value(serde_json::to_value(
+        response.items[2].result.as_ref().unwrap(),
+    )?)?;
     assert_eq!(retained.text, format!("{raw}\n"));
     assert!(matches!(
         retained.evidence,
@@ -1021,7 +1022,7 @@ fn supplied_reader_cannot_exceed_request_cache_policy_or_turn_eof_into_citation(
         ),
     )?;
     let window: crate::ArtifactTextWindow =
-        serde_json::from_value(eof.items[0].result.clone().unwrap())?;
+        serde_json::from_value(serde_json::to_value(eof.items[0].result.as_ref().unwrap())?)?;
     assert!(window.text.is_empty());
     assert!(eof.items[0].coverage.exhausted);
     assert!(eof.items[0].coverage.cursor.is_none());

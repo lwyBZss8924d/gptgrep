@@ -764,11 +764,12 @@ impl PreparedRichBatch {
                             RichBatchStatus::Ok
                         },
                         reserved_output_bytes: self.quotas[i],
-                        result: Some(result),
+                        result: Some(result.into()),
                         error: failed,
                         coverage,
                         read_metrics: None,
                         decisions: Some(accounting),
+                        metadata_lease: None,
                     }
                 }
             };

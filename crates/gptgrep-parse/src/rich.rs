@@ -1,9 +1,10 @@
 //! Count-admitted native stages. Opaque upstream rich getters remain explicit
 //! capabilities until their length/count preflight can be implemented.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
+use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -316,7 +317,7 @@ impl NativeCandidate {
         )?;
         ensure!(
             self.native_profile_sha256
-                == native_text_metadata::native_font_word_profile_digest(
+                == crate::native_graphics_profile_digest(
                     &self.summary,
                     document_metadata.native_dpi,
                     document_metadata.native_render_pages
@@ -381,7 +382,7 @@ impl NativeCandidate {
             }
             ensure!(
                 matches!(page.capabilities.get("native_recipe"),
-                Some(FeatureState::Present(recipe)) if recipe == native_text_metadata::NATIVE_FONT_WORD_RECIPE),
+                Some(FeatureState::Present(recipe)) if recipe == crate::NATIVE_GRAPHICS_RECIPE),
                 "native font/word recipe missing"
             );
             ensure!(
@@ -403,13 +404,21 @@ impl NativeCandidate {
                 page.metadata_artifact.bytes,
                 &page.metadata_artifact.sha256,
             )?;
-            native_text_metadata::validate_native_text_metadata(
+            ensure!(
+                self.native_owned_upper
+                    .checked_add(crate::native_metadata_working_upper(&bytes)?)
+                    .is_some_and(|n| n <= budget.owned_working_bytes),
+                "resource_limit: retained native candidate and typed graphics validation"
+            );
+            // The strict v7 validator below also validates the complete native
+            // character/font/word stream under its bound unclipped policy.
+            let retained = crate::validate_native_graphics_metadata(
                 &bytes,
                 &self.summary,
+                &self.native_profile_sha256,
                 page.number,
                 budget,
             )?;
-            let retained: NativeMetadata = serde_json::from_slice(&bytes)?;
             ensure!(
                 serde_json::to_vec(&retained.page)? == serde_json::to_vec(raw)?
                     && serde_json::to_value(&retained.capabilities)?
@@ -742,17 +751,6 @@ pub async fn extract_native(
         .context("rich PDFium worker failed")?
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct NativeMetadata {
-    page: Page,
-    objects: Vec<serde_json::Value>,
-    capabilities: std::collections::BTreeMap<String, FeatureState<String>>,
-    complexity: stages::PageComplexityStats,
-    image_rects: Vec<liteparse::types::Rect>,
-    geometry: PageGeometry,
-    native_text_metadata: native_text_metadata::NativeTextMetadata,
-}
-
 pub(crate) fn admit_staging(used: &mut u64, bytes: u64, budget: &ResourceBudget) -> Result<()> {
     let next = used
         .checked_add(bytes)
@@ -800,7 +798,7 @@ pub(crate) fn extract_sync(
     if prepared.summary.format == "plaintext" {
         return crate::rich_text::extract(prepared, budget);
     }
-    let native_profile_sha256 = native_text_metadata::native_font_word_profile_digest(
+    let native_profile_sha256 = crate::native_graphics_profile_digest(
         &prepared.summary,
         options.dpi,
         options.render_pages,
@@ -924,142 +922,101 @@ pub(crate) fn extract_sync(
                 glyph_bound <= budget.page_layout_bytes,
                 "resource_limit: native char count rejected before glyph allocation"
             );
-            let mut objects = Vec::new();
-            let mut image_rects = Vec::new();
-            let mut vector_count = 0usize;
-            let mut stack = Vec::new();
-            let mut visited = HashSet::new();
-            let object_count = page_obj.object_count();
-            ensure!(
-                object_count as u64 <= budget.page_layout_bytes / 2048,
-                "resource_limit: native object count rejected before object allocation"
-            );
-            let mut object_bound = object_count as u64 * 2048;
             let label_bound = match &document_metadata.page_labels[index].label {
                 FeatureState::Present(label) => label.len() as u64 * 12,
                 _ => 1024,
             };
+            let base_bound = glyph_bound + annotation_bound + label_bound + 16_384;
             ensure!(
-                object_bound + glyph_bound + annotation_bound + label_bound + 16_384
-                    <= budget.page_layout_bytes,
-                "resource_limit: page char/object admission"
+                base_bound < budget.page_layout_bytes,
+                "resource_limit: page character admission"
             );
-            admit_native_estimate(
-                &mut metadata_used,
-                &mut owned_upper,
-                object_bound + glyph_bound + annotation_bound + 16_384,
-                &budget,
-            )?;
-            for object_index in 0..object_count {
-                stack.push((
-                    page_obj
-                        .object(object_index)
-                        .context("PDF object disappeared")?,
-                    0u32,
-                ));
-            }
-            while let Some((object, depth)) = stack.pop() {
-                ensure!(
-                    depth < 32 && visited.insert(object.id()),
-                    "capability_unavailable: cyclic/repeated/deep Form object tree"
-                );
-                if let Some(children) = object.form_object_count() {
-                    let addition = (children as u64)
-                        .checked_mul(2048)
-                        .context("resource_limit: nested object multiplication overflow")?;
-                    object_bound = object_bound
-                        .checked_add(children as u64 * 2048)
-                        .context("resource_limit: nested object count overflow")?;
-                    ensure!(
-                        object_bound + glyph_bound + annotation_bound + label_bound + 16_384
-                            <= budget.page_layout_bytes,
-                        "resource_limit: nested object admission"
-                    );
-                    admit_native_estimate(&mut metadata_used, &mut owned_upper, addition, &budget)?;
-                    for child in 0..children {
-                        stack.push((
-                            object
-                                .form_object(child)
-                                .context("Form child disappeared")?,
-                            depth + 1,
-                        ));
+            admit_native_estimate(&mut metadata_used, &mut owned_upper, base_bound, &budget)?;
+            let graphics = crate::native_graphics::collect(
+                &prepared.summary,
+                &native_profile_sha256,
+                number,
+                &geometry,
+                budget.page_layout_bytes - base_bound,
+                |ordinal| page_obj.object(ordinal),
+                |parent| match parent {
+                    None => page_obj.object_count_checked(),
+                    Some(object) => object.form_object_count(),
+                },
+                |object, ordinal| object.form_object(ordinal),
+                |object| {
+                    use crate::native_graphics::{ImageObservation, ObjectObservation};
+                    let raw_kind = object.raw_kind();
+                    let is_path = raw_kind == 2;
+                    ObjectObservation {
+                        identity: object.id(),
+                        raw_kind,
+                        matrix: object.matrix().map(|m| [m.a, m.b, m.c, m.d, m.e, m.f]),
+                        bounds: object.bounds().map(|r| [r.left, r.bottom, r.right, r.top]),
+                        segments: if is_path {
+                            object.path_segment_count()
+                        } else {
+                            None
+                        },
+                        draw: if is_path {
+                            object.path_raw_draw_mode()
+                        } else {
+                            None
+                        },
+                        stroke_width: if is_path { object.stroke_width() } else { None },
+                        fill: if is_path {
+                            object.fill_color().map(|c| [c.r, c.g, c.b, c.a])
+                        } else {
+                            None
+                        },
+                        stroke: if is_path {
+                            object.stroke_color().map(|c| [c.r, c.g, c.b, c.a])
+                        } else {
+                            None
+                        },
+                        image: if raw_kind == 3 {
+                            object.image_metadata().map(|m| ImageObservation {
+                                width: m.width,
+                                height: m.height,
+                                bits: m.bits_per_pixel,
+                                colorspace: m.colorspace,
+                                marked: m.marked_content_id,
+                                horizontal_dpi: m.horizontal_dpi,
+                                vertical_dpi: m.vertical_dpi,
+                            })
+                        } else {
+                            None
+                        },
                     }
-                }
-                if let Some(segments) = object.path_segment_count() {
-                    let addition = (segments as u64)
-                        .checked_mul(256)
-                        .context("resource_limit: segment multiplication overflow")?;
-                    object_bound = object_bound
-                        .checked_add(segments as u64 * 256)
-                        .context("resource_limit: path segment count overflow")?;
-                    ensure!(
-                        object_bound + glyph_bound + annotation_bound + label_bound + 16_384
-                            <= budget.page_layout_bytes,
-                        "resource_limit: path segment count rejected before allocation"
-                    );
-                    admit_native_estimate(&mut metadata_used, &mut owned_upper, addition, &budget)?;
-                    let mut points = Vec::with_capacity(segments);
-                    for segment in 0..segments {
-                        let segment = object
-                            .path_segment(segment)
-                            .context("path segment unavailable")?;
-                        if let Some((x, y)) = segment.point {
-                            ensure!(x.is_finite() && y.is_finite(), "invalid path geometry");
+                },
+                |object, ordinal| {
+                    object.path_segment(ordinal).map(|segment| {
+                        use crate::native_graphics::{NativeSegmentKind, SegmentObservation};
+                        SegmentObservation {
+                            kind: match segment.kind_label() {
+                                Some("move_to") => Some(NativeSegmentKind::MoveTo),
+                                Some("line_to") => Some(NativeSegmentKind::LineTo),
+                                Some("bezier_to") => Some(NativeSegmentKind::BezierTo),
+                                _ => None,
+                            },
+                            point: segment.point.map(|(x, y)| [x, y]),
+                            close: segment.close,
                         }
-                        points.push(serde_json::json!({"kind":format!("{:?}",segment.kind),"point":segment.point,"close":segment.close}));
-                    }
-                    let matrix = object.matrix().map(|m| [m.a, m.b, m.c, m.d, m.e, m.f]);
-                    ensure!(
-                        matrix
-                            .as_ref()
-                            .is_none_or(|m| m.iter().all(|v| v.is_finite())),
-                        "invalid path matrix"
-                    );
-                    objects.push(serde_json::json!({"kind":"path","segments":points,"matrix":matrix,"depth":depth}));
-                    vector_count += 1;
-                } else if let Some(image) = object.image_metadata() {
-                    let bbox = object
-                        .bounds()
-                        .context("capability_unavailable: image bounds missing")?;
-                    ensure!(
-                        depth == 0,
-                        "capability_unavailable: nested image geometry requires ancestor matrix adapter"
-                    );
-                    let corners = [
-                        native_transform.transform_point(bbox.left, bbox.top),
-                        native_transform.transform_point(bbox.right, bbox.top),
-                        native_transform.transform_point(bbox.left, bbox.bottom),
-                        native_transform.transform_point(bbox.right, bbox.bottom),
-                    ];
-                    ensure!(
-                        corners.iter().all(|(x, y)| x.is_finite() && y.is_finite()),
-                        "invalid image object geometry"
-                    );
-                    let minx = corners.iter().map(|p| p.0).fold(f32::INFINITY, f32::min);
-                    let miny = corners.iter().map(|p| p.1).fold(f32::INFINITY, f32::min);
-                    let maxx = corners
-                        .iter()
-                        .map(|p| p.0)
-                        .fold(f32::NEG_INFINITY, f32::max);
-                    let maxy = corners
-                        .iter()
-                        .map(|p| p.1)
-                        .fold(f32::NEG_INFINITY, f32::max);
-                    image_rects.push(liteparse::types::Rect {
-                        x: minx,
-                        y: miny,
-                        width: maxx - minx,
-                        height: maxy - miny,
-                    });
-                    objects.push(serde_json::json!({"kind":"image","width":image.width,"height":image.height,"bits_per_pixel":image.bits_per_pixel,"depth":depth}));
-                }
-            }
+                    })
+                },
+                |bytes| admit_native_estimate(&mut metadata_used, &mut owned_upper, bytes, &budget),
+            )?;
+            let object_count = graphics.header.top_level_count;
+            let object_bound = graphics.charged_bytes;
+            let vector_count = graphics.paths;
+            let image_rects = graphics.image_rects;
             let mut font_bound = 0u64;
             let characters = native_text_metadata::collect_characters(
                 count as u32,
                 width,
                 height,
                 &budget,
+                native_text_metadata::NativeBoundsPolicy::UnclippedV7,
                 |ordinal| {
                     let glyph = text_page.char_at_unchecked(ordinal as i32);
                     let bounds = glyph.char_box().map(|box_| {
@@ -1115,7 +1072,7 @@ pub(crate) fn extract_sync(
                     })
                 },
             )?;
-            let raw = Page {
+            let mut raw = Page {
                 page_number: number as usize,
                 page_label: match &document_metadata.page_labels[index].label {
                     FeatureState::Present(label) => Some(label.clone()),
@@ -1124,7 +1081,7 @@ pub(crate) fn extract_sync(
                 page_width: width,
                 page_height: height,
                 content_bounds: None,
-                text_items: native_text_metadata::glyph_runs(&characters),
+                text_items: native_text_metadata::unclipped_glyph_runs(&characters)?,
                 graphics: Vec::new(),
                 vector_graphics: None,
                 struct_nodes: Vec::new(),
@@ -1133,12 +1090,18 @@ pub(crate) fn extract_sync(
                 form_fields: None,
                 structure_tree: None,
             };
-            admit_projection(std::slice::from_ref(&raw), &budget, owned_upper)?;
-            let projected = stages::project(vec![raw.clone()]);
             // Avoid upstream image_bounds()/vector Vec getters. Inputs to this
             // pure classifier were admitted by the object-count walk above.
+            // Preserve the pre-G3 classifier inputs; the layout derivative is
+            // assigned only after that original source classification.
             let mut complexity =
                 liteparse::ocr_merge::calculate_native_page_complexity(&raw, &image_rects, 0, 1);
+            let (content_bounds, vector_graphics) =
+                crate::native_graphics::derive_layout(&graphics.header, &graphics.objects)?;
+            raw.content_bounds = content_bounds;
+            raw.vector_graphics = Some(vector_graphics);
+            admit_projection(std::slice::from_ref(&raw), &budget, owned_upper)?;
+            let projected = stages::project(vec![raw.clone()]);
             if vector_count > 0
                 && !complexity
                     .reasons
@@ -1177,6 +1140,10 @@ pub(crate) fn extract_sync(
                 "native_stream".into(),
                 FeatureState::Present(native_text_metadata::stream_recipe().into()),
             );
+            capabilities.insert(
+                "native_character_geometry".into(),
+                FeatureState::Present(native_text_metadata::UNCLIPPED_GEOMETRY.into()),
+            );
             for feature in [
                 "tagged_structure",
                 "annotations",
@@ -1190,7 +1157,7 @@ pub(crate) fn extract_sync(
             }
             capabilities.insert(
                 "native_recipe".into(),
-                FeatureState::Present(native_text_metadata::NATIVE_FONT_WORD_RECIPE.into()),
+                FeatureState::Present(crate::NATIVE_GRAPHICS_RECIPE.into()),
             );
             capabilities.insert(
                 "document_metadata".into(),
@@ -1213,8 +1180,16 @@ pub(crate) fn extract_sync(
             capabilities.insert(
                 "vector_objects".into(),
                 FeatureState::Present(
-                    "count-admitted raw path segments/object matrices; ancestor geometry is unsupported".into(),
+                    "complete native geometry; ancestor composition; metadata only; visibility unsupported".into(),
                 ),
+            );
+            capabilities.insert(
+                "native_layout_graphics".into(),
+                FeatureState::Present(crate::native_graphics::LAYOUT_GRAPHICS_RECIPE.into()),
+            );
+            capabilities.insert(
+                "native_content_bounds_semantics".into(),
+                FeatureState::Present(crate::native_graphics::CONTENT_BOUNDS_SEMANTICS.into()),
             );
             let name = format!("{}-p{number}-native.txt", prepared.summary.source_sha256);
             admit_staging(&mut staged, text.len() as u64, &budget)?;
@@ -1250,9 +1225,10 @@ pub(crate) fn extract_sync(
                 "resource_limit: native metadata classifier/frame binding admission"
             );
             admit_native_estimate(&mut metadata_used, &mut owned_upper, binding_bytes, &budget)?;
-            let metadata = NativeMetadata {
+            let metadata = crate::NativePageMetadata {
                 page: raw.clone(),
-                objects,
+                objects: graphics.objects,
+                graphics: graphics.header,
                 capabilities: capabilities.clone(),
                 complexity: complexity.clone(),
                 image_rects,
@@ -1465,15 +1441,123 @@ pub(crate) fn extract_sync(
     Ok(candidate)
 }
 
-/// Conservative bound for the pinned pure projection's sparse-space output.
-/// Extremely thin text and huge coordinate spans need a limited projection
-/// adapter rather than invoking an unbounded upstream space expansion.
+/// Logical owned scratch for the pinned liteparse XY stage, independent of
+/// sparse-text padding. Its 2pt density and 5pt column buckets use absolute
+/// spans, even when the characters themselves have very large advances.
+fn projection_xy_scratch_upper(x_span: f64, y_span: f64, items: u64) -> Result<u64> {
+    // The only admitted item rotation is zero. The pinned projection rounds
+    // dimensions, then has two merging passes (at most 2N merges). Each merge
+    // has at most three endpoint/difference operations per axis. Including
+    // zero in the input extent bounds absolute coordinates as well as spans.
+    // Two points cover dimension rounding; a fourfold enclosure dominates
+    // accumulated f32 rounding with 8N*EPSILON <= 1/4. Reject a coarser case.
+    ensure!(
+        items as f64 * 8.0 * f64::from(f32::EPSILON) <= 0.25,
+        "resource_limit: projection merge precision admission"
+    );
+    let buckets = |span: f64, width: f32| -> Result<u64> {
+        ensure!(
+            span.is_finite() && span >= 0.0 && (span as f32).is_finite(),
+            "resource_limit: projection finite absolute span admission"
+        );
+        let enclosure = (span + 2.0) * 4.0;
+        let rounded = enclosure as f32;
+        ensure!(
+            rounded.is_finite(),
+            "resource_limit: projection rounded span overflow"
+        );
+        // next_up prevents the f64->f32 conversion rounding the enclosure
+        // down. Use the upstream f32 division/ceil, then check before casting.
+        let count = (rounded.next_up() / width).ceil().max(1.0);
+        ensure!(
+            count.is_finite()
+                && f64::from(count) < u64::MAX as f64
+                && f64::from(count) < usize::MAX as f64,
+            "resource_limit: projection bucket count overflow"
+        );
+        Ok(count as u64)
+    };
+    let bx = buckets(x_span, 2.0)?;
+    let by = buckets(y_span, 2.0)?;
+    let histogram = buckets(x_span, 5.0)?;
+    // Density: one exact Vec, growing nonzero Vec (including reallocation
+    // overlap), and stable-sort scratch fit eight f32 slots per bucket.
+    // Axis calls release their arrays before recursion; sum both axes anyway.
+    let density = bx
+        .checked_add(by)
+        .and_then(|n| n.checked_mul(8 * size_of::<f32>() as u64))
+        .context("resource_limit: projection density scratch overflow")?;
+    // The column histogram is exact usize storage. At most N occupied peaks
+    // and line starts exist. 64 usize slots per item cover their growable
+    // vectors, peak clones, fill arrays and sort scratch. Charge this at every
+    // one of the 13 retained levels (root plus XY_MAX_DEPTH=12), also covering
+    // parent/sibling index vectors, region nodes, and collected leaf paths.
+    let histogram = histogram
+        .checked_mul(size_of::<usize>() as u64)
+        .context("resource_limit: projection histogram scratch overflow")?;
+    let indices = items
+        .checked_mul(64 * size_of::<usize>() as u64)
+        .and_then(|n| n.checked_mul(13))
+        .context("resource_limit: projection index scratch overflow")?;
+    density
+        .checked_add(histogram)
+        .and_then(|n| n.checked_add(indices))
+        .and_then(|n| n.checked_add(4096))
+        .context("resource_limit: projection XY scratch overflow")
+}
+
+/// Bound sparse text, projected copies and absolute-span scratch before either
+/// native classification or finalization calls the unchanged pure projector.
 fn admit_projection(pages: &[Page], budget: &ResourceBudget, held_upper: u64) -> Result<u64> {
     let mut total = 0u64;
+    let mut scratch = 0u64;
     for page in pages {
+        ensure!(
+            [page.page_width, page.page_height]
+                .iter()
+                .all(|v| v.is_finite() && *v > 0.0),
+            "native projection page geometry invalid"
+        );
         let mut smallest = f32::INFINITY;
         let mut chars = 0u64;
+        // Signed/out-of-CropBox native positions are retained, so page size
+        // alone no longer bounds sparse layout padding. Admit the whole span
+        // before the unchanged projection stage allocates any output.
+        let mut left = 0.0_f64;
+        let mut top = 0.0_f64;
+        let mut right = f64::from(page.page_width);
+        let mut bottom = f64::from(page.page_height);
         for item in &page.text_items {
+            // Native glyph runs and OCR replacement items use TextItem's
+            // derived Default rotation=0. PDF quarter-turns already belong to
+            // the page viewport transform, not this virtual-canvas mechanism.
+            ensure!(
+                item.rotation == 0.0,
+                "capability_unavailable: projection item rotation is not qualified"
+            );
+            ensure!(
+                [
+                    item.x,
+                    item.y,
+                    item.width,
+                    item.height,
+                    item.x + item.width,
+                    item.y + item.height,
+                    item.x + item.width.round(),
+                    item.y + item.height.round()
+                ]
+                .iter()
+                .all(|n| n.is_finite())
+                    && item.width > 0.0
+                    && item.height > 0.0,
+                "native projection geometry or endpoint overflow"
+            );
+            left = left.min(f64::from(item.x));
+            top = top.min(f64::from(item.y));
+            right = right.max(f64::from(item.x) + f64::from(item.width));
+            bottom = bottom.max(f64::from(item.y) + f64::from(item.height));
+            right = right.max(f64::from(item.x + item.width.round()));
+            bottom = bottom.max(f64::from(item.y + item.height.round()));
             let count = item.text.chars().count().max(1);
             smallest = smallest.min(item.width / count as f32);
             chars = chars
@@ -1487,7 +1571,12 @@ fn admit_projection(pages: &[Page], budget: &ResourceBudget, held_upper: u64) ->
             smallest.is_finite() && smallest >= 0.25,
             "capability_unavailable: projection glyph advance below qualified minimum"
         );
-        let columns = (page.page_width.max(page.page_height) / smallest).ceil() as u64;
+        let columns = ((right - left).max(bottom - top) / f64::from(smallest)).ceil();
+        ensure!(
+            columns.is_finite() && columns <= budget.page_layout_bytes as f64,
+            "resource_limit: native projection coordinate span exceeds admission"
+        );
+        let columns = columns as u64;
         let upper = chars
             .checked_mul(
                 columns
@@ -1503,6 +1592,24 @@ fn admit_projection(pages: &[Page], budget: &ResourceBudget, held_upper: u64) ->
         total = total
             .checked_add(upper)
             .context("projection document overflow")?;
+        let items =
+            u64::try_from(page.text_items.len()).context("projection item count overflow")?;
+        let xy = projection_xy_scratch_upper(right - left, bottom - top, items)?;
+        // Include dynamic strings/words and typed TextItem storage in copies
+        // retained by projection, line formation and ParsedPage construction.
+        // Counting serialization uses a sink; it does not materialize JSON.
+        let copies = encoded_size(&page.text_items, budget.page_layout_bytes)?
+            .checked_add(
+                items
+                    .checked_mul(size_of::<TextItem>() as u64)
+                    .context("projection typed copy overflow")?,
+            )
+            .and_then(|n| n.checked_mul(16))
+            .context("projection owned copy overflow")?;
+        scratch = scratch
+            .checked_add(xy)
+            .and_then(|n| n.checked_add(copies))
+            .context("resource_limit: projection document scratch overflow")?;
     }
     ensure!(
         held_upper
@@ -1511,9 +1618,10 @@ fn admit_projection(pages: &[Page], budget: &ResourceBudget, held_upper: u64) ->
                     .checked_mul(4)
                     .context("projection working overflow")?
             )
+            .and_then(|n| n.checked_add(scratch))
             .context("projection held working overflow")?
             <= budget.owned_working_bytes,
-        "resource_limit: complete projection working admission"
+        "resource_limit: complete projection working admission including XY scratch and copies"
     );
     Ok(total)
 }
@@ -1902,6 +2010,195 @@ pub fn finalize_document(
 #[cfg(test)]
 mod boundary_tests {
     use super::*;
+
+    #[test]
+    fn native_projection_admits_signed_span_and_rejects_far_outside_before_allocation() {
+        let mut page = Page {
+            page_number: 1,
+            page_label: None,
+            page_width: 100.0,
+            page_height: 100.0,
+            content_bounds: None,
+            text_items: vec![TextItem {
+                text: "A".into(),
+                x: 10.0,
+                y: 10.0,
+                width: 5.0,
+                height: 10.0,
+                ..Default::default()
+            }],
+            graphics: vec![],
+            vector_graphics: None,
+            struct_nodes: vec![],
+            image_refs: vec![],
+            annotations: None,
+            form_fields: None,
+            structure_tree: None,
+        };
+        let budget = ResourceBudget::default();
+        let inside = admit_projection(std::slice::from_ref(&page), &budget, 0).unwrap();
+        page.text_items[0].x = -20.0;
+        page.text_items[0].y = -30.0;
+        assert!(admit_projection(std::slice::from_ref(&page), &budget, 0).unwrap() > inside);
+        let projected = stages::project(vec![page.clone()]);
+        assert!(projected[0].text.contains('A'));
+        page.text_items[0].x = 1.0e15;
+        assert!(
+            admit_projection(std::slice::from_ref(&page), &budget, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("coordinate span")
+        );
+        page.text_items[0].x = f32::MAX;
+        page.text_items[0].width = f32::MAX;
+        assert!(admit_projection(std::slice::from_ref(&page), &budget, 0).is_err());
+    }
+
+    #[test]
+    fn native_projection_xy_scratch_rejects_wide_glyph_density_and_histogram_before_projection() {
+        // Five items reach density; eight also qualify for column histograms.
+        // Only small DTOs are constructed. Never invoke projection on them.
+        for count in [5, 8] {
+            let page = Page {
+                page_number: 1,
+                page_label: None,
+                page_width: 100.0,
+                page_height: 100.0,
+                content_bounds: None,
+                text_items: (0..count)
+                    .map(|i| TextItem {
+                        text: "A".into(),
+                        x: 0.0,
+                        y: i as f32 * 100.0,
+                        width: 1_000_000.0,
+                        height: 10.0,
+                        ..Default::default()
+                    })
+                    .collect(),
+                graphics: vec![],
+                vector_graphics: None,
+                struct_nodes: vec![],
+                image_refs: vec![],
+                annotations: None,
+                form_fields: None,
+                structure_tree: None,
+            };
+            let mut budget = ResourceBudget::default();
+            budget.owned_working_bytes = 1_048_576;
+            let old_text_upper = count as u64 * (1 + 64) * 4;
+            let copies = (encoded_size(&page.text_items, budget.page_layout_bytes).unwrap()
+                + count as u64 * size_of::<TextItem>() as u64)
+                * 16;
+            assert!(old_text_upper * 4 + copies < budget.owned_working_bytes);
+            let error = admit_projection(std::slice::from_ref(&page), &budget, 0).unwrap_err();
+            assert!(error.to_string().contains("including XY scratch"));
+        }
+    }
+
+    #[test]
+    fn native_projection_xy_scratch_joins_held_bytes_and_all_pages() {
+        let page = Page {
+            page_number: 1,
+            page_label: None,
+            page_width: 100.0,
+            page_height: 100.0,
+            content_bounds: None,
+            text_items: vec![
+                TextItem {
+                    text: "A".into(),
+                    x: -20.0,
+                    y: -30.0,
+                    width: 100.0,
+                    height: 10.0,
+                    ..Default::default()
+                };
+                8
+            ],
+            graphics: vec![],
+            vector_graphics: None,
+            struct_nodes: vec![],
+            image_refs: vec![],
+            annotations: None,
+            form_fields: None,
+            structure_tree: None,
+        };
+        let mut budget = ResourceBudget::default();
+        let text = admit_projection(std::slice::from_ref(&page), &budget, 0).unwrap();
+        let xy = projection_xy_scratch_upper(120.0, 130.0, 8).unwrap();
+        // Fourfold rounded enclosure: ceil(next_up(488)/2)=245;
+        // ceil(next_up(528)/2)=265; ceil(next_up(488)/5)=98.
+        let word = size_of::<usize>() as u64;
+        assert_eq!(xy, (245 + 265) * 32 + 98 * word + 8 * 64 * word * 13 + 4096);
+        let copies = (encoded_size(&page.text_items, budget.page_layout_bytes).unwrap()
+            + 8 * size_of::<TextItem>() as u64)
+            * 16;
+        let held = 1024;
+        let one = text * 4 + xy + copies;
+        budget.owned_working_bytes = held + one;
+        assert_eq!(
+            admit_projection(std::slice::from_ref(&page), &budget, held).unwrap(),
+            text
+        );
+        budget.owned_working_bytes -= 1;
+        assert!(admit_projection(std::slice::from_ref(&page), &budget, held).is_err());
+        budget.owned_working_bytes = held + one * 2;
+        assert_eq!(
+            admit_projection(&[page.clone(), page.clone()], &budget, held).unwrap(),
+            text * 2
+        );
+        budget.owned_working_bytes -= 1;
+        assert!(admit_projection(&[page.clone(), page], &budget, held).is_err());
+    }
+
+    #[test]
+    fn native_projection_xy_scratch_rejects_unqualified_numeric_ranges_and_item_rotation() {
+        for span in [
+            f64::NAN,
+            f64::INFINITY,
+            -1.0,
+            f64::from(f32::MAX) * 2.0,
+            f64::from(f32::MAX),
+            u64::MAX as f64,
+        ] {
+            assert!(projection_xy_scratch_upper(span, 100.0, 8).is_err());
+            assert!(projection_xy_scratch_upper(100.0, span, 8).is_err());
+        }
+        assert!(projection_xy_scratch_upper(100.0, 100.0, u64::MAX).is_err());
+        let mut page = Page {
+            page_number: 1,
+            page_label: None,
+            page_width: 100.0,
+            page_height: 100.0,
+            content_bounds: None,
+            text_items: vec![TextItem {
+                text: "A".into(),
+                x: 0.0,
+                y: 0.0,
+                width: 5.0,
+                height: 10.0,
+                ..Default::default()
+            }],
+            graphics: vec![],
+            vector_graphics: None,
+            struct_nodes: vec![],
+            image_refs: vec![],
+            annotations: None,
+            form_fields: None,
+            structure_tree: None,
+        };
+        let budget = ResourceBudget::default();
+        assert_eq!(page.text_items[0].rotation, 0.0);
+        admit_projection(std::slice::from_ref(&page), &budget, 0).unwrap();
+        for rotation in [90.0, 180.0, 270.0, f32::NAN] {
+            page.text_items[0].rotation = rotation;
+            assert!(
+                admit_projection(std::slice::from_ref(&page), &budget, 0)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("item rotation")
+            );
+        }
+    }
 
     #[tokio::test]
     async fn finalizer_rejects_forged_coverage_source_recipe_and_artifact_snapshots() {

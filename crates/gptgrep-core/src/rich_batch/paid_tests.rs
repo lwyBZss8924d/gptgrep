@@ -498,7 +498,14 @@ async fn loopback_provider_failure_keeps_receipt_stops_paid_and_continues_local(
     );
     let m = r.metrics.decisions.as_ref().unwrap();
     assert_eq!(m.unique_scheduled_logical_attempts, 1);
-    assert_eq!(m.observed_cost_subtotal_usd, Some(0.01));
+    // Non-success HTTP responses terminate before their body is read.
+    // A cost in that unread body is unknown, not observed billing.
+    assert_eq!(m.observed_cost_subtotal_usd, None);
+    assert_eq!(m.observed_cost_attempts, 0);
+    assert!(!m.cost_complete);
+    assert!(
+        r.items[0].result.as_ref().unwrap()["attempts"][0]["failure"]["reported_usage"].is_null()
+    );
     assert_eq!(ctx.snapshot()?.logical_reservations, 1);
     Ok(())
 }

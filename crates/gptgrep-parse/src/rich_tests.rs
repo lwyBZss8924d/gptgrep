@@ -248,11 +248,10 @@ async fn incomplete_and_unbound_ocr_are_rejected() {
             "mutation {change}"
         );
     }
+    let error = finalize_document(candidate, vec![], OcrMode::Auto, &budget).unwrap_err();
     assert!(
-        finalize_document(candidate, vec![], OcrMode::Auto, &budget)
-            .unwrap_err()
-            .to_string()
-            .contains("coverage incomplete")
+        error.to_string().contains("coverage incomplete"),
+        "{error:#}"
     );
 }
 
@@ -348,12 +347,16 @@ async fn vector_paths_require_ocr_and_count_admission_precedes_materialization()
     )
     .await
     .unwrap();
+    let error = extract_native(&prepared, &NativeOptions::default(), &small)
+        .await
+        .unwrap_err();
+    // The complete graphics collector reserves traversal storage before any
+    // object materialization; this page budget rejects that earlier admission.
     assert!(
-        extract_native(&prepared, &NativeOptions::default(), &small)
-            .await
-            .unwrap_err()
+        error
             .to_string()
-            .contains("page char/object admission")
+            .contains("graphics preallocation admission"),
+        "{error:#}"
     );
     // Document metadata is independently admitted before page materialization.
     // A page-count refusal may retain that snapshot, never a page/raster output.
@@ -637,11 +640,10 @@ async fn visible_annotation_appearances_cannot_be_verified_blank_or_bypass_ocr()
                 > 500
         );
         assert!(candidate.plan().tasks.iter().any(|task| task.page == 1));
+        let error = finalize_document(candidate, vec![], OcrMode::Auto, &budget).unwrap_err();
         assert!(
-            finalize_document(candidate, vec![], OcrMode::Auto, &budget)
-                .unwrap_err()
-                .to_string()
-                .contains("coverage incomplete")
+            error.to_string().contains("coverage incomplete"),
+            "{error:#}"
         );
         let prepared = prepare_document(
             &source,
@@ -768,4 +770,106 @@ fn artifact_identity_binds_recipe_kind_page_and_source() {
         )
         .is_err()
     );
+}
+
+#[tokio::test]
+async fn native_graphics_complete_26_page_windows_and_after_ocr_metadata_are_invariant() {
+    let mut outputs = Vec::new();
+    for window in [1, 25] {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("fresh-whole-document.pdf");
+        std::fs::write(
+            &source,
+            include_bytes!("../../../tests/fixtures/native-graphics-26-pages.pdf"),
+        )
+        .unwrap();
+        let budget = ResourceBudget::default();
+        let prepared = prepare_document(
+            &source,
+            &dir.path().join("staging"),
+            &PreparationOptions,
+            &budget,
+        )
+        .await
+        .unwrap();
+        let candidate = extract_native(
+            &prepared,
+            &NativeOptions {
+                dpi: 72.,
+                render_pages: true,
+                page_window: window,
+            },
+            &budget,
+        )
+        .await
+        .unwrap();
+        assert_eq!(candidate.pages().len(), 26);
+        assert_eq!(candidate.plan().tasks.len(), 26);
+        let raw: Vec<_> = candidate
+            .pages()
+            .iter()
+            .map(|p| {
+                std::fs::read(
+                    prepared
+                        .staging_root()
+                        .join(&p.metadata_artifact.relative_path),
+                )
+                .unwrap()
+            })
+            .collect();
+        let results = candidate
+            .plan()
+            .tasks
+            .iter()
+            .map(|t| {
+                complete_result(
+                    t,
+                    &format!("Authored offline geometry transcription page {}.", t.page),
+                )
+            })
+            .collect();
+        let final_document = finalize_document(candidate, results, OcrMode::Auto, &budget).unwrap();
+        assert_eq!(final_document.coverage.len(), 26);
+        assert!(
+            final_document
+                .coverage
+                .iter()
+                .all(|(_, c)| *c == CoverageState::ValidatedOcr)
+        );
+        assert!(
+            final_document
+                .document
+                .text
+                .contains("transcription page 26")
+        );
+        assert_eq!(final_document.unmapped_merged_lines, 0);
+        for (p, bytes) in final_document.pages.iter().zip(&raw) {
+            assert_eq!(
+                &std::fs::read(
+                    prepared
+                        .staging_root()
+                        .join(&p.metadata_artifact.relative_path)
+                )
+                .unwrap(),
+                bytes
+            );
+            let metadata = validate_native_graphics_metadata(
+                bytes,
+                &final_document.summary,
+                &final_document.native_profile_sha256,
+                p.number,
+                &budget,
+            )
+            .unwrap();
+            assert_eq!(metadata.graphics.object_count, 7);
+            assert!(!metadata.native_text_metadata.characters.is_empty());
+            assert!(metadata.page.text_items.iter().any(|i| !i.words.is_empty()));
+            assert_eq!(
+                metadata.page.vector_graphics.as_ref().unwrap().shapes.len(),
+                2
+            );
+        }
+        outputs.push((raw, serde_json::to_value(&final_document.document).unwrap()));
+    }
+    assert_eq!(outputs[0], outputs[1]);
 }

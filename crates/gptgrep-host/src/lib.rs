@@ -96,6 +96,9 @@ impl std::error::Error for HostCapabilityError {}
 pub struct HostConfig {
     pub codex_bin: String,
     pub codex_home: PathBuf,
+    /// Optional canonical existing state directory with an existing logs child.
+    /// Authentication and profile selection continue to use codex_home.
+    pub codex_state_dir: Option<PathBuf>,
     pub model: String,
     pub reasoning_effort: String,
     pub service_tier: String,
@@ -121,6 +124,7 @@ impl Default for HostConfig {
                 .unwrap_or_else(|| {
                     PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".codex")
                 }),
+            codex_state_dir: None,
             model: DEFAULT_MODEL.into(),
             reasoning_effort: DEFAULT_REASONING_EFFORT.into(),
             service_tier: DEFAULT_SERVICE_TIER.into(),
@@ -484,7 +488,12 @@ async fn run_process_until(
         PathBuf::from(&config.codex_bin)
     };
     ensure!(home.is_dir(), "Selected CODEX_HOME must be a directory");
-    let mut command = process_command(&binary, cwd.path(), &home)?;
+    let mut command = process_command(
+        &binary,
+        cwd.path(),
+        &home,
+        config.codex_state_dir.as_deref(),
+    )?;
     ensure!(
         tokio::time::Instant::now() < deadline,
         "host_deadline_exceeded"
@@ -617,7 +626,40 @@ fn finalize_captured_invocation<T>(
     Ok((result, bytes, truncated))
 }
 
-fn process_command(binary: &Path, cwd: &Path, home: &Path) -> Result<Command> {
+fn native_state_paths(state: Option<&Path>) -> Result<Option<(PathBuf, PathBuf)>> {
+    fn directory(path: &Path) -> Result<PathBuf> {
+        ensure!(
+            path.is_absolute(),
+            "Codex state and logs directories must be absolute"
+        );
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|_| anyhow!("Selected Codex state or logs directory is unavailable"))?;
+        ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "Codex state and logs paths must be existing directories, not symlinks"
+        );
+        let canonical = path
+            .canonicalize()
+            .map_err(|_| anyhow!("Selected Codex state or logs directory is unavailable"))?;
+        ensure!(
+            canonical.as_os_str() == path.as_os_str(),
+            "Codex state and logs directories must be canonical; symlink ancestors are unsupported"
+        );
+        Ok(canonical)
+    }
+    let Some(state) = state else { return Ok(None) };
+    let state = directory(state)?;
+    let logs = directory(&state.join("logs"))?;
+    Ok(Some((state, logs)))
+}
+
+fn process_command(
+    binary: &Path,
+    cwd: &Path,
+    home: &Path,
+    state: Option<&Path>,
+) -> Result<Command> {
+    let state = native_state_paths(state)?;
     let mut command = Command::new(binary);
     process_group::configure(&mut command);
     command
@@ -641,10 +683,17 @@ fn process_command(binary: &Path, cwd: &Path, home: &Path) -> Result<Command> {
     ] {
         command.env_remove(key);
     }
-    // Explicit CLI state root wins over an inherited CODEX_SQLITE_HOME or config override.
+    // Preserve the original home binding unless a separate state root is explicit.
+    // CLI overrides win over inherited CODEX_SQLITE_HOME and profile settings.
+    let sqlite = state.as_ref().map_or(home, |(state, _)| state.as_path());
     command
         .arg("-c")
-        .arg(format!("sqlite_home={}", serde_json::to_string(home)?));
+        .arg(format!("sqlite_home={}", serde_json::to_string(sqlite)?));
+    if let Some((_, logs)) = state {
+        command
+            .arg("-c")
+            .arg(format!("log_dir={}", serde_json::to_string(&logs)?));
+    }
     for (key, value) in protocol::base_config().as_object().expect("static object") {
         command
             .arg("-c")
@@ -654,6 +703,7 @@ fn process_command(binary: &Path, cwd: &Path, home: &Path) -> Result<Command> {
 }
 
 fn validate_config(config: &HostConfig, question: &str) -> Result<()> {
+    native_state_paths(config.codex_state_dir.as_deref())?;
     ensure!(
         !question.trim().is_empty() && question.len() <= 8192,
         "Question must contain 1..8192 bytes"

@@ -137,6 +137,24 @@ pub enum RichBatchOperation {
         #[serde(default)]
         cursor: Option<String>,
     },
+    /// Fresh structural page metadata. Never citation or image delivery authority.
+    InspectNativeMetadata {
+        id: String,
+        artifact_id: String,
+        #[serde(default)]
+        fields: Vec<String>,
+        collection: crate::NativeMetadataCollection,
+        #[serde(default)]
+        item_fields: Vec<String>,
+        #[serde(default)]
+        object_id: Option<String>,
+        #[serde(default = "default_page_size")]
+        page_size: usize,
+        #[serde(default = "default_native_metadata_output")]
+        max_output_bytes: usize,
+        #[serde(default)]
+        cursor: Option<String>,
+    },
     ReadArtifact {
         id: String,
         artifact_id: String,
@@ -199,6 +217,9 @@ pub enum RichBatchOperation {
 fn default_multimodal_window() -> usize {
     1024
 }
+fn default_native_metadata_output() -> usize {
+    MAX_RICH_BATCH_OUTPUT_BYTES
+}
 fn default_multimodal_visual() -> usize {
     8
 }
@@ -216,6 +237,7 @@ impl RichBatchOperation {
         match self {
             Self::InspectDocuments { id, .. }
             | Self::InspectPages { id, .. }
+            | Self::InspectNativeMetadata { id, .. }
             | Self::ReadArtifact { id, .. }
             | Self::SearchArtifacts { id, .. }
             | Self::InspectVisual { id, .. }
@@ -277,7 +299,8 @@ impl RichBatchOperation {
                 cursor.as_deref(),
             ),
             // These operations never use the text/metadata cursor codec.
-            Self::InspectVisual { .. }
+            Self::InspectNativeMetadata { .. }
+            | Self::InspectVisual { .. }
             | Self::ReadVisual { .. }
             | Self::SearchMultimodal { .. }
             | Self::Rerank { .. } => ("visual", "visual", Value::Null, None),
@@ -345,13 +368,45 @@ pub struct RichBatchItemCoverage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
 }
+/// Immutable owned JSON. Clones share the actual allocation, so a retained
+/// metadata admission lease cannot outlive an unaccounted deep-cloned payload.
+#[derive(Debug, Clone)]
+pub struct RichBatchValue(std::sync::Arc<Value>, Option<crate::NativeMetadataLease>);
+// Admission leases describe ownership; equality retains JSON value semantics.
+impl PartialEq for RichBatchValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+impl Eq for RichBatchValue {}
+impl From<Value> for RichBatchValue {
+    fn from(value: Value) -> Self {
+        Self(std::sync::Arc::new(value), None)
+    }
+}
+impl std::ops::Deref for RichBatchValue {
+    type Target = Value;
+    fn deref(&self) -> &Value {
+        &self.0
+    }
+}
+impl Serialize for RichBatchValue {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.as_ref().serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for RichBatchValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Value::deserialize(deserializer).map(Into::into)
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RichBatchItem {
     pub id: String,
     pub status: RichBatchStatus,
     pub reserved_output_bytes: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<Value>,
+    pub result: Option<RichBatchValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<RichBatchError>,
     pub coverage: RichBatchItemCoverage,
@@ -359,6 +414,9 @@ pub struct RichBatchItem {
     pub read_metrics: Option<ReaderReadMetrics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decisions: Option<paid::RichBatchItemDecisions>,
+    /// Retained owned metadata JSON stays charged across item/response clones.
+    #[serde(skip)]
+    pub(crate) metadata_lease: Option<crate::NativeMetadataLease>,
 }
 impl RichBatchItem {
     fn failed(id: &str, quota: usize, failure: RichBatchError) -> Self {
@@ -371,6 +429,7 @@ impl RichBatchItem {
             coverage: Default::default(),
             read_metrics: None,
             decisions: None,
+            metadata_lease: None,
         }
     }
     fn pending(id: &str, quota: usize) -> Self {
@@ -616,6 +675,7 @@ fn validate_request(request: &RichBatchRequest) -> Result<(), RichBatchError> {
     }
     let mut ids = BTreeSet::new();
     for op in &request.operations {
+        validate_native_operation(op)?;
         let id = op.id();
         if id.is_empty() || id.len() > 128 || id.chars().any(char::is_control) {
             return Err(error(
@@ -776,6 +836,10 @@ fn preflight(pin: &GenerationPin, op: &RichBatchOperation) -> Result<usize, Rich
                 },
             };
             crate::rich_multimodal::validate_rich_rerank_request(&request).map_err(|_| bad())?;
+            return Ok(0);
+        }
+        RichBatchOperation::InspectNativeMetadata { .. } => {
+            validate_native_operation(op)?;
             return Ok(0);
         }
         RichBatchOperation::InspectDocuments {
@@ -1722,11 +1786,12 @@ fn successful_with_error<T: Serialize>(
         id: op.id().into(),
         status,
         reserved_output_bytes: quota,
-        result: Some(result),
+        result: Some(result.into()),
         error: failure,
         coverage,
         read_metrics: Some(metrics),
         decisions: None,
+        metadata_lease: None,
     })
 }
 fn coverage(
@@ -2077,6 +2142,303 @@ fn enumerate<T: Serialize>(
         )
     })
 }
+fn native_selection(op: &RichBatchOperation) -> Option<crate::NativeMetadataSelection> {
+    if let RichBatchOperation::InspectNativeMetadata {
+        fields,
+        collection,
+        item_fields,
+        object_id,
+        ..
+    } = op
+    {
+        Some(crate::NativeMetadataSelection {
+            fields: fields.clone(),
+            collection: *collection,
+            item_fields: item_fields.clone(),
+            object_id: object_id.clone(),
+        })
+    } else {
+        None
+    }
+}
+fn validate_native_operation(op: &RichBatchOperation) -> Result<(), RichBatchError> {
+    let RichBatchOperation::InspectNativeMetadata {
+        artifact_id,
+        page_size,
+        max_output_bytes,
+        cursor,
+        ..
+    } = op
+    else {
+        return Ok(());
+    };
+    native_selection(op)
+        .expect("selected operation")
+        .validate()
+        .map_err(|e| {
+            if e.to_string().contains("invalid_fields") {
+                error(
+                    RichBatchErrorCode::InvalidFields,
+                    "Native metadata fields are unknown, duplicated or invalid for this collection",
+                )
+            } else {
+                error(
+                    RichBatchErrorCode::InvalidOperation,
+                    "Native metadata object selector does not match collection",
+                )
+            }
+        })?;
+    if artifact_id.is_empty()
+        || artifact_id.len() > 512
+        || !(1..=1000).contains(page_size)
+        || *max_output_bytes == 0
+        || *max_output_bytes > MAX_RICH_BATCH_OUTPUT_BYTES
+        || cursor
+            .as_ref()
+            .is_some_and(|c| c.len() > MAX_RICH_BATCH_CURSOR_BYTES)
+    {
+        return Err(error(
+            RichBatchErrorCode::InvalidOperation,
+            "Native metadata options exceed bounded contract",
+        ));
+    }
+    Ok(())
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeCursorBody {
+    schema: String,
+    binding: crate::NativeMetadataBinding,
+    options_sha256: String,
+    position: usize,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeCursor {
+    body: NativeCursorBody,
+    sha256: String,
+}
+fn native_options_digest(op: &RichBatchOperation) -> String {
+    let RichBatchOperation::InspectNativeMetadata {
+        page_size,
+        max_output_bytes,
+        ..
+    } = op
+    else {
+        unreachable!()
+    };
+    digest(&(
+        native_selection(op)
+            .expect("metadata selection")
+            .normalized(),
+        page_size,
+        max_output_bytes,
+    ))
+}
+fn native_cursor(
+    binding: &crate::NativeMetadataBinding,
+    op: &RichBatchOperation,
+    position: usize,
+    quota: usize,
+) -> Result<String, RichBatchError> {
+    let body = NativeCursorBody {
+        schema: "gptgrep.native_metadata.cursor.v1".into(),
+        binding: binding.clone(),
+        options_sha256: native_options_digest(op),
+        position,
+    };
+    let sha256 = digest(&body);
+    let value = NativeCursor { body, sha256 };
+    let bytes = measure(&value, (MAX_RICH_BATCH_CURSOR_BYTES / 2).min(quota / 2))?;
+    let value = serde_json::to_vec(&value).map_err(|_| {
+        error(
+            RichBatchErrorCode::SharedIntegrity,
+            "Native metadata cursor encoding failed",
+        )
+    })?;
+    let mut token = String::with_capacity(bytes * 2);
+    use std::fmt::Write;
+    for b in value {
+        write!(&mut token, "{b:02x}").expect("String write");
+    }
+    Ok(token)
+}
+fn native_position(
+    binding: &crate::NativeMetadataBinding,
+    op: &RichBatchOperation,
+) -> Result<usize, RichBatchError> {
+    let RichBatchOperation::InspectNativeMetadata { cursor, .. } = op else {
+        unreachable!()
+    };
+    let Some(token) = cursor else { return Ok(0) };
+    let bad = || {
+        error(
+            RichBatchErrorCode::InvalidCursor,
+            "Native metadata cursor differs in pin, artifact, recipe, fields, collection, object or limits",
+        )
+    };
+    if token.len() > MAX_RICH_BATCH_CURSOR_BYTES
+        || token.len() % 2 != 0
+        || !token
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(bad());
+    }
+    let bytes: Result<Vec<u8>, _> = token
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|p| u8::from_str_radix(std::str::from_utf8(p).expect("checked ASCII"), 16))
+        .collect();
+    let value: NativeCursor =
+        serde_json::from_slice(&bytes.map_err(|_| bad())?).map_err(|_| bad())?;
+    if value.body.schema != "gptgrep.native_metadata.cursor.v1"
+        || digest(&value.body.binding) != digest(binding)
+        || value.body.options_sha256 != native_options_digest(op)
+        || value.sha256 != digest(&value.body)
+    {
+        return Err(bad());
+    }
+    Ok(value.body.position)
+}
+fn native_metadata_error(e: anyhow::Error) -> RichBatchError {
+    let message = e.to_string();
+    if message.contains("rebuild_required") {
+        error(
+            RichBatchErrorCode::InvalidOperation,
+            "Requested native geometry is unsupported by retained recipe; rebuild required",
+        )
+    } else if message.contains("native_metadata_object_not_present") {
+        error(
+            RichBatchErrorCode::ResourceNotFound,
+            "Native object is absent from selected page artifact",
+        )
+    } else if message.contains("native_metadata_object_not_path")
+        || message.contains("native_metadata_page_artifact_required")
+    {
+        error(
+            RichBatchErrorCode::InvalidOperation,
+            "Selected resource is not the required page metadata or path type",
+        )
+    } else {
+        reader_error(e)
+    }
+}
+fn execute_native_metadata(
+    reader: &RichGenerationReader,
+    op: &RichBatchOperation,
+    quota: usize,
+    before: &ReaderReadMetrics,
+) -> Result<RichBatchItem, RichBatchError> {
+    let RichBatchOperation::InspectNativeMetadata {
+        artifact_id,
+        page_size,
+        max_output_bytes,
+        ..
+    } = op
+    else {
+        unreachable!()
+    };
+    let quota = quota.min(*max_output_bytes);
+    let selection = native_selection(op).expect("metadata selection");
+    // The output Value (including tree nodes/keys), serialization overlap and
+    // cursor stay independently charged after the backing snapshot is dropped.
+    let lease = reader
+        .reserve_native_projection(
+            (quota as u64).checked_mul(64).ok_or_else(|| {
+                error(
+                    RichBatchErrorCode::OutputBudgetInsufficient,
+                    "Metadata output sizing overflow",
+                )
+            })?,
+            crate::MAX_NATIVE_METADATA_WORKING_BYTES,
+        )
+        .map_err(native_metadata_error)?;
+    let snapshot = reader
+        .read_page_native_metadata(artifact_id, &crate::NativeMetadataReadBudget::default())
+        .map_err(native_metadata_error)?;
+    let total = snapshot
+        .collection_len(&selection)
+        .map_err(native_metadata_error)?;
+    let start = native_position(snapshot.binding(), op)?;
+    if start > total {
+        return Err(error(
+            RichBatchErrorCode::InvalidCursor,
+            "Native metadata cursor exceeds collection",
+        ));
+    }
+    let limit = start.saturating_add(*page_size).min(total);
+    let metrics = item_meter(reader, before)?;
+    let coverage_for = |end: usize| -> Result<RichBatchItemCoverage, RichBatchError> {
+        Ok(RichBatchItemCoverage {
+            unit: "native_metadata_rows".into(),
+            available: Some(total),
+            start,
+            end,
+            selected: end - start,
+            exhausted: end == total,
+            budget_truncated: end < limit,
+            search_ceiling_reached: false,
+            cursor: if end < total {
+                Some(native_cursor(snapshot.binding(), op, end, quota)?)
+            } else {
+                None
+            },
+        })
+    };
+    let measure_page = |end: usize| -> Result<(), RichBatchError> {
+        let projection = snapshot
+            .projection(&selection, start, end)
+            .map_err(native_metadata_error)?;
+        measure(
+            &ItemCandidate {
+                id: op.id(),
+                status: RichBatchStatus::Ok,
+                reserved_output_bytes: quota,
+                result: &projection,
+                coverage: &coverage_for(end)?,
+                read_metrics: &metrics,
+                error: None,
+            },
+            quota,
+        )?;
+        Ok(())
+    };
+    // Only borrowed DTOs are traversed during admission; no row Value/string
+    // copies occur until the complete scalars, rows, cursor and envelope fit.
+    let mut end = start;
+    if start == total {
+        measure_page(start)?;
+    } else {
+        for candidate in start + 1..=limit {
+            match measure_page(candidate) {
+                Ok(()) => end = candidate,
+                Err(e) if e.code == RichBatchErrorCode::OutputBudgetInsufficient => break,
+                Err(e) => return Err(e),
+            }
+        }
+        if end == start {
+            return Err(error(
+                RichBatchErrorCode::OutputBudgetInsufficient,
+                "Reserved output cannot hold the next whole native metadata row and mandatory scalars",
+            ));
+        }
+    }
+    reader
+        .recheck_native_metadata(&snapshot)
+        .map_err(native_metadata_error)?;
+    let projection = snapshot
+        .projection(&selection, start, end)
+        .map_err(native_metadata_error)?;
+    let mut item = successful(reader, op, quota, before, &projection, coverage_for(end)?)?;
+    item.result.as_mut().expect("successful metadata result").1 = Some(lease.clone());
+    item.metadata_lease = Some(lease);
+    reader
+        .recheck_native_metadata(&snapshot)
+        .map_err(native_metadata_error)?;
+    Ok(item)
+}
+
 fn execute(
     reader: &RichGenerationReader,
     op: &RichBatchOperation,
@@ -2085,6 +2447,9 @@ fn execute(
     before: &ReaderReadMetrics,
 ) -> Result<RichBatchItem, RichBatchError> {
     match op {
+        RichBatchOperation::InspectNativeMetadata { .. } => {
+            execute_native_metadata(reader, op, quota, before)
+        }
         RichBatchOperation::SearchMultimodal { .. } | RichBatchOperation::Rerank { .. } => {
             Err(error(
                 RichBatchErrorCode::ModelContextRequired,

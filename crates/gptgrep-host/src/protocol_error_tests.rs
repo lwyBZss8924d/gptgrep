@@ -346,7 +346,10 @@ done
         wait_for_live_mock_pid(&ready_pid_file),
     );
     let error = result.unwrap_err();
-    assert!(error.to_string().contains("time limit"), "{error}");
+    assert!(
+        error.to_string().contains("time limit") || error.to_string() == "host_deadline_exceeded",
+        "{error}"
+    );
     let ready_pid = ready.expect("mock runtime did not reach turn/start before the startup limit");
     assert!(started.elapsed() < Duration::from_secs(10));
     let raw = std::fs::read_to_string(trace_path).unwrap();

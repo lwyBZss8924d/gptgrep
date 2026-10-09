@@ -54,6 +54,19 @@ pub struct RawPathSegment {
     pub close: bool,
 }
 
+impl RawPathSegment {
+    /// Closed, allocation-free segment discriminant; unknown native types stay
+    /// unavailable. Coordinates and close flags remain separate observations.
+    pub fn kind_label(&self) -> Option<&'static str> {
+        match self.kind {
+            Some(SegmentKind::MoveTo) => Some("move_to"),
+            Some(SegmentKind::LineTo) => Some("line_to"),
+            Some(SegmentKind::BezierTo) => Some("bezier_to"),
+            None => None,
+        }
+    }
+}
+
 /// `FPDF_IMAGEOBJ_METADATA`: facts about an image object's pixels. The DPI values
 /// are the image's effective resolution as placed on its page.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -82,6 +95,13 @@ pub struct PageObject<'page, 'lib> {
 }
 
 impl<'doc, 'lib: 'doc> Page<'doc, 'lib> {
+    /// Checked count: negative native errors are preserved as `None`. A zero
+    /// count retains PDFium's documented zero/error ambiguity; it is not a
+    /// pixel-visibility or blank-page guarantee.
+    pub fn object_count_checked(&self) -> Option<usize> {
+        usize::try_from(unsafe { ffi!(FPDFPage_CountObjects(self.handle)) }).ok()
+    }
+
     /// Number of top-level content objects (`FPDFPage_CountObjects`), 0 on error.
     pub fn object_count(&self) -> usize {
         let count = unsafe { ffi!(FPDFPage_CountObjects(self.handle)) };
@@ -107,6 +127,11 @@ impl<'page, 'lib> PageObject<'page, 'lib> {
     /// visits without holding the object.
     pub fn id(&self) -> usize {
         self.handle as usize
+    }
+
+    /// Exact observed native type, including unrecognized future values.
+    pub fn raw_kind(&self) -> i32 {
+        unsafe { ffi!(FPDFPageObj_GetType(self.handle)) }
     }
 
     pub fn kind(&self) -> PageObjectKind {
@@ -185,6 +210,15 @@ impl<'page, 'lib> PageObject<'page, 'lib> {
             _page: PhantomData,
             _lib: PhantomData,
         })
+    }
+
+    /// Preserve the raw fill-rule value. The consumer must reject unknown
+    /// rules instead of collapsing alternate and winding into one boolean.
+    pub fn path_raw_draw_mode(&self) -> Option<(i32, bool)> {
+        let mut fill = 0;
+        let mut stroke = 0;
+        let ok = unsafe { ffi!(FPDFPath_GetDrawMode(self.handle, &mut fill, &mut stroke)) };
+        (ok != 0).then_some((fill, stroke != 0))
     }
 
     /// A path's fill/stroke mode (`FPDFPath_GetDrawMode`); `None` for non-paths.

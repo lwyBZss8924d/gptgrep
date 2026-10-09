@@ -19,6 +19,7 @@ mod geometry;
 mod image_prepare;
 #[cfg(test)]
 mod image_prepare_tests;
+pub mod native_graphics;
 mod ocr;
 mod ocr_compat;
 mod office;
@@ -37,6 +38,12 @@ pub use document_metadata::{
 };
 pub use geometry::{AffineTransform, BoundingBox, PageGeometry};
 pub use image_prepare::image_preparation_profile_digest;
+pub use liteparse::stages::PageComplexityStats as NativePageComplexity;
+pub use liteparse::types::{Page as NativeLayoutPage, WordBox as NativeWordBox};
+pub use native_graphics::{
+    NATIVE_GRAPHICS_RECIPE, NativePageMetadata, native_graphics_profile_digest,
+    native_metadata_working_upper, validate_native_graphics_metadata,
+};
 pub use ocr::{
     OcrExecutor, OcrImage, OcrImageDelivery, OcrPageResult, OcrProfile, OcrReceipt, OcrRegion,
     OcrRegionResult, OcrRegionStatus, OcrResultStatus, OcrTask, OcrTaskBudget, ocr_profile_digest,
@@ -50,7 +57,8 @@ pub use ocr_compat::{
 pub use office::{is_office_extension, office_preparation_profile_digest};
 pub use resource::ResourceBudget;
 pub use rich::native_text_metadata::{
-    NATIVE_FONT_WORD_RECIPE, native_font_word_profile_digest, validate_native_text_metadata,
+    NATIVE_FONT_WORD_RECIPE, NativeBounds, NativeCharacter, NativeFontInfo, NativeGeometry,
+    NativeTextMetadata, native_font_word_profile_digest, validate_native_text_metadata,
 };
 pub use rich::{
     ConversionIdentity, CoverageState, NativeCandidate, NativeOptions, NativePage, OcrMode,

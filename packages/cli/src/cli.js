@@ -69,7 +69,7 @@ const requests = {
     model: z.string().min(1).max(128).optional().describe('Decisions model for explicit paid rich operations'),
     multimodalTimeout: z.number().int().min(1).max(900).optional(),
     decisionsBudget,
-    batch: z.record(z.string(), z.unknown()).describe('Native batch request object; native validation owns its versioned operation schema'),
+    batch: z.record(z.string(), z.unknown()).describe('Native batch request object; rich inspect_native_metadata returns noncitable structural page metadata with closed fields/collections and bound cursors; native validation owns the versioned operation schema'),
   }).strict(),
   rerank: z.object({root,
     model:z.string().min(1).max(128).optional(),

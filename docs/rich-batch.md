@@ -1,8 +1,10 @@
 # Rich batch composition
 
 `gptgrep batch --rich --root DOCUMENTS --input operations.json --json` accepts
-`gptgrep.batch.rich.request.v1`. The six local operations keep their existing
-behavior and cursors. Explicit `search_multimodal` performs mandatory document
+`gptgrep.batch.rich.request.v1`. Local operations keep their existing behavior
+and cursors. `inspect_native_metadata` adds bounded page-object, path, image,
+character and word inspection; see [native page metadata](native-metadata.md)
+for discovery and pagination. Explicit `search_multimodal` performs mandatory document
 routing followed by source-bound text and independent visual reranking. It uses
 the normal product search, with no local fallback or inference cursor.
 

@@ -53,6 +53,9 @@ The host profile defaults are `model = "gpt-6-luna"` and
 helper settings; they do not change the development agent's model. Runtime
 `CODEX_HOME` selects an existing Codex configuration and authentication directory. The program does not read/copy auth
 files, change global profiles, or perform an interactive login.
+An optional `--codex-state-dir` selects a separate existing canonical directory
+for native SQLite state and its existing `logs` child for logs. Authentication
+continues to use `--codex-home`; callers route temporary and protocol trace files separately.
 
 ## Ingestion and snapshot consistency
 

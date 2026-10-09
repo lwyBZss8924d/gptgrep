@@ -1,7 +1,15 @@
 //! Independently bound native/OCR artifacts in an immutable v2 generation.
 //! Publication consumes completed parser output; it never starts a model.
 
+mod native_metadata;
 mod visual;
+pub use native_metadata::{
+    MAX_NATIVE_METADATA_BYTES, MAX_NATIVE_METADATA_WORKING_BYTES, NATIVE_CHARACTER_FIELDS,
+    NATIVE_IMAGE_FIELDS, NATIVE_METADATA_SCALAR_FIELDS, NATIVE_OBJECT_FIELDS,
+    NATIVE_SEGMENT_FIELDS, NATIVE_WORD_FIELDS, NativeMetadataBinding, NativeMetadataCollection,
+    NativeMetadataLease, NativeMetadataReadBudget, NativeMetadataSelection,
+    NativePageMetadataSnapshot,
+};
 pub use visual::{
     MAX_VISUAL_OUTPUT_BYTES, VerifiedRenditionFile, VerifiedVisualPayload, VisualCandidate,
     VisualCandidateReport, VisualCandidateRequest, VisualCoverage, VisualGenerationReader,
@@ -450,6 +458,7 @@ pub struct RichGenerationReader {
     cache: ReadCache,
     cache_budget: ReaderCacheBudget,
     read_meter: ReadMeter,
+    metadata_used: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(Deserialize)]
@@ -547,6 +556,7 @@ impl RichGenerationReader {
             cache: ReadCache::new(budget.max_bytes, budget.max_entries)?,
             cache_budget: budget.clone(),
             read_meter: meter,
+            metadata_used: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -585,14 +595,12 @@ impl RichGenerationReader {
             "retained generation directory changed"
         );
         ensure!(
-            digest_metered(
-                &bounded_read_metered(
-                    &owned_path(&self.dir, Path::new("manifest.json"))?,
-                    MAX_MANIFEST_BYTES,
-                    &self.read_meter
-                )?,
+            hash_reader_file(
+                &owned_path(&self.dir, Path::new("manifest.json"))?,
+                MAX_MANIFEST_BYTES,
                 &self.read_meter
-            )? == self.pin.manifest_sha256,
+            )?
+            .1 == self.pin.manifest_sha256,
             "retained rich manifest changed"
         );
         if let Some(Ok(index)) = self.index.get() {
@@ -1926,7 +1934,8 @@ fn document_metadata_artifact(doc: &RichDocument) -> Result<Option<&StoredArtifa
             None => {}
             Some(gptgrep_parse::FeatureState::Present(recipe))
                 if recipe == gptgrep_parse::DOCUMENT_METADATA_NATIVE_RECIPE
-                    || recipe == gptgrep_parse::NATIVE_FONT_WORD_RECIPE =>
+                    || recipe == gptgrep_parse::NATIVE_FONT_WORD_RECIPE
+                    || recipe == gptgrep_parse::NATIVE_GRAPHICS_RECIPE =>
             {
                 ensure!(
                     selected_recipe.is_none_or(|selected| selected == recipe),
@@ -2005,6 +2014,15 @@ fn validate_document_metadata_binding(
             if recipe == gptgrep_parse::NATIVE_FONT_WORD_RECIPE =>
         {
             gptgrep_parse::native_font_word_profile_digest(
+                &doc.prepared,
+                metadata.native_dpi,
+                metadata.native_render_pages,
+            )?
+        }
+        Some(gptgrep_parse::FeatureState::Present(recipe))
+            if recipe == gptgrep_parse::NATIVE_GRAPHICS_RECIPE =>
+        {
+            gptgrep_parse::native_graphics_profile_digest(
                 &doc.prepared,
                 metadata.native_dpi,
                 metadata.native_render_pages,
@@ -2193,8 +2211,69 @@ fn verify_document(
                 budget,
             )?;
         }
-        let metadata: NativeCoverageMetadata = serde_json::from_slice(&bytes)
-            .context("rebuild_required: retained native coverage metadata missing or invalid")?;
+        let graphics_recipe = matches!(page.capabilities.get("native_recipe"),
+            Some(gptgrep_parse::FeatureState::Present(recipe)) if recipe == gptgrep_parse::NATIVE_GRAPHICS_RECIPE);
+        let metadata: NativeCoverageMetadata = if graphics_recipe {
+            ensure!(
+                bytes.len() as u64 == page.metadata_artifact.bytes
+                    && digest(&bytes) == page.metadata_artifact.sha256,
+                "native graphics changed while reading"
+            );
+            let document_held = document_metadata_artifact(doc)?
+                .map(|a| {
+                    a.artifact
+                        .bytes
+                        .checked_mul(32)
+                        .context("resource_limit: held document metadata overflow")
+                })
+                .transpose()?
+                .unwrap_or(0);
+            ensure!(
+                gptgrep_parse::native_metadata_working_upper(&bytes)?
+                    .checked_add(document_held)
+                    .is_some_and(|n| n <= budget.owned_working_bytes),
+                "resource_limit: document and page native metadata validation overlap"
+            );
+            let typed = gptgrep_parse::validate_native_graphics_metadata(
+                &bytes,
+                &doc.prepared,
+                &doc.native_profile_sha256,
+                page.number,
+                budget,
+            )?;
+            // Generic records never enter the legacy path/image-only decoder.
+            NativeCoverageMetadata {
+                page: NativeCoveragePage {
+                    page_number: typed.page.page_number,
+                    page_width: typed.page.page_width,
+                    page_height: typed.page.page_height,
+                    text_items: SequenceCount(typed.page.text_items.len()),
+                    page_label: typed.page.page_label,
+                },
+                objects: ObjectCoverage {
+                    count: typed.objects.len(),
+                    paths: typed.objects.iter().filter(|o| o.path.is_some()).count(),
+                    images: typed.objects.iter().filter(|o| o.image.is_some()).count(),
+                },
+                // Compare the same JSON number representation as the retained manifest.
+                complexity: serde_json::from_slice(&serde_json::to_vec(&typed.complexity)?)?,
+                geometry: typed.geometry,
+                image_rects: typed
+                    .image_rects
+                    .into_iter()
+                    .map(|r| NativeImageRect {
+                        x: r.x,
+                        y: r.y,
+                        width: r.width,
+                        height: r.height,
+                    })
+                    .collect(),
+                capabilities: typed.capabilities,
+            }
+        } else {
+            serde_json::from_slice(&bytes)
+                .context("rebuild_required: retained native coverage metadata missing or invalid")?
+        };
         if document_metadata.is_some() {
             ensure!(
                 metadata.page.page_label.as_deref()

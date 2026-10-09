@@ -1209,6 +1209,945 @@ async fn captured_host_deadline_blocks_delayed_execution_before_any_admission() 
     assert!(execution.original_run_remaining()? > Duration::from_secs(50));
     Ok(())
 }
+
+// The existing graphics fixture supplies native objects, paths, an image and
+// text. IDs and row counts come from the published generation, never test gold
+// injected into a product selector. These tests need admitted PDFium execution;
+// the protocol peer below is in-memory and is not a native model observation.
+// Offline coverage makes the real graphics fixture publishable; it is not a model receipt.
+fn native_metadata_offline_ocr(task: &OcrTask) -> Result<OcrPageResult> {
+    Ok(OcrPageResult {
+        schema_version: "gptgrep.ocr.result.v1".into(),
+        task_id: task.id.clone(),
+        task_sha256: task.task_sha256.clone(),
+        source_sha256: task.source_sha256.clone(),
+        prepared_sha256: task.prepared_sha256.clone(),
+        page: task.page,
+        status: OcrResultStatus::Complete,
+        regions: task
+            .regions
+            .iter()
+            .enumerate()
+            .map(|(i, r)| OcrRegionResult {
+                id: r.id.clone(),
+                bbox: r.bbox,
+                text: "Authored offline host fixture transcription.".into(),
+                reading_order: i as u32,
+                status: OcrRegionStatus::Complete,
+            })
+            .collect(),
+        receipt: OcrReceipt {
+            model: task.profile.model.clone(),
+            profile_sha256: ocr_profile_digest(&task.profile)?,
+            request_sha256: "1".repeat(64),
+            response_sha256: "2".repeat(64),
+            runtime_profile_sha256: "3".repeat(64),
+            image_deliveries: task
+                .images
+                .iter()
+                .enumerate()
+                .map(|(i, image)| OcrImageDelivery {
+                    artifact_id: image.artifact.id.clone(),
+                    artifact_sha256: image.artifact.sha256.clone(),
+                    tool_ordinal: i as u32 + 1,
+                    mime: image.artifact.mime.clone(),
+                    width: image.width,
+                    height: image.height,
+                    tool_response_sha256: "4".repeat(64),
+                })
+                .collect(),
+            usage: None,
+            latency_ms: None,
+        },
+    })
+}
+pub(crate) async fn native_metadata_generation(
+    include_other: bool,
+) -> Result<(tempfile::TempDir, RichGenerationReader)> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let budget = ResourceBudget::default();
+    let mut writer = RichGenerationWriter::begin(&root, budget.clone())?;
+    for name in if include_other {
+        vec!["source.pdf", "other.pdf"]
+    } else {
+        vec!["source.pdf"]
+    } {
+        let mut bytes = include_bytes!("../../../../tests/fixtures/native-graphics.pdf").to_vec();
+        if name == "other.pdf" {
+            bytes.extend_from_slice(b"\n% independent source identity\n");
+        }
+        fs::write(root.join(name), bytes)?;
+        let prepared = prepare_document(
+            &root.join(name),
+            &root.join(format!("stage-{name}")),
+            &PreparationOptions,
+            &budget,
+        )
+        .await?;
+        let candidate = extract_native(
+            &prepared,
+            &NativeOptions {
+                dpi: 72.,
+                render_pages: true,
+                page_window: 1,
+            },
+            &budget,
+        )
+        .await?;
+        let outcomes = candidate
+            .plan()
+            .tasks
+            .iter()
+            .map(native_metadata_offline_ocr)
+            .collect::<Result<Vec<_>>>()?;
+        let parsed = finalize_document(candidate, outcomes, OcrMode::Auto, &budget)?;
+        writer.add_document(name, prepared.staging_root(), parsed)?;
+    }
+    writer.publish()?;
+    Ok((temp, RichGenerationReader::open(&root)?))
+}
+
+fn native_metadata_config(scoped: bool) -> HostConfig {
+    HostConfig {
+        max_tool_calls: 64,
+        document: scoped.then(|| "source.pdf".into()),
+        ..Default::default()
+    }
+}
+async fn native_metadata_evidence(
+    reader: RichGenerationReader,
+    scoped: bool,
+) -> Result<(RichEvidence, ExecutionContext)> {
+    let execution = context(2)?;
+    let (endpoint, server) = mock(2, Arc::new(|_| Ok(())), false).await?;
+    let config = native_metadata_config(scoped);
+    let mut options = RichTextHostOptions::default();
+    options.retrieval.document = config.document.clone();
+    let evidence = genuine(prepare_rich_text_host(
+        reader,
+        client(&endpoint, execution.clone())?,
+        "source claim",
+        &config,
+        &options,
+    )?)
+    .await?;
+    assert_eq!(server.await??.len(), 2);
+    Ok((evidence, execution))
+}
+
+async fn metadata_call(
+    read: &mut (impl tokio::io::AsyncBufRead + Unpin),
+    write: &mut (impl tokio::io::AsyncWrite + Unpin),
+    frames: &mut Vec<Value>,
+    ordinal: &mut usize,
+    tool: &str,
+    arguments: Value,
+) -> Result<Value> {
+    ensure!(*ordinal < 64, "metadata fixture call bound");
+    let id = format!("metadata-call-{ordinal}");
+    *ordinal += 1;
+    emit(
+        write,
+        json!({"id":id,"method":"item/tool/call","params":{
+        "threadId":"metadata-thread","turnId":"metadata-turn","callId":id,
+        "namespace":"gptgrep","tool":tool,"arguments":arguments}}),
+    )
+    .await?;
+    let frame = line(read).await?;
+    ensure!(frame["id"] == id, "metadata RPC identity");
+    let body = serde_json::from_str(
+        frame["result"]["contentItems"][0]["text"]
+            .as_str()
+            .context("metadata tool inputText")?,
+    )?;
+    frames.push(frame);
+    Ok(body)
+}
+
+pub(crate) async fn native_metadata_rpc_peer(
+    stream: tokio::io::DuplexStream,
+    override_call: Option<(&'static str, Value)>,
+    all_collections: bool,
+) -> Result<Vec<Value>> {
+    let (read, mut write) = tokio::io::split(stream);
+    let mut read = BufReader::new(read);
+    let mut frames = Vec::new();
+    loop {
+        let request = line(&mut read).await?;
+        match request["method"].as_str() {
+            Some("initialize") => emit(&mut write, json!({"id":1,"result":{}})).await?,
+            Some("initialized") => {}
+            Some("account/read") => {
+                emit(
+                    &mut write,
+                    json!({"id":100,"result":{"account":{"type":"chatgpt"}}}),
+                )
+                .await?;
+            }
+            Some("config/read") => {
+                emit(
+                    &mut write,
+                    json!({"id":2,"result":{"config":{"mcp_servers":{}}}}),
+                )
+                .await?;
+            }
+            Some("thread/start") => {
+                assert!(
+                    request["params"]["dynamicTools"][0]["tools"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|tool| tool["name"] == NATIVE_METADATA_TOOL)
+                );
+                emit(&mut write, json!({"id":3,"result":{"thread":{"id":"metadata-thread"},
+                    "model":request["params"]["model"],"modelProvider":"openai","approvalPolicy":"never",
+                    "sandbox":{"type":"readOnly","networkAccess":false},"reasoningEffort":"max","serviceTier":"priority"}})).await?;
+            }
+            Some("turn/start") => {
+                let mut ordinal = 0;
+                // Discovery and the first metadata call arrive before turn ACK.
+                let discovery = metadata_call(
+                    &mut read,
+                    &mut write,
+                    &mut frames,
+                    &mut ordinal,
+                    "gptgrep_inspect_artifact",
+                    json!({"document":"source.pdf"}),
+                )
+                .await?;
+                let artifact = discovery["result"]["items"][0]["result"]["objects"][0]
+                    ["metadata_artifact"]["id"].as_str().context("discovered page metadata")?.to_owned();
+                if let Some((tool, arguments)) = override_call {
+                    metadata_call(
+                        &mut read,
+                        &mut write,
+                        &mut frames,
+                        &mut ordinal,
+                        tool,
+                        arguments,
+                    )
+                    .await?;
+                } else if all_collections {
+                    let mut path_id = None;
+                    let mut binding = None;
+                    for collection in [
+                        "object_summaries",
+                        "native_characters",
+                        "native_words",
+                        "image_geometry",
+                        "path_segments",
+                    ] {
+                        let mut cursor = Value::Null;
+                        let mut end = 0;
+                        loop {
+                            let mut arguments = json!({"artifact_id":artifact,"collection":collection,
+                                "fields":["counts"],"page_size":2,"cursor":cursor});
+                            if collection == "object_summaries" {
+                                arguments["item_fields"] = json!(["id", "kind", "ordinal"]);
+                            }
+                            if collection == "path_segments" {
+                                arguments["object_id"] =
+                                    json!(path_id.as_ref().context("discovered path")?);
+                            }
+                            let body = metadata_call(
+                                &mut read,
+                                &mut write,
+                                &mut frames,
+                                &mut ordinal,
+                                NATIVE_METADATA_TOOL,
+                                arguments,
+                            )
+                            .await?;
+                            assert_eq!(frames.last().unwrap()["result"]["success"], true);
+                            assert_eq!(
+                                body["citation_status"],
+                                "not_registered_read_artifact_required"
+                            );
+                            let item = &body["result"]["items"][0];
+                            let value = &item["result"];
+                            assert_eq!(value["metadata_only"], true);
+                            assert_eq!(value["citation_authority"], false);
+                            assert!(value.get("issued_id").is_none());
+                            if let Some(expected) = &binding {
+                                assert_eq!(&value["binding"], expected);
+                            } else {
+                                binding = Some(value["binding"].clone());
+                            }
+                            let rows = value["rows"].as_array().context("whole rows")?;
+                            assert_eq!(item["coverage"]["start"], end);
+                            end += rows.len();
+                            assert_eq!(item["coverage"]["end"], end);
+                            if collection == "object_summaries" {
+                                for row in rows {
+                                    if row["kind"] == "path" {
+                                        path_id =
+                                            Some(row["id"].as_str().context("path ID")?.to_owned());
+                                    }
+                                }
+                            }
+                            if item["coverage"]["exhausted"] == true {
+                                assert_eq!(item["coverage"]["available"], end);
+                                assert!(end > 0, "fixture supplies each collection");
+                                assert!(item["coverage"].get("cursor").is_none());
+                                break;
+                            }
+                            assert!(!rows.is_empty());
+                            cursor = item["coverage"]["cursor"].clone();
+                            assert!(cursor.as_str().is_some());
+                        }
+                    }
+                } else {
+                    metadata_call(
+                        &mut read,
+                        &mut write,
+                        &mut frames,
+                        &mut ordinal,
+                        NATIVE_METADATA_TOOL,
+                        json!({"artifact_id":artifact,"collection":"native_characters",
+                            "fields":["counts"],"page_size":1}),
+                    )
+                    .await?;
+                }
+                emit(
+                    &mut write,
+                    json!({"id":4,"result":{"turn":{"id":"metadata-turn"}}}),
+                )
+                .await?;
+                let answer = json!({"answer":"Metadata inspected; no source window was delivered.",
+                    "insufficient_evidence":true,"citations":[]})
+                .to_string();
+                emit(
+                    &mut write,
+                    json!({"method":"turn/completed","params":{"threadId":"metadata-thread",
+                    "turn":{"id":"metadata-turn","status":"completed","error":null,
+                    "items":[{"type":"agentMessage","text":answer}]}}}),
+                )
+                .await?;
+                return Ok(frames);
+            }
+            _ => return Err(anyhow!("unexpected metadata fixture request")),
+        }
+    }
+}
+
+async fn drive_native_metadata(
+    evidence: &mut RichEvidence,
+    override_call: Option<(&'static str, Value)>,
+    all_collections: bool,
+) -> Result<(protocol::Outcome, Vec<Value>)> {
+    let (host, server) = tokio::io::duplex(262144);
+    let (read, write) = tokio::io::split(host);
+    let peer = tokio::spawn(native_metadata_rpc_peer(
+        server,
+        override_call,
+        all_collections,
+    ));
+    let config = native_metadata_config(evidence.document.is_some());
+    let deadline = evidence.deadline;
+    let result = protocol::run_observed_budget(
+        read,
+        write,
+        Path::new("."),
+        &config,
+        protocol::Workflow::RichText {
+            question: "source claim",
+            evidence,
+        },
+        None,
+        protocol::RunOptions::default(),
+        crate::transport::TransportBudget::new(protocol::MAX_TOTAL_BYTES),
+        deadline,
+    )
+    .await;
+    match result {
+        Ok(outcome) => Ok((outcome, peer.await??)),
+        Err(error) => {
+            peer.abort();
+            let _ = peer.await;
+            Err(error)
+        }
+    }
+}
+
+#[test]
+fn native_metadata_closed_arguments_and_tool_specific_limits() -> Result<()> {
+    let valid = json!({"artifact_id":"a".repeat(64),"collection":"native_characters"});
+    let parsed = NativeMetadataArgs::parse(&valid)?;
+    assert_eq!((parsed.page_size, parsed.max_output_bytes), (100, 16384));
+    for patch in [
+        json!({"unknown":0}),
+        json!({"document":"other.pdf"}),
+        json!({"collection":"unknown"}),
+        json!({"page_size":0}),
+        json!({"page_size":1001}),
+        json!({"max_output_bytes":0}),
+        json!({"max_output_bytes":16385}),
+        json!({"fields":["unknown"]}),
+        json!({"fields":["counts","counts"]}),
+        json!({"item_fields":["page_point"]}),
+        json!({"object_id":"a".repeat(64)}),
+        json!({"collection":"path_segments"}),
+        json!({"cursor":"A0"}),
+        json!({"cursor":"a"}),
+        json!({"cursor":"aa".repeat(8193)}),
+    ] {
+        let mut invalid = valid.clone();
+        invalid
+            .as_object_mut()
+            .unwrap()
+            .extend(patch.as_object().unwrap().clone());
+        assert!(validate_arguments(NATIVE_METADATA_TOOL, &invalid).is_err());
+    }
+    let maximum = json!({"artifact_id":"\0".repeat(512),"fields":gptgrep_core::NATIVE_METADATA_SCALAR_FIELDS,
+        "collection":"image_geometry","item_fields":gptgrep_core::NATIVE_IMAGE_FIELDS,"object_id":null,
+        "page_size":1000,"max_output_bytes":16384,"cursor":"a".repeat(16384)});
+    assert_eq!(measure(&maximum, MAX_NATIVE_ARGUMENTS)?, 19842);
+    validate_arguments(NATIVE_METADATA_TOOL, &maximum)?;
+    assert_eq!(argument_limit(NATIVE_METADATA_TOOL), 20480);
+    for tool in [
+        "gptgrep_catalog",
+        "gptgrep_inspect_artifact",
+        "gptgrep_search_text",
+        "gptgrep_read_artifact",
+        "gptgrep_render",
+    ] {
+        assert_eq!(argument_limit(tool), 4096);
+        assert!(measure(&maximum, argument_limit(tool)).is_err());
+    }
+    let toolset = tools();
+    let tool = toolset[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == NATIVE_METADATA_TOOL)
+        .unwrap();
+    assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+    assert_eq!(
+        tool["inputSchema"]["properties"]["page_size"]["maximum"],
+        1000
+    );
+    assert_eq!(
+        tool["inputSchema"]["properties"]["page_size"]["default"],
+        100
+    );
+    assert_eq!(
+        tool["inputSchema"]["properties"]["max_output_bytes"]["maximum"],
+        16384
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_metadata_actual_rpc_discovers_all_collections_and_pages_without_citations()
+-> Result<()> {
+    let (_temp, reader) = native_metadata_generation(false).await?;
+    let (mut evidence, execution) = native_metadata_evidence(reader, false).await?;
+    let (outcome, frames) = drive_native_metadata(&mut evidence, None, true).await?;
+    assert!(evidence.finish(&outcome.answer)?.citations.is_empty());
+    assert_eq!(evidence.calls, frames.len());
+    assert!(frames.len() > 6, "continuations used actual dynamic calls");
+    let discovery: Value = serde_json::from_str(
+        frames[0]["result"]["contentItems"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )?;
+    let id = &discovery["result"]["items"][0]["result"]["objects"][0]["metadata_artifact"]["id"];
+    assert!(
+        evidence
+            .finish(
+                &json!({"answer":"claim","insufficient_evidence":false,
+        "citations":[{"issued_id":id,"offset":0,"length":1,"quote":"x"}]})
+                .to_string()
+            )
+            .is_err()
+    );
+    assert_eq!(evidence.reader.native_metadata_retained_bytes(), 0);
+    assert_eq!(evidence.delivery.as_ref().unwrap().retained_bytes(), 0);
+    assert_eq!(execution.snapshot()?.submission_observations, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_metadata_actual_rpc_long_cursor_preserves_integrity_and_other_tool_cap()
+-> Result<()> {
+    let (_temp, reader) = native_metadata_generation(false).await?;
+    let id = reader.manifest()?.documents[0].pages[0]
+        .metadata_artifact
+        .id
+        .clone();
+    let (mut evidence, _execution) = native_metadata_evidence(reader.clone(), false).await?;
+    let (outcome, frames) = drive_native_metadata(
+        &mut evidence,
+        Some((
+            NATIVE_METADATA_TOOL,
+            json!({"artifact_id":id,"collection":"native_characters","cursor":"a".repeat(16384)}),
+        )),
+        false,
+    )
+    .await?;
+    assert!(evidence.finish(&outcome.answer)?.citations.is_empty());
+    assert_eq!(frames[1]["result"]["success"], false);
+    let body: Value = serde_json::from_str(
+        frames[1]["result"]["contentItems"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )?;
+    assert_eq!(
+        body["result"]["items"][0]["error"]["code"],
+        "invalid_cursor"
+    );
+    assert_eq!(evidence.reader.native_metadata_retained_bytes(), 0);
+    let (mut evidence, _) = native_metadata_evidence(reader, false).await?;
+    assert!(
+        drive_native_metadata(
+            &mut evidence,
+            Some(("gptgrep_catalog", json!({"cursor":"a".repeat(4096)}))),
+            false
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        evidence.calls, 1,
+        "oversized old-tool call was not admitted"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_metadata_scope_and_artifact_kind_fail_before_native_content_read() -> Result<()> {
+    let (_temp, reader) = native_metadata_generation(true).await?;
+    let manifest = reader.manifest()?;
+    let own = manifest
+        .documents
+        .iter()
+        .find(|d| d.document.path == "source.pdf")
+        .unwrap();
+    let other = manifest
+        .documents
+        .iter()
+        .find(|d| d.document.path == "other.pdf")
+        .unwrap();
+    let own_id = own.pages[0].metadata_artifact.id.clone();
+    let other_id = other.pages[0].metadata_artifact.id.clone();
+    let text_id = own.pages[0].native_text.id.clone();
+    let document_id = own
+        .artifacts
+        .iter()
+        .find(|a| a.artifact.kind == ArtifactKind::NativeMetadata && a.artifact.page.is_none())
+        .unwrap()
+        .artifact
+        .id
+        .clone();
+    let other_path = manifest
+        .root
+        .join(".gptgrep/generations")
+        .join(reader.pin().generation)
+        .join(&other.pages[0].metadata_artifact.relative_path);
+    let (mut evidence, _) = native_metadata_evidence(reader, true).await?;
+    // A content read would see corruption; scope must reject first by identity.
+    let saved = fs::read(&other_path)?;
+    fs::write(&other_path, b"corrupt out-of-scope metadata")?;
+    for id in [
+        other_id.clone(),
+        text_id,
+        document_id,
+        "missing-resource".into(),
+    ] {
+        let error = evidence
+            .native_metadata_tool(&json!({"artifact_id":id,"collection":"native_characters"}))
+            .err()
+            .context("unavailable resource must fail")?;
+        assert_eq!(error.to_string(), "host_rich_native_metadata_unavailable");
+        assert_eq!(evidence.reader.native_metadata_retained_bytes(), 0);
+    }
+    fs::write(other_path, saved)?;
+    let reply = evidence
+        .native_metadata_tool(&json!({"artifact_id":own_id,"collection":"native_characters"}))?;
+    reply.validate(&evidence.reader)?;
+    drop(reply);
+    assert_eq!(evidence.reader.native_metadata_retained_bytes(), 0);
+    assert!(
+        drive_native_metadata(
+            &mut evidence,
+            Some((
+                NATIVE_METADATA_TOOL,
+                json!({"artifact_id":other_id,"collection":"native_characters"})
+            )),
+            false
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        evidence.calls, 2,
+        "discovery then scoped rejection used actual RPC"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_metadata_cursor_options_and_first_unfit_remain_core_errors() -> Result<()> {
+    let (_temp, reader) = native_metadata_generation(false).await?;
+    let id = reader.manifest()?.documents[0].pages[0]
+        .metadata_artifact
+        .id
+        .clone();
+    let (evidence, _) = native_metadata_evidence(reader, false).await?;
+    let mut arguments = json!({"artifact_id":id,"collection":"native_characters",
+        "fields":["counts"],"page_size":1});
+    let first = evidence.native_metadata_tool(&arguments)?;
+    arguments["cursor"] = json!(
+        first._response.items[0]
+            .coverage
+            .cursor
+            .as_ref()
+            .context("continuation")?
+    );
+    drop(first);
+    for patch in [
+        json!({"fields":["geometry"]}),
+        json!({"page_size":2}),
+        json!({"max_output_bytes":16383}),
+        json!({"collection":"native_words"}),
+    ] {
+        let mut changed = arguments.clone();
+        changed
+            .as_object_mut()
+            .unwrap()
+            .extend(patch.as_object().unwrap().clone());
+        let reply = evidence.native_metadata_tool(&changed)?;
+        assert_eq!(
+            reply._response.items[0].error.as_ref().unwrap().code,
+            gptgrep_core::rich_batch::RichBatchErrorCode::InvalidCursor
+        );
+        drop(reply);
+        assert_eq!(evidence.reader.native_metadata_retained_bytes(), 0);
+    }
+    arguments.as_object_mut().unwrap().remove("cursor");
+    arguments["max_output_bytes"] = json!(1);
+    let reply = evidence.native_metadata_tool(&arguments)?;
+    assert_eq!(
+        reply._response.items[0].error.as_ref().unwrap().code,
+        gptgrep_core::rich_batch::RichBatchErrorCode::OutputBudgetInsufficient
+    );
+    assert!(reply._response.items[0].result.is_none());
+    assert_eq!(
+        evidence.reader.native_metadata_retained_bytes(),
+        NATIVE_TRANSPORT_RETAINED
+    );
+    drop(reply);
+    assert_eq!(evidence.reader.native_metadata_retained_bytes(), 0);
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum MetadataWriteMode {
+    Observe,
+    Partial,
+    Flush,
+    ChangeSource,
+    ChangePrepared,
+    ChangeMetadata,
+    HoldWrite,
+    HoldFlush,
+}
+#[derive(Default)]
+struct MetadataSendObservation {
+    samples: std::sync::Mutex<Vec<u64>>,
+    entered: tokio::sync::Notify,
+    saw_flush: std::sync::atomic::AtomicBool,
+}
+struct MetadataWriter<W> {
+    inner: W,
+    reader: RichGenerationReader,
+    mode: MetadataWriteMode,
+    path: std::path::PathBuf,
+    native_frame: bool,
+    changed: bool,
+    partial: bool,
+    observation: Arc<MetadataSendObservation>,
+}
+impl<W> MetadataWriter<W> {
+    fn observe(&self) {
+        let held = self.reader.native_metadata_retained_bytes();
+        assert!(held >= NATIVE_TRANSPORT_RETAINED + 64 * MAX_NATIVE_ITEM_OUTPUT as u64);
+        self.observation.samples.lock().unwrap().push(held);
+    }
+}
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for MetadataWriter<W> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if bytes
+            .windows(b"gptgrep.native_metadata.inspection.v1".len())
+            .any(|part| part == b"gptgrep.native_metadata.inspection.v1")
+        {
+            self.native_frame = true;
+        }
+        if self.native_frame {
+            self.observe();
+            if matches!(self.mode, MetadataWriteMode::HoldWrite) {
+                self.observation.entered.notify_one();
+                return std::task::Poll::Pending;
+            }
+            if matches!(self.mode, MetadataWriteMode::Partial) {
+                if self.partial {
+                    return std::task::Poll::Ready(Err(std::io::Error::other(
+                        "metadata partial write",
+                    )));
+                }
+                let result = std::pin::Pin::new(&mut self.inner)
+                    .poll_write(cx, &bytes[..bytes.len().min(17)]);
+                if matches!(&result, std::task::Poll::Ready(Ok(n)) if *n > 0) {
+                    self.partial = true;
+                }
+                return result;
+            }
+        }
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, bytes)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.native_frame {
+            self.observe();
+            self.observation
+                .saw_flush
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if matches!(self.mode, MetadataWriteMode::HoldFlush) {
+                self.observation.entered.notify_one();
+                return std::task::Poll::Pending;
+            }
+            if matches!(self.mode, MetadataWriteMode::Flush) {
+                return std::task::Poll::Ready(Err(std::io::Error::other(
+                    "metadata flush failure",
+                )));
+            }
+        }
+        let result = std::pin::Pin::new(&mut self.inner).poll_flush(cx);
+        if self.native_frame
+            && !self.changed
+            && matches!(result, std::task::Poll::Ready(Ok(())))
+            && matches!(
+                self.mode,
+                MetadataWriteMode::ChangeSource
+                    | MetadataWriteMode::ChangePrepared
+                    | MetadataWriteMode::ChangeMetadata
+            )
+        {
+            fs::write(&self.path, b"changed during native metadata flush").unwrap();
+            self.changed = true;
+        }
+        result
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[tokio::test]
+async fn native_metadata_rpc_retains_both_leases_through_write_flush_and_freshness() -> Result<()> {
+    for mode in [
+        MetadataWriteMode::Observe,
+        MetadataWriteMode::Partial,
+        MetadataWriteMode::Flush,
+        MetadataWriteMode::ChangeSource,
+        MetadataWriteMode::ChangePrepared,
+        MetadataWriteMode::ChangeMetadata,
+    ] {
+        let (_temp, reader) = native_metadata_generation(false).await?;
+        let (mut evidence, _) = native_metadata_evidence(reader.clone(), false).await?;
+        let manifest = reader.manifest()?;
+        let document = &manifest.documents[0];
+        let generation = manifest
+            .root
+            .join(".gptgrep/generations")
+            .join(reader.pin().generation);
+        let path = match mode {
+            MetadataWriteMode::ChangePrepared => generation.join(&document.prepared_path),
+            MetadataWriteMode::ChangeMetadata => {
+                generation.join(&document.pages[0].metadata_artifact.relative_path)
+            }
+            _ => manifest.root.join(&document.document.path),
+        };
+        let held = reader.reserve_native_metadata_transport(4096)?;
+        let observation = Arc::new(MetadataSendObservation::default());
+        let (host, server) = tokio::io::duplex(262144);
+        let (read, inner) = tokio::io::split(host);
+        let writer = MetadataWriter {
+            inner,
+            reader: reader.clone(),
+            mode,
+            path,
+            native_frame: false,
+            changed: false,
+            partial: false,
+            observation: observation.clone(),
+        };
+        let peer = tokio::spawn(native_metadata_rpc_peer(server, None, false));
+        let deadline = evidence.deadline;
+        let config = native_metadata_config(false);
+        let budget = crate::transport::TransportBudget::new(protocol::MAX_TOTAL_BYTES);
+        let result = protocol::run_observed_budget(
+            read,
+            writer,
+            Path::new("."),
+            &config,
+            protocol::Workflow::RichText {
+                question: "source claim",
+                evidence: &mut evidence,
+            },
+            None,
+            protocol::RunOptions::default(),
+            budget.clone(),
+            deadline,
+        )
+        .await;
+        if matches!(mode, MetadataWriteMode::Observe) {
+            let outcome = result?;
+            assert!(evidence.finish(&outcome.answer)?.citations.is_empty());
+            assert_eq!(peer.await??.len(), 2);
+            budget.check_host()?;
+        } else {
+            assert!(result.is_err());
+            peer.abort();
+            let _ = peer.await;
+            assert!(budget.check_host().is_err());
+        }
+        let samples = observation.samples.lock().unwrap();
+        assert!(!samples.is_empty());
+        assert!(
+            samples.iter().all(|bytes| *bytes
+                == 4096 + NATIVE_TRANSPORT_RETAINED + 64 * MAX_NATIVE_ITEM_OUTPUT as u64)
+        );
+        if !matches!(mode, MetadataWriteMode::Partial) {
+            assert!(
+                observation
+                    .saw_flush
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            );
+        } else {
+            assert!(
+                samples.len() >= 2,
+                "partial write followed by a failing retry"
+            );
+        }
+        assert_eq!(reader.native_metadata_retained_bytes(), 4096);
+        let handle = evidence.delivery.as_ref().unwrap();
+        assert_eq!(handle.unknown_entries(), 0);
+        assert_eq!(handle.retained_bytes(), 0);
+        drop(held);
+        assert_eq!(reader.native_metadata_retained_bytes(), 0);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_metadata_rpc_cancellation_drops_shared_reservations_after_pending_io() -> Result<()>
+{
+    for mode in [MetadataWriteMode::HoldWrite, MetadataWriteMode::HoldFlush] {
+        let (_temp, reader) = native_metadata_generation(false).await?;
+        let (mut evidence, _) = native_metadata_evidence(reader.clone(), false).await?;
+        let held = reader.reserve_native_metadata_transport(4096)?;
+        let ceiling = reader
+            .manifest()?
+            .resource_budget
+            .owned_working_bytes
+            .min(gptgrep_core::MAX_NATIVE_METADATA_WORKING_BYTES);
+        let observation = Arc::new(MetadataSendObservation::default());
+        let (host, server) = tokio::io::duplex(262144);
+        let (read, inner) = tokio::io::split(host);
+        let writer = MetadataWriter {
+            inner,
+            reader: reader.clone(),
+            mode,
+            path: std::path::PathBuf::new(),
+            native_frame: false,
+            changed: false,
+            partial: false,
+            observation: observation.clone(),
+        };
+        let peer = tokio::spawn(native_metadata_rpc_peer(server, None, false));
+        let deadline = evidence.deadline;
+        let config = native_metadata_config(false);
+        let budget = crate::transport::TransportBudget::new(protocol::MAX_TOTAL_BYTES);
+        let mut run = Box::pin(protocol::run_observed_budget(
+            read,
+            writer,
+            Path::new("."),
+            &config,
+            protocol::Workflow::RichText {
+                question: "source claim",
+                evidence: &mut evidence,
+            },
+            None,
+            protocol::RunOptions::default(),
+            budget.clone(),
+            deadline,
+        ));
+        tokio::select! {
+            result = &mut run => panic!("send did not remain pending: {:?}", result.err()),
+            _ = observation.entered.notified() => {}
+        }
+        let before = reader.native_metadata_retained_bytes();
+        assert_eq!(
+            before,
+            4096 + NATIVE_TRANSPORT_RETAINED + 64 * MAX_NATIVE_ITEM_OUTPUT as u64
+        );
+        assert!(
+            reader
+                .reserve_native_metadata_transport(ceiling - before + 1)
+                .is_err()
+        );
+        assert_eq!(reader.native_metadata_retained_bytes(), before);
+        drop(run);
+        assert!(budget.check_host().is_err());
+        assert_eq!(reader.native_metadata_retained_bytes(), 4096);
+        assert_eq!(evidence.delivery.as_ref().unwrap().unknown_entries(), 0);
+        assert_eq!(evidence.delivery.as_ref().unwrap().retained_bytes(), 0);
+        peer.abort();
+        let _ = peer.await;
+        drop(held);
+        assert_eq!(reader.native_metadata_retained_bytes(), 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn native_metadata_bounded_serialization_covers_escaping_and_rejects_growth() -> Result<()> {
+    let inner = json!({"text":"\"\\\u{0}中".repeat(128)});
+    let length = measure(&inner, MAX_NATIVE_ENVELOPE)?;
+    assert!(bounded_json_string(&inner, length - 1).is_err());
+    let text = bounded_json_string(&inner, length)?;
+    assert_eq!(serde_json::from_str::<Value>(&text)?, inner);
+    let frame = json!({"id":"\0".repeat(256),"result":{"success":false,
+        "contentItems":[{"type":"inputText","text":text}]}});
+    assert!(measure(&frame, MAX_NATIVE_METADATA_FRAME - 1)? < 2 * length + 1621);
+    assert_eq!(MAX_NATIVE_METADATA_FRAME, 67393);
+    struct ChangesAfterMeasure(std::cell::Cell<bool>);
+    impl Serialize for ChangesAfterMeasure {
+        fn serialize<S: serde::Serializer>(
+            &self,
+            serializer: S,
+        ) -> std::result::Result<S::Ok, S::Error> {
+            serializer.serialize_str(if self.0.replace(true) {
+                "does not fit"
+            } else {
+                "x"
+            })
+        }
+    }
+    assert!(bounded_json_string(&ChangesAfterMeasure(std::cell::Cell::new(false)), 64).is_err());
+    Ok(())
+}
 #[tokio::test]
 async fn captured_host_deadline_quarantines_slow_route_without_second_admission() -> Result<()> {
     let (_dir, prepared, execution, observed, server) =

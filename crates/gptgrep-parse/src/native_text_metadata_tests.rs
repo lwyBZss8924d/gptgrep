@@ -47,9 +47,14 @@ fn geometryless(c: char, generated: bool) -> NativeCharacterObservation {
 fn source(observations: Vec<NativeCharacterObservation>) -> Vec<NativeCharacter> {
     let count = observations.len() as u32;
     let mut values = observations.into_iter();
-    collect_characters(count, 1500.0, 300.0, &ResourceBudget::default(), |_| {
-        Ok(values.next().unwrap())
-    })
+    collect_characters(
+        count,
+        1500.0,
+        300.0,
+        &ResourceBudget::default(),
+        NativeBoundsPolicy::LegacyViewport,
+        |_| Ok(values.next().unwrap()),
+    )
     .unwrap()
 }
 
@@ -84,6 +89,131 @@ fn validate(value: &serde_json::Value) -> Result<()> {
         1,
         &ResourceBudget::default(),
     )
+}
+
+#[test]
+fn v7_unclipped_characters_preserve_signed_outside_and_zero_area_without_changing_v6() {
+    let make = || {
+        let mut space = observed(' ', -7.0, 301.0, b"Helvetica", 32);
+        space.bounds.as_mut().unwrap().width = 0.0;
+        vec![
+            observed('A', -20.0, -30.0, b"Helvetica", 32),
+            observed('B', 1498.0, 299.0, b"Helvetica", 32),
+            space,
+            geometryless('\n', true),
+        ]
+    };
+    let collect = |policy| {
+        let mut observations = make().into_iter();
+        collect_characters(4, 1500.0, 300.0, &ResourceBudget::default(), policy, |_| {
+            Ok(observations.next().unwrap())
+        })
+    };
+    assert!(collect(NativeBoundsPolicy::LegacyViewport).is_err());
+    let characters = collect(NativeBoundsPolicy::UnclippedV7).unwrap();
+    assert_eq!(
+        characters.iter().map(character).collect::<String>(),
+        "AB \n"
+    );
+    assert_eq!(
+        characters.iter().map(|c| c.ordinal).collect::<Vec<_>>(),
+        [0, 1, 2, 3]
+    );
+    let NativeGeometry::Positioned(first) = &characters[0].geometry else {
+        panic!("positioned")
+    };
+    assert_eq!(
+        (first.x, first.y, first.width, first.height),
+        (-20.0, -30.0, 5.0, 10.0)
+    );
+    assert!(matches!(
+        characters[2].geometry,
+        NativeGeometry::ZeroArea(_)
+    ));
+    assert!(characters[3].generated);
+    let runs = unclipped_glyph_runs(&characters).unwrap();
+    assert_eq!(runs[0].words[0].x, -20.0);
+    assert_eq!(runs[1].words[0].y, 299.0);
+    assert_eq!(runs[1].font_flags, Some(32));
+    let mut value = envelope(characters);
+    value["capabilities"]["native_character_geometry"] =
+        json!(FeatureState::Present(UNCLIPPED_GEOMETRY));
+    let bytes = serde_json::to_vec(&value).unwrap();
+    validate_native_text_metadata_unclipped(&bytes, &summary(), 1, &ResourceBudget::default())
+        .unwrap();
+    assert!(validate(&value).is_err());
+    for case in 0..4 {
+        let mut forged = value.clone();
+        match case {
+            0 => forged["native_text_metadata"]["characters"][1]["ordinal"] = json!(0),
+            1 => {
+                forged["native_text_metadata"]["characters"][0]["font"]["value"]["flags"] = json!(0)
+            }
+            2 => forged["page"]["text_items"][0]["words"][0]["x"] = json!(0),
+            _ => forged["capabilities"]["native_character_geometry"] = json!({"state":"absent"}),
+        }
+        assert!(
+            validate_native_text_metadata_unclipped(
+                &serde_json::to_vec(&forged).unwrap(),
+                &summary(),
+                1,
+                &ResourceBudget::default()
+            )
+            .is_err(),
+            "case {case}"
+        );
+    }
+}
+
+#[test]
+fn v7_unclipped_geometry_rejects_nonfinite_negative_extent_endpoint_and_union_overflow() {
+    for case in 0..5 {
+        let mut value = observed('A', -20.0, -30.0, b"Helvetica", 0);
+        let b = value.bounds.as_mut().unwrap();
+        match case {
+            0 => b.x = f32::NAN,
+            1 => b.y = f32::INFINITY,
+            2 => b.width = -1.0,
+            3 => {
+                b.x = f32::MAX;
+                b.width = f32::MAX;
+            }
+            _ => {
+                b.y = f32::MAX;
+                b.height = f32::MAX;
+            }
+        }
+        let mut value = Some(value);
+        assert!(
+            collect_characters(
+                1,
+                1500.0,
+                300.0,
+                &ResourceBudget::default(),
+                NativeBoundsPolicy::UnclippedV7,
+                |_| Ok(value.take().unwrap())
+            )
+            .is_err()
+        );
+    }
+    // Each source box and endpoint is finite; their merged union is not.
+    let mut values = [-2.0e38_f32, 0.0].into_iter().map(|x| {
+        let mut o = observed('A', x, 0.0, b"Helvetica", 0);
+        o.bounds.as_mut().unwrap().width = 3.0e38;
+        o.bounds.as_mut().unwrap().height = 1.0e-10;
+        o.font_size = f64::from(3.0e38_f32);
+        o
+    });
+    let characters = collect_characters(
+        2,
+        1500.0,
+        300.0,
+        &ResourceBudget::default(),
+        NativeBoundsPolicy::UnclippedV7,
+        |_| Ok(values.next().unwrap()),
+    )
+    .unwrap();
+    assert!(unclipped_glyph_runs(&characters).is_err());
 }
 
 #[test]
@@ -388,9 +518,14 @@ fn retention_seam_preserves_invalid_raw_codepoint_without_lossy_font_or_geometry
         o.bounds = bounds;
         let mut once = Some(o);
         assert!(
-            collect_characters(1, 1500.0, 300.0, &ResourceBudget::default(), |_| Ok(once
-                .take()
-                .unwrap()))
+            collect_characters(
+                1,
+                1500.0,
+                300.0,
+                &ResourceBudget::default(),
+                NativeBoundsPolicy::LegacyViewport,
+                |_| Ok(once.take().unwrap())
+            )
             .is_err()
         );
     }
@@ -471,10 +606,17 @@ fn validation_and_retention_count_byte_and_working_bounds_reject_before_allocati
 {
     let mut observed_count = 0;
     assert!(
-        collect_characters(u32::MAX, 1500.0, 300.0, &ResourceBudget::default(), |_| {
-            observed_count += 1;
-            Ok(geometryless(' ', false))
-        })
+        collect_characters(
+            u32::MAX,
+            1500.0,
+            300.0,
+            &ResourceBudget::default(),
+            NativeBoundsPolicy::LegacyViewport,
+            |_| {
+                observed_count += 1;
+                Ok(geometryless(' ', false))
+            }
+        )
         .is_err()
     );
     assert_eq!(observed_count, 0);
@@ -591,7 +733,13 @@ async fn synthetic_pdf_preserves_actual_fonts_words_and_complete_native_ordinals
     );
     let a = &candidate.pages()[0].metadata_artifact;
     let bytes = std::fs::read(prepared.staging_root().join(&a.relative_path))?;
-    validate_native_text_metadata(&bytes, prepared.summary(), 1, &budget)?;
+    crate::validate_native_graphics_metadata(
+        &bytes,
+        prepared.summary(),
+        candidate.native_profile_sha256(),
+        1,
+        &budget,
+    )?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)?;
     let count = value["native_text_metadata"]["native_char_count"]
         .as_u64()
@@ -620,9 +768,14 @@ fn positioned_font_size_refuses_f64_to_f32_underflow_and_preserves_representable
     invalid.font_size = tiny;
     let mut invalid = Some(invalid);
     assert!(
-        collect_characters(1, 1500.0, 300.0, &ResourceBudget::default(), |_| Ok(
-            invalid.take().unwrap()
-        ))
+        collect_characters(
+            1,
+            1500.0,
+            300.0,
+            &ResourceBudget::default(),
+            NativeBoundsPolicy::LegacyViewport,
+            |_| Ok(invalid.take().unwrap())
+        )
         .is_err()
     );
     let raw = 12.0000000001_f64;
@@ -695,7 +848,13 @@ async fn synthetic_rotated_cropped_userunit_words_match_independent_viewport_ora
                 .staging_root()
                 .join(&page.metadata_artifact.relative_path),
         )?;
-        validate_native_text_metadata(&bytes, prepared.summary(), page.number, &budget)?;
+        crate::validate_native_graphics_metadata(
+            &bytes,
+            prepared.summary(),
+            candidate.native_profile_sha256(),
+            page.number,
+            &budget,
+        )?;
         let v: serde_json::Value = serde_json::from_slice(&bytes)?;
         let stream: NativeTextMetadata = serde_json::from_value(v["native_text_metadata"].clone())?;
         assert_eq!(stream.characters.len(), stream.native_char_count as usize);
@@ -863,11 +1022,23 @@ async fn synthetic_v6_complete_metadata_and_document_signals_are_window_1_25_inv
                 .staging_root()
                 .join(&bp.metadata_artifact.relative_path),
         )?;
-        validate_native_text_metadata(&av, first.summary(), ap.number, &budget)?;
-        validate_native_text_metadata(&bv, second.summary(), bp.number, &budget)?;
+        crate::validate_native_graphics_metadata(
+            &av,
+            first.summary(),
+            a.native_profile_sha256(),
+            ap.number,
+            &budget,
+        )?;
+        crate::validate_native_graphics_metadata(
+            &bv,
+            second.summary(),
+            b.native_profile_sha256(),
+            bp.number,
+            &budget,
+        )?;
         assert_eq!(
             av, bv,
-            "exact v6 metadata includes complete font/character/word stream"
+            "exact v7 metadata includes complete font/character/word stream"
         );
         assert_eq!(ap.metadata_artifact.sha256, bp.metadata_artifact.sha256);
         assert_eq!(

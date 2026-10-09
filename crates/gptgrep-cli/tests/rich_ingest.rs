@@ -61,7 +61,9 @@ fn fixed_public_native_pdf_indexes_through_normal_rich_cli_and_batch() {
     let output = invoke(tmp.path(), &["--ocr", "off"]);
     assert!(
         output.status.success(),
-        "{}",
+        "status={} stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     let report = decoded(&output);
@@ -101,7 +103,14 @@ fn failed_office_conversion_has_structured_error_and_preserves_current() {
 
     let tmp = tempfile::tempdir().unwrap();
     fixture(tmp.path(), "rich-native.pdf");
-    assert!(invoke(tmp.path(), &["--ocr", "off"]).status.success());
+    let baseline = invoke(tmp.path(), &["--ocr", "off"]);
+    assert!(
+        baseline.status.success(),
+        "status={} stdout={} stderr={}",
+        baseline.status,
+        String::from_utf8_lossy(&baseline.stdout),
+        String::from_utf8_lossy(&baseline.stderr)
+    );
     let current = tmp.path().join(".gptgrep/CURRENT.json");
     let before = fs::read(&current).unwrap();
     fs::write(tmp.path().join("failure.docx"), b"mock Office source").unwrap();

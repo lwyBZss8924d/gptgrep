@@ -1329,7 +1329,7 @@ async fn font_word_v6_reader_preserves_exact_native_metadata_and_freshness() -> 
             .pages
             .iter()
             .all(|p| matches!(p.capabilities.get("native_recipe"),
-        Some(FeatureState::Present(r)) if r==gptgrep_parse::NATIVE_FONT_WORD_RECIPE))
+        Some(FeatureState::Present(r)) if r==gptgrep_parse::NATIVE_GRAPHICS_RECIPE))
     );
     let mut writer = RichGenerationWriter::begin(&root, budget.clone())?;
     writer.add_document("metadata-source.pdf", prepared.staging_root(), parsed)?;
@@ -1415,5 +1415,733 @@ async fn font_word_v6_forged_snapshot_and_recipe_cannot_publish_or_move_current(
         assert_eq!(fs::read(root.join(STATE).join("CURRENT.json"))?, pointer);
         assert_eq!(RichGenerationReader::open(&root)?.pin(), prior);
     }
+    Ok(())
+}
+
+async fn completed_native_graphics(
+    root: &Path,
+    long: bool,
+) -> Result<(
+    gptgrep_parse::PreparedDocument,
+    RichParsedDocument,
+    ResourceBudget,
+)> {
+    let bytes: &[u8] = if long {
+        include_bytes!("../../../../tests/fixtures/native-graphics-long-path.pdf")
+    } else {
+        include_bytes!("../../../../tests/fixtures/native-graphics.pdf")
+    };
+    fs::write(root.join("graphics.pdf"), bytes)?;
+    let budget = ResourceBudget::default();
+    let prepared = gptgrep_parse::prepare_document(
+        &root.join("graphics.pdf"),
+        &root.join("graphics-staging"),
+        &gptgrep_parse::PreparationOptions,
+        &budget,
+    )
+    .await?;
+    let candidate = gptgrep_parse::extract_native(
+        &prepared,
+        &gptgrep_parse::NativeOptions {
+            dpi: 72.,
+            render_pages: true,
+            page_window: 1,
+        },
+        &budget,
+    )
+    .await?;
+    let outcomes = candidate
+        .plan()
+        .tasks
+        .iter()
+        .map(declared_offline_ocr)
+        .collect::<Result<Vec<_>>>()?;
+    let parsed = gptgrep_parse::finalize_document(
+        candidate,
+        outcomes,
+        gptgrep_parse::OcrMode::Auto,
+        &budget,
+    )?;
+    Ok((prepared, parsed, budget))
+}
+async fn publish_native_graphics(root: &Path, long: bool) -> Result<RichGenerationReader> {
+    let (prepared, parsed, budget) = completed_native_graphics(root, long).await?;
+    let mut writer = RichGenerationWriter::begin(root, budget)?;
+    writer.add_document("graphics.pdf", prepared.staging_root(), parsed)?;
+    let pin = writer.publish()?;
+    RichGenerationReader::open_pinned(root, &pin)
+}
+fn metadata_request(
+    artifact: &str,
+    collection: &str,
+    page_size: usize,
+    max_output: usize,
+) -> serde_json::Value {
+    json!({"schema_version":"gptgrep.batch.rich.request.v1","operations":[{"id":"metadata","op":"inspect_native_metadata",
+        "artifact_id":artifact,"fields":["geometry","counts"],"collection":collection,"item_fields":[],"page_size":page_size,"max_output_bytes":max_output}]})
+}
+fn metadata_dispatch(
+    reader: &RichGenerationReader,
+    value: serde_json::Value,
+) -> Result<crate::rich_batch::RichBatchResponse> {
+    let request = crate::rich_batch::parse_rich_batch_request(&serde_json::to_vec(&value)?)?;
+    assert!(!request.requires_model());
+    Ok(crate::rich_batch::dispatch_rich_batch_with_reader(
+        reader, request,
+    )?)
+}
+#[tokio::test]
+async fn native_metadata_snapshot_exact_binding_aggregate_clone_and_freshness() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let reader = publish_native_graphics(&root, false).await?;
+    let doc = &reader.manifest()?.documents[0];
+    let id = doc.pages[0].metadata_artifact.id.clone();
+    let file_bytes = doc.pages[0].metadata_artifact.bytes;
+    let before = reader.read_metrics()?;
+    let below_scratch = NativeMetadataReadBudget {
+        max_working_bytes: 1,
+        ..Default::default()
+    };
+    assert!(
+        reader
+            .read_page_native_metadata(&id, &below_scratch)
+            .is_err()
+    );
+    assert_eq!(reader.read_metrics()?, before);
+    assert_eq!(reader.native_metadata_retained_bytes(), 0);
+    let small = NativeMetadataReadBudget {
+        max_artifact_bytes: file_bytes - 1,
+        ..Default::default()
+    };
+    assert!(reader.read_page_native_metadata(&id, &small).is_err());
+    assert_eq!(reader.native_metadata_retained_bytes(), 0);
+    let exact_bytes = fs::read(
+        reader
+            .dir
+            .join(&doc.pages[0].metadata_artifact.relative_path),
+    )?;
+    let upper = gptgrep_parse::native_metadata_working_upper(&exact_bytes)?;
+    let tight_working = NativeMetadataReadBudget {
+        max_working_bytes: upper - 1,
+        ..Default::default()
+    };
+    assert!(
+        reader
+            .read_page_native_metadata(&id, &tight_working)
+            .is_err()
+    );
+    assert_eq!(reader.native_metadata_retained_bytes(), 0);
+    let snapshot = reader.read_page_native_metadata(&id, &NativeMetadataReadBudget::default())?;
+    assert_eq!(snapshot.binding().artifact_id, id);
+    assert_eq!(snapshot.binding().generation, reader.pin());
+    assert_eq!(snapshot.objects().unwrap().len(), 7);
+    assert!(
+        snapshot
+            .native_text()
+            .characters
+            .iter()
+            .any(|c| matches!(c.font, FeatureState::Present(_)))
+    );
+    assert!(
+        snapshot
+            .page()
+            .text_items
+            .iter()
+            .any(|i| !i.words.is_empty())
+    );
+    let held = reader.native_metadata_retained_bytes();
+    assert_eq!(held, snapshot.retained_bytes());
+    assert_eq!(held, upper);
+    let clone = snapshot.clone();
+    assert!(std::ptr::eq(snapshot.native_text(), clone.native_text()));
+    drop(snapshot);
+    assert_eq!(reader.clone().native_metadata_retained_bytes(), held);
+    let tight = NativeMetadataReadBudget {
+        max_working_bytes: held + 1024,
+        ..Default::default()
+    };
+    assert!(
+        reader
+            .clone()
+            .read_page_native_metadata(&id, &tight)
+            .is_err()
+    );
+    assert_eq!(reader.native_metadata_retained_bytes(), held);
+    let doc_id = doc
+        .artifacts
+        .iter()
+        .find(|a| a.artifact.kind == ArtifactKind::NativeMetadata && a.artifact.page.is_none())
+        .unwrap()
+        .artifact
+        .id
+        .clone();
+    assert!(
+        reader
+            .read_page_native_metadata(&doc_id, &NativeMetadataReadBudget::default())
+            .is_err()
+    );
+    assert!(reader.read_text(&id, 0, 100).is_err());
+    let text = reader.read_text(&doc.pages[0].native_text.id, 0, 64)?;
+    assert!(matches!(text.evidence, EvidenceRef::NativeText { .. }));
+    reader.validate_text_evidence(&text.evidence)?;
+    let metadata_path = reader
+        .dir
+        .join(&doc.pages[0].metadata_artifact.relative_path);
+    let saved = fs::read(&metadata_path)?;
+    fs::write(&metadata_path, b"changed metadata")?;
+    assert!(reader.recheck_native_metadata(&clone).is_err());
+    assert!(
+        reader
+            .read_page_native_metadata(&id, &NativeMetadataReadBudget::default())
+            .is_err()
+    );
+    fs::write(metadata_path, saved)?;
+    let prepared_path = reader.dir.join(&doc.prepared_path);
+    let saved = fs::read(&prepared_path)?;
+    fs::write(&prepared_path, b"changed prepared")?;
+    assert!(reader.recheck_native_metadata(&clone).is_err());
+    assert!(
+        reader
+            .read_page_native_metadata(&id, &NativeMetadataReadBudget::default())
+            .is_err()
+    );
+    fs::write(prepared_path, saved)?;
+    fs::write(root.join("graphics.pdf"), b"changed source")?;
+    assert!(
+        reader
+            .read_page_native_metadata(&id, &NativeMetadataReadBudget::default())
+            .is_err()
+    );
+    assert!(reader.recheck_native_metadata(&clone).is_err());
+    drop(clone);
+    assert_eq!(reader.native_metadata_retained_bytes(), 0);
+    Ok(())
+}
+#[tokio::test]
+async fn native_metadata_batch_long_path_pagination_cursor_binding_and_non_citation() -> Result<()>
+{
+    use crate::rich_batch::{RichBatchErrorCode, RichBatchStatus};
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let reader = publish_native_graphics(&root, true).await?;
+    let id = reader.manifest()?.documents[0].pages[0]
+        .metadata_artifact
+        .id
+        .clone();
+    let snapshot = reader.read_page_native_metadata(&id, &NativeMetadataReadBudget::default())?;
+    let object = snapshot
+        .objects()
+        .unwrap()
+        .iter()
+        .find(|o| o.path.is_some())
+        .unwrap();
+    let object_id = object.id.clone();
+    let expected = serde_json::to_value(&object.path.as_ref().unwrap().segments)?;
+    drop(snapshot);
+    let mut request = metadata_request(&id, "path_segments", 37, 12_000);
+    request["operations"][0]["object_id"] = json!(object_id);
+    let first = metadata_dispatch(&reader, request.clone())?;
+    assert_eq!(first.items[0].status, RichBatchStatus::Ok);
+    assert_eq!(
+        first.items[0].result.as_ref().unwrap()["metadata_only"],
+        true
+    );
+    assert_eq!(
+        first.items[0].result.as_ref().unwrap()["citation_authority"],
+        false
+    );
+    let first_cursor = first.items[0]
+        .coverage
+        .cursor
+        .clone()
+        .expect("long path continues");
+    let mut rows = first.items[0].result.as_ref().unwrap()["rows"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(rows.len(), 37);
+    assert!(serde_json::from_value::<EvidenceRef>(rows[0].clone()).is_err());
+    let mut cursor = Some(first_cursor.clone());
+    drop(first);
+    while let Some(token) = cursor {
+        request["operations"][0]["cursor"] = json!(token);
+        let page = metadata_dispatch(&reader, request.clone())?;
+        assert_eq!(page.items[0].status, RichBatchStatus::Ok);
+        assert_eq!(page.items[0].coverage.start, rows.len());
+        rows.extend(
+            page.items[0].result.as_ref().unwrap()["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .cloned(),
+        );
+        cursor = page.items[0].coverage.cursor.clone();
+    }
+    assert_eq!(serde_json::Value::Array(rows), expected);
+    let snapshot = reader.read_page_native_metadata(&id, &NativeMetadataReadBudget::default())?;
+    let saved_binding = serde_json::to_value(snapshot.binding())?;
+    drop(snapshot);
+    // The token is public integrity data, not an authorization capability.
+    // Even a recomputed token checksum cannot change its exact resource pin.
+    let token_bytes = first_cursor
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 16).unwrap())
+        .collect::<Vec<_>>();
+    let original_token: serde_json::Value = serde_json::from_slice(&token_bytes)?;
+    assert_eq!(original_token["body"]["binding"], saved_binding);
+    for key in [
+        "artifact_id",
+        "artifact_sha256",
+        "source_sha256",
+        "prepared_sha256",
+        "native_profile_sha256",
+        "recipe",
+        "document_id",
+        "page",
+        "generation",
+    ] {
+        let mut token = original_token.clone();
+        token["body"]["binding"][key] = if key == "page" {
+            json!(2)
+        } else if key == "generation" {
+            json!({"generation":"different","manifest_sha256":"0".repeat(64)})
+        } else {
+            json!("0".repeat(64))
+        };
+        token["sha256"] = json!(digest(&serde_json::to_vec(&token["body"])?));
+        let token = serde_json::to_vec(&token)?
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let mut changed = request.clone();
+        changed["operations"][0]["cursor"] = json!(token);
+        let response = metadata_dispatch(&reader, changed)?;
+        assert_eq!(
+            response.items[0].error.as_ref().unwrap().code,
+            RichBatchErrorCode::InvalidCursor,
+            "binding {key}"
+        );
+    }
+    request["operations"][0]["cursor"] = json!(first_cursor);
+    for field in [
+        "page_size",
+        "max_output_bytes",
+        "fields",
+        "item_fields",
+        "object_id",
+        "collection",
+    ] {
+        let mut changed = request.clone();
+        changed["operations"][0][field] = match field {
+            "page_size" => json!(38),
+            "max_output_bytes" => json!(12_001),
+            "fields" => json!(["counts"]),
+            "item_fields" => json!(["ordinal"]),
+            "object_id" => json!("0".repeat(64)),
+            _ => json!("object_summaries"),
+        };
+        if field == "collection" {
+            changed["operations"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("object_id");
+        }
+        let response = metadata_dispatch(&reader, changed)?;
+        assert!(matches!(
+            response.items[0].error.as_ref().unwrap().code,
+            RichBatchErrorCode::InvalidCursor | RichBatchErrorCode::ResourceNotFound
+        ));
+    }
+    let mut tiny = metadata_request(&id, "object_summaries", 1, 256);
+    let response = metadata_dispatch(&reader, tiny.clone())?;
+    assert_eq!(
+        response.items[0].error.as_ref().unwrap().code,
+        RichBatchErrorCode::OutputBudgetInsufficient
+    );
+    assert!(response.items[0].coverage.cursor.is_none());
+    tiny["operations"][0]["fields"] = json!(["invented"]);
+    assert!(crate::rich_batch::parse_rich_batch_request(&serde_json::to_vec(&tiny)?).is_err());
+    tiny["operations"][0]["fields"] = json!([]);
+    tiny["operations"][0]["unknown_option"] = json!(true);
+    assert!(crate::rich_batch::parse_rich_batch_request(&serde_json::to_vec(&tiny)?).is_err());
+    Ok(())
+}
+#[tokio::test]
+async fn native_metadata_owned_batch_values_and_clones_keep_aggregate_leases() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let reader = publish_native_graphics(&root, false).await?;
+    let id = reader.manifest()?.documents[0].pages[0]
+        .metadata_artifact
+        .id
+        .clone();
+    let mut request = metadata_request(&id, "object_summaries", 2, 16_384);
+    let mut second = request["operations"][0].clone();
+    second["id"] = json!("later");
+    second["collection"] = json!("native_characters");
+    request["operations"].as_array_mut().unwrap().push(second);
+    let response = metadata_dispatch(&reader, request)?;
+    assert!(response.items.iter().all(|i| i.error.is_none()));
+    let held = reader.native_metadata_retained_bytes();
+    assert_eq!(held, 2 * 16_384 * 64);
+    let clone = response.clone();
+    assert!(std::ptr::eq::<serde_json::Value>(
+        &**response.items[0].result.as_ref().unwrap(),
+        &**clone.items[0].result.as_ref().unwrap()
+    ));
+    let value = clone.items[0].result.clone().unwrap();
+    let wire = serde_json::to_value(&response)?;
+    assert!(wire["items"][0].get("metadata_lease").is_none());
+    drop(response);
+    assert_eq!(reader.native_metadata_retained_bytes(), held);
+    drop(clone);
+    assert_eq!(reader.native_metadata_retained_bytes(), 16_384 * 64);
+    assert!(value["rows"].is_array());
+    drop(value);
+    assert_eq!(reader.native_metadata_retained_bytes(), 0);
+    Ok(())
+}
+#[tokio::test]
+async fn native_metadata_manifest_streaming_and_concurrent_scratch_share_admission() -> Result<()> {
+    use super::native_metadata::NATIVE_METADATA_FRESHNESS_SCRATCH as SCRATCH;
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let initial = publish_native_graphics(&root, false).await?;
+    let artifact = initial.manifest.documents[0].pages[0]
+        .metadata_artifact
+        .clone();
+    let metadata = fs::read(initial.dir.join(&artifact.relative_path))?;
+    let upper = gptgrep_parse::native_metadata_working_upper(&metadata)?;
+    drop(metadata);
+    let working = upper + 8 * SCRATCH;
+    // Whitespace keeps the typed manifest and every document/artifact binding
+    // unchanged, while the manifest payload exceeds this operation's budget.
+    let padded_len = working + 2 * SCRATCH;
+    assert!(
+        padded_len < MAX_MANIFEST_BYTES
+            && 2 * upper + 2 * SCRATCH < MAX_NATIVE_METADATA_WORKING_BYTES
+    );
+    let manifest_path = initial.dir.join("manifest.json");
+    let manifest = fs::read(&manifest_path)?;
+    assert!(manifest.len() < padded_len as usize);
+    let mut padded = vec![b' '; padded_len as usize - manifest.len()];
+    padded.extend_from_slice(&manifest);
+    let mut pin = initial.pin();
+    pin.manifest_sha256 = digest(&padded);
+    fs::write(&manifest_path, &padded)?;
+    drop(padded);
+    drop(manifest);
+    drop(initial);
+    // Initial opening has its existing manifest ownership contract. Only the
+    // subsequent selected operation is under the tighter metadata allowance.
+    let reader = RichGenerationReader::open_pinned(&root, &pin)?;
+    let budget = NativeMetadataReadBudget {
+        max_working_bytes: working,
+        ..Default::default()
+    };
+    let before = reader.read_metrics()?;
+    let snapshot = reader.read_page_native_metadata(&artifact.id, &budget)?;
+    let after = reader.read_metrics()?;
+    assert!(after.observed_rust_read_bytes - before.observed_rust_read_bytes >= padded_len);
+    assert_eq!(snapshot.retained_bytes(), upper);
+    assert_eq!(reader.native_metadata_retained_bytes(), upper);
+    reader.recheck_native_metadata(&snapshot)?;
+
+    let response = metadata_dispatch(
+        &reader,
+        metadata_request(&artifact.id, "object_summaries", 1, 16_384),
+    )?;
+    assert!(response.items[0].error.is_none());
+    let value = response.items[0].result.clone().unwrap();
+    drop(response);
+    let held = reader.native_metadata_retained_bytes();
+    assert_eq!(held, upper + 16_384 * 64);
+    let exhausted = NativeMetadataReadBudget {
+        max_working_bytes: held + SCRATCH - 1,
+        ..Default::default()
+    };
+    let before = reader.read_metrics()?;
+    let start = std::sync::Barrier::new(3);
+    std::thread::scope(|scope| {
+        let one = scope.spawn(|| {
+            start.wait();
+            reader
+                .clone()
+                .read_page_native_metadata(&artifact.id, &exhausted)
+                .is_err()
+        });
+        let two = scope.spawn(|| {
+            start.wait();
+            reader
+                .clone()
+                .read_page_native_metadata(&artifact.id, &exhausted)
+                .is_err()
+        });
+        start.wait();
+        assert!(one.join().unwrap() && two.join().unwrap());
+    });
+    assert_eq!(reader.read_metrics()?, before);
+    assert_eq!(reader.native_metadata_retained_bytes(), held);
+    assert!(value["rows"].is_array());
+    drop(value);
+    drop(snapshot);
+    assert_eq!(reader.native_metadata_retained_bytes(), 0);
+
+    // Both completed reads retain their snapshots at this barrier. Admission
+    // and release are observable without timing assumptions or sleeps.
+    let retained = std::sync::Barrier::new(3);
+    let release = std::sync::Barrier::new(3);
+    std::thread::scope(|scope| {
+        let read = || {
+            let result = reader
+                .clone()
+                .read_page_native_metadata(&artifact.id, &NativeMetadataReadBudget::default());
+            retained.wait();
+            release.wait();
+            result.map(|snapshot| snapshot.retained_bytes())
+        };
+        let one = scope.spawn(read);
+        let two = scope.spawn(read);
+        retained.wait();
+        let observed = reader.native_metadata_retained_bytes();
+        release.wait();
+        assert_eq!(one.join().unwrap().unwrap(), upper);
+        assert_eq!(two.join().unwrap().unwrap(), upper);
+        assert_eq!(observed, 2 * upper);
+    });
+    assert_eq!(reader.native_metadata_retained_bytes(), 0);
+    fs::write(&manifest_path, b"changed manifest")?;
+    assert!(
+        reader
+            .read_page_native_metadata(&artifact.id, &NativeMetadataReadBudget::default())
+            .is_err()
+    );
+    assert_eq!(reader.native_metadata_retained_bytes(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_metadata_forged_complete_geometry_cannot_publish_or_move_current() -> Result<()> {
+    for case in 0..7 {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let prior = publish(&root, &["Prior native metadata generation\n"])?;
+        let current = fs::read(root.join(STATE).join("CURRENT.json"))?;
+        let (prepared, mut parsed, budget) = completed_native_graphics(&root, false).await?;
+        let old = parsed.pages[0].metadata_artifact.id.clone();
+        let path = prepared
+            .staging_root()
+            .join(&parsed.pages[0].metadata_artifact.relative_path);
+        let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        match case {
+            0 => value["objects"][3]["path"]["segments"][0]["page_point"][0] = json!(999.),
+            1 => value["graphics"]["object_count"] = json!(0),
+            2 => value["objects"][0]["id"] = json!("0".repeat(64)),
+            3 => value["graphics"]["content_bounds"] = json!({"state":"absent"}),
+            4 => value["objects"][5]["image"]["page_quad"][0][0] = json!(999.),
+            5 => {
+                assert_eq!(parsed.pages[0].geometry.user_unit, 2.0);
+                value["geometry"]["user_unit"] = json!(3.0);
+                parsed.pages[0].geometry.user_unit = 3.0;
+            }
+            _ => {
+                assert_eq!(parsed.pages[0].geometry.rotation_quarter_turns, 1);
+                value["geometry"]["rotation_quarter_turns"] = json!(2);
+                parsed.pages[0].geometry.rotation_quarter_turns = 2;
+            }
+        }
+        let bytes = serde_json::to_vec(&value)?;
+        fs::write(&path, &bytes)?;
+        let artifact = &mut parsed.pages[0].metadata_artifact;
+        artifact.sha256 = digest(&bytes);
+        artifact.bytes = bytes.len() as u64;
+        artifact.id = gptgrep_parse::artifact_id(
+            &parsed.summary.source_sha256,
+            &artifact.profile_sha256,
+            &artifact.kind,
+            artifact.page,
+            None,
+            &artifact.sha256,
+        )?;
+        *parsed.artifacts.iter_mut().find(|a| a.id == old).unwrap() = artifact.clone();
+        let mut writer = RichGenerationWriter::begin(&root, budget)?;
+        assert!(
+            writer
+                .add_document("graphics.pdf", prepared.staging_root(), parsed)
+                .is_err()
+        );
+        assert_eq!(fs::read(root.join(STATE).join("CURRENT.json"))?, current);
+        assert_eq!(RichGenerationReader::open(&root)?.pin(), prior);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_metadata_v6_font_projection_stays_qualified_and_graphics_requires_rebuild()
+-> Result<()> {
+    // Authored v6-compatible fixture from retained native font observations.
+    // This is source compatibility evidence, not a historical producer replay.
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let budget = ResourceBudget::default();
+    let (prepared, mut parsed) = completed_document_metadata(&root, &budget).await?;
+    let doc_index = parsed
+        .artifacts
+        .iter()
+        .position(|a| a.kind == ArtifactKind::NativeMetadata && a.page.is_none())
+        .unwrap();
+    let doc_meta: gptgrep_parse::NativeDocumentMetadata = serde_json::from_slice(&fs::read(
+        prepared
+            .staging_root()
+            .join(&parsed.artifacts[doc_index].relative_path),
+    )?)?;
+    let profile = gptgrep_parse::native_font_word_profile_digest(
+        &parsed.summary,
+        doc_meta.native_dpi,
+        doc_meta.native_render_pages,
+    )?;
+    let mut remapped = BTreeMap::new();
+    let mut doc_artifact = parsed.artifacts[doc_index].clone();
+    let old_doc = doc_artifact.id.clone();
+    doc_artifact.profile_sha256 = profile.clone();
+    doc_artifact.id = gptgrep_parse::artifact_id(
+        &parsed.summary.source_sha256,
+        &profile,
+        &doc_artifact.kind,
+        None,
+        None,
+        &doc_artifact.sha256,
+    )?;
+    remapped.insert(old_doc, doc_artifact.clone());
+    parsed.artifacts[doc_index] = doc_artifact.clone();
+    for page in &mut parsed.pages {
+        page.capabilities.insert(
+            "native_recipe".into(),
+            FeatureState::Present(gptgrep_parse::NATIVE_FONT_WORD_RECIPE.into()),
+        );
+        page.capabilities.insert(
+            "document_metadata".into(),
+            FeatureState::Present(doc_artifact.id.clone()),
+        );
+        if matches!(
+            page.capabilities.get("bookmarks"),
+            Some(FeatureState::Present(_))
+        ) {
+            page.capabilities.insert(
+                "bookmarks".into(),
+                FeatureState::Present(doc_artifact.id.clone()),
+            );
+        }
+        page.capabilities.remove("native_layout_graphics");
+        page.capabilities.remove("native_content_bounds_semantics");
+        page.capabilities.remove("native_character_geometry");
+        page.capabilities.insert("vector_objects".into(),FeatureState::Present("count-admitted raw path segments/object matrices; ancestor geometry is unsupported".into()));
+        let old = page.metadata_artifact.id.clone();
+        let path = prepared
+            .staging_root()
+            .join(&page.metadata_artifact.relative_path);
+        let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        value.as_object_mut().unwrap().remove("graphics");
+        value["objects"] = json!([]);
+        value["page"]
+            .as_object_mut()
+            .unwrap()
+            .remove("content_bounds");
+        value["page"]
+            .as_object_mut()
+            .unwrap()
+            .remove("vector_graphics");
+        value["capabilities"] = serde_json::to_value(&page.capabilities)?;
+        let bytes = serde_json::to_vec(&value)?;
+        fs::write(path, &bytes)?;
+        let artifact = &mut page.metadata_artifact;
+        artifact.bytes = bytes.len() as u64;
+        artifact.sha256 = digest(&bytes);
+        artifact.profile_sha256 = profile.clone();
+        artifact.id = gptgrep_parse::artifact_id(
+            &parsed.summary.source_sha256,
+            &profile,
+            &artifact.kind,
+            artifact.page,
+            None,
+            &artifact.sha256,
+        )?;
+        remapped.insert(old, artifact.clone());
+        let old = page.native_text.id.clone();
+        page.native_text.profile_sha256 = profile.clone();
+        page.native_text.id = gptgrep_parse::artifact_id(
+            &parsed.summary.source_sha256,
+            &profile,
+            &page.native_text.kind,
+            page.native_text.page,
+            None,
+            &page.native_text.sha256,
+        )?;
+        remapped.insert(old, page.native_text.clone());
+    }
+    for artifact in &mut parsed.artifacts {
+        if let Some(next) = remapped.get(&artifact.id) {
+            *artifact = next.clone();
+        }
+    }
+    for segment in &mut parsed.segments {
+        if let Some(next) = remapped.get(&segment.artifact_id) {
+            segment.artifact_id = next.id.clone();
+        }
+    }
+    parsed.native_profile_sha256 = profile;
+    let mut writer = RichGenerationWriter::begin(&root, budget)?;
+    writer.add_document("metadata-source.pdf", prepared.staging_root(), parsed)?;
+    let pin = writer.publish()?;
+    let reader = RichGenerationReader::open_pinned(&root, &pin)?;
+    reader.verify_all()?;
+    let artifact = reader.manifest()?.documents[0].pages[0]
+        .metadata_artifact
+        .id
+        .clone();
+    let snapshot =
+        reader.read_page_native_metadata(&artifact, &NativeMetadataReadBudget::default())?;
+    assert_eq!(
+        snapshot.binding().recipe,
+        gptgrep_parse::NATIVE_FONT_WORD_RECIPE
+    );
+    assert!(snapshot.graphics().is_none());
+    assert!(snapshot.objects().is_none());
+    assert!(!snapshot.native_text().characters.is_empty());
+    drop(snapshot);
+    let mut request = metadata_request(&artifact, "native_characters", 2, 16_384);
+    request["operations"][0]["item_fields"] = json!(["ordinal", "font", "geometry"]);
+    assert!(
+        metadata_dispatch(&reader, request)?.items[0]
+            .error
+            .is_none()
+    );
+    assert_eq!(
+        metadata_dispatch(
+            &reader,
+            metadata_request(&artifact, "object_summaries", 2, 16_384)
+        )?
+        .items[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .code,
+        crate::rich_batch::RichBatchErrorCode::InvalidOperation
+    );
+    let strict = RichGenerationReader::open_pinned_with_cache_budget(
+        &root,
+        &pin,
+        &ReaderCacheBudget {
+            strict_cache_only: true,
+            ..Default::default()
+        },
+    )?;
+    assert!(
+        strict
+            .read_page_native_metadata(&artifact, &NativeMetadataReadBudget::default())
+            .is_err()
+    );
     Ok(())
 }

@@ -171,7 +171,7 @@ impl Handle {
             "host_rich_tool_allowlist"
         );
         let arguments = frame["params"]["arguments"].take();
-        crate::rich_text::measure(&arguments, 4096)?;
+        crate::rich_text::measure(&arguments, crate::rich_text::argument_limit(&tool))?;
         if tool == "gptgrep_render" && self.visual_enabled() {
             RenderRequest::parse(&arguments)?;
         } else {

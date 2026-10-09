@@ -364,6 +364,114 @@ async fn model_only_exposure_metadata_and_forged_refs_never_mint_image_citations
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn native_metadata_shared_schema_and_actual_multimodal_rpc_never_mint_citations() -> Result<()>
+{
+    fn native_tool(catalog: &Value) -> &Value {
+        catalog[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == crate::rich_text::NATIVE_METADATA_TOOL)
+            .unwrap()
+    }
+    assert_eq!(
+        native_tool(&tools()),
+        native_tool(&crate::rich_text::tools())
+    );
+    let (_temp, reader) = crate::rich_text::tests::native_metadata_generation(false).await?;
+    let execution = crate::rich_text::tests::context(2)?;
+    let (endpoint, server) = crate::rich_text::tests::mock(2, Arc::new(|_| Ok(())), false).await?;
+    let config = HostConfig {
+        max_tool_calls: 64,
+        ..config()
+    };
+    let mut options = RichMultimodalHostOptions::default();
+    options.retrieval.require_shared_ledger = false;
+    let prepared = prepare_rich_multimodal_host(
+        reader.clone(),
+        crate::rich_text::tests::client(&endpoint, execution.clone())?,
+        "same neutral question",
+        &config,
+        &options,
+    )?;
+    let initial = prepared.bootstrap.execute().await?;
+    assert_eq!(server.await??.len(), 2);
+    let mut evidence = from_initial(
+        initial,
+        8,
+        prepared.deadline,
+        None,
+        options.retrieval.resources,
+    )?;
+    let (host, server) = tokio::io::duplex(262144);
+    let (read, write) = tokio::io::split(host);
+    let peer = tokio::spawn(crate::rich_text::tests::native_metadata_rpc_peer(
+        server, None, false,
+    ));
+    let deadline = evidence.deadline;
+    let result = protocol::run_observed_budget(
+        read,
+        write,
+        Path::new("."),
+        &config,
+        protocol::Workflow::RichMultimodal {
+            question: "same neutral question",
+            evidence: &mut evidence,
+        },
+        None,
+        protocol::RunOptions::default(),
+        crate::transport::TransportBudget::new(protocol::MAX_TOTAL_BYTES),
+        deadline,
+    )
+    .await;
+    let outcome = match result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            peer.abort();
+            let _ = peer.await;
+            return Err(error);
+        }
+    };
+    let frames = peer.await??;
+    assert_eq!(frames.len(), 2);
+    assert!(finish(&evidence, &outcome.answer)?.citations.is_empty());
+    let body: Value = serde_json::from_str(
+        frames[1]["result"]["contentItems"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )?;
+    let metadata = &body["result"]["items"][0]["result"];
+    assert_eq!(metadata["metadata_only"], true);
+    assert_eq!(metadata["citation_authority"], false);
+    assert_eq!(
+        frames[1]["result"]["contentItems"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let id = &metadata["binding"]["artifact_id"];
+    for citation in [
+        json!({"kind":"image","issued_id":id}),
+        json!({"kind":"text","issued_id":id,"offset":0,"length":1,"quote":"x"}),
+    ] {
+        assert!(
+            finish(
+                &evidence,
+                &json!({"answer":"claim","insufficient_evidence":false,
+            "citations":[citation]})
+                .to_string()
+            )
+            .is_err()
+        );
+    }
+    assert_eq!(reader.native_metadata_retained_bytes(), 0);
+    assert_eq!(evidence.delivery.as_ref().unwrap().retained_bytes(), 0);
+    assert_eq!(execution.snapshot()?.submission_observations, 2);
+    Ok(())
+}
 #[tokio::test]
 async fn same_question_different_images_and_post_delivery_tampering_stay_distinct() -> Result<()> {
     let mut hashes = vec![];

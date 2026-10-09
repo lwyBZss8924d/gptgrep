@@ -16,10 +16,17 @@ const NO_FONT: &str = "pdfium_font_zero_length_unavailable_or_getter_failure";
 const UNKNOWN_NAME: &str =
     "native_font_names_incomplete; character_states_retain_zero_length_or_encoding_ambiguity";
 const NO_SIZE: &str = "pdfium_font_size_nonpositive_or_nonfinite_or_getter_failure";
+pub(crate) const UNCLIPPED_GEOMETRY: &str = "finite-signed-native-viewport-bounds-v1; unclipped-character-and-glyph-word-unions; finite-f32-endpoints; not-visible-pixel-or-evidence-bounds";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum NativeBoundsPolicy {
+    LegacyViewport,
+    UnclippedV7,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct NativeFontInfo {
+pub struct NativeFontInfo {
     pub raw_name: Vec<u8>,
     pub name: FeatureState<String>,
     pub flags: i32,
@@ -29,7 +36,7 @@ pub(super) struct NativeFontInfo {
 #[serde(deny_unknown_fields)]
 /// The observed native box transformed into the existing f32 viewport frame.
 /// Zero-area observations remain zero-area; MissingBox carries no rectangle.
-pub(super) struct NativeBounds {
+pub struct NativeBounds {
     pub x: f32,
     pub y: f32,
     pub width: f32,
@@ -43,7 +50,7 @@ pub(super) struct NativeBounds {
     rename_all = "snake_case",
     deny_unknown_fields
 )]
-pub(super) enum NativeGeometry {
+pub enum NativeGeometry {
     MissingBox,
     ZeroArea(NativeBounds),
     Positioned(NativeBounds),
@@ -51,7 +58,7 @@ pub(super) enum NativeGeometry {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct NativeCharacter {
+pub struct NativeCharacter {
     pub ordinal: u32,
     /// Exact native u32, even when it is not a Unicode scalar value.
     pub unicode: u32,
@@ -79,7 +86,7 @@ pub(super) struct NativeCharacterObservation {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct NativeTextMetadata {
+pub struct NativeTextMetadata {
     pub schema_version: String,
     pub source_sha256: String,
     pub prepared_sha256: String,
@@ -132,6 +139,7 @@ fn validate_character(
     width: f32,
     height: f32,
     budget: &ResourceBudget,
+    policy: NativeBoundsPolicy,
 ) -> Result<()> {
     let c = character(value);
     let bounds = match &value.geometry {
@@ -156,12 +164,19 @@ fn validate_character(
             [b.x, b.y, b.width, b.height].iter().all(|n| n.is_finite())
                 && b.width >= 0.0
                 && b.height >= 0.0
-                && b.x >= -1.0
-                && b.y >= -1.0
-                && b.x + b.width <= width + 1.0
-                && b.y + b.height <= height + 1.0,
+                && (b.x + b.width).is_finite()
+                && (b.y + b.height).is_finite(),
             "native character geometry invalid"
         );
+        if policy == NativeBoundsPolicy::LegacyViewport {
+            ensure!(
+                b.x >= -1.0
+                    && b.y >= -1.0
+                    && b.x + b.width <= width + 1.0
+                    && b.y + b.height <= height + 1.0,
+                "native character geometry invalid"
+            );
+        }
     }
     match &value.font_size {
         FeatureState::Present(size) => {
@@ -208,6 +223,7 @@ pub(super) fn collect_characters(
     width: f32,
     height: f32,
     budget: &ResourceBudget,
+    policy: NativeBoundsPolicy,
     mut observe: impl FnMut(u32) -> Result<NativeCharacterObservation>,
 ) -> Result<Vec<NativeCharacter>> {
     budget.validate()?;
@@ -245,7 +261,7 @@ pub(super) fn collect_characters(
             font_weight: observation.font_weight,
             font: observation.font,
         };
-        validate_character(&value, width, height, budget)?;
+        validate_character(&value, width, height, budget, policy)?;
         characters.push(value);
     }
     Ok(characters)
@@ -360,6 +376,36 @@ pub(super) fn glyph_runs(characters: &[NativeCharacter]) -> Vec<TextItem> {
     runs
 }
 
+/// V7 retains unclipped native positions in its layout DTO as well as the
+/// character stream. It never clamps or removes a glyph to fit the viewport.
+/// Even finite individual glyphs can overflow a merged run/word union.
+pub(super) fn unclipped_glyph_runs(characters: &[NativeCharacter]) -> Result<Vec<TextItem>> {
+    let runs = glyph_runs(characters);
+    validate_unclipped_layout(&runs)?;
+    Ok(runs)
+}
+
+fn validate_unclipped_layout(items: &[TextItem]) -> Result<()> {
+    let valid = |x: f32, y: f32, width: f32, height: f32| {
+        [x, y, width, height, x + width, y + height, width * height]
+            .iter()
+            .all(|v| v.is_finite())
+            && width > 0.0
+            && height > 0.0
+    };
+    ensure!(
+        items
+            .iter()
+            .all(|item| valid(item.x, item.y, item.width, item.height)
+                && item
+                    .words
+                    .iter()
+                    .all(|word| valid(word.x, word.y, word.width, word.height))),
+        "native unclipped glyph/word union overflow or invalid geometry"
+    );
+    Ok(())
+}
+
 pub(super) fn capabilities(
     characters: &[NativeCharacter],
 ) -> (FeatureState<String>, FeatureState<String>) {
@@ -386,7 +432,7 @@ pub(super) fn capabilities(
     (fonts, words)
 }
 
-pub(super) fn metadata(
+pub(crate) fn metadata(
     summary: &PreparedSummary,
     page: u32,
     count: u32,
@@ -433,6 +479,37 @@ pub fn validate_native_text_metadata(
     physical_page: u32,
     budget: &ResourceBudget,
 ) -> Result<()> {
+    validate_text_metadata(
+        bytes,
+        summary,
+        physical_page,
+        budget,
+        NativeBoundsPolicy::LegacyViewport,
+    )
+}
+
+pub(crate) fn validate_native_text_metadata_unclipped(
+    bytes: &[u8],
+    summary: &PreparedSummary,
+    physical_page: u32,
+    budget: &ResourceBudget,
+) -> Result<()> {
+    validate_text_metadata(
+        bytes,
+        summary,
+        physical_page,
+        budget,
+        NativeBoundsPolicy::UnclippedV7,
+    )
+}
+
+fn validate_text_metadata(
+    bytes: &[u8],
+    summary: &PreparedSummary,
+    physical_page: u32,
+    budget: &ResourceBudget,
+    policy: NativeBoundsPolicy,
+) -> Result<()> {
     budget.validate()?;
     ensure!(
         physical_page > 0 && physical_page <= crate::MAX_NATIVE_PAGES,
@@ -454,6 +531,13 @@ pub fn validate_native_text_metadata(
     let envelope: Envelope = serde_json::from_slice(bytes)
         .context("native character/font/word metadata missing or invalid")?;
     let text = &envelope.native_text_metadata;
+    if policy == NativeBoundsPolicy::UnclippedV7 {
+        ensure!(
+            matches!(envelope.capabilities.get("native_character_geometry"),
+            Some(FeatureState::Present(recipe)) if recipe == UNCLIPPED_GEOMETRY),
+            "native unclipped character geometry recipe missing"
+        );
+    }
     ensure!(
         text.schema_version == TEXT_SCHEMA
             && text.stream_recipe == STREAM_RECIPE
@@ -488,9 +572,14 @@ pub fn validate_native_text_metadata(
             envelope.page.page_width,
             envelope.page.page_height,
             budget,
+            policy,
         )?;
     }
     let expected = glyph_runs(&text.characters);
+    if policy == NativeBoundsPolicy::UnclippedV7 {
+        validate_unclipped_layout(&expected)?;
+        validate_unclipped_layout(&envelope.page.text_items)?;
+    }
     crate::resource::encoded_size(&expected, budget.page_layout_bytes)?;
     crate::resource::encoded_size(&envelope.page.text_items, budget.page_layout_bytes)?;
     ensure!(
@@ -512,7 +601,7 @@ pub fn validate_native_text_metadata(
     Ok(())
 }
 
-pub(super) fn stream_recipe() -> &'static str {
+pub(crate) fn stream_recipe() -> &'static str {
     STREAM_RECIPE
 }
 

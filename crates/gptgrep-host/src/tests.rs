@@ -871,7 +871,7 @@ fn process_uses_only_the_selected_profile_and_does_not_modify_it() {
     let cwd = tempfile::tempdir().unwrap();
     let config = home.path().join("config.toml");
     std::fs::write(&config, "# profile sentinel\n").unwrap();
-    let command = process_command(Path::new("codex"), cwd.path(), home.path()).unwrap();
+    let command = process_command(Path::new("codex"), cwd.path(), home.path(), None).unwrap();
     let env: std::collections::BTreeMap<_, _> = command.as_std().get_envs().collect();
     assert_eq!(
         env[std::ffi::OsStr::new("CODEX_HOME")],
@@ -895,10 +895,80 @@ fn process_uses_only_the_selected_profile_and_does_not_modify_it() {
             "sqlite_home={}",
             serde_json::to_string(home.path()).unwrap()
         )));
+    assert!(!args.iter().any(|arg| arg.starts_with("log_dir=")));
+    assert!(HostConfig::default().codex_state_dir.is_none());
     assert_eq!(
         std::fs::read_to_string(config).unwrap(),
         "# profile sentinel\n"
     );
+}
+
+#[test]
+fn explicit_native_state_overrides_inherited_sqlite_without_changing_account_home() {
+    let home = tempfile::tempdir().unwrap();
+    let state_directory = tempfile::tempdir().unwrap();
+    let state = state_directory.path().canonicalize().unwrap();
+    std::fs::create_dir(state.join("logs")).unwrap();
+    let command = process_command(Path::new("codex"), &state, home.path(), Some(&state)).unwrap();
+    let env: std::collections::BTreeMap<_, _> = command.as_std().get_envs().collect();
+    // This explicit removal wins even if the parent inherited an internal home.
+    // No process-global environment mutation or child process is needed.
+    assert_eq!(env[std::ffi::OsStr::new("CODEX_SQLITE_HOME")], None);
+    assert_eq!(
+        env[std::ffi::OsStr::new("CODEX_HOME")],
+        Some(home.path().as_os_str())
+    );
+    let args: Vec<_> = command
+        .as_std()
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    assert!(args.contains(&format!(
+        "sqlite_home={}",
+        serde_json::to_string(&state).unwrap()
+    )));
+    assert!(args.contains(&format!(
+        "log_dir={}",
+        serde_json::to_string(&state.join("logs")).unwrap()
+    )));
+    assert!(!args.contains(&format!(
+        "sqlite_home={}",
+        serde_json::to_string(home.path()).unwrap()
+    )));
+}
+
+#[test]
+fn invalid_native_state_or_logs_refuse_command_before_spawn() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let state = root.join("state");
+    std::fs::create_dir(&state).unwrap();
+    let file = root.join("not-a-directory");
+    std::fs::write(&file, b"fixture").unwrap();
+    let rejected = |path: &Path| {
+        assert!(process_command(Path::new("never-spawned"), &root, &root, Some(path)).is_err());
+    };
+    rejected(Path::new("relative-state"));
+    rejected(&root.join("missing"));
+    rejected(&file);
+    rejected(&state); // Missing logs is not silently created.
+    std::fs::write(state.join("logs"), b"not a directory").unwrap();
+    rejected(&state);
+    std::fs::remove_file(state.join("logs")).unwrap();
+    std::fs::create_dir(state.join("logs")).unwrap();
+    rejected(&state.join("..").join("state"));
+    #[cfg(unix)]
+    {
+        let linked_state = root.join("linked-state");
+        std::os::unix::fs::symlink(&state, &linked_state).unwrap();
+        rejected(&linked_state);
+        let linked_parent = root.join("linked-parent");
+        std::os::unix::fs::symlink(&root, &linked_parent).unwrap();
+        rejected(&linked_parent.join("state"));
+        std::fs::rename(state.join("logs"), root.join("real-logs")).unwrap();
+        std::os::unix::fs::symlink(root.join("real-logs"), state.join("logs")).unwrap();
+        rejected(&state);
+    }
 }
 
 async fn receive(reader: &mut Reader) -> Value {

@@ -56,11 +56,15 @@ pub use planned::{
 };
 use read_cache::{CacheError, CacheKey, ReadCache, ReadMeter, ReadMetrics, ReadOrigin, ReadPin};
 pub use rich_generation::{
-    ArtifactSearchReport, ArtifactTextWindow, EvidenceRef, MAX_VISUAL_OUTPUT_BYTES,
-    RICH_MANIFEST_SCHEMA, RichDocument, RichGenerationReader, RichGenerationWriter, RichManifest,
-    StoredArtifact, TextEvidenceBinding, VerifiedRenditionFile, VerifiedVisualPayload,
-    VisualCandidate, VisualCandidateReport, VisualCandidateRequest, VisualCoverage,
-    VisualGenerationReader, VisualScope,
+    ArtifactSearchReport, ArtifactTextWindow, EvidenceRef, MAX_NATIVE_METADATA_BYTES,
+    MAX_NATIVE_METADATA_WORKING_BYTES, MAX_VISUAL_OUTPUT_BYTES, NATIVE_CHARACTER_FIELDS,
+    NATIVE_IMAGE_FIELDS, NATIVE_METADATA_SCALAR_FIELDS, NATIVE_OBJECT_FIELDS,
+    NATIVE_SEGMENT_FIELDS, NATIVE_WORD_FIELDS, NativeMetadataBinding, NativeMetadataCollection,
+    NativeMetadataLease, NativeMetadataReadBudget, NativeMetadataSelection,
+    NativePageMetadataSnapshot, RICH_MANIFEST_SCHEMA, RichDocument, RichGenerationReader,
+    RichGenerationWriter, RichManifest, StoredArtifact, TextEvidenceBinding, VerifiedRenditionFile,
+    VerifiedVisualPayload, VisualCandidate, VisualCandidateReport, VisualCandidateRequest,
+    VisualCoverage, VisualGenerationReader, VisualScope,
 };
 pub use rich_ingest::{
     MAX_RICH_OCR_PAGES, PreparedRichIngest, RichIngestDocumentPlan, RichIngestOptions,

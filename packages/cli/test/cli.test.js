@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
@@ -115,6 +116,27 @@ test('rich batch reaches native stdin with exact pin, image operations and liter
   const readSchema = JSON.parse((await run(['request-schema', 'read', '--json'], '/missing/native')).stdout)
   assert.equal(readSchema.properties.maxBytes.default, 8192)
   assert.equal(readSchema.properties.offset.default, 0)
+})
+
+test('native metadata projection forwards exact selectors and cursor without wrapper interpretation', async () => {
+  const operation = {id: 'metadata', op: 'inspect_native_metadata', artifact_id: 'artifact-' + 'a'.repeat(64),
+    fields: ['geometry', 'counts'], collection: 'path_segments', object_id: 'b'.repeat(64),
+    item_fields: ['ordinal', 'raw_point', 'page_point'], page_size: 3, max_output_bytes: 8192, cursor: '0a12'}
+  const batch = {schema_version: 'gptgrep.batch.rich.request.v1', generation: {generation: 'fixed', manifest_sha256: 'c'.repeat(64)}, operations: [operation]}
+  const result = JSON.parse((await run(['batch', '--request', JSON.stringify({root: '/docs space', rich: true, batch}), '--json'])).stdout)
+  assert.deepEqual(result.request, batch)
+  assert.equal(result.input, JSON.stringify(batch))
+  assert.deepEqual(result.args, ['batch', '--root=/docs space', '--input=-', '--rich', '--json'])
+  const schema = JSON.parse((await run(['request-schema', 'batch', '--json'], '/missing/native')).stdout)
+  assert.match(schema.properties.batch.description, /inspect_native_metadata/)
+  assert.match(schema.properties.batch.description, /noncitable/)
+  await assert.rejects(run(['batch', '--request', JSON.stringify({rich: true, batch: {...batch, fixtureFailure: true}}), '--json']), error => {
+    assert.equal(error.code, 2)
+    const report = JSON.parse(error.stdout)
+    assert.equal(report.schema_version, 'gptgrep.batch.rich.response.v1')
+    assert.equal(report.execution.model_submissions, 0)
+    return true
+  })
 })
 
 test('native batch failure retains complete structured evidence and nonzero exit', async () => {
@@ -374,4 +396,93 @@ test('source-bound rerank wrapper refuses unknown fields and oversized stdin bef
       assert.match(error.stdout,/INVALID_REQUEST/);assert.doesNotMatch(error.stdout,/NATIVE_ERROR/);return true
     })
   await assert.rejects(runNative(['rerank'],'/missing/native',1000,'界'.repeat(349526)),/1048576 bytes/)
+})
+
+test('real native metadata wrapper composition preserves objects segments cursors and errors', {
+  skip: !process.env.GPTGREP_NATIVE_INTEGRATION_BIN && !process.env.GPTGREP_NATIVE_INTEGRATION_FIXTURE && !process.env.GPTGREP_NATIVE_INTEGRATION_ROOT
+    ? 'Explicit real native metadata binary, authored PDF and admitted published fixture were not supplied'
+    : false,
+}, async () => {
+  const native = process.env.GPTGREP_NATIVE_INTEGRATION_BIN
+  const fixture = process.env.GPTGREP_NATIVE_INTEGRATION_FIXTURE
+  const root = process.env.GPTGREP_NATIVE_INTEGRATION_ROOT
+  assert.ok(native && fixture && root, 'All exact real integration inputs are required')
+  const binding = JSON.parse(await readFile(path.join(root, 'fixture-binding.json'), 'utf8'))
+  assert.equal(binding.schema, 'gptgrep.synthetic.native_wrapper_fixture.v1')
+  assert.equal(binding.synthetic_offline_ocr, true)
+  const authored = await readFile(fixture)
+  const retained = await readFile(path.join(root, binding.source_relative))
+  assert.deepEqual(authored, retained)
+  assert.equal(createHash('sha256').update(authored).digest('hex'), binding.source_sha256)
+  const request = operation => ({schema_version: 'gptgrep.batch.rich.request.v1', generation: binding.generation, operations: [operation]})
+  const direct = async batch => {
+    try {
+      const value = await runNative(['batch', '--rich', '--root=' + root, '--input=-', '--json'], native, 30000, JSON.stringify(batch))
+      return value
+    } catch (error) {
+      if (error.report) return error.report
+      if (error.stdout) return JSON.parse(error.stdout)
+      throw error
+    }
+  }
+  const wrapped = async batch => {
+    try {
+      return JSON.parse((await run(['batch', '--request', JSON.stringify({root, rich: true, batch}), '--json'], native)).stdout)
+    } catch (error) {
+      assert.equal(error.code, 2)
+      return JSON.parse(error.stdout)
+    }
+  }
+  const discover = await direct(request({id: 'pages', op: 'inspect_pages', document: binding.source_relative, fields: ['metadata_artifact']}))
+  const artifact = discover.items[0].result.objects[0].metadata_artifact.id
+  const base = {id: 'metadata', op: 'inspect_native_metadata', artifact_id: artifact,
+    fields: ['geometry', 'content_bounds', 'counts'], collection: 'object_summaries',
+    item_fields: ['id', 'kind', 'segment_count', 'page_bounds'], page_size: 3, max_output_bytes: 16384}
+  // JavaScript JSON output canonicalizes signed zero; compare that one numeric
+  // representation only, preserving every other value, key and array position.
+  const normalizeSignedZero = value => {
+    if (typeof value === 'number') return Object.is(value, -0) ? 0 : value
+    if (Array.isArray(value)) return value.map(normalizeSignedZero)
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, normalizeSignedZero(entry)]))
+    }
+    return value
+  }
+  const nativeFirst = await direct(request(base))
+  const wrapperFirst = await wrapped(request(base))
+  assert.equal(wrapperFirst.items[0].status, 'ok')
+  assert.deepEqual(wrapperFirst.items[0].result, normalizeSignedZero(nativeFirst.items[0].result))
+  assert.deepEqual(wrapperFirst.items[0].coverage, nativeFirst.items[0].coverage)
+  assert.equal(wrapperFirst.items[0].result.binding.source_sha256, binding.source_sha256)
+  assert.equal(wrapperFirst.items[0].result.metadata_only, true)
+  assert.equal(wrapperFirst.items[0].result.citation_authority, false)
+  const next = {...base, cursor: nativeFirst.items[0].coverage.cursor}
+  const nativeNext = await direct(request(next))
+  const wrapperNext = await wrapped(request(next))
+  assert.deepEqual(wrapperNext.items[0].result, normalizeSignedZero(nativeNext.items[0].result))
+  const object = wrapperNext.items[0].result.rows.find(row => row.kind === 'path')
+  assert.ok(object)
+  const segments = {...base, collection: 'path_segments', object_id: object.id,
+    fields: ['counts'], item_fields: ['ordinal', 'kind', 'raw_point', 'page_point', 'closes_subpath'], page_size: 1}
+  const rows = []
+  let operation = segments
+  for (;;) {
+    const expected = await direct(request(operation))
+    const actual = await wrapped(request(operation))
+    assert.equal(actual.items[0].status, 'ok')
+    assert.deepEqual(actual.items[0].result, normalizeSignedZero(expected.items[0].result))
+    assert.deepEqual(actual.items[0].coverage, expected.items[0].coverage)
+    rows.push(...actual.items[0].result.rows)
+    const cursor = actual.items[0].coverage.cursor
+    if (!cursor) break
+    operation = {...segments, cursor}
+  }
+  assert.equal(rows.length, object.segment_count)
+  assert.deepEqual(rows.map(row => row.ordinal), rows.map((_, index) => index))
+  for (const bad of [{...base, max_output_bytes: 256}, {...next, page_size: 4}, {...base, fields: ['unknown_field']}]) {
+    const expected = await direct(request(bad))
+    const actual = await wrapped(request(bad))
+    assert.deepEqual(actual.error ?? actual.items[0].error, expected.error ?? expected.items[0].error)
+    assert.ok(actual.error ?? actual.items[0].error)
+  }
 })

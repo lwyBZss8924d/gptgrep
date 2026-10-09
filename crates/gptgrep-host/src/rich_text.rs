@@ -25,6 +25,44 @@ const MAX_TEXT: usize = 2048;
 const MAX_CITATIONS: usize = 8;
 const SEED_HITS: usize = 3;
 const MAX_TOOL_OUTPUT: usize = 131072;
+pub(crate) const NATIVE_METADATA_TOOL: &str = "gptgrep_inspect_native_metadata";
+const MAX_NATIVE_ARGUMENTS: usize = 20480;
+const MAX_NATIVE_ITEM_OUTPUT: usize = 16384;
+const MAX_NATIVE_BATCH_OUTPUT: usize = 32768;
+const MAX_NATIVE_ENVELOPE: usize = MAX_NATIVE_BATCH_OUTPUT + 118;
+// Compact inner JSON has no unescaped controls: quoting at most doubles its
+// bytes. The remainder includes a maximally escaped 256-byte RPC ID, false
+// success flag, fixed tool wrapper and newline.
+pub(crate) const MAX_NATIVE_METADATA_FRAME: usize = 2 * MAX_NATIVE_ENVELOPE + 1621;
+// The original core response keeps its own lease. This extra reservation covers
+// envelope/frame/proof buffers and their allocation overlap, parsed arguments,
+// small container/trace-label allocations, and fixed bookkeeping through close.
+const NATIVE_TRANSPORT_RETAINED: u64 = (16 * MAX_NATIVE_METADATA_FRAME + 4096) as u64;
+
+pub(crate) struct NativeMetadataReply {
+    _response: gptgrep_core::rich_batch::RichBatchResponse,
+    _transport: gptgrep_core::NativeMetadataLease,
+    artifact_id: Option<String>,
+    result: Value,
+}
+impl NativeMetadataReply {
+    pub(crate) fn validate(&self, reader: &RichGenerationReader) -> Result<()> {
+        if let Some(id) = &self.artifact_id {
+            reader.recheck_page_native_metadata(id)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn take_frame(&mut self, rpc_id: Value) -> Result<Value> {
+        ensure!(!self.result.is_null(), "host_rich_native_reply_consumed");
+        // Move the payload instead of serializing it into another owned Value.
+        let mut frame = serde_json::Map::new();
+        frame.insert("id".into(), rpc_id);
+        frame.insert("result".into(), std::mem::take(&mut self.result));
+        let frame = Value::Object(frame);
+        measure(&frame, MAX_NATIVE_METADATA_FRAME - 1)?;
+        Ok(frame)
+    }
+}
 
 #[derive(Clone)]
 pub struct RichTextHostOptions {
@@ -508,6 +546,104 @@ impl RichEvidence {
         );
         Ok(())
     }
+    fn ensure_native_metadata_artifact(&self, id: &str) -> Result<()> {
+        let manifest = self.reader.manifest()?;
+        ensure!(
+            manifest.documents.iter().any(|document| {
+                self.document
+                    .as_ref()
+                    .is_none_or(|scope| scope == &document.document.path)
+                    && document.artifacts.iter().any(|stored| {
+                        stored.artifact.id == id
+                            && stored.artifact.kind == ArtifactKind::NativeMetadata
+                            && stored.artifact.page.is_some_and(|number| {
+                                document.pages.iter().any(|page| {
+                                    page.number == number && page.metadata_artifact.id == id
+                                })
+                            })
+                    })
+            }),
+            "host_rich_native_metadata_unavailable"
+        );
+        Ok(())
+    }
+    pub(crate) fn native_metadata_tool(&self, args: &Value) -> Result<NativeMetadataReply> {
+        use gptgrep_core::rich_batch::{
+            RichBatchBudget, RichBatchGeneration, RichBatchOperation, RichBatchRequest,
+            RichBatchStatus,
+        };
+        measure(args, MAX_NATIVE_ARGUMENTS)?;
+        // Reserve before retained argument, metadata or serialization copies. The
+        // core response's projection lease remains separate and also stays live.
+        let transport = self
+            .reader
+            .reserve_native_metadata_transport(NATIVE_TRANSPORT_RETAINED)?;
+        let request = NativeMetadataArgs::parse(args)?;
+        self.ensure_native_metadata_artifact(&request.artifact_id)?;
+        self.validate()?;
+        let artifact_id = request.artifact_id.clone();
+        let response = gptgrep_core::rich_batch::dispatch_rich_batch_with_reader(
+            &self.reader,
+            RichBatchRequest {
+                schema_version: "gptgrep.batch.rich.request.v1".into(),
+                generation: RichBatchGeneration::Exact(self.reader.pin()),
+                budget: RichBatchBudget {
+                    max_operations: 1,
+                    max_output_bytes: MAX_NATIVE_BATCH_OUTPUT,
+                    ..Default::default()
+                },
+                operations: vec![RichBatchOperation::InspectNativeMetadata {
+                    id: "metadata".into(),
+                    artifact_id: request.artifact_id,
+                    fields: request.fields,
+                    collection: request.collection,
+                    item_fields: request.item_fields,
+                    object_id: request.object_id,
+                    page_size: request.page_size,
+                    max_output_bytes: request.max_output_bytes,
+                    cursor: request.cursor,
+                }],
+            },
+        )
+        .map_err(|_| anyhow!("host_rich_native_metadata_rejected"))?;
+        self.validate()?;
+        measure(&response, MAX_NATIVE_BATCH_OUTPUT)?;
+        let success = response
+            .items
+            .first()
+            .is_some_and(|item| item.status == RichBatchStatus::Ok);
+        #[derive(Serialize)]
+        struct Envelope<'a> {
+            schema_version: &'static str,
+            result: &'a gptgrep_core::rich_batch::RichBatchResponse,
+            citation_status: &'static str,
+        }
+        let text = bounded_json_string(
+            &Envelope {
+                schema_version: "gptgrep.rich_text.metadata.v1",
+                result: &response,
+                citation_status: "not_registered_read_artifact_required",
+            },
+            MAX_NATIVE_ENVELOPE,
+        )?;
+        let mut content = serde_json::Map::new();
+        content.insert("type".into(), Value::String("inputText".into()));
+        content.insert("text".into(), Value::String(text));
+        let mut result = serde_json::Map::new();
+        result.insert("success".into(), Value::Bool(success));
+        result.insert(
+            "contentItems".into(),
+            Value::Array(vec![Value::Object(content)]),
+        );
+        let result = Value::Object(result);
+        measure(&result, MAX_TOOL_OUTPUT)?;
+        Ok(NativeMetadataReply {
+            _response: response,
+            _transport: transport,
+            artifact_id: success.then_some(artifact_id),
+            result,
+        })
+    }
     pub(crate) fn metadata_tool(&self, tool: &str, args: &Value) -> Result<Value> {
         validate_arguments(tool, args)?;
         self.validate()?;
@@ -569,11 +705,17 @@ impl RichEvidence {
                     id: "metadata".into(),
                     document: request.document,
                     fields: if self.multimodal.is_some() {
-                        ["coverage", "native_text", "ocr_text", "renditions"]
-                            .map(str::to_owned)
-                            .to_vec()
+                        [
+                            "coverage",
+                            "native_text",
+                            "ocr_text",
+                            "metadata_artifact",
+                            "renditions",
+                        ]
+                        .map(str::to_owned)
+                        .to_vec()
                     } else {
-                        ["coverage", "native_text", "ocr_text"]
+                        ["coverage", "native_text", "ocr_text", "metadata_artifact"]
                             .map(str::to_owned)
                             .to_vec()
                     },
@@ -811,6 +953,65 @@ struct SearchArgs {
     #[serde(default)]
     cursor: Option<String>,
 }
+fn native_page_default() -> usize {
+    100
+}
+fn native_output_default() -> usize {
+    MAX_NATIVE_ITEM_OUTPUT
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeMetadataArgs {
+    artifact_id: String,
+    #[serde(default)]
+    fields: Vec<String>,
+    collection: gptgrep_core::NativeMetadataCollection,
+    #[serde(default)]
+    item_fields: Vec<String>,
+    #[serde(default)]
+    object_id: Option<String>,
+    #[serde(default = "native_page_default")]
+    page_size: usize,
+    #[serde(default = "native_output_default")]
+    max_output_bytes: usize,
+    #[serde(default)]
+    cursor: Option<String>,
+}
+impl NativeMetadataArgs {
+    fn parse(args: &Value) -> Result<Self> {
+        measure(args, MAX_NATIVE_ARGUMENTS)?;
+        let request = Self::deserialize(args)?;
+        ensure!(
+            !request.artifact_id.is_empty()
+                && request.artifact_id.len() <= 512
+                && (1..=1000).contains(&request.page_size)
+                && (1..=MAX_NATIVE_ITEM_OUTPUT).contains(&request.max_output_bytes)
+                && request.cursor.as_ref().is_none_or(|cursor| {
+                    cursor.len() <= 16384
+                        && cursor.len() % 2 == 0
+                        && cursor
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                }),
+            "host_rich_native_metadata_arguments"
+        );
+        gptgrep_core::NativeMetadataSelection {
+            fields: request.fields.clone(),
+            collection: request.collection,
+            item_fields: request.item_fields.clone(),
+            object_id: request.object_id.clone(),
+        }
+        .validate()?;
+        Ok(request)
+    }
+}
+pub(crate) fn argument_limit(tool: &str) -> usize {
+    if tool == NATIVE_METADATA_TOOL {
+        MAX_NATIVE_ARGUMENTS
+    } else {
+        4096
+    }
+}
 pub(crate) fn validate_arguments(tool: &str, args: &Value) -> Result<()> {
     fn cursor(value: &Option<String>) -> Result<()> {
         ensure!(
@@ -820,6 +1021,9 @@ pub(crate) fn validate_arguments(tool: &str, args: &Value) -> Result<()> {
         Ok(())
     }
     match tool {
+        NATIVE_METADATA_TOOL => {
+            NativeMetadataArgs::parse(args)?;
+        }
         "gptgrep_catalog" => {
             let r: PageArgs = serde_json::from_value(args.clone())?;
             ensure!((1..=8).contains(&r.page_size), "host_rich_page_limit");
@@ -890,6 +1094,35 @@ fn metadata_response(success: bool, result: &impl Serialize) -> Result<Value> {
     Ok(value)
 }
 
+fn bounded_json_string(value: &impl Serialize, limit: usize) -> Result<String> {
+    struct Buffer {
+        bytes: Vec<u8>,
+        limit: usize,
+    }
+    impl Write for Buffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes
+                .len()
+                .checked_add(bytes.len())
+                .filter(|end| *end <= self.limit)
+                .ok_or_else(|| std::io::Error::other("host_rich_output_budget"))?;
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let length = measure(value, limit)?;
+    let mut buffer = Buffer {
+        bytes: Vec::new(),
+        limit: length,
+    };
+    buffer.bytes.try_reserve_exact(length)?;
+    serde_json::to_writer(&mut buffer, value)?;
+    Ok(String::from_utf8(buffer.bytes)?)
+}
+
 pub(crate) fn tool_error(code: &str) -> Value {
     json!({"success":false,"contentItems":[{"type":"inputText","text":json!({"error":{"code":code}}).to_string()}]})
 }
@@ -898,12 +1131,24 @@ pub(crate) fn allowed(tool: &str) -> bool {
         tool,
         "gptgrep_catalog"
             | "gptgrep_inspect_artifact"
+            | NATIVE_METADATA_TOOL
             | "gptgrep_search_text"
             | "gptgrep_read_artifact"
             | "gptgrep_render"
     )
 }
 pub(crate) fn tools() -> Value {
+    let native_item_fields: std::collections::BTreeSet<_> = [
+        gptgrep_core::NATIVE_OBJECT_FIELDS,
+        gptgrep_core::NATIVE_SEGMENT_FIELDS,
+        gptgrep_core::NATIVE_IMAGE_FIELDS,
+        gptgrep_core::NATIVE_CHARACTER_FIELDS,
+        gptgrep_core::NATIVE_WORD_FIELDS,
+    ]
+    .into_iter()
+    .flatten()
+    .copied()
+    .collect();
     let fields = [
         (
             "gptgrep_catalog",
@@ -914,6 +1159,20 @@ pub(crate) fn tools() -> Value {
             "gptgrep_inspect_artifact",
             json!({"document":{"type":"string"},"page_size":{"type":"integer","minimum":1,"maximum":8},"cursor":{"type":"string"}}),
             vec!["document"],
+        ),
+        (
+            NATIVE_METADATA_TOOL,
+            json!({
+                "artifact_id":{"type":"string","minLength":1,"maxLength":512,"description":"Page metadata_artifact.id from inspect_artifact; scoped source identity, never a path or citation ID"},
+                "fields":{"type":"array","items":{"type":"string","enum":gptgrep_core::NATIVE_METADATA_SCALAR_FIELDS},"uniqueItems":true,"maxItems":4,"default":[]},
+                "collection":{"type":"string","enum":["object_summaries","path_segments","image_geometry","native_characters","native_words"]},
+                "item_fields":{"type":"array","items":{"type":"string","enum":native_item_fields},"uniqueItems":true,"maxItems":14,"default":[],"description":"Closed fields for the selected collection; empty selects all row fields"},
+                "object_id":{"type":["string","null"],"pattern":"^[0-9a-f]{64}$","description":"Required only for path_segments: a path ID returned by object_summaries"},
+                "page_size":{"type":"integer","minimum":1,"maximum":1000,"default":100},
+                "max_output_bytes":{"type":"integer","minimum":1,"maximum":16384,"default":16384,"description":"Complete core item quota, including rows, scalars and cursor; enclosing batch is fixed at32768 bytes"},
+                "cursor":{"type":["string","null"],"maxLength":16384,"pattern":"^([0-9a-f]{2})*$","description":"Return coverage.cursor unchanged with identical fields, collection, object, page_size and max_output_bytes"}
+            }),
+            vec!["artifact_id", "collection"],
         ),
         (
             "gptgrep_search_text",
@@ -931,8 +1190,8 @@ pub(crate) fn tools() -> Value {
             vec!["resource_id"],
         ),
     ];
-    json!([{"type":"namespace","name":"gptgrep","description":"Source-bound v2 native/OCR text only; images unavailable",
-        "tools":fields.into_iter().map(|(name,properties,required)|json!({"type":"function","name":name,"description":name,
+    json!([{"type":"namespace","name":"gptgrep","description":"Source-bound v2 native/OCR text and non-citable native metadata; images unavailable",
+        "tools":fields.into_iter().map(|(name,properties,required)|json!({"type":"function","name":name,"description":if name == NATIVE_METADATA_TOOL { "Inspect freshly verified page metadata. Discover metadata_artifact.id with inspect_artifact. Geometry and character/path/image placement are non-citable metadata, not visible pixels or citation bounds. Closed fields depend on collection; path_segments requires object_id. Whole rows and cursor must fit the selected quota." } else { name },
             "inputSchema":{"type":"object","additionalProperties":false,"properties":properties,"required":required}})).collect::<Vec<_>>()}])
 }
 pub(crate) fn final_schema(maximum: usize) -> Value {
