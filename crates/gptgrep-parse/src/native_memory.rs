@@ -870,4 +870,215 @@ mod tests {
         }
         Ok(())
     }
+
+    const FONT_TEST_LINE: &str = "WMWMWMWMWMWMWMWMWMWMWMWMWMWMWMWMWMWMWMWM";
+    const FONT_TEST_ROWS: usize = 6;
+    const FONT_TEST_NAMES: [&str; 2] = ["Courier-BoldOblique", "Courier-Bold"];
+
+    // Ordinary authored text and standard PDF fonts only. The wider page keeps
+    // all forty large-print glyphs inside its frame; no corpus input is used.
+    fn generated_font_metadata_pdf(mixed: bool) -> Vec<u8> {
+        let mut content = String::from("BT 50 TL 20 740 Td\n");
+        for row in 0..FONT_TEST_ROWS {
+            if row > 0 {
+                content.push_str("T*\n");
+            }
+            let font = if mixed { row % 2 + 1 } else { 1 };
+            content.push_str(&format!("/F{font} 48 Tf ({FONT_TEST_LINE}) Tj\n"));
+        }
+        content.push_str("ET\n");
+        crate::tests::pdf_objects(&[
+            "<< /Type /Catalog /Pages 2 0 R >>".into(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1224 792] /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>".into(),
+            format!("<< /Length {} >>\nstream\n{content}endstream", content.len()),
+            format!("<< /Type /Font /Subtype /Type1 /BaseFont /{} >>", FONT_TEST_NAMES[0]),
+            format!("<< /Type /Font /Subtype /Type1 /BaseFont /{} >>", FONT_TEST_NAMES[1]),
+        ])
+    }
+
+    fn page_metadata_bytes(candidate: &NativeCandidate) -> Result<Vec<u8>> {
+        assert_eq!(candidate.pages.len(), 1);
+        let artifact = &candidate.pages[0].metadata_artifact;
+        crate::artifact::read_bounded(
+            &candidate
+                .prepared
+                .staging_root
+                .join(&artifact.relative_path),
+            artifact.bytes,
+            &artifact.sha256,
+        )
+    }
+
+    async fn generated_font_page_wire_boundary(mixed: bool) -> Result<()> {
+        use crate::{NativeOptions, PreparationOptions, extract_native, prepare_document};
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("ordinary-fonts.pdf");
+        std::fs::write(&source, generated_font_metadata_pdf(mixed))?;
+        let options = NativeOptions {
+            render_pages: false,
+            ..Default::default()
+        };
+        // Match the ordinary CLI single-document share of the working budget.
+        let mut baseline_budget = ResourceBudget::default();
+        baseline_budget.owned_working_bytes /= 2;
+        let prepared = prepare_document(
+            &source,
+            &directory.path().join("baseline"),
+            &PreparationOptions,
+            &baseline_budget,
+        )
+        .await?;
+        let baseline = extract_native(&prepared, &options, &baseline_budget).await?;
+        let bytes = page_metadata_bytes(&baseline)?;
+        let metadata: crate::NativePageMetadata = serde_json::from_slice(&bytes)?;
+        let wire = bytes.len() as u64;
+        assert_eq!(crate::resource::encoded_size(&metadata, wire)?, wire);
+        let stream = &metadata.native_text_metadata;
+        assert_eq!(stream.characters.len(), stream.native_char_count as usize);
+        let mut authored = String::new();
+        let mut old_font_upper = 0u64;
+        for (ordinal, character) in stream.characters.iter().enumerate() {
+            assert_eq!(character.ordinal as usize, ordinal);
+            if let FeatureState::Present(info) = &character.font {
+                // The pinned getter reserves 24*length+256 before allocation;
+                // its native length includes the trailing NUL removed on fill.
+                old_font_upper += (info.raw_name.len() as u64 + 1) * 24 + 256;
+            }
+            let value = char::from_u32(character.unicode).context("fixture Unicode scalar")?;
+            if value.is_control() {
+                continue;
+            }
+            assert!(!character.generated);
+            assert!(!character.has_unicode_map_error);
+            assert_eq!(character.char_code, character.unicode);
+            let row = authored.len() / FONT_TEST_LINE.len();
+            let expected = FONT_TEST_NAMES[if mixed { row % 2 } else { 0 }];
+            let FeatureState::Present(info) = &character.font else {
+                panic!("authored character lost native font information");
+            };
+            assert_eq!(info.raw_name, expected.as_bytes());
+            assert!(matches!(&info.name, FeatureState::Present(name) if name == expected));
+            authored.push(value);
+        }
+        assert_eq!(authored, FONT_TEST_LINE.repeat(FONT_TEST_ROWS));
+        assert!(
+            old_font_upper > wire,
+            "fixture must distinguish the old font estimate: font={old_font_upper}, wire={wire}"
+        );
+        assert!(baseline.native_owned_upper < baseline_budget.owned_working_bytes);
+        baseline.verify_integrity(&baseline_budget)?;
+
+        let mut exact_budget = ResourceBudget::default();
+        exact_budget.owned_working_bytes /= 2;
+        exact_budget.page_layout_bytes = wire;
+        let prepared = prepare_document(
+            &source,
+            &directory.path().join("exact"),
+            &PreparationOptions,
+            &exact_budget,
+        )
+        .await?;
+        let exact = extract_native(&prepared, &options, &exact_budget).await?;
+        assert_eq!(exact.pages[0].metadata_artifact.bytes, wire);
+        assert_eq!(page_metadata_bytes(&exact)?, bytes);
+        exact.verify_integrity(&exact_budget)?;
+
+        let mut short_budget = ResourceBudget::default();
+        short_budget.owned_working_bytes /= 2;
+        short_budget.page_layout_bytes = wire - 1;
+        // Prove the earlier projection and its counting serializer fit the
+        // same cap. The complete metadata serializer must be the failing stage.
+        let projection = super::super::projection_admission(
+            std::slice::from_ref(&metadata.page),
+            &short_budget,
+            0,
+        )?;
+        assert!(projection.text_upper <= short_budget.page_layout_bytes);
+        crate::resource::encoded_size(&metadata.page.text_items, wire - 1)?;
+        crate::resource::encoded_size(
+            &(
+                &metadata.complexity,
+                &metadata.image_rects,
+                &metadata.geometry,
+            ),
+            wire - 1,
+        )?;
+        assert!(baseline.pages[0].native_text.bytes < wire - 1);
+        let prepared = prepare_document(
+            &source,
+            &directory.path().join("one-byte-short"),
+            &PreparationOptions,
+            &short_budget,
+        )
+        .await?;
+        let error = extract_native(&prepared, &options, &short_budget)
+            .await
+            .expect_err("complete page metadata exceeds the wire cap by one byte");
+        assert!(
+            error
+                .to_string()
+                .contains("resource_limit: bounded writer admission failed"),
+            "{error:#}"
+        );
+        // Extraction has passed projection and written native text, but has
+        // not admitted or written the complete page metadata artifact.
+        let native_text = &baseline.pages[0].native_text;
+        crate::artifact::read_bounded(
+            &prepared.staging_root.join(&native_text.relative_path),
+            native_text.bytes,
+            &native_text.sha256,
+        )?;
+        assert!(
+            !prepared
+                .staging_root
+                .join(&baseline.pages[0].metadata_artifact.relative_path)
+                .exists()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn generated_repeated_font_page_uses_exact_metadata_wire_limit() -> Result<()> {
+        generated_font_page_wire_boundary(false).await
+    }
+
+    #[tokio::test]
+    async fn generated_mixed_font_page_uses_exact_metadata_wire_limit() -> Result<()> {
+        generated_font_page_wire_boundary(true).await
+    }
+
+    #[test]
+    fn prospective_font_working_reservation_is_atomic_at_exact_and_minus_one() -> Result<()> {
+        // This is the parser-ledger half of the preallocation contract. The
+        // vendor's font_length_refusal_never_calls_write_getter separately
+        // observes that a rejected admission callback never reaches FFI fill.
+        let retained = 4096;
+        let previous_native = 24_576;
+        let font_upper = (FONT_TEST_NAMES[0].len() as u64 + 1) * 24 + 256;
+        let exact = retained + (previous_native + font_upper) * 4;
+        let mut budget = ResourceBudget::default();
+        budget.owned_working_bytes = exact;
+        let mut admitted = NativeAdmission::new(retained, &budget)?;
+        admitted.reserve_native(previous_native, &budget)?;
+        admitted.reserve_native(font_upper, &budget)?;
+        assert_eq!(admitted.held_upper()?, exact);
+        assert_eq!(admitted.retained_owned(), retained);
+
+        budget.owned_working_bytes = exact - 1;
+        let mut rejected = NativeAdmission::new(retained, &budget)?;
+        rejected.reserve_native(previous_native, &budget)?;
+        let before = rejected.held_upper()?;
+        let error = rejected.reserve_native(font_upper, &budget).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("resource_limit: native retained plus active working admission"),
+            "{error:#}"
+        );
+        assert_eq!(rejected.held_upper()?, before);
+        assert_eq!(rejected.retained_owned(), retained);
+        assert_eq!(rejected.metadata_bytes(), 0);
+        Ok(())
+    }
 }

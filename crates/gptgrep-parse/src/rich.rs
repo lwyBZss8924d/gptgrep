@@ -1025,7 +1025,6 @@ pub(crate) fn extract_sync(
             let object_bound = graphics.charged_bytes;
             let vector_count = graphics.paths;
             let image_rects = graphics.image_rects;
-            let mut font_bound = 0u64;
             let characters = native_text_metadata::collect_characters(
                 count as u32,
                 width,
@@ -1048,23 +1047,14 @@ pub(crate) fn extract_sync(
                     });
                     // Every admitted character, including geometryless spaces
                     // and actual/generated controls, reaches the same retained
-                    // source stream. Font allocation remains separately bounded.
-                    let font_info = glyph.font_info_admitted(
-                        budget.native_layout_input_bytes,
-                        &mut |bytes| -> Result<()> {
-                            let next = font_bound
-                                .checked_add(bytes)
-                                .context("resource_limit: page font metadata sum overflow")?;
-                            ensure!(
-                                object_bound + annotation_bound + label_bound + 16_384 + next
-                                    <= budget.page_layout_bytes,
-                                "resource_limit: page font metadata admission"
-                            );
-                            admission.reserve_native(bytes, &budget)?;
-                            font_bound = next;
-                            Ok(())
-                        },
-                    )?;
+                    // source stream. The font estimate includes active copies
+                    // and worst-case JSON. Reserve its working allowance before
+                    // the getter allocates; the bounded metadata writer measures
+                    // final page bytes against the separate wire cap.
+                    let font_info = glyph
+                        .font_info_admitted(budget.native_layout_input_bytes, &mut |bytes| {
+                            admission.reserve_native(bytes, &budget)
+                        })?;
                     Ok(native_text_metadata::NativeCharacterObservation {
                         unicode: glyph.unicode(),
                         char_code: glyph.char_code(),
@@ -1232,7 +1222,7 @@ pub(crate) fn extract_sync(
                 budget.page_layout_bytes,
             )?;
             ensure!(
-                object_bound + annotation_bound + label_bound + 16_384 + binding_bytes + font_bound
+                object_bound + annotation_bound + label_bound + 16_384 + binding_bytes
                     <= budget.page_layout_bytes,
                 "resource_limit: native metadata classifier/frame binding admission"
             );
