@@ -1081,4 +1081,179 @@ mod tests {
         assert_eq!(rejected.metadata_bytes(), 0);
         Ok(())
     }
+
+    #[tokio::test]
+    async fn generated_projection_estimate_can_exceed_exact_page_wire_limit() -> Result<()> {
+        use crate::{NativeOptions, PreparationOptions, extract_native, prepare_document};
+        const ROWS: usize = 12;
+        const STAGING_BYTES: u64 = 8 * 1024 * 1024;
+        let line = "A".repeat(100);
+        // Ordinary authored text inside a square page. The small glyph advance
+        // makes the conservative projection estimate exceed the actual output.
+        let mut content = String::from("BT /F1 1.5 Tf 20 TL 20 960 Td\n");
+        for row in 0..ROWS {
+            if row > 0 {
+                content.push_str("T*\n");
+            }
+            content.push_str(&format!("({line}) Tj\n"));
+        }
+        content.push_str("ET\n");
+        let pdf = crate::tests::pdf_objects(&[
+            "<< /Type /Catalog /Pages 2 0 R >>".into(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1000 1000] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".into(),
+            format!("<< /Length {} >>\nstream\n{content}endstream", content.len()),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>".into(),
+        ]);
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("ordinary-small-print.pdf");
+        assert!(pdf.len() <= 8192);
+        std::fs::write(&source, pdf)?;
+        let options = NativeOptions {
+            render_pages: false,
+            ..Default::default()
+        };
+        let mut baseline_budget = ResourceBudget::default();
+        baseline_budget.owned_working_bytes /= 2;
+        baseline_budget.document_staging_bytes = STAGING_BYTES;
+        let prepared = prepare_document(
+            &source,
+            &directory.path().join("baseline"),
+            &PreparationOptions,
+            &baseline_budget,
+        )
+        .await?;
+        let baseline = extract_native(&prepared, &options, &baseline_budget).await?;
+        let bytes = page_metadata_bytes(&baseline)?;
+        let metadata: crate::NativePageMetadata = serde_json::from_slice(&bytes)?;
+        let wire = bytes.len() as u64;
+        assert!(wire < baseline_budget.page_layout_bytes);
+        assert_eq!(crate::resource::encoded_size(&metadata, wire)?, wire);
+        let projection = super::super::projection_admission(
+            std::slice::from_ref(&metadata.page),
+            &baseline_budget,
+            0,
+        )?;
+        assert!(
+            projection.text_upper > baseline_budget.page_layout_bytes,
+            "fixture must cross the old projection estimate cap: upper={}, cap={}",
+            projection.text_upper,
+            baseline_budget.page_layout_bytes
+        );
+        let stream = &metadata.native_text_metadata;
+        assert_eq!(stream.characters.len(), stream.native_char_count as usize);
+        let mut authored = String::new();
+        for (ordinal, character) in stream.characters.iter().enumerate() {
+            assert_eq!(character.ordinal as usize, ordinal);
+            let value = char::from_u32(character.unicode).context("fixture Unicode scalar")?;
+            if value.is_control() {
+                continue;
+            }
+            assert_eq!(value, 'A');
+            assert!(!character.generated);
+            assert!(!character.has_unicode_map_error);
+            assert_eq!(character.char_code, character.unicode);
+            let FeatureState::Present(info) = &character.font else {
+                panic!("authored character lost native font information");
+            };
+            assert_eq!(info.raw_name.as_slice(), b"Courier");
+            assert!(matches!(&info.name, FeatureState::Present(name) if name == "Courier"));
+            authored.push(value);
+        }
+        assert_eq!(authored, line.repeat(ROWS));
+        let native_text = &baseline.pages[0].native_text;
+        let text_bytes = crate::artifact::read_bounded(
+            &baseline
+                .prepared
+                .staging_root
+                .join(&native_text.relative_path),
+            native_text.bytes,
+            &native_text.sha256,
+        )?;
+        assert!(native_text.bytes < wire - 1);
+        assert!(native_text.bytes < baseline_budget.page_layout_bytes);
+        let text = std::str::from_utf8(&text_bytes)?;
+        assert_eq!(text.matches(line.as_str()).count(), ROWS);
+        assert_eq!(
+            text.chars()
+                .filter(|value| !value.is_whitespace())
+                .collect::<String>(),
+            line.repeat(ROWS)
+        );
+        baseline.verify_integrity(&baseline_budget)?;
+
+        let mut exact_budget = ResourceBudget::default();
+        exact_budget.owned_working_bytes /= 2;
+        exact_budget.document_staging_bytes = STAGING_BYTES;
+        exact_budget.page_layout_bytes = wire;
+        let prepared = prepare_document(
+            &source,
+            &directory.path().join("exact"),
+            &PreparationOptions,
+            &exact_budget,
+        )
+        .await?;
+        let exact = extract_native(&prepared, &options, &exact_budget).await?;
+        assert_eq!(exact.pages[0].metadata_artifact.bytes, wire);
+        assert_eq!(page_metadata_bytes(&exact)?, bytes);
+        assert_eq!(exact.pages[0].native_text.bytes, native_text.bytes);
+        assert_eq!(exact.pages[0].native_text.sha256, native_text.sha256);
+        assert_eq!(
+            crate::artifact::read_bounded(
+                &exact.prepared.staging_root.join(&native_text.relative_path),
+                native_text.bytes,
+                &native_text.sha256,
+            )?,
+            text_bytes
+        );
+        exact.verify_integrity(&exact_budget)?;
+
+        let mut short_budget = ResourceBudget::default();
+        short_budget.owned_working_bytes /= 2;
+        short_budget.document_staging_bytes = STAGING_BYTES;
+        short_budget.page_layout_bytes = wire - 1;
+        // Smaller counting serializations must pass. Native text is also
+        // written before the complete metadata serializer reaches this limit.
+        super::super::projection_admission(std::slice::from_ref(&metadata.page), &short_budget, 0)?;
+        crate::resource::encoded_size(&metadata.page.text_items, wire - 1)?;
+        crate::resource::encoded_size(
+            &(
+                &metadata.complexity,
+                &metadata.image_rects,
+                &metadata.geometry,
+            ),
+            wire - 1,
+        )?;
+        let prepared = prepare_document(
+            &source,
+            &directory.path().join("one-byte-short"),
+            &PreparationOptions,
+            &short_budget,
+        )
+        .await?;
+        let error = extract_native(&prepared, &options, &short_budget)
+            .await
+            .expect_err("complete page metadata exceeds the wire cap by one byte");
+        assert!(
+            error
+                .to_string()
+                .contains("resource_limit: bounded writer admission failed"),
+            "{error:#}"
+        );
+        assert_eq!(
+            crate::artifact::read_bounded(
+                &prepared.staging_root.join(&native_text.relative_path),
+                native_text.bytes,
+                &native_text.sha256,
+            )?,
+            text_bytes
+        );
+        assert!(
+            !prepared
+                .staging_root
+                .join(&baseline.pages[0].metadata_artifact.relative_path)
+                .exists()
+        );
+        Ok(())
+    }
 }

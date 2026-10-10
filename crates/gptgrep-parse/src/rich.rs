@@ -1617,10 +1617,8 @@ fn projection_admission(
             )
             .and_then(|v| v.checked_mul(4))
             .context("projection size overflow")?;
-        ensure!(
-            upper <= budget.page_layout_bytes,
-            "resource_limit: projection upper bound rejected before pure stage allocation"
-        );
+        // This padding estimate belongs to working admission below. Actual
+        // projected text and metadata retain their bounded wire writers.
         total = total
             .checked_add(upper)
             .context("projection document overflow")?;
@@ -2101,6 +2099,77 @@ pub fn finalize_document(
 #[cfg(test)]
 mod boundary_tests {
     use super::*;
+
+    #[test]
+    fn dense_projection_separates_actual_wire_bytes_from_working_admission() {
+        let page = Page {
+            page_number: 1,
+            page_label: None,
+            page_width: 1000.0,
+            page_height: 1000.0,
+            content_bounds: None,
+            text_items: (0..40)
+                .map(|row| TextItem {
+                    text: "A".repeat(100),
+                    x: 10.0,
+                    y: 10.0 + row as f32 * 20.0,
+                    width: 500.0,
+                    height: 10.0,
+                    ..Default::default()
+                })
+                .collect(),
+            graphics: vec![],
+            vector_graphics: None,
+            struct_nodes: vec![],
+            image_refs: vec![],
+            annotations: None,
+            form_fields: None,
+            structure_tree: None,
+        };
+        let mut budget = ResourceBudget::default();
+        let held = 1024;
+        let admission = projection_admission(std::slice::from_ref(&page), &budget, held)
+            .expect("dense text fits working admission");
+        assert!(admission.text_upper > budget.page_layout_bytes);
+        budget.owned_working_bytes = admission.working_upper;
+        projection_admission(std::slice::from_ref(&page), &budget, held)
+            .expect("exact working bound is admitted");
+        let projected = stages::project(vec![page.clone()]);
+        assert_eq!(projected.len(), 1);
+        let output = &projected[0];
+        assert_eq!(
+            output
+                .text
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>(),
+            "A".repeat(4000)
+        );
+        assert!((output.text.len() as u64) < budget.page_layout_bytes);
+        assert!(encoded_size(output, budget.page_layout_bytes).unwrap() < budget.page_layout_bytes);
+        assert_eq!(output.text_items.len(), page.text_items.len());
+        for (actual, expected) in output.text_items.iter().zip(&page.text_items) {
+            assert_eq!(actual.text, expected.text);
+            assert_eq!(actual.x, expected.x);
+            assert_eq!(actual.y, expected.y);
+            assert_eq!(actual.width, expected.width);
+            assert_eq!(actual.height, expected.height);
+            assert_eq!(actual.rotation, expected.rotation);
+        }
+        budget.owned_working_bytes -= 1;
+        let mut projection_started = false;
+        let rejected = projection_admission(std::slice::from_ref(&page), &budget, held).map(|_| {
+            projection_started = true;
+            stages::project(vec![page])
+        });
+        let error = rejected.expect_err("one byte below working bound must reject");
+        assert!(
+            error
+                .to_string()
+                .contains("complete projection working admission")
+        );
+        assert!(!projection_started);
+    }
 
     #[test]
     fn native_projection_admits_signed_span_and_rejects_far_outside_before_allocation() {
