@@ -9,7 +9,7 @@ use anyhow::{Context, Result, ensure};
 use std::{
     fs,
     io::Read,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
@@ -108,23 +108,101 @@ fn profile_url(path: &Path) -> Result<String> {
     }
     Ok(url)
 }
+#[cfg(test)]
 fn inventory_bytes(root: &Path, count: &mut usize) -> Result<u64> {
+    inventory_bytes_with_font_cache(root, count, None)
+}
+fn is_font_cache_alias(path: &Path) -> bool {
+    let Ok(target) = fs::read_link(path) else {
+        return false;
+    };
+    let mut components = target.components();
+    let Some(Component::Normal(name)) = components.next() else {
+        return false;
+    };
+    // Comparing the original spelling also rejects normalized "./name" and
+    // trailing separators. Inspect the sibling itself; never follow the alias.
+    components.next().is_none()
+        && target.as_os_str() == name
+        && fs::symlink_metadata(path.with_file_name(name)).is_ok_and(|metadata| metadata.is_file())
+}
+#[derive(Clone, Copy)]
+enum InventoryPhase<'a> {
+    Final,
+    Live { profile: &'a Path, tmp: &'a Path },
+}
+impl InventoryPhase<'_> {
+    fn observe<T>(self, path: &Path, result: std::io::Result<T>) -> std::io::Result<Option<T>> {
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(error) => {
+                let mutable_descendant = match self {
+                    Self::Final => false,
+                    Self::Live { profile, tmp } => [profile, tmp]
+                        .into_iter()
+                        .any(|root| path != root && path.starts_with(root)),
+                };
+                if mutable_descendant && error.kind() == std::io::ErrorKind::NotFound {
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+}
+#[cfg(test)]
+fn inventory_bytes_with_font_cache(
+    root: &Path,
+    count: &mut usize,
+    font_cache: Option<&Path>,
+) -> Result<u64> {
+    inventory_entries(
+        root,
+        fs::read_dir(root)?,
+        count,
+        font_cache,
+        InventoryPhase::Final,
+    )
+}
+fn inventory_entries(
+    root: &Path,
+    entries: impl Iterator<Item = std::io::Result<fs::DirEntry>>,
+    count: &mut usize,
+    font_cache: Option<&Path>,
+    phase: InventoryPhase<'_>,
+) -> Result<u64> {
     let mut bytes = 0u64;
-    for entry in fs::read_dir(root)? {
+    for entry in entries {
         *count += 1;
         ensure!(
             *count <= 8192,
             "resource_limit: Office conversion file count"
         );
+        // Iterator errors have no attributable child path and remain strict.
         let path = entry?.path();
-        let metadata = fs::symlink_metadata(&path)?;
-        ensure!(
-            !metadata.file_type().is_symlink(),
-            "Office staging symlink rejected"
-        );
+        let Some(metadata) = phase.observe(&path, fs::symlink_metadata(&path))? else {
+            continue;
+        };
         bytes = bytes
-            .checked_add(if metadata.is_dir() {
-                inventory_bytes(&path, count)?
+            .checked_add(if metadata.file_type().is_symlink() {
+                // Fontconfig creates version aliases inside the converter's
+                // private cache. Account for their link bytes, without reading
+                // their targets through the aliases or relaxing other paths.
+                ensure!(
+                    font_cache == Some(root) && is_font_cache_alias(&path),
+                    "Office staging symlink rejected"
+                );
+                metadata.len()
+            } else if metadata.is_dir() {
+                // A converter may remove a scratch directory after metadata was
+                // observed. Skip only that missing child, never a subtree error
+                // that could discard bytes already counted from its siblings.
+                if let Some(children) = phase.observe(&path, fs::read_dir(&path))? {
+                    inventory_entries(&path, children, count, font_cache, phase)?
+                } else {
+                    0
+                }
             } else {
                 ensure!(metadata.is_file(), "Office staging special file rejected");
                 metadata.len()
@@ -164,9 +242,25 @@ fn inventory_failure(error: anyhow::Error, cap: u64, entries: usize) -> anyhow::
         "Office conversion staging inventory failed: cause={cause}, observed_bytes=unavailable, cap_bytes={cap}, entries_visited={entries}"
     )
 }
+#[cfg(test)]
 fn check_staging(root: &Path, cap: u64) -> Result<()> {
+    check_staging_with_font_cache(root, cap, None)
+}
+fn check_staging_with_font_cache(root: &Path, cap: u64, font_cache: Option<&Path>) -> Result<()> {
+    check_staging_in_phase(root, cap, font_cache, InventoryPhase::Final)
+}
+fn check_staging_in_phase(
+    root: &Path,
+    cap: u64,
+    font_cache: Option<&Path>,
+    phase: InventoryPhase<'_>,
+) -> Result<()> {
     let mut entries = 0;
-    let bytes = inventory_bytes(root, &mut entries)
+    // The work root must exist even during a live sample. Only enumerated
+    // descendants of the converter-owned mutable scratch may disappear.
+    let bytes = fs::read_dir(root)
+        .map_err(anyhow::Error::from)
+        .and_then(|children| inventory_entries(root, children, &mut entries, font_cache, phase))
         .map_err(|error| inventory_failure(error, cap, entries))?;
     ensure!(
         bytes <= cap,
@@ -197,6 +291,7 @@ async fn convert(
     timeout: Duration,
 ) -> Result<PathBuf> {
     let profile = work.join("profile");
+    let font_cache = profile.join(".cache/fontconfig");
     let output = work.join("output");
     let tmp = work.join("tmp");
     for path in [&profile, &output, &tmp] {
@@ -250,7 +345,9 @@ async fn convert(
                 }
                 _ = tokio::time::sleep_until(deadline) => {break Err(anyhow::anyhow!("Office conversion deadline exceeded"));}
                 _ = tokio::time::sleep(Duration::from_millis(20)) => {
-                    if let Err(error) = check_staging(work, cap) {
+                    if let Err(error) = check_staging_in_phase(
+                        work, cap, Some(&font_cache), InventoryPhase::Live { profile: &profile, tmp: &tmp },
+                    ) {
                         break Err(error);
                     }
                     match child.try_wait() {
@@ -271,7 +368,8 @@ async fn convert(
         let _ = child.wait().await;
     }
     result?;
-    check_staging(work, cap).context("Office final staging admission failed")?;
+    check_staging_with_font_cache(work, cap, Some(&font_cache))
+        .context("Office final staging admission failed")?;
     let files = fs::read_dir(&output)?.collect::<std::io::Result<Vec<_>>>()?;
     ensure!(
         files.len() == 1,
@@ -380,6 +478,149 @@ mod tests {
         format!("'{}'", path.display().to_string().replace('\'', "'\"'\"'"))
     }
     #[test]
+    fn live_inventory_skips_disappeared_scratch_entries_but_final_is_strict() -> Result<()> {
+        for directory in [false, true] {
+            for final_pass in [false, true] {
+                let dir = tempfile::tempdir()?;
+                let profile = dir.path().join("profile");
+                let tmp = dir.path().join("tmp");
+                fs::create_dir(&profile)?;
+                fs::create_dir(&tmp)?;
+                let vanished = profile.join("transient");
+                if directory {
+                    fs::create_dir(&vanished)?;
+                } else {
+                    fs::write(&vanished, b"temporary")?;
+                }
+                // Capture the real directory entry before removing it. This
+                // exercises the live enumeration/metadata race deterministically.
+                let entry = fs::read_dir(&profile)?.next().unwrap();
+                if directory {
+                    fs::remove_dir(&vanished)?;
+                } else {
+                    fs::remove_file(&vanished)?;
+                }
+                let phase = if final_pass {
+                    InventoryPhase::Final
+                } else {
+                    InventoryPhase::Live {
+                        profile: &profile,
+                        tmp: &tmp,
+                    }
+                };
+                let mut count = 0;
+                let result =
+                    inventory_entries(&profile, std::iter::once(entry), &mut count, None, phase);
+                assert_eq!(count, 1);
+                if final_pass {
+                    let error = inventory_failure(result.unwrap_err(), 4, count);
+                    assert!(error.to_string().contains("cause=missing,"));
+                    assert!(!format!("{error:#?}").contains("transient"));
+                } else {
+                    assert_eq!(result?, 0);
+                    // A directory can also disappear after its metadata lookup,
+                    // before descent. Exercise that exact I/O result separately.
+                    assert!(phase.observe(&vanished, fs::read_dir(&vanished))?.is_none());
+                }
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn live_inventory_keeps_root_input_output_and_non_missing_errors_strict() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let profile = dir.path().join("profile");
+        let tmp = dir.path().join("tmp");
+        let phase = InventoryPhase::Live {
+            profile: &profile,
+            tmp: &tmp,
+        };
+        for path in [
+            &profile,
+            &tmp,
+            &dir.path().join("input.docx"),
+            &dir.path().join("output/result.pdf"),
+        ] {
+            let error = phase.observe(path, fs::symlink_metadata(path)).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        }
+        for phase in [phase, InventoryPhase::Final] {
+            let error = check_staging_in_phase(&dir.path().join("missing-root"), 4, None, phase)
+                .unwrap_err();
+            assert!(error.to_string().contains("cause=missing,"));
+            assert!(error.to_string().contains("entries_visited=0"));
+        }
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::NotADirectory,
+        ] {
+            let error = phase
+                .observe::<()>(&profile.join("transient"), Err(std::io::Error::from(kind)))
+                .unwrap_err();
+            assert_eq!(error.kind(), kind);
+        }
+        let mut count = 0;
+        let iterator_error =
+            std::iter::once(Err(std::io::Error::from(std::io::ErrorKind::NotFound)));
+        let error =
+            inventory_entries(&profile, iterator_error, &mut count, None, phase).unwrap_err();
+        assert_eq!(count, 1);
+        assert!(
+            inventory_failure(error, 4, count)
+                .to_string()
+                .contains("cause=missing,")
+        );
+        Ok(())
+    }
+    #[test]
+    fn live_inventory_retains_bytes_and_entry_limit_when_a_sibling_disappears() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let profile = dir.path().join("profile");
+        let tmp = dir.path().join("tmp");
+        fs::create_dir(&profile)?;
+        fs::create_dir(&tmp)?;
+        fs::write(profile.join("survivor"), b"data")?;
+        let vanished = profile.join("transient");
+        fs::write(&vanished, b"temporary")?;
+        let mut entries = fs::read_dir(&profile)?.collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        fs::remove_file(&vanished)?;
+        let phase = InventoryPhase::Live {
+            profile: &profile,
+            tmp: &tmp,
+        };
+        let mut count = 0;
+        let bytes = inventory_entries(
+            &profile,
+            entries.into_iter().map(Ok),
+            &mut count,
+            None,
+            phase,
+        )?;
+        assert_eq!((bytes, count), (4, 2));
+        let error = check_staging_in_phase(dir.path(), 3, None, phase).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cause=logical_bytes, observed_bytes=4, cap_bytes=3,")
+        );
+        fs::write(&vanished, b"temporary")?;
+        let entry = fs::read_dir(&profile)?
+            .find(|entry| entry.as_ref().is_ok_and(|entry| entry.path() == vanished))
+            .unwrap();
+        fs::remove_file(&vanished)?;
+        let mut count = 8192;
+        let error = inventory_entries(&profile, std::iter::once(entry), &mut count, None, phase)
+            .unwrap_err();
+        assert_eq!(count, 8193);
+        assert!(
+            inventory_failure(error, 4, count)
+                .to_string()
+                .contains("cause=entry_limit,")
+        );
+        Ok(())
+    }
+    #[test]
     fn staging_admission_reports_measured_bytes_and_keeps_exact_cap() -> Result<()> {
         let dir = tempfile::tempdir()?;
         fs::create_dir(dir.path().join("private-directory"))?;
@@ -430,6 +671,112 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn converter_font_cache_aliases_keep_byte_and_entry_accounting() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cache = dir.path().join("profile/.cache/fontconfig");
+        fs::create_dir_all(&cache)?;
+        fs::write(cache.join("current-cache"), b"cache")?;
+        std::os::unix::fs::symlink("current-cache", cache.join("previous-cache"))?;
+        let mut entries = 0;
+        let bytes = inventory_bytes_with_font_cache(dir.path(), &mut entries, Some(&cache))?;
+        assert_eq!((bytes, entries), (18, 5));
+        check_staging_with_font_cache(dir.path(), 18, Some(&cache))?;
+        assert_eq!(
+            check_staging_with_font_cache(dir.path(), 17, Some(&cache))
+                .unwrap_err()
+                .to_string(),
+            "resource_limit: Office conversion staging exceeded: cause=logical_bytes, observed_bytes=18, cap_bytes=17, entries_visited=5"
+        );
+        assert!(
+            check_staging(dir.path(), 18)
+                .unwrap_err()
+                .to_string()
+                .contains("cause=symlink,")
+        );
+        let mut entries = 8188;
+        let error =
+            inventory_bytes_with_font_cache(dir.path(), &mut entries, Some(&cache)).unwrap_err();
+        assert_eq!(entries, 8193);
+        assert!(
+            inventory_failure(error, 18, entries)
+                .to_string()
+                .contains("cause=entry_limit,")
+        );
+        Ok(())
+    }
+    #[test]
+    fn converter_font_cache_rejects_non_sibling_and_non_regular_aliases() -> Result<()> {
+        for target in [
+            "absolute-cache",
+            "../current-cache",
+            "nested/current-cache",
+            "./current-cache",
+            "current-cache/",
+            "missing-cache",
+            "directory-cache",
+            "chained-cache",
+            "previous-cache",
+        ] {
+            let dir = tempfile::tempdir()?;
+            let cache = dir.path().join("profile/.cache/fontconfig");
+            fs::create_dir_all(cache.join("nested"))?;
+            fs::create_dir(cache.join("directory-cache"))?;
+            fs::write(cache.join("current-cache"), b"cache")?;
+            fs::write(cache.join("nested/current-cache"), b"cache")?;
+            fs::write(cache.parent().unwrap().join("current-cache"), b"cache")?;
+            std::os::unix::fs::symlink("current-cache", cache.join("chained-cache"))?;
+            let target = if target == "absolute-cache" {
+                cache.canonicalize()?.join("current-cache")
+            } else {
+                PathBuf::from(target)
+            };
+            std::os::unix::fs::symlink(&target, cache.join("previous-cache"))?;
+            assert!(
+                !is_font_cache_alias(&cache.join("previous-cache")),
+                "accepted {target:?}"
+            );
+            let error = check_staging_with_font_cache(dir.path(), 4096, Some(&cache)).unwrap_err();
+            assert!(
+                error.to_string().contains("cause=symlink,"),
+                "{target:?}: {error:#}"
+            );
+            assert!(!format!("{error:#?}").contains(dir.path().to_str().unwrap()));
+            assert!(!error.to_string().contains("staging exceeded"));
+        }
+        Ok(())
+    }
+    #[test]
+    fn converter_font_cache_allowance_does_not_extend_to_other_paths() -> Result<()> {
+        for alias in [
+            "input.docx",
+            "output/result.pdf",
+            "tmp/alias",
+            "profile/alias",
+            "profile/.cache/alias",
+            "profile/.cache/fontconfig",
+            "profile/.cache/fontconfig/nested/alias",
+        ] {
+            let dir = tempfile::tempdir()?;
+            let cache = dir.path().join("profile/.cache/fontconfig");
+            let alias = dir.path().join(alias);
+            if alias != cache {
+                fs::create_dir_all(&cache)?;
+            }
+            let parent = alias.parent().unwrap();
+            fs::create_dir_all(parent)?;
+            fs::write(parent.join("current-cache"), b"cache")?;
+            std::os::unix::fs::symlink("current-cache", &alias)?;
+            assert!(is_font_cache_alias(&alias));
+            assert!(
+                check_staging_with_font_cache(dir.path(), 4096, Some(&cache))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("cause=symlink,")
+            );
+        }
+        Ok(())
+    }
+    #[test]
     fn staging_inventory_error_causes_are_closed_and_redact_context() {
         for (message, cause) in [
             ("Office staging special file rejected", "special"),
@@ -476,7 +823,7 @@ mod tests {
         let converter = script(
             &root,
             &format!(
-                "printf x >> {}\n/bin/cp {} \"$8/result.pdf\"",
+                "mkdir -p \"$HOME/.cache/fontconfig\"\nprintf cache > \"$HOME/.cache/fontconfig/current-cache\"\nln -s current-cache \"$HOME/.cache/fontconfig/previous-cache\"\nprintf x >> {}\n/bin/cp {} \"$8/result.pdf\"",
                 quote(&calls),
                 quote(&fixture)
             ),
