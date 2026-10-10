@@ -1,0 +1,237 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Prospective paired Harbor resource and reward observations",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "task_id",
+    "repeat",
+    "arm",
+    "status",
+    "reward",
+    "preprocessing",
+    "reader",
+    "judge"
+  ],
+  "properties": {
+    "task_id": {
+      "type": "string"
+    },
+    "repeat": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "arm": {
+      "enum": [
+        "control",
+        "gptgrep"
+      ]
+    },
+    "status": {
+      "enum": [
+        "unexecuted",
+        "succeeded",
+        "failed",
+        "verification_unavailable"
+      ]
+    },
+    "reward": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "enum": [
+        0,
+        1,
+        null
+      ]
+    },
+    "preprocessing": {
+      "$ref": "#/$defs/resources"
+    },
+    "reader": {
+      "$ref": "#/$defs/resources"
+    },
+    "judge": {
+      "$ref": "#/$defs/resources"
+    },
+    "operational_status": {
+      "enum": [
+        "unexecuted",
+        "pending",
+        "completed",
+        "failed",
+        "unknown"
+      ],
+      "description": "Normalized execution lifecycle; completed or failed requires terminal evidence. Never-launched or missing-terminal observations remain pending or unknown even in a final report."
+    },
+    "judge_status": {
+      "enum": [
+        "not_attempted",
+        "pending",
+        "completed",
+        "unavailable"
+      ]
+    },
+    "failure_reason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Failure classification or unavailable-evidence reason; native status strings do not replace the normalized status enums."
+    },
+    "query_wall_ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "query_wall_scope": {
+      "enum": [
+        "task_delivery_to_query_terminal",
+        "unavailable"
+      ],
+      "description": "Query terminal is a final answer or an observed terminal failure; component latency remains separate."
+    },
+    "timing_complete": {
+      "type": "boolean"
+    },
+    "terminal_sha256": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "answer_sha256": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "schema_version": {
+      "const": "gptgrep.harbor.metrics.v2"
+    },
+    "cohort_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "configuration_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "judge_receipt_sha256": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "judged_answer_sha256": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "judge_rubric_sha256": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "request_count",
+        "latency_ms",
+        "input_tokens",
+        "output_tokens",
+        "cost_usd",
+        "cost_known",
+        "failures"
+      ],
+      "properties": {
+        "request_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "latency_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "input_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "output_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "cost_usd": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cost_known": {
+          "type": "boolean"
+        },
+        "failures": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "request_count_scope": {
+          "enum": [
+            "logical_submissions",
+            "validated_responses",
+            "physical_provider_requests",
+            "unknown"
+          ]
+        },
+        "cost_scope": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Declared provenance and coverage of cost_usd; missing cost remains unknown."
+        },
+        "cost_complete": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

@@ -21,6 +21,12 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    ReportPaired {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        input_sha256: String,
+    },
     PlanProduction {
         #[arg(long)]
         corpus: PathBuf,
@@ -826,6 +832,22 @@ fn verifier(
 }
 fn run(command: Command) -> Result<()> {
     match command {
+        Command::ReportPaired {
+            input,
+            input_sha256,
+        } => {
+            check_hash(&input_sha256)?;
+            let bytes = regular_bytes(&input, MAX_JSON)?;
+            if hash(&bytes) != input_sha256 {
+                return Err("paired_input_digest_mismatch".into());
+            }
+            let mut report = report_metrics::report(&bytes)?;
+            report["input_sha256"] = serde_json::Value::String(input_sha256);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+            );
+        }
         Command::PlanProduction {
             corpus,
             corpus_sha256,
@@ -935,5 +957,6 @@ fn main() {
 }
 
 mod production_export;
+mod report_metrics;
 #[cfg(test)]
 mod tests;

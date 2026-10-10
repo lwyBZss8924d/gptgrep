@@ -174,6 +174,9 @@ class FrozenCodexAgent(BaseAgent):
             number = value.get(key)
             if number is not None and (type(number) is not int or not 0 <= number <= 255):
                 raise ValueError("exit observation")
+        latency = value.get("latency_ms")
+        if latency is not None and (type(latency) is not int or not 0 <= latency <= 2**64-1):
+            raise ValueError("latency observation")
         context.n_input_tokens = clean["input_tokens"]
         context.n_cache_tokens = clean["cached_input_tokens"]
         context.n_output_tokens = clean["output_tokens"]
@@ -182,6 +185,8 @@ class FrozenCodexAgent(BaseAgent):
         summary = {"status":status, "failure":failure, "requested":self._admission["requested"],
                    "actual":{key:None for key in ("model", "provider", "reasoning_effort", "service_tier", "paid_request_count", "cost_usd")},
                    "observations":clean, "native_exit_code":value.get("native_exit_code"), "native_signal":value.get("native_signal"),
+                   "native_latency_ms":latency, "native_latency_scope":"native_execution_component",
+                   "query_wall_ms":None, "query_wall_scope":"unavailable",
                    "execution_qualified":False, "control_sha256":self.options.control_sha256,
                    "clock_scope":"external phase metadata; not a Jev RunClock join", "phase":self._admission["phase"]}
         context.metadata = {"native_agent":summary}
