@@ -13,6 +13,91 @@ use std::{
 };
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
+// Structured Outputs uses a stricter subset than general JSON Schema.
+fn assert_strict_citation_union(schema: &Value) {
+    assert_eq!(schema["type"], "object");
+    assert_eq!(schema["additionalProperties"], false);
+    assert!(schema.get("anyOf").is_none());
+    let items = &schema["properties"]["citations"]["items"];
+    assert!(items.get("oneOf").is_none());
+    let branches = items["anyOf"].as_array().expect("supported citation union");
+    assert_eq!(branches.len(), 2);
+    for (branch, tag) in branches.iter().zip(["text", "image"]) {
+        assert_eq!(branch["type"], "object");
+        assert_eq!(branch["additionalProperties"], false);
+        assert_eq!(branch["properties"]["kind"]["type"], "string");
+        assert_eq!(branch["properties"]["kind"]["enum"], json!([tag]));
+        let properties = branch["properties"].as_object().unwrap();
+        let required = branch["required"].as_array().unwrap();
+        assert_eq!(properties.len(), required.len());
+        for (name, property) in properties {
+            assert!(
+                required
+                    .iter()
+                    .any(|field| field.as_str() == Some(name.as_str()))
+            );
+            assert!(property["type"].is_string());
+        }
+    }
+}
+
+#[test]
+fn final_schema_uses_supported_strict_citation_union() {
+    for maximum in [0, 1, 8] {
+        let schema = final_schema(maximum);
+        assert_strict_citation_union(&schema);
+        assert_eq!(schema["properties"]["citations"]["maxItems"], maximum);
+    }
+}
+
+#[test]
+fn final_schema_preserves_closed_citation_variants_and_limits() -> Result<()> {
+    let schema = final_schema(2);
+    let validator = jsonschema::validator_for(&schema)?;
+    let text = json!({"kind":"text","issued_id":"issued-text","offset":0,"length":1,"quote":"x"});
+    let image = json!({"kind":"image","issued_id":"issued-image"});
+    let answer = |citations: Value| json!({"answer":"fixture","citations":citations,"insufficient_evidence":true});
+    for citations in [
+        json!([]),
+        json!([text]),
+        json!([image]),
+        json!([text, image]),
+    ] {
+        let value = answer(citations);
+        assert!(validator.is_valid(&value));
+        let _: Final = serde_json::from_value(value)?;
+    }
+    for citation in [
+        json!({"kind":"image","issued_id":"issued-image","quote":"x"}),
+        json!({"kind":"text","issued_id":"issued-text"}),
+        json!({"kind":"other","issued_id":"issued-image"}),
+        json!({"kind":1,"issued_id":"issued-image"}),
+    ] {
+        let value = answer(json!([citation]));
+        assert!(!validator.is_valid(&value));
+        assert!(serde_json::from_value::<Final>(value).is_err());
+    }
+    for (field, invalid) in [
+        ("issued_id", json!("x".repeat(65))),
+        ("offset", json!(-1)),
+        ("length", json!(0)),
+        ("length", json!(2049)),
+        ("quote", json!("x".repeat(2049))),
+    ] {
+        let mut citation = text.clone();
+        citation[field] = invalid;
+        assert!(!validator.is_valid(&answer(json!([citation]))));
+    }
+    assert!(!validator.is_valid(&answer(json!([image, image, image]))));
+    let mut extra = answer(json!([]));
+    extra["unexpected"] = json!(true);
+    assert!(!validator.is_valid(&extra));
+    let mut long_answer = answer(json!([]));
+    long_answer["answer"] = json!("x".repeat(8193));
+    assert!(!validator.is_valid(&long_answer));
+    Ok(())
+}
+
 fn config() -> HostConfig {
     HostConfig {
         model: "gpt-6-luna".into(),
@@ -264,6 +349,7 @@ async fn native_fixture(
                     "approvalPolicy":"never","sandbox":{"type":"readOnly","networkAccess":false},"reasoningEffort":"max","serviceTier":"priority"}})).await?;
             }
             Some("turn/start") => {
+                assert_strict_citation_union(&request["params"]["outputSchema"]);
                 let state: Value = serde_json::from_str(
                     request["params"]["input"][0]["text"]
                         .as_str()

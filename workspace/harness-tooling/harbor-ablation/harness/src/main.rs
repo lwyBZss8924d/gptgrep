@@ -25,9 +25,15 @@ enum Command {
         #[arg(long)]
         corpus: PathBuf,
         #[arg(long)]
+        corpus_sha256: String,
+        #[arg(long)]
         readers: PathBuf,
         #[arg(long)]
+        readers_sha256: String,
+        #[arg(long)]
         options: PathBuf,
+        #[arg(long)]
+        options_sha256: String,
         #[arg(long)]
         output_dir: PathBuf,
     },
@@ -35,9 +41,15 @@ enum Command {
         #[arg(long)]
         corpus: PathBuf,
         #[arg(long)]
+        corpus_sha256: String,
+        #[arg(long)]
         readers: PathBuf,
         #[arg(long)]
+        readers_sha256: String,
+        #[arg(long)]
         options: PathBuf,
+        #[arg(long)]
+        options_sha256: String,
         #[arg(long)]
         output_dir: PathBuf,
     },
@@ -816,19 +828,43 @@ fn run(command: Command) -> Result<()> {
     match command {
         Command::PlanProduction {
             corpus,
+            corpus_sha256,
             readers,
+            readers_sha256,
             options,
+            options_sha256,
             output_dir,
         } => {
-            production_export::prepare(&corpus, &readers, &options, false)?.publish(&output_dir)?;
+            production_export::prepare_bound(
+                &corpus,
+                &readers,
+                &options,
+                &corpus_sha256,
+                &readers_sha256,
+                &options_sha256,
+                false,
+            )?
+            .publish(&output_dir)?;
         }
         Command::ExportProductionReaders {
             corpus,
+            corpus_sha256,
             readers,
+            readers_sha256,
             options,
+            options_sha256,
             output_dir,
         } => {
-            production_export::prepare(&corpus, &readers, &options, true)?.publish(&output_dir)?;
+            production_export::prepare_bound(
+                &corpus,
+                &readers,
+                &options,
+                &corpus_sha256,
+                &readers_sha256,
+                &options_sha256,
+                true,
+            )?
+            .publish(&output_dir)?;
         }
         Command::ExportProductionVerifier {
             graders,

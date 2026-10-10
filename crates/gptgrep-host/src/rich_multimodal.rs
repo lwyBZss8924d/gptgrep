@@ -651,13 +651,15 @@ pub(crate) fn tools() -> Value {
     tools
 }
 pub(crate) fn final_schema(maximum: usize) -> Value {
+    // Structured Outputs supports nested anyOf. Distinct typed tags keep the
+    // citation branches disjoint while retaining the closed wire contract.
     json!({"type":"object","additionalProperties":false,
         "properties":{"answer":{"type":"string","maxLength":8192},"insufficient_evidence":{"type":"boolean"},
-        "citations":{"type":"array","maxItems":maximum,"items":{"oneOf":[
-            {"type":"object","additionalProperties":false,"properties":{"kind":{"const":"text"},"issued_id":{"type":"string","maxLength":64},
+        "citations":{"type":"array","maxItems":maximum,"items":{"anyOf":[
+            {"type":"object","additionalProperties":false,"properties":{"kind":{"type":"string","enum":["text"]},"issued_id":{"type":"string","maxLength":64},
                 "offset":{"type":"integer","minimum":0},"length":{"type":"integer","minimum":1,"maximum":2048},"quote":{"type":"string","maxLength":2048}},
                 "required":["kind","issued_id","offset","length","quote"]},
-            {"type":"object","additionalProperties":false,"properties":{"kind":{"const":"image"},"issued_id":{"type":"string","maxLength":64}},
+            {"type":"object","additionalProperties":false,"properties":{"kind":{"type":"string","enum":["image"]},"issued_id":{"type":"string","maxLength":64}},
                 "required":["kind","issued_id"]}]}}},"required":["answer","citations","insufficient_evidence"]})
 }
 

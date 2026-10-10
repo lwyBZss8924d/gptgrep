@@ -483,7 +483,38 @@ async fn installed_office_conversion_once_retains_normalized_pdf_for_native_gene
         },
         ..Default::default()
     };
-    let prepared = prepare_rich_ingest(&root, options).await?;
+    let prepared = match prepare_rich_ingest(&root, options).await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            // Keep failed converter scratch inside this private test directory.
+            // Paths belong only in this bounded local artifact, never stdout.
+            let retained = tmp.keep();
+            let metadata = serde_json::to_vec(&serde_json::json!({
+                "schema": "gptgrep.office-test-failure-custody.v1",
+                "retained_corpus_root": &retained,
+                "retained_staging_root": retained.join(STATE).join("ingest-candidates"),
+                "staging_presence": "not_inspected",
+                "prepare_outcome": "error",
+            }));
+            let metadata_written = match metadata {
+                Ok(bytes) if bytes.len() <= 16_384 => fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(retained.join(".office-failure-custody.json"))
+                    .and_then(|mut file| {
+                        std::io::Write::write_all(&mut file, &bytes)?;
+                        file.sync_all()
+                    })
+                    .is_ok(),
+                _ => false,
+            };
+            return Err(if metadata_written {
+                error
+            } else {
+                error.context("Office failure custody metadata could not be persisted")
+            });
+        }
+    };
     assert_eq!(prepared.report().required_pages, 0);
     let report = prepared.publish(None).await;
     assert_eq!(report.status, "published", "{report:?}");

@@ -274,7 +274,107 @@ def runtime_debian_expected(options, files):
     return assets, metadata, checksums
 
 
-def production_reader_dockerfile(options, groups, scope, arm):
+def production_helper_evidence(data, binding, task, group):
+    if not isinstance(binding, dict) or set(binding) != {
+            "group_id", "evidence_sha256", "evidence_bytes", "accounting_sha256"} \
+            or binding["group_id"] != group["id"] or binding["group_id"] not in task["group_scope"] \
+            or type(binding["evidence_bytes"]) is not int or len(data) != binding["evidence_bytes"] \
+            or not 0 < len(data) <= 1048576 or digest(data) != binding["evidence_sha256"] \
+            or not sha256_string(binding["accounting_sha256"]):
+        raise ValueError("production_helper_binding")
+    evidence = production_json(data)
+    keys = {"schema_version", "status", "generation", "query_sha256", "config_sha256",
+            "request_sha256", "preparation_sha256", "operations", "actual_image_delivery", "citation_authority"}
+    if not isinstance(evidence, dict) or set(evidence) != keys \
+            or evidence["schema_version"] != "gptgrep.harbor.rich_helper_evidence.v2" \
+            or evidence["status"] != "completed" or evidence["generation"] != group["pin"] \
+            or evidence["query_sha256"] != task["question_sha256"] \
+            or evidence["actual_image_delivery"] is not False or evidence["citation_authority"] is not False \
+            or not all(sha256_string(evidence[k]) for k in ("config_sha256", "request_sha256", "preparation_sha256")) \
+            or not isinstance(evidence["operations"], list) or not 1 <= len(evidence["operations"]) <= 8:
+        raise ValueError("production_helper_evidence")
+    ids = set()
+    inventory_hashes = {a["sha256"] for a in group["generation_inventory"]}
+    raw = {(r["path"], r["sha256"]) for r in group["raw_documents"]}
+    for op in evidence["operations"]:
+        if not isinstance(op, dict) or set(op) != {"id", "kind", "entries", "coverage"} \
+                or not isinstance(op["id"], str) or re.fullmatch("[a-z0-9-]{1,64}", op["id"]) is None \
+                or op["id"] in ids or not isinstance(op["entries"], list) or len(op["entries"]) > 128:
+            raise ValueError("production_helper_operation")
+        ids.add(op["id"])
+        if op["kind"] == "search_multimodal":
+            counts = {"scoped_documents", "routed_documents", "selected_documents",
+                      "available_text_artifacts", "inspected_text_artifacts", "omitted_text_artifacts",
+                      "scanned_text_bytes", "potential_text_candidates", "potential_visual_candidates",
+                      "available_visual_candidates", "omitted_visual_candidates", "visual_pages_in_scope",
+                      "visual_pages_without_rendition", "union_text_candidates", "union_visual_candidates",
+                      "filtered_candidates"}
+            flags = {"lexical_truncated", "lexical_query_terms_truncated", "visual_enumeration_complete",
+                     "selected_visual_artifact_bytes_verified", "semantic_scope_complete"}
+            fixed = ("delivered_set_sufficiency", "unassessed")
+        elif op["kind"] == "rerank":
+            counts = {"supplied_candidates", "text_candidates", "visual_candidates", "scored_candidates"}
+            flags, fixed = {"complete"}, ("scope", "supplied_candidate_pool_only")
+        else:
+            raise ValueError("production_helper_operation")
+        coverage = op["coverage"]
+        if not isinstance(coverage, dict) or set(coverage) != counts | flags | {fixed[0]} \
+                or any(type(coverage[k]) is not int or not 0 <= coverage[k] <= 18446744073709551615 for k in counts) \
+                or any(type(coverage[k]) is not bool for k in flags) or coverage[fixed[0]] != fixed[1]:
+            raise ValueError("production_helper_coverage")
+        candidates = set()
+        for entry in op["entries"]:
+            if not isinstance(entry, dict) or set(entry) != {
+                    "candidate_id", "evidence", "score", "confidence", "literal_anchor"} \
+                    or not sha256_string(entry["candidate_id"]) or entry["candidate_id"] in candidates \
+                    or type(entry["score"]) not in (int, float) or not math.isfinite(entry["score"]) \
+                    or not 0 <= entry["score"] <= 1 \
+                    or (entry["confidence"] is not None and (
+                        type(entry["confidence"]) not in (int, float) or not math.isfinite(entry["confidence"])
+                        or not 0 <= entry["confidence"] <= 1)) \
+                    or (entry["literal_anchor"] is not None and type(entry["literal_anchor"]) is not bool) \
+                    or (op["kind"] == "rerank" and entry["literal_anchor"] is not None):
+                raise ValueError("production_helper_score")
+            candidates.add(entry["candidate_id"])
+            ref = entry["evidence"]
+            if not isinstance(ref, dict):
+                raise ValueError("production_helper_source_reference")
+            if ref.get("kind") == "native_text":
+                text_keys = {"generation", "document_id", "source_path", "source_sha256",
+                             "artifact_id", "artifact_sha256", "page", "byte_start", "byte_end", "line"}
+                text = ref.get("binding")
+                if set(ref) != {"kind", "binding"} or not isinstance(text, dict) or set(text) != text_keys \
+                        or any(type(text[k]) is not int or not 0 <= text[k] <= 18446744073709551615
+                               for k in ("page", "byte_start", "byte_end", "line")) \
+                        or not 1 <= text["page"] <= 4294967295 or text["line"] == 0 \
+                        or not text["byte_start"] < text["byte_end"] \
+                        or not all(isinstance(text[k], str) for k in (
+                            "document_id", "source_path", "source_sha256", "artifact_id", "artifact_sha256")):
+                    raise ValueError("production_helper_text_reference")
+                pin, path, sha, artifact_sha = (text[k] for k in (
+                    "generation", "source_path", "source_sha256", "artifact_sha256"))
+            elif ref.get("kind") == "visual_region":
+                visual_keys = {"kind", "generation", "document_id", "source_path", "source_sha256",
+                               "page", "region_id", "rendition_id", "rendition_sha256", "bbox", "page_to_raster"}
+                if set(ref) != visual_keys or entry["literal_anchor"] is not None \
+                        or type(ref["page"]) is not int or not 1 <= ref["page"] <= 4294967295 \
+                        or not all(isinstance(ref[k], str) for k in (
+                            "document_id", "source_path", "source_sha256", "region_id", "rendition_id", "rendition_sha256")):
+                    raise ValueError("production_helper_visual_reference")
+                for field, expected_keys in (("bbox", {"x", "y", "width", "height"}),
+                                             ("page_to_raster", {"a", "b", "c", "d", "e", "f"})):
+                    if not isinstance(ref[field], dict) or set(ref[field]) != expected_keys \
+                            or any(type(n) not in (int, float) or not math.isfinite(n) for n in ref[field].values()):
+                        raise ValueError("production_helper_visual_reference")
+                pin, path, sha, artifact_sha = (ref[k] for k in (
+                    "generation", "source_path", "source_sha256", "rendition_sha256"))
+            else:
+                raise ValueError("production_helper_native_coverage")
+            if pin != group["pin"] or (path, sha) not in raw or artifact_sha not in inventory_hashes:
+                raise ValueError("production_helper_source_reference")
+    return evidence
+
+def production_reader_dockerfile(options, groups, scope, arm, helper=False):
     image = options["reader_image"]
     if not isinstance(image, str) or "@sha256:" not in image \
             or not sha256_string(image.rsplit("@sha256:", 1)[1]) \
@@ -301,6 +401,8 @@ def production_reader_dockerfile(options, groups, scope, arm):
         docker += f"COPY --chown={uid}:{gid} groups/{group_id}/raw/ {root}/\n"
     if arm == "gptgrep":
         docker += "COPY tool/ /app/tool/\nRUN chmod 0555 /app/tool/gptgrep\n"
+        if helper:
+            docker += f"COPY --chown={uid}:{gid} helper-evidence.json /app/helper-evidence.json\n"
     return (docker + f"USER {uid}:{gid}\n").encode()
 
 
@@ -308,8 +410,7 @@ def production_instruction(question, arm):
     instruction = (question + '\n\nRead the raw PDF groups named in /app/reader-input.json. '
                    'Write only {"answer":"..."} to /app/answer.json.\n')
     if arm == "gptgrep":
-        instruction += (
-            '\nGPTgrep retrieval is available at /app/tool/gptgrep. Discover its command and request contracts with /app/tool/gptgrep --schema and /app/tool/gptgrep --llms. For each relevant group named in /app/reader-input.json, read its canonical_root and exact generation pin from /app/prebuild-seals/GROUP/receipt.json and /app/prebuild-seals/GROUP/pin.json. Use the pinned rich batch interface to retrieve document evidence: save a bounded JSON request to a file and invoke /app/tool/gptgrep batch --rich --root ROOT --input FILE as a direct command. Use inspect_documents and inspect_pages to discover artifact identifiers, then search_artifacts and read_artifact for relevant native text. Preserve the exact generation pin and continuation cursors, respect the documented operation/output limits, and inspect coverage and errors. The tool and prebuilt generation are local retrieval resources; they do not supply a verified answer or an interactive model helper. Native PDF tools remain available.\n')
+        instruction += "\nGPTgrep retrieval is available at /app/tool/gptgrep. Discover its command and request contracts with /app/tool/gptgrep --schema and /app/tool/gptgrep --llms. For each relevant group named in /app/reader-input.json, read its canonical_root and exact generation pin from /app/prebuild-seals/GROUP/receipt.json and /app/prebuild-seals/GROUP/pin.json. Save bounded requests and invoke /app/tool/gptgrep batch --rich --root ROOT --input FILE directly. Use inspect_documents, inspect_pages and inspect_native_metadata to discover source structure; use search_artifacts and read_artifact for text evidence. Use inspect_visual to discover retained rendition identifiers and read_visual for complete verified image bytes. Metadata or image_base64 in JSON does not prove that you viewed an image: decode verified bytes and use an available image-view tool before claiming visual consumption. Preserve generation pins, source references, cursors, coverage and operation/output limits. If /app/helper-evidence.json is present, it contains source-bound scored references from a separately controlled host search_multimodal or rerank phase; follow them with local reads. It supplies no verified answer, image delivery or citation authority. Paid helper execution and credentials stay with the trusted host; this reader must not start paid operations. Native PDF tools remain available.\n"
     return instruction.encode("utf-8")
 
 
@@ -337,7 +438,7 @@ def production_reader_namespace(manifest, files):
         for arm in ("control", "gptgrep"):
             prefix = f"{arm}/{task_id}"
             if small_bytes(files[f"{prefix}/environment/Dockerfile"]) != production_reader_dockerfile(
-                    options, groups, task["group_scope"], arm):
+                    options, groups, task["group_scope"], arm, task.get("helper") is not None):
                 raise ValueError("production_reader_docker_binding")
             if runtime is not None:
                 assets, metadata, checksums = runtime
@@ -395,6 +496,14 @@ def production_reader_namespace(manifest, files):
                         "receipt.json", "pin.json", "raw-manifest.json", "build-controls.json"))
             if arm == "gptgrep":
                 expected.update(f"{prefix}/environment/tool/{name}" for name in ("gptgrep", "provenance.json"))
+                if task.get("helper") is not None:
+                    binding = task["helper"]
+                    group = groups.get(binding.get("group_id")) if isinstance(binding, dict) else None
+                    name = f"{prefix}/environment/helper-evidence.json"
+                    if group is None or name not in files:
+                        raise ValueError("production_helper_group")
+                    production_helper_evidence(small_bytes(files[name]), binding, task, group)
+                    expected.add(name)
         if raw != task["raw_sha256"]:
             raise ValueError("production_raw_scope")
     if set(files) != expected:

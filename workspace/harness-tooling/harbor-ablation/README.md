@@ -213,8 +213,9 @@ candidate APIs. It inspects the candidate plan before finalizing with no outcome
 and `OcrMode::Off`. Required OCR, OCR tasks or capability blockers refuse import
 and publication. It never creates successful OCR receipts or rewrites native
 coverage. Raw source checks run before/after native awaits, before import and
-before publication. This native-only round intentionally blocks visual/scanned
-sources requiring qualified OCR.
+before publication. Pages requiring qualified OCR remain blocked. Native pages
+may retain rendered visual artifacts when `render_pages` is enabled; keeping a
+rendition does not establish reader image delivery.
 
 The observation deadline is checked at admission and operation boundaries.
 PDFium extraction is a blocking library call, and synchronous writer publication
@@ -508,13 +509,69 @@ observations and terminal results in the unchanged original context. Concurrent
 unrelated ledger changes invalidate that attribution; failed response usage,
 physical requests and billed cost remain outside this completeness claim.
 
+### Rich-batch bootstrap and treatment evidence
+
+The separate `--rich` mode uses the closed
+`gptgrep.harbor.rich_batch_helper.v1` config. It binds the raw query plus a
+bytes/SHA-pinned `gptgrep.batch.rich.request.v1` file, an exact generation, the
+original context, `max_calls`, and an optional `expected_preparation_sha256`.
+Only `search_multimodal` and `rerank` operations are admitted, all with the same
+query, unique IDs, and `max_concurrent_batches: 1`. Local visual inspection and
+complete rendition reads remain available to the treatment reader through the
+existing batch tool.
+
+`--rich --prepare-rich --config PATH --config-sha256 SHA` opens the pinned
+reader and prepares every intended paid operation. A failed item blocks the
+whole helper before submission. It emits bounded envelope metadata and its
+preparation digest, with no credentials, logical reservation, provider call or
+output directory. The original context is joined and checked without consuming
+it. `reserved_calls` is derived from the prepared routing and reranking objects;
+it is not fixed at two. Full-pool reranking envelopes are conservative bounds;
+actual routing-selected subset bodies and hashes appear in terminal accounting.
+
+Preparation metadata is an integrity binding. The private monetary coordinator
+must inspect the actual prepared bodies, reserve the entire bounded phase under
+its canonical dollar guard, and approve launch before `--rich --execute`.
+The public helper has no monetary-admission authority. Execution requires the
+expected preparation digest, recreates that preparation against unchanged input
+pins, and retains each actual attempt before deciding evidence delivery. It
+requires checked actual model, numeric token/cost observations and exact context
+deltas for the derived observed call count. Failures or an expired original
+clock prevent reader startup; no retry, refund, deadline reset or money
+settlement is performed.
+
+A completed rich helper emits the closed
+`gptgrep.harbor.rich_helper_evidence.v2` attachment: source-bound native/visual
+references, scores and structured coverage only. It contains no document text,
+image bytes, answer, freeform model prose, credentials or accounting. Its
+`actual_image_delivery` and `citation_authority` stay false. The treatment must
+read cited source bytes and open decoded `read_visual` image bytes through its
+native image viewer before claiming visual consumption. Helper preparation,
+provider latency, receipt handling and delivery all count as treatment retrieval.
+
+Each reader task may optionally add `helper: {group_id, evidence, accounting}`;
+`evidence` and `accounting` use the existing external bytes/SHA input shape.
+The exporter validates the attachment against the task question, group,
+generation, raw sources, native coordinates or exact rendition, and completed
+private accounting. It retains both inputs through publication, copies only the
+evidence to the treatment's `/app/helper-evidence.json`, and excludes it from
+the control. Rust and Python validate the same closed attachment and namespace.
+Source tests exercise native and visual references, stale custody, forged
+bindings and baseline exclusion. These sources do not qualify a live reader,
+image consumption, monetary admission, Harbor mounts or paired outcomes.
+
 The exporter adds explicit commands with no task selection shortcuts:
 
 ```sh
-gptgrep-harbor-ablation-exporter plan-production --corpus corpus.json --readers readers.json --options options.json --output-dir /path/to/new/plan
-gptgrep-harbor-ablation-exporter export-production-readers --corpus corpus.json --readers readers.json --options options.json --output-dir /path/to/new/readers
+gptgrep-harbor-ablation-exporter plan-production --corpus corpus.json --corpus-sha256 "$CORPUS_SHA256" --readers readers.json --readers-sha256 "$READERS_SHA256" --options options.json --options-sha256 "$OPTIONS_SHA256" --output-dir /path/to/new/plan
+gptgrep-harbor-ablation-exporter export-production-readers --corpus corpus.json --corpus-sha256 "$CORPUS_SHA256" --readers readers.json --readers-sha256 "$READERS_SHA256" --options options.json --options-sha256 "$OPTIONS_SHA256" --output-dir /path/to/new/readers
 gptgrep-harbor-ablation-exporter export-production-verifier --graders graders.json --reader-export /path/to/readers --output-dir /path/to/new/graders
 ```
+
+Set `CORPUS_SHA256`, `READERS_SHA256`, and `OPTIONS_SHA256` to the lowercase
+SHA-256 digests of the exact bytes in their corresponding input files. Both
+commands require all three digests and check them against the held input bytes
+before admitting corpus assets.
 
 `validate` dispatches by the exact export schema. Production uses
 `gptgrep.harbor.export.v2`; the existing synthetic export remains v1. Python
@@ -545,7 +602,7 @@ This first production route admits native/verified-blank pages only; it does not
 substitute supplied OCR or promote a native-only build to the full harness.
 
 A reader projection binds the exact corpus digest and contains only
-`tasks: [{id, question, question_sha256, group_scope}]`. A scope selects whole
+`tasks: [{id, question, question_sha256, group_scope, helper?}]`. A scope selects whole
 admitted groups. Baseline and treatment receive exactly the same raw files and
 Codex options. Production options require the requested reader profile
 `gpt-6-luna`/`max`/`fast`, derived from the project role contract. Actual returned

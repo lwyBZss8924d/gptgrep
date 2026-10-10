@@ -357,6 +357,67 @@ fn subset_selection_and_noncanonical_options_bytes_remain_bound() {
     );
 }
 
+#[test]
+fn production_cli_requires_all_three_input_digests() {
+    for command in ["plan-production", "export-production-readers"] {
+        for omitted in 0..3 {
+            let mut argv = vec!["exporter".to_owned(), command.to_owned()];
+            for (index, (path_flag, digest_flag)) in [
+                ("--corpus", "--corpus-sha256"),
+                ("--readers", "--readers-sha256"),
+                ("--options", "--options-sha256"),
+            ]
+            .iter()
+            .enumerate()
+            {
+                argv.extend([path_flag.to_string(), "unopened.json".to_owned()]);
+                if index != omitted {
+                    argv.extend([digest_flag.to_string(), "a".repeat(64)]);
+                }
+            }
+            argv.extend(["--output-dir".to_owned(), "uncreated-output".to_owned()]);
+            assert_eq!(
+                Cli::try_parse_from(argv).err().unwrap().kind(),
+                clap::error::ErrorKind::MissingRequiredArgument
+            );
+        }
+    }
+}
+
+#[test]
+fn production_cli_malformed_input_digests_precede_open() {
+    for export in [false, true] {
+        for index in [0, 1, 2] {
+            for malformed in ["".to_owned(), "g".repeat(64), "a".repeat(63)] {
+                let mut digests = ["a".repeat(64), "b".repeat(64), "c".repeat(64)];
+                digests[index] = malformed;
+                let command = if export {
+                    Command::ExportProductionReaders {
+                        corpus: "unopened-corpus.json".into(),
+                        corpus_sha256: digests[0].clone(),
+                        readers: "unopened-readers.json".into(),
+                        readers_sha256: digests[1].clone(),
+                        options: "unopened-options.json".into(),
+                        options_sha256: digests[2].clone(),
+                        output_dir: "uncreated-output".into(),
+                    }
+                } else {
+                    Command::PlanProduction {
+                        corpus: "unopened-corpus.json".into(),
+                        corpus_sha256: digests[0].clone(),
+                        readers: "unopened-readers.json".into(),
+                        readers_sha256: digests[1].clone(),
+                        options: "unopened-options.json".into(),
+                        options_sha256: digests[2].clone(),
+                        output_dir: "uncreated-output".into(),
+                    }
+                };
+                assert_eq!(run(command).unwrap_err(), "invalid_sha256");
+            }
+        }
+    }
+}
+
 // Genuine v2 Writer/Reader with generic MOCK parsed artifacts, never native extraction.
 mod production {
     use super::*;
@@ -631,6 +692,36 @@ mod production {
                 readers,
                 options,
             })
+        }
+        fn input_digests(&self) -> Result<[String; 3]> {
+            Ok([
+                hash(&fs::read(&self.corpus)?),
+                hash(&fs::read(&self.readers)?),
+                hash(&fs::read(&self.options)?),
+            ])
+        }
+        fn bound_command(&self, export: bool, digests: &[String; 3], out: &Path) -> Command {
+            if export {
+                Command::ExportProductionReaders {
+                    corpus: self.corpus.clone(),
+                    corpus_sha256: digests[0].clone(),
+                    readers: self.readers.clone(),
+                    readers_sha256: digests[1].clone(),
+                    options: self.options.clone(),
+                    options_sha256: digests[2].clone(),
+                    output_dir: out.to_path_buf(),
+                }
+            } else {
+                Command::PlanProduction {
+                    corpus: self.corpus.clone(),
+                    corpus_sha256: digests[0].clone(),
+                    readers: self.readers.clone(),
+                    readers_sha256: digests[1].clone(),
+                    options: self.options.clone(),
+                    options_sha256: digests[2].clone(),
+                    output_dir: out.to_path_buf(),
+                }
+            }
         }
         fn prepare(&self) -> super::super::Result<production_export::Plan> {
             production_export::prepare(&self.corpus, &self.readers, &self.options, true)
@@ -1142,6 +1233,288 @@ mod production {
         Ok(())
     }
 
+    fn attach_helper(
+        f: &ProductionFixture,
+        change: impl FnOnce(&mut Value),
+    ) -> Result<(PathBuf, PathBuf)> {
+        let pin = serde_json::from_slice(&fs::read(f.base.join("pin.json"))?)?;
+        let reader = RichGenerationReader::open_pinned(&f.raw, &pin)?;
+        let text = reader
+            .search_artifacts("copper", false, true, 1, None, MAX_JSON as usize)?
+            .hits
+            .remove(0)
+            .evidence;
+        let manifest = reader.manifest()?;
+        let visual = reader.visual_reader()?;
+        let rendition = visual.open_rendition(
+            &manifest.documents[0].pages[0].renditions[0].artifact.id,
+            &manifest.resource_budget,
+        )?;
+        let mut evidence = json!({"schema_version":"gptgrep.harbor.rich_helper_evidence.v2",
+            "status":"completed","generation":pin,"query_sha256":hash(b"What material is named?"),
+            "config_sha256":"a".repeat(64),"request_sha256":"b".repeat(64),"preparation_sha256":"c".repeat(64),
+            "operations":[{"id":"rerank","kind":"rerank","entries":[
+                {"candidate_id":"d".repeat(64),"evidence":text,"score":0.75,"confidence":0.8,"literal_anchor":null},
+                {"candidate_id":"e".repeat(64),"evidence":rendition.candidate().evidence,"score":0.5,"confidence":null,"literal_anchor":null}],
+                "coverage":{"scope":"supplied_candidate_pool_only","supplied_candidates":2,"text_candidates":1,
+                    "visual_candidates":1,"scored_candidates":2,"complete":true}}],
+            "actual_image_delivery":false,"citation_authority":false});
+        change(&mut evidence);
+        let evidence_path = f.base.join("helper-evidence.json");
+        save(&evidence_path, &evidence)?;
+        let account_path = f.base.join("helper-accounting.json");
+        save(
+            &account_path,
+            &json!({"schema_version":"gptgrep.harbor.rich_batch_accounting.v1",
+            "status":"completed","helper_logical_accounting_complete":true,"reader_must_not_start":false,
+            "reader_evidence_sha256":hash(&fs::read(&evidence_path)?),"query_sha256":evidence["query_sha256"],
+            "config_sha256":evidence["config_sha256"],"request_sha256":evidence["request_sha256"],
+            "preparation_sha256":evidence["preparation_sha256"],"generation":evidence["generation"],
+            "private_accounting_marker":"PRIVATE_ACCOUNTING_MUST_NOT_REACH_READER"}),
+        )?;
+        let mut readers: Value = serde_json::from_slice(&fs::read(&f.readers)?)?;
+        readers["tasks"][0]["helper"] = json!({"group_id":"group-a","evidence":external(&evidence_path),
+            "accounting":external(&account_path)});
+        save(&f.readers, &readers)?;
+        Ok((evidence_path, account_path))
+    }
+    #[tokio::test]
+    async fn production_helper_delivers_only_bound_native_and_visual_references_to_treatment()
+    -> Result<()> {
+        let f = ProductionFixture::new().await?;
+        let (evidence, _) = attach_helper(&f, |_| {})?;
+        let out = f.base.join("helper-readers");
+        f.export(&out);
+        assert_eq!(
+            fs::read(&evidence)?,
+            fs::read(out.join("gptgrep/task-a/environment/helper-evidence.json"))?
+        );
+        assert!(
+            !out.join("control/task-a/environment/helper-evidence.json")
+                .exists()
+        );
+        for file in files(&out) {
+            let body = fs::read(out.join(file["path"].as_str().unwrap()))?;
+            assert!(
+                !body
+                    .windows(b"PRIVATE_ACCOUNTING_MUST_NOT_REACH_READER".len())
+                    .any(|part| part == b"PRIVATE_ACCOUNTING_MUST_NOT_REACH_READER")
+            );
+        }
+        let instruction = fs::read_to_string(out.join("gptgrep/task-a/instruction.md"))?;
+        assert!(instruction.contains("inspect_visual") && instruction.contains("read_visual"));
+        assert!(instruction.contains("image_base64") && instruction.contains("image-view tool"));
+        Ok(())
+    }
+    #[tokio::test]
+    async fn production_helper_rejects_forged_bindings_and_changed_held_accounting() -> Result<()> {
+        for case in [
+            "query",
+            "source",
+            "coordinates",
+            "authority",
+            "coverage",
+            "freeform",
+            "confidence-missing",
+            "literal-anchor-missing",
+        ] {
+            let f = ProductionFixture::new().await?;
+            attach_helper(&f, |e| match case {
+                "query" => e["query_sha256"] = json!("0".repeat(64)),
+                "source" => {
+                    e["operations"][0]["entries"][0]["evidence"]["binding"]["source_sha256"] =
+                        json!("0".repeat(64))
+                }
+                "coordinates" => {
+                    e["operations"][0]["entries"][0]["evidence"]["binding"]["line"] = json!(999)
+                }
+                "authority" => e["actual_image_delivery"] = json!(true),
+                "coverage" => {
+                    e["operations"][0]["coverage"]["untrusted_text"] = json!("not source evidence")
+                }
+                "freeform" => e["answer"] = json!("not source evidence"),
+                "confidence-missing" => {
+                    e["operations"][0]["entries"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("confidence");
+                }
+                "literal-anchor-missing" => {
+                    e["operations"][0]["entries"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("literal_anchor");
+                }
+                _ => unreachable!(),
+            })?;
+            assert!(f.prepare().is_err(), "{case}");
+        }
+        let f = ProductionFixture::new().await?;
+        let (_, accounting) = attach_helper(&f, |_| {})?;
+        let plan = f.prepare().map_err(anyhow::Error::msg)?;
+        fs::write(accounting, b"changed after admission")?;
+        assert!(
+            plan.publish(&f.base.join("changed-accounting-readers"))
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn production_cli_checked_digests_accept_plan_and_reader_fixture() -> Result<()> {
+        for export in [false, true] {
+            let f = ProductionFixture::new().await?;
+            let digests = f.input_digests()?;
+            let out = f.base.join("bound-output");
+            run(f.bound_command(export, &digests, &out)).map_err(anyhow::Error::msg)?;
+            let manifest: Value =
+                serde_json::from_slice(&fs::read(out.join("export-manifest.json"))?)?;
+            assert_eq!(manifest["corpus_sha256"], digests[0]);
+            assert_eq!(manifest["reader_projection_sha256"], digests[1]);
+            assert_eq!(manifest["options_sha256"], digests[2]);
+            assert_eq!(manifest["qualification"]["runtime"], "HOLD");
+            if export {
+                production_export::validate(&out).map_err(anyhow::Error::msg)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn production_cli_wrong_input_digest_precedes_asset_admission() -> Result<()> {
+        for export in [false, true] {
+            for index in [0, 1, 2] {
+                let f = ProductionFixture::new().await?;
+                let mut digests = f.input_digests()?;
+                digests[index] = "0".repeat(64);
+                // Opening this tool would fail: the digest error must occur first.
+                fs::remove_file(f.base.join("tool"))?;
+                let out = f.base.join("refused-output");
+                assert_eq!(
+                    run(f.bound_command(export, &digests, &out)).unwrap_err(),
+                    "production_asset_digest"
+                );
+                assert!(!out.exists());
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn production_cli_replaced_input_refused_before_asset_admission() -> Result<()> {
+        for export in [false, true] {
+            for index in [0, 1, 2] {
+                let f = ProductionFixture::new().await?;
+                let digests = f.input_digests()?;
+                let path = [&f.corpus, &f.readers, &f.options][index];
+                fs::rename(path, f.base.join("checked-original.json"))?;
+                fs::write(path, b"{}")?;
+                fs::remove_file(f.base.join("tool"))?;
+                let out = f.base.join("refused-output");
+                assert_eq!(
+                    run(f.bound_command(export, &digests, &out)).unwrap_err(),
+                    "production_asset_digest"
+                );
+                assert!(!out.exists());
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checked_input_change_after_prepare_refuses_publication() -> Result<()> {
+        for export in [false, true] {
+            for index in [0, 1, 2] {
+                let f = ProductionFixture::new().await?;
+                let digests = f.input_digests()?;
+                let plan = production_export::prepare_bound(
+                    &f.corpus,
+                    &f.readers,
+                    &f.options,
+                    &digests[0],
+                    &digests[1],
+                    &digests[2],
+                    export,
+                )
+                .map_err(anyhow::Error::msg)?;
+                fs::write([&f.corpus, &f.readers, &f.options][index], b"{}")?;
+                let out = f.base.join("refused-output");
+                assert!(plan.publish(&out).is_err());
+                assert!(!out.exists());
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn production_compiled_cli_input_digest_regression_if_selected() -> Result<()> {
+        let Some(binary) = std::env::var_os("GPTGREP_PRODUCTION_DIGEST_CLI_BIN") else {
+            return Ok(());
+        };
+        let mut observed = [0, 0, 0]; // total, negative, positive child cases
+        for command in ["plan-production", "export-production-readers"] {
+            let f = ProductionFixture::new().await?;
+            let digests = f.input_digests()?;
+            let paths = [&f.corpus, &f.readers, &f.options];
+            let flags = ["--corpus-sha256", "--readers-sha256", "--options-sha256"];
+            let path_flags = ["--corpus", "--readers", "--options"];
+            for variant in 0..10 {
+                let out = f.base.join(format!("compiled-output-{variant}"));
+                let mut child = std::process::Command::new(&binary);
+                child.arg(command).arg("--output-dir").arg(&out);
+                for (index, path) in paths.iter().enumerate() {
+                    child.arg(path_flags[index]).arg(path);
+                    if variant == index {
+                        continue;
+                    }
+                    child.arg(flags[index]);
+                    if variant == index + 3 {
+                        child.arg("malformed");
+                    } else if variant == index + 6 {
+                        child.arg("0".repeat(64));
+                    } else {
+                        child.arg(&digests[index]);
+                    }
+                }
+                let result = child.output()?;
+                if variant == 9 {
+                    ensure!(
+                        result.status.success(),
+                        "compiled positive digest fixture refused: {}",
+                        String::from_utf8_lossy(&result.stderr)
+                    );
+                    let manifest: Value =
+                        serde_json::from_slice(&fs::read(out.join("export-manifest.json"))?)?;
+                    assert_eq!(manifest["corpus_sha256"], digests[0]);
+                    assert_eq!(manifest["reader_projection_sha256"], digests[1]);
+                    assert_eq!(manifest["options_sha256"], digests[2]);
+                    assert_eq!(manifest["qualification"]["runtime"], "HOLD");
+                    observed[2] += 1;
+                } else {
+                    assert!(!result.status.success());
+                    assert!(!out.exists());
+                    if variant < 3 {
+                        assert_eq!(result.status.code(), Some(2));
+                        assert!(String::from_utf8_lossy(&result.stderr).contains(flags[variant]));
+                    }
+                    if variant >= 3 {
+                        let expected = if variant < 6 {
+                            "invalid_sha256"
+                        } else {
+                            "production_asset_digest"
+                        };
+                        assert!(String::from_utf8_lossy(&result.stderr).contains(expected));
+                    }
+                    observed[1] += 1;
+                }
+                observed[0] += 1;
+            }
+        }
+        assert_eq!(observed, [20, 18, 2]);
+        println!("G9_COMPILED_CLI_DIGEST_CASES commands=2 total=20 negative=18 positive=2");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn production_bridge_fixture_if_selected() -> Result<()> {
         let f = ProductionFixture::new().await?;
@@ -1161,6 +1534,9 @@ mod production {
             None => {}
             Some("runtime") => {
                 bind_runtime(&f, &runtime_fixture(&f));
+            }
+            Some("helper") => {
+                attach_helper(&f, |_| {})?;
             }
             Some("null") => {
                 let mut options: Value = serde_json::from_slice(&fs::read(&f.options)?)?;

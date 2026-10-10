@@ -636,6 +636,92 @@ class ToolObservationTests(unittest.TestCase):
             bridge.observe_tool_use(self.events, self.pin_path, self.raw_root)
 
 
+class ProductionHelperEvidenceTests(unittest.TestCase):
+    def fixture(self):
+        pin = {"generation": "ordinary-generation", "manifest_sha256": "a" * 64}
+        group = {"id": "group-a", "pin": pin,
+                 "raw_documents": [{"path": "ordinary.pdf", "sha256": "b" * 64}],
+                 "generation_inventory": [{"sha256": "c" * 64}, {"sha256": "d" * 64}]}
+        text = {"kind": "native_text", "binding": {
+            "generation": pin, "document_id": "document", "source_path": "ordinary.pdf",
+            "source_sha256": "b" * 64, "artifact_id": "text", "artifact_sha256": "c" * 64,
+            "page": 1, "byte_start": 0, "byte_end": 4, "line": 1}}
+        visual = {"kind": "visual_region", "generation": pin, "document_id": "document",
+                  "source_path": "ordinary.pdf", "source_sha256": "b" * 64, "page": 1,
+                  "region_id": "region", "rendition_id": "rendition", "rendition_sha256": "d" * 64,
+                  "bbox": {"x": 0, "y": 0, "width": 8, "height": 16},
+                  "page_to_raster": {"a": 1, "b": 0, "c": 0, "d": 1, "e": 0, "f": 0}}
+        evidence = {"schema_version": "gptgrep.harbor.rich_helper_evidence.v2", "status": "completed",
+                    "generation": pin, "query_sha256": "e" * 64, "config_sha256": "f" * 64,
+                    "request_sha256": "1" * 64, "preparation_sha256": "2" * 64,
+                    "operations": [{"id": "rerank", "kind": "rerank", "entries": [
+                        {"candidate_id": "3" * 64, "evidence": text, "score": 0.75,
+                         "confidence": None, "literal_anchor": None},
+                        {"candidate_id": "4" * 64, "evidence": visual, "score": 0.5,
+                         "confidence": 0.8, "literal_anchor": None}],
+                        "coverage": {"scope": "supplied_candidate_pool_only", "supplied_candidates": 2,
+                                     "text_candidates": 1, "visual_candidates": 1, "scored_candidates": 2,
+                                     "complete": True}}], "actual_image_delivery": False, "citation_authority": False}
+        task = {"question_sha256": "e" * 64, "group_scope": ["group-a"]}
+        return evidence, task, group
+
+    def admit(self, evidence, task, group):
+        data = json.dumps(evidence, allow_nan=False).encode()
+        binding = {"group_id": "group-a", "evidence_sha256": bridge.digest(data),
+                   "evidence_bytes": len(data), "accounting_sha256": "5" * 64}
+        return bridge.production_helper_evidence(data, binding, task, group)
+
+    def test_closed_native_and_visual_references_preserve_delivery_limits(self):
+        evidence, task, group = self.fixture()
+        result = self.admit(evidence, task, group)
+        self.assertEqual(result, evidence)
+        self.assertFalse(result["actual_image_delivery"])
+        self.assertFalse(result["citation_authority"])
+
+    def test_query_generation_source_and_freeform_changes_refuse_even_with_new_payload_digest(self):
+        mutations = [lambda e: e.update(query_sha256="0" * 64),
+                     lambda e: e.update(generation={"generation": "other", "manifest_sha256": "a" * 64}),
+                     lambda e: e.update(actual_image_delivery=True),
+                     lambda e: e.update(answer="model text is not evidence"),
+                     lambda e: e["operations"][0]["coverage"].update(freeform="not source evidence"),
+                     lambda e: e["operations"][0]["entries"][0]["evidence"]["binding"].update(source_sha256="0" * 64),
+                     lambda e: e["operations"][0]["entries"][1]["evidence"].update(rendition_sha256="0" * 64),
+                     lambda e: e["operations"][0]["entries"][0].update(score=True),
+                     lambda e: e["operations"][0]["entries"][1]["evidence"].update(image_base64="forbidden"),
+                     lambda e: e["operations"][0]["entries"][0].pop("confidence"),
+                     lambda e: e["operations"][0]["entries"][0].pop("literal_anchor")]
+        for mutation in mutations:
+            evidence, task, group = self.fixture()
+            mutation(evidence)
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                self.admit(evidence, task, group)
+
+    def test_duplicate_keys_and_payload_digest_drift_refuse(self):
+        evidence, task, group = self.fixture()
+        data = json.dumps(evidence).encode()
+        binding = {"group_id": "group-a", "evidence_sha256": bridge.digest(data),
+                   "evidence_bytes": len(data), "accounting_sha256": "5" * 64}
+        with self.assertRaisesRegex(ValueError, "production_helper_binding"):
+            bridge.production_helper_evidence(data + b" ", binding, task, group)
+        data = data[:-1] + b', "status":"completed"}'
+        binding.update(evidence_bytes=len(data), evidence_sha256=bridge.digest(data))
+        with self.assertRaises(ValueError):
+            bridge.production_helper_evidence(data, binding, task, group)
+
+    def test_only_treatment_receives_helper_and_visual_guidance(self):
+        options = {"reader_image": "python@sha256:" + "a" * 64, "reader_uid": 501, "reader_gid": 20}
+        groups = {"group-a": {"runtime_root": "/app/groups/group-a/raw"}}
+        control = bridge.production_reader_dockerfile(options, groups, ["group-a"], "control", helper=True)
+        treatment = bridge.production_reader_dockerfile(options, groups, ["group-a"], "gptgrep", helper=True)
+        self.assertNotIn(b"helper-evidence", control)
+        self.assertIn(b"helper-evidence.json /app/helper-evidence.json", treatment)
+        guidance = bridge.production_instruction("ordinary query", "gptgrep")
+        self.assertIn(b"inspect_visual", guidance)
+        self.assertIn(b"read_visual", guidance)
+        self.assertIn(b"image-view tool", guidance)
+        self.assertNotIn(b"helper-evidence", bridge.production_instruction("ordinary query", "control"))
+
+
 if __name__ == "__main__":
     parser=argparse.ArgumentParser()
     parser.add_argument("--exporter",required=True);parser.add_argument("--scratch",required=True)

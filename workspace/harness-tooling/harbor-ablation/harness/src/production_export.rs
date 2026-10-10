@@ -360,10 +360,14 @@ fn canonical_root(path: &Path) -> Result<PathBuf> {
     }
     Ok(path.to_path_buf())
 }
+#[cfg(test)]
 fn admit(path: &Path) -> Result<AdmittedCorpus> {
     let corpus_file = Held::open(path, None)?;
     let bytes = corpus_file.bytes()?;
-    let corpus: Corpus = strict(&bytes)?;
+    admit_held(corpus_file, &bytes)
+}
+fn admit_held(corpus_file: Arc<Held>, bytes: &[u8]) -> Result<AdmittedCorpus> {
+    let corpus: Corpus = strict(bytes)?;
     if corpus.schema_version != "gptgrep.harbor.production-corpus.v1"
         || corpus.groups.is_empty()
         || corpus.groups.len() > 16
@@ -661,7 +665,7 @@ fn admit(path: &Path) -> Result<AdmittedCorpus> {
         });
     }
     let c = AdmittedCorpus {
-        digest: hash(&bytes),
+        digest: hash(bytes),
         groups,
         tool: corpus.tool,
         tool_file,
@@ -709,6 +713,8 @@ struct TaskInput {
     question: String,
     question_sha256: String,
     group_scope: Vec<String>,
+    #[serde(default)]
+    helper: Option<HelperInput>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -904,6 +910,374 @@ struct TaskBinding {
     question_sha256: String,
     group_scope: Vec<String>,
     raw_sha256: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    helper: Option<HelperBinding>,
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HelperInput {
+    group_id: String,
+    evidence: External,
+    accounting: External,
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HelperBinding {
+    group_id: String,
+    evidence_sha256: String,
+    evidence_bytes: u64,
+    accounting_sha256: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HelperEntry {
+    candidate_id: String,
+    #[serde(deserialize_with = "helper_evidence_reference")]
+    evidence: gptgrep_core::EvidenceRef,
+    score: f64,
+    #[serde(deserialize_with = "required_nullable")]
+    confidence: Option<f64>,
+    #[serde(deserialize_with = "required_nullable")]
+    literal_anchor: Option<bool>,
+}
+// Decode each concrete reference directly from JSON. Internally tagged enum
+// buffering turns arbitrary_precision decimals into maps before f64 decoding.
+fn helper_evidence_reference<'de, D>(
+    deserializer: D,
+) -> std::result::Result<gptgrep_core::EvidenceRef, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use gptgrep_core::{EvidenceRef, TextEvidenceBinding};
+    use serde::de::Error;
+
+    #[derive(Deserialize)]
+    struct Tag {
+        kind: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Native {
+        #[serde(rename = "kind")]
+        _kind: String,
+        binding: TextEvidenceBinding,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Ocr {
+        #[serde(rename = "kind")]
+        _kind: String,
+        binding: TextEvidenceBinding,
+        region_ids: Vec<String>,
+        ocr_profile_sha256: String,
+        ocr_receipt_sha256: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Visual {
+        #[serde(rename = "kind")]
+        _kind: String,
+        generation: GenerationPin,
+        document_id: String,
+        source_path: String,
+        source_sha256: String,
+        page: u32,
+        region_id: String,
+        rendition_id: String,
+        rendition_sha256: String,
+        bbox: gptgrep_parse::BoundingBox,
+        page_to_raster: gptgrep_parse::AffineTransform,
+    }
+
+    let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+    let tag: Tag = serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
+    match tag.kind.as_str() {
+        "native_text" => {
+            let item: Native = serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
+            Ok(EvidenceRef::NativeText {
+                binding: item.binding,
+            })
+        }
+        "ocr_text" => {
+            let item: Ocr = serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
+            Ok(EvidenceRef::OcrText {
+                binding: item.binding,
+                region_ids: item.region_ids,
+                ocr_profile_sha256: item.ocr_profile_sha256,
+                ocr_receipt_sha256: item.ocr_receipt_sha256,
+            })
+        }
+        "visual_region" => {
+            let item: Visual = serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
+            Ok(EvidenceRef::VisualRegion {
+                generation: item.generation,
+                document_id: item.document_id,
+                source_path: item.source_path,
+                source_sha256: item.source_sha256,
+                page: item.page,
+                region_id: item.region_id,
+                rendition_id: item.rendition_id,
+                rendition_sha256: item.rendition_sha256,
+                bbox: item.bbox,
+                page_to_raster: item.page_to_raster,
+            })
+        }
+        _ => Err(D::Error::unknown_variant(
+            &tag.kind,
+            &["native_text", "ocr_text", "visual_region"],
+        )),
+    }
+}
+
+// Null is admitted; an omitted field is not. Match the Python closed DTO.
+fn required_nullable<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HelperOperation {
+    id: String,
+    kind: String,
+    entries: Vec<HelperEntry>,
+    coverage: Value,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HelperEvidence {
+    schema_version: String,
+    status: String,
+    generation: GenerationPin,
+    query_sha256: String,
+    config_sha256: String,
+    request_sha256: String,
+    preparation_sha256: String,
+    operations: Vec<HelperOperation>,
+    actual_image_delivery: bool,
+    citation_authority: bool,
+}
+fn helper_coverage(kind: &str, value: &Value) -> Result<()> {
+    let (counts, flags, fixed): (&[&str], &[&str], (&str, &str)) = match kind {
+        "search_multimodal" => (
+            &[
+                "scoped_documents",
+                "routed_documents",
+                "selected_documents",
+                "available_text_artifacts",
+                "inspected_text_artifacts",
+                "omitted_text_artifacts",
+                "scanned_text_bytes",
+                "potential_text_candidates",
+                "potential_visual_candidates",
+                "available_visual_candidates",
+                "omitted_visual_candidates",
+                "visual_pages_in_scope",
+                "visual_pages_without_rendition",
+                "union_text_candidates",
+                "union_visual_candidates",
+                "filtered_candidates",
+            ],
+            &[
+                "lexical_truncated",
+                "lexical_query_terms_truncated",
+                "visual_enumeration_complete",
+                "selected_visual_artifact_bytes_verified",
+                "semantic_scope_complete",
+            ],
+            ("delivered_set_sufficiency", "unassessed"),
+        ),
+        "rerank" => (
+            &[
+                "supplied_candidates",
+                "text_candidates",
+                "visual_candidates",
+                "scored_candidates",
+            ],
+            &["complete"],
+            ("scope", "supplied_candidate_pool_only"),
+        ),
+        _ => return Err("production_helper_operation".into()),
+    };
+    let object = value.as_object().ok_or("production_helper_coverage")?;
+    if object.len() != counts.len() + flags.len() + 1
+        || !counts
+            .iter()
+            .all(|key| object.get(*key).and_then(Value::as_u64).is_some())
+        || !flags
+            .iter()
+            .all(|key| object.get(*key).and_then(Value::as_bool).is_some())
+        || object.get(fixed.0).and_then(Value::as_str) != Some(fixed.1)
+    {
+        return Err("production_helper_coverage".into());
+    }
+    Ok(())
+}
+fn helper_shape(
+    bytes: &[u8],
+    binding: &HelperBinding,
+    task: &TaskBinding,
+    group: &GroupBinding,
+) -> Result<HelperEvidence> {
+    if bytes.len() as u64 != binding.evidence_bytes
+        || bytes.len() > 1_048_576
+        || hash(bytes) != binding.evidence_sha256
+        || !task.group_scope.contains(&binding.group_id)
+        || binding.group_id != group.id
+    {
+        return Err("production_helper_binding".into());
+    }
+    check_hash(&binding.accounting_sha256)?;
+    let evidence: HelperEvidence = strict(bytes)?;
+    if evidence.schema_version != "gptgrep.harbor.rich_helper_evidence.v2"
+        || evidence.status != "completed"
+        || evidence.generation != group.pin
+        || evidence.query_sha256 != task.question_sha256
+        || evidence.actual_image_delivery
+        || evidence.citation_authority
+        || evidence.operations.is_empty()
+        || evidence.operations.len() > 8
+    {
+        return Err("production_helper_evidence".into());
+    }
+    for digest in [
+        &evidence.config_sha256,
+        &evidence.request_sha256,
+        &evidence.preparation_sha256,
+    ] {
+        check_hash(digest)?;
+    }
+    let mut operations = BTreeSet::new();
+    for operation in &evidence.operations {
+        check_id(&operation.id)?;
+        if !operations.insert(&operation.id) || operation.entries.len() > 128 {
+            return Err("production_helper_operation".into());
+        }
+        helper_coverage(&operation.kind, &operation.coverage)?;
+        let mut candidates = BTreeSet::new();
+        for entry in &operation.entries {
+            check_hash(&entry.candidate_id)?;
+            if !candidates.insert(&entry.candidate_id)
+                || !entry.score.is_finite()
+                || !(0.0..=1.0).contains(&entry.score)
+                || entry
+                    .confidence
+                    .is_some_and(|n| !n.is_finite() || !(0.0..=1.0).contains(&n))
+                || (operation.kind == "rerank" && entry.literal_anchor.is_some())
+            {
+                return Err("production_helper_score".into());
+            }
+            let (pin, path, sha, artifact_sha) = match &entry.evidence {
+                gptgrep_core::EvidenceRef::NativeText { binding: text } => {
+                    if text.byte_start >= text.byte_end || text.page == 0 || text.line == 0 {
+                        return Err("production_helper_text_reference".into());
+                    }
+                    (
+                        &text.generation,
+                        &text.source_path,
+                        &text.source_sha256,
+                        &text.artifact_sha256,
+                    )
+                }
+                gptgrep_core::EvidenceRef::VisualRegion {
+                    generation,
+                    source_path,
+                    source_sha256,
+                    rendition_sha256,
+                    page,
+                    ..
+                } => {
+                    if *page == 0 || entry.literal_anchor.is_some() {
+                        return Err("production_helper_visual_reference".into());
+                    }
+                    (generation, source_path, source_sha256, rendition_sha256)
+                }
+                gptgrep_core::EvidenceRef::OcrText { .. } => {
+                    return Err("production_helper_native_coverage".into());
+                }
+            };
+            if pin != &group.pin
+                || !group
+                    .raw_documents
+                    .iter()
+                    .any(|r| &r.path == path && &r.sha256 == sha)
+                || !group
+                    .generation_inventory
+                    .iter()
+                    .any(|a| &a.sha256 == artifact_sha)
+            {
+                return Err("production_helper_source_reference".into());
+            }
+        }
+    }
+    Ok(evidence)
+}
+fn admit_helper(
+    input: &HelperInput,
+    task: &TaskBinding,
+    group: &Group,
+) -> Result<(HelperBinding, Arc<Held>, Arc<Held>)> {
+    if input.group_id != group.binding.id || !task.group_scope.contains(&input.group_id) {
+        return Err("production_helper_group".into());
+    }
+    let evidence_file = input.evidence.admit()?;
+    let accounting_file = input.accounting.admit()?;
+    if evidence_file.bytes > 1_048_576 || accounting_file.bytes > 262144 {
+        return Err("production_helper_input_bound".into());
+    }
+    let binding = HelperBinding {
+        group_id: input.group_id.clone(),
+        evidence_sha256: evidence_file.sha.clone(),
+        evidence_bytes: evidence_file.bytes,
+        accounting_sha256: accounting_file.sha.clone(),
+    };
+    let evidence = helper_shape(&evidence_file.bytes()?, &binding, task, &group.binding)?;
+    let accounting: Value = strict(&accounting_file.bytes()?)?;
+    if accounting["schema_version"] != "gptgrep.harbor.rich_batch_accounting.v1"
+        || accounting["status"] != "completed"
+        || accounting["helper_logical_accounting_complete"] != true
+        || accounting["reader_must_not_start"] != false
+        || accounting["reader_evidence_sha256"] != evidence_file.sha
+        || accounting["query_sha256"] != evidence.query_sha256
+        || accounting["config_sha256"] != evidence.config_sha256
+        || accounting["request_sha256"] != evidence.request_sha256
+        || accounting["preparation_sha256"] != evidence.preparation_sha256
+        || accounting["generation"] != value!(evidence.generation)
+    {
+        return Err("production_helper_accounting_binding".into());
+    }
+    let reader =
+        RichGenerationReader::open_pinned(&group.binding.canonical_root, &group.binding.pin)
+            .map_err(err)?;
+    for operation in &evidence.operations {
+        for entry in &operation.entries {
+            match &entry.evidence {
+                gptgrep_core::EvidenceRef::NativeText { .. } => reader
+                    .validate_text_evidence(&entry.evidence)
+                    .map_err(err)?,
+                gptgrep_core::EvidenceRef::VisualRegion { rendition_id, .. } => {
+                    let visual = reader.visual_reader().map_err(err)?;
+                    let file = visual
+                        .open_rendition(
+                            rendition_id,
+                            &reader.manifest().map_err(err)?.resource_budget,
+                        )
+                        .map_err(err)?;
+                    if value!(&file.candidate().evidence) != value!(&entry.evidence) {
+                        return Err("production_helper_visual_reference".into());
+                    }
+                    visual.validate().map_err(err)?;
+                }
+                _ => return Err("production_helper_native_coverage".into()),
+            }
+        }
+    }
+    reader.validate().map_err(err)?;
+    // Held descriptors are rechecked by Plan before publication. This is source
+    // custody, not authenticated runtime, money settlement or image consumption.
+    Ok((binding, evidence_file, accounting_file))
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1388,7 +1762,7 @@ pub(super) fn reader_instruction(question: &str, arm: &str) -> Vec<u8> {
     );
     if arm == "gptgrep" {
         instruction.push_str(
-            "\nGPTgrep retrieval is available at /app/tool/gptgrep. Discover its command and request contracts with /app/tool/gptgrep --schema and /app/tool/gptgrep --llms. For each relevant group named in /app/reader-input.json, read its canonical_root and exact generation pin from /app/prebuild-seals/GROUP/receipt.json and /app/prebuild-seals/GROUP/pin.json. Use the pinned rich batch interface to retrieve document evidence: save a bounded JSON request to a file and invoke /app/tool/gptgrep batch --rich --root ROOT --input FILE as a direct command. Use inspect_documents and inspect_pages to discover artifact identifiers, then search_artifacts and read_artifact for relevant native text. Preserve the exact generation pin and continuation cursors, respect the documented operation/output limits, and inspect coverage and errors. The tool and prebuilt generation are local retrieval resources; they do not supply a verified answer or an interactive model helper. Native PDF tools remain available.\n",
+            "\nGPTgrep retrieval is available at /app/tool/gptgrep. Discover its command and request contracts with /app/tool/gptgrep --schema and /app/tool/gptgrep --llms. For each relevant group named in /app/reader-input.json, read its canonical_root and exact generation pin from /app/prebuild-seals/GROUP/receipt.json and /app/prebuild-seals/GROUP/pin.json. Save bounded requests and invoke /app/tool/gptgrep batch --rich --root ROOT --input FILE directly. Use inspect_documents, inspect_pages and inspect_native_metadata to discover source structure; use search_artifacts and read_artifact for text evidence. Use inspect_visual to discover retained rendition identifiers and read_visual for complete verified image bytes. Metadata or image_base64 in JSON does not prove that you viewed an image: decode verified bytes and use an available image-view tool before claiming visual consumption. Preserve generation pins, source references, cursors, coverage and operation/output limits. If /app/helper-evidence.json is present, it contains source-bound scored references from a separately controlled host search_multimodal or rerank phase; follow them with local reads. It supplies no verified answer, image delivery or citation authority. Paid helper execution and credentials stay with the trusted host; this reader must not start paid operations. Native PDF tools remain available.\n",
         );
     }
     instruction.into_bytes()
@@ -1399,6 +1773,7 @@ fn reader_dockerfile(
     groups: &[GroupBinding],
     scope: &[String],
     arm: &str,
+    helper: bool,
 ) -> Result<Vec<u8>> {
     let mut docker = format!(
         "FROM {}\nWORKDIR /app\nRUN chown {}:{} /app && chmod 0755 /app\nCOPY --chown={}:{} reader-input.json codex-config.json /app/\n",
@@ -1427,22 +1802,80 @@ fn reader_dockerfile(
     }
     if arm == "gptgrep" {
         docker.push_str("COPY tool/ /app/tool/\nRUN chmod 0555 /app/tool/gptgrep\n");
+        if helper {
+            docker.push_str("COPY --chown=");
+            docker.push_str(&format!(
+                "{}:{} helper-evidence.json /app/helper-evidence.json\n",
+                o.reader_uid, o.reader_gid
+            ));
+        }
     }
     docker.push_str(&format!("USER {}:{}\n", o.reader_uid, o.reader_gid));
     Ok(docker.into_bytes())
 }
+#[cfg(test)]
 pub(super) fn prepare(
     corpus_path: &Path,
     reader_path: &Path,
     option_path: &Path,
     export: bool,
 ) -> Result<Plan> {
-    // Admission order is deliberate: no reader question is loaded during corpus verification.
+    // Retained unbound API for historical callers; it is not the selected G9 CLI.
     let corpus = admit(corpus_path)?;
     let readers_file = Held::open(reader_path, None)?;
-    let readers: Readers = strict(&readers_file.bytes()?)?;
+    let reader_bytes = readers_file.bytes()?;
     let option_file = Held::open(option_path, None)?;
     let option_bytes = option_file.bytes()?;
+    prepare_admitted(
+        corpus,
+        readers_file,
+        reader_bytes,
+        option_file,
+        option_bytes,
+        export,
+    )
+}
+// Selected G9 ABI: gptgrep.harbor.production-input-sha256.v1.
+// Required expected digests are checked against the same descriptor buffers that
+// are parsed, before any corpus/tool/raw/generation asset is admitted.
+pub(super) fn prepare_bound(
+    corpus_path: &Path,
+    reader_path: &Path,
+    option_path: &Path,
+    corpus_sha256: &str,
+    readers_sha256: &str,
+    options_sha256: &str,
+    export: bool,
+) -> Result<Plan> {
+    check_hash(corpus_sha256)?;
+    check_hash(readers_sha256)?;
+    check_hash(options_sha256)?;
+    let corpus_file = Held::open_limit(corpus_path, Some(corpus_sha256), MAX_JSON)?;
+    let readers_file = Held::open_limit(reader_path, Some(readers_sha256), MAX_JSON)?;
+    let option_file = Held::open_limit(option_path, Some(options_sha256), MAX_JSON)?;
+    let corpus_bytes = corpus_file.bytes()?;
+    let reader_bytes = readers_file.bytes()?;
+    let option_bytes = option_file.bytes()?;
+    // No reader question is deserialized while verifying the corpus assets.
+    let corpus = admit_held(corpus_file, &corpus_bytes)?;
+    prepare_admitted(
+        corpus,
+        readers_file,
+        reader_bytes,
+        option_file,
+        option_bytes,
+        export,
+    )
+}
+fn prepare_admitted(
+    corpus: AdmittedCorpus,
+    readers_file: Arc<Held>,
+    reader_bytes: Vec<u8>,
+    option_file: Arc<Held>,
+    option_bytes: Vec<u8>,
+    export: bool,
+) -> Result<Plan> {
+    let readers: Readers = strict(&reader_bytes)?;
     let o = options(&option_bytes)?;
     let runtime = o
         .runtime_debian_packages
@@ -1515,12 +1948,31 @@ pub(super) fn prepare(
                 raw.insert(format!("{id}/{}", d.path), d.sha256.clone());
             }
         }
-        plan.manifest.task_bindings.push(TaskBinding {
+        let mut task_binding = TaskBinding {
             id: t.id.clone(),
             question_sha256: t.question_sha256.clone(),
             group_scope: t.group_scope.clone(),
             raw_sha256: raw,
-        });
+            helper: None,
+        };
+        let helper = t
+            .helper
+            .as_ref()
+            .map(|input| {
+                let group = corpus
+                    .groups
+                    .iter()
+                    .find(|g| g.binding.id == input.group_id)
+                    .ok_or_else(|| "production_helper_group".to_string())?;
+                admit_helper(input, &task_binding, group)
+            })
+            .transpose()?;
+        if let Some((binding, evidence, accounting)) = &helper {
+            task_binding.helper = Some(binding.clone());
+            plan.held.push(evidence.clone());
+            plan.held.push(accounting.clone());
+        }
+        plan.manifest.task_bindings.push(task_binding);
         for repeat in 0..o.repetitions {
             let arms =
                 if ((ordinal as u32).wrapping_add(repeat).wrapping_add(o.seed)).is_multiple_of(2) {
@@ -1598,6 +2050,12 @@ pub(super) fn prepare(
                     Payload::File(corpus.tool_file.clone()),
                 )?;
                 plan.put(format!("{prefix}/environment/tool/provenance.json"),Payload::Bytes(json(&value!({"declared_artifact":corpus.tool,"qualification":"HOLD_metadata_not_runtime_or_helper_capability"}))?))?;
+                if let Some((_, evidence, _)) = &helper {
+                    plan.put(
+                        format!("{prefix}/environment/helper-evidence.json"),
+                        Payload::File(evidence.clone()),
+                    )?;
+                }
             }
             plan.put(
                 format!("{prefix}/environment/Dockerfile"),
@@ -1606,6 +2064,7 @@ pub(super) fn prepare(
                     &plan.manifest.group_bindings,
                     &t.group_scope,
                     arm,
+                    helper.is_some(),
                 )?),
             )?;
             plan.put(
@@ -1673,8 +2132,13 @@ pub(super) fn validate(root: &Path) -> Result<(Manifest, String)> {
                 if super::regular_bytes(
                     &root.join(&prefix).join("environment/Dockerfile"),
                     MAX_JSON,
-                )? != reader_dockerfile(&o, &m.group_bindings, &t.group_scope, arm)?
-                {
+                )? != reader_dockerfile(
+                    &o,
+                    &m.group_bindings,
+                    &t.group_scope,
+                    arm,
+                    t.helper.is_some(),
+                )? {
                     return Err("production_reader_docker_binding".into());
                 }
                 if super::regular_bytes(
@@ -1746,6 +2210,19 @@ pub(super) fn validate(root: &Path) -> Result<(Manifest, String)> {
                 }
                 if expected_raw != t.raw_sha256 {
                     return Err("production_task_raw_set".into());
+                }
+                if arm == "gptgrep"
+                    && let Some(binding) = &t.helper
+                {
+                    let group = m
+                        .group_bindings
+                        .iter()
+                        .find(|g| g.id == binding.group_id)
+                        .ok_or("production_helper_group")?;
+                    let name = format!("{prefix}/environment/helper-evidence.json");
+                    let bytes = super::regular_bytes(&root.join(&name), 1_048_576)?;
+                    helper_shape(&bytes, binding, t, group)?;
+                    all_allowed.insert(name);
                 }
                 let marker = format!("{prefix}/environment/groups/");
                 let allowed = t
@@ -1934,4 +2411,123 @@ pub(super) fn verifier(graders: &Path, reader: &Path) -> Result<Plan> {
     plan.manifest = manifest;
     plan.fresh()?;
     Ok(plan)
+}
+
+#[cfg(test)]
+mod input_digest_tests {
+    use super::*;
+
+    #[test]
+    fn checked_descriptor_same_inode_mutation_refuses_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.json");
+        fs::write(&path, b"{}").unwrap();
+        let expected = hash(b"{}");
+        let held = Held::open_limit(&path, Some(&expected), MAX_JSON).unwrap();
+        fs::write(&path, b"[]").unwrap();
+        assert_eq!(held.bytes().unwrap_err(), "production_snapshot_changed");
+        assert!(held.fresh().is_err());
+    }
+
+    #[test]
+    fn checked_descriptor_path_replacement_never_reopens_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.json");
+        fs::write(&path, b"{}").unwrap();
+        let expected = hash(b"{}");
+        let held = Held::open_limit(&path, Some(&expected), MAX_JSON).unwrap();
+        fs::rename(&path, dir.path().join("original.json")).unwrap();
+        fs::write(&path, b"[]").unwrap();
+        assert_eq!(held.bytes().unwrap(), b"{}");
+        assert!(held.fresh().is_err());
+    }
+}
+
+#[cfg(test)]
+mod helper_evidence_tests {
+    use super::*;
+
+    #[derive(Deserialize)]
+    struct Reference {
+        #[serde(deserialize_with = "helper_evidence_reference")]
+        evidence: gptgrep_core::EvidenceRef,
+    }
+
+    fn visual() -> Value {
+        value!({
+            "kind": "visual_region",
+            "generation": {"generation": "generation", "manifest_sha256": "a".repeat(64)},
+            "document_id": "document", "source_path": "document.pdf", "source_sha256": "b".repeat(64),
+            "page": 1, "region_id": "region", "rendition_id": "rendition",
+            "rendition_sha256": "c".repeat(64),
+            "bbox": {"x": 0.25, "y": 0.5, "width": 72.75, "height": 91.125},
+            "page_to_raster": {"a": 1.25, "b": 0.0, "c": 0.0, "d": 1.25, "e": 0.125, "f": 0.25}
+        })
+    }
+
+    #[test]
+    fn helper_evidence_adapter_round_trips_all_variants_with_fractional_geometry() {
+        let binding = value!({
+            "generation": {"generation": "generation", "manifest_sha256": "a".repeat(64)},
+            "document_id": "document", "source_path": "document.pdf", "source_sha256": "b".repeat(64),
+            "artifact_id": "artifact", "artifact_sha256": "c".repeat(64),
+            "page": 1, "byte_start": 0, "byte_end": 6, "line": 1
+        });
+        for reference in [
+            value!({"kind": "native_text", "binding": binding.clone()}),
+            value!({"kind": "ocr_text", "binding": binding, "region_ids": ["region"],
+                "ocr_profile_sha256": "d".repeat(64), "ocr_receipt_sha256": "e".repeat(64)}),
+            visual(),
+        ] {
+            let input = serde_json::to_vec(&value!({"evidence": reference.clone()})).unwrap();
+            let decoded: Reference = serde_json::from_slice(&input).unwrap();
+            assert_eq!(serde_json::to_value(decoded.evidence).unwrap(), reference);
+        }
+    }
+
+    #[test]
+    fn helper_evidence_adapter_rejects_numeric_objects_and_open_variant_shapes() {
+        for case in [
+            "bbox-object",
+            "transform-object",
+            "unknown-field",
+            "unknown-kind",
+            "missing-field",
+            "bbox-extra",
+            "duplicate-kind",
+            "duplicate-page",
+            "overflow",
+        ] {
+            let mut reference = visual();
+            match case {
+                "bbox-object" => {
+                    reference["bbox"]["x"] = value!({"$serde_json::private::Number": "0.25"})
+                }
+                "transform-object" => {
+                    reference["page_to_raster"]["a"] =
+                        value!({"$serde_json::private::Number": "1.25"})
+                }
+                "unknown-field" => reference["extra"] = value!(true),
+                "unknown-kind" => reference["kind"] = value!("other"),
+                "missing-field" => {
+                    reference.as_object_mut().unwrap().remove("page");
+                }
+                "bbox-extra" => reference["bbox"]["extra"] = value!(1),
+                _ => {}
+            }
+            let mut input = serde_json::to_string(&value!({"evidence": reference})).unwrap();
+            match case {
+                "duplicate-kind" => {
+                    input = input.replace(
+                        "\"kind\":\"visual_region\"",
+                        "\"kind\":\"visual_region\",\"kind\":\"visual_region\"",
+                    )
+                }
+                "duplicate-page" => input = input.replace("\"page\":1", "\"page\":1,\"page\":1"),
+                "overflow" => input = input.replace("\"width\":72.75", "\"width\":1e400"),
+                _ => {}
+            }
+            assert!(serde_json::from_str::<Reference>(&input).is_err(), "{case}");
+        }
+    }
 }

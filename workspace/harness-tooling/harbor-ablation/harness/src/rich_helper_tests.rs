@@ -739,3 +739,371 @@ async fn full_pool_bounds_and_omitted_coverage_are_preserved_without_wrapper_tru
     );
     Ok(())
 }
+
+struct RichFixture {
+    base: Fixture,
+    config: RichConfig,
+    request: Value,
+    config_sha: String,
+}
+impl RichFixture {
+    fn new(calls: u32) -> Result<Self> {
+        Self::with_lifetime(calls, Duration::from_secs(30))
+    }
+    fn with_lifetime(calls: u32, lifetime: Duration) -> Result<Self> {
+        let base = Fixture::with_lifetime(lifetime)?;
+        let reader =
+            RichGenerationReader::open_pinned(&base.config.corpus_root, &base.config.generation)?;
+        let evidence = reader
+            .search_artifacts("pouch", false, true, 1, None, EVIDENCE_CAP)?
+            .hits
+            .remove(0)
+            .evidence;
+        let query = fs::read_to_string(&base.config.query.path)?;
+        let operations = (0..calls)
+            .map(|i| {
+                json!({"op":"rerank","id":format!("rerank-{i}"),
+            "query":query,"candidates":[{"id":"ordinary-source","evidence":evidence}],
+            "max_concurrent_batches":1})
+            })
+            .collect::<Vec<_>>();
+        let request = json!({"schema_version":"gptgrep.batch.rich.request.v1",
+            "generation":base.config.generation,"budget":{"max_operations":8,
+                "max_output_bytes":131072,"max_decisions_submissions":calls},"operations":operations});
+        let config = RichConfig {
+            schema_version: "gptgrep.harbor.rich_batch_helper.v1".into(),
+            corpus_root: base.config.corpus_root.clone(),
+            generation: base.config.generation.clone(),
+            query: base.config.query.clone(),
+            request: InputFile {
+                path: base.config_path.with_file_name("rich-request.json"),
+                bytes: 0,
+                sha256: String::new(),
+            },
+            expected_actual_model: base.config.expected_actual_model.clone(),
+            context: base.config.context.clone(),
+            max_calls: calls,
+            expected_preparation_sha256: None,
+            output_dir: base.config.output_dir.clone(),
+        };
+        let mut fixture = Self {
+            base,
+            config,
+            request,
+            config_sha: String::new(),
+        };
+        fixture.refresh()?;
+        Ok(fixture)
+    }
+    fn refresh(&mut self) -> Result<()> {
+        let request = serde_json::to_vec(&self.request)?;
+        fs::write(&self.config.request.path, &request)?;
+        self.config.request.bytes = request.len() as u64;
+        self.config.request.sha256 = digest(&request);
+        let bytes = serde_json::to_vec(&self.config)?;
+        fs::write(&self.base.config_path, &bytes)?;
+        self.config_sha = digest(&bytes);
+        Ok(())
+    }
+    fn bound(&self) -> Result<RichBound> {
+        bind_rich(&self.base.config_path, &self.config_sha)
+    }
+    fn seal_preparation(&mut self) -> Result<Value> {
+        let prepared = rich_prepare_only(&self.bound()?)?;
+        self.config.expected_preparation_sha256 =
+            Some(prepared["preparation_sha256"].as_str().unwrap().into());
+        self.refresh()?;
+        Ok(prepared)
+    }
+}
+async fn run_rich(fixture: &RichFixture, endpoint: &str) -> Result<Value> {
+    let endpoint = endpoint.to_owned();
+    execute_rich(fixture.bound()?, Instant::now(), move |context| {
+        Ok(
+            JevClient::with_endpoint("mock-key-not-a-secret", Some(MODEL), &endpoint)?
+                .with_execution_context(context),
+        )
+    })
+    .await
+}
+#[test]
+fn rich_preparation_binds_real_envelopes_without_consuming_context_or_outputs() -> Result<()> {
+    let mut fixture = RichFixture::new(1)?;
+    let ledger = fs::read(&fixture.config.context.ledger)?;
+    let lock = fs::read(lock_path(&fixture.config.context.ledger)?)?;
+    let plan = fixture.seal_preparation()?;
+    assert_eq!(plan["preparation"]["reserved_calls"], 1);
+    assert_eq!(
+        plan["preparation"]["envelopes"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        plan["preparation"]["envelopes"][0]["stage"],
+        "exact_reranking"
+    );
+    assert_eq!(plan["execution_authorized"], false);
+    assert_eq!(ledger, fs::read(&fixture.config.context.ledger)?);
+    assert_eq!(lock, fs::read(lock_path(&fixture.config.context.ledger)?)?);
+    assert!(!fixture.config.output_dir.exists());
+    assert_eq!(
+        rich_prepare_only(&fixture.bound()?)?["preparation_sha256"],
+        plan["preparation_sha256"]
+    );
+    Ok(())
+}
+#[test]
+fn rich_all_paid_items_must_prepare_even_when_an_earlier_item_is_valid() -> Result<()> {
+    let mut fixture = RichFixture::new(2)?;
+    fixture.request["operations"][1]["candidates"] = json!([]);
+    fixture.refresh()?;
+    let before = fs::read(&fixture.config.context.ledger)?;
+    assert!(rich_prepare_only(&fixture.bound()?).is_err());
+    assert_eq!(before, fs::read(&fixture.config.context.ledger)?);
+    assert!(!fixture.config.output_dir.exists());
+    fixture.request["operations"][1]["query"] = json!("different query");
+    fixture.refresh()?;
+    assert!(fixture.bound().is_err());
+    Ok(())
+}
+#[tokio::test]
+async fn rich_preparation_drift_fails_before_any_submission() -> Result<()> {
+    let mut fixture = RichFixture::new(1)?;
+    fixture.seal_preparation()?;
+    fixture.config.expected_preparation_sha256 = Some("0".repeat(64));
+    fixture.refresh()?;
+    let before = fs::read(&fixture.config.context.ledger)?;
+    let result = run_rich(&fixture, "http://127.0.0.1:1/decisions").await?;
+    assert_eq!(result["status"], "failed");
+    assert_eq!(result["reader_must_not_start"], true);
+    assert_eq!(before, fs::read(&fixture.config.context.ledger)?);
+    assert_eq!(
+        fixture.base.read_output("reader-evidence.json")?["status"],
+        "unavailable"
+    );
+    Ok(())
+}
+#[tokio::test]
+async fn rich_accounting_uses_actual_variable_paid_counts_and_references_only() -> Result<()> {
+    for calls in [1, 2] {
+        let mut fixture = RichFixture::new(calls)?;
+        fixture.seal_preparation()?;
+        let (endpoint, server) = mock(
+            calls as usize,
+            None,
+            &fixture.config.expected_actual_model,
+            Arc::new(|_| Ok(())),
+        )
+        .await?;
+        let account = run_rich(&fixture, &endpoint).await?;
+        assert_eq!(server.await??.len(), calls as usize);
+        assert_eq!(account["status"], "completed");
+        assert_eq!(account["logical_calls_observed"], calls);
+        assert_eq!(account["actual_provider_requests"], Value::Null);
+        assert_eq!(account["helper_logical_accounting_complete"], true);
+        let evidence = fixture.base.read_output("reader-evidence.json")?;
+        assert_eq!(
+            evidence["operations"].as_array().unwrap().len(),
+            calls as usize
+        );
+        assert_eq!(evidence["actual_image_delivery"], false);
+        assert_eq!(evidence["citation_authority"], false);
+        assert_eq!(
+            evidence["operations"][0]["coverage"]["scope"],
+            "supplied_candidate_pool_only"
+        );
+        let encoded = serde_json::to_string(&evidence)?;
+        for absent in [
+            "blue linen pouch",
+            "PRIVATE_ID",
+            "PRIVATE_PROVIDER",
+            "DO_NOT_RETAIN_PROVIDER_DETAIL",
+            "image_base64",
+        ] {
+            assert!(!encoded.contains(absent));
+        }
+        assert_eq!(
+            account["reader_evidence_sha256"],
+            digest(&fs::read(
+                fixture.config.output_dir.join("reader-evidence.json")
+            )?)
+        );
+    }
+    Ok(())
+}
+#[tokio::test]
+async fn rich_original_deadline_and_stale_sources_revoke_evidence_after_paid_work() -> Result<()> {
+    for selected in [
+        FinalizationPoint::BeforeEvidence,
+        FinalizationPoint::AfterAccounting,
+    ] {
+        for expire in [false, true] {
+            let mut fixture = RichFixture::with_lifetime(1, Duration::from_secs(3))?;
+            fixture.seal_preparation()?;
+            let original_lock = fs::read(lock_path(&fixture.config.context.ledger)?)?;
+            let (endpoint, server) = mock(
+                1,
+                None,
+                &fixture.config.expected_actual_model,
+                Arc::new(|_| Ok(())),
+            )
+            .await?;
+            let source = fixture.config.corpus_root.join("source.pdf");
+            let original_source_sha = digest(&fs::read(&source)?);
+            let output = fixture.config.output_dir.clone();
+            let reached = std::sync::atomic::AtomicBool::new(false);
+            let result = execute_rich_with_finalization_hook(
+                fixture.bound()?,
+                Instant::now(),
+                move |context| {
+                    Ok(
+                        JevClient::with_endpoint("mock-key-not-a-secret", Some(MODEL), &endpoint)?
+                            .with_execution_context(context),
+                    )
+                },
+                |context, point| {
+                    if point == selected {
+                        context.check_deadline()?;
+                        let account: Value = decode(&fs::read(output.join("accounting.json"))?)?;
+                        let evidence: Value =
+                            decode(&fs::read(output.join("reader-evidence.json"))?)?;
+                        if point == FinalizationPoint::BeforeEvidence {
+                            assert_eq!(account["status"], "running");
+                            assert_eq!(evidence["status"], "unavailable");
+                        } else {
+                            assert_eq!(account["status"], "completed");
+                            assert_eq!(evidence["status"], "completed");
+                        }
+                        if expire {
+                            let remaining = context.original_run_remaining()?;
+                            assert!(remaining <= Duration::from_secs(3));
+                            // Expire the unchanged original anchor, never reset or synthesize it.
+                            std::thread::sleep(remaining + Duration::from_millis(5));
+                            assert!(context.check_deadline().is_err());
+                        } else {
+                            fs::write(&source, b"source changed at evidence publication barrier")?;
+                            assert_ne!(digest(&fs::read(&source)?), original_source_sha);
+                        }
+                        reached.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Ok(())
+                },
+            )
+            .await?;
+            assert!(reached.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(server.await??.len(), 1);
+            assert_eq!(result["status"], "failed");
+            assert_eq!(result["reader_must_not_start"], true);
+            assert_eq!(result["helper_logical_accounting_complete"], false);
+            assert_eq!(result["execution_after"]["logical_reservations"], 1);
+            assert_eq!(result["execution_after"]["send_start_observations"], 1);
+            assert_eq!(result["execution_after"]["terminal_submissions"], 1);
+            assert_eq!(fixture.base.read_output("accounting.json")?, result);
+            assert_eq!(
+                fixture.base.read_output("reader-evidence.json")?["status"],
+                "unavailable"
+            );
+            assert_eq!(
+                original_lock,
+                fs::read(lock_path(&fixture.config.context.ledger)?)?
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn rich_search_routes_and_reranks_text_and_visual_without_claiming_image_delivery()
+-> Result<()> {
+    let mut fixture = RichFixture::new(2)?;
+    let (stage, mut parsed) = candidate(
+        &fixture.config.corpus_root,
+        &["The workshop green cabinet holds a blue linen pouch.\n"],
+    )?;
+    let mut pixels = Vec::new();
+    use image::{ExtendedColorType, ImageEncoder};
+    image::codecs::png::PngEncoder::new(&mut pixels).write_image(
+        &[255; 8 * 16 * 4],
+        8,
+        16,
+        ExtendedColorType::Rgba8,
+    )?;
+    let artifact = ArtifactRef {
+        id: gptgrep_parse::artifact_id(
+            &parsed.summary.source_sha256,
+            &parsed.native_profile_sha256,
+            &ArtifactKind::Rendition,
+            Some(1),
+            None,
+            &digest(&pixels),
+        )?,
+        kind: ArtifactKind::Rendition,
+        relative_path: "p1.png".into(),
+        sha256: digest(&pixels),
+        profile_sha256: parsed.native_profile_sha256.clone(),
+        bytes: pixels.len() as u64,
+        mime: "image/png".into(),
+        page: Some(1),
+        region_id: None,
+    };
+    fs::write(stage.path().join("p1.png"), &pixels)?;
+    parsed.pages[0].renditions.push(OcrImage {
+        artifact: artifact.clone(),
+        path: stage.path().join("p1.png"),
+        width: 8,
+        height: 16,
+        page_to_raster: AffineTransform {
+            a: 0.08,
+            d: 0.08,
+            ..AffineTransform::IDENTITY
+        },
+    });
+    parsed.artifacts.push(artifact);
+    let mut writer =
+        RichGenerationWriter::begin(&fixture.config.corpus_root, ResourceBudget::default())?;
+    writer.add_document("source.pdf", &stage.path().canonicalize()?, parsed)?;
+    let pin = writer.publish()?;
+    fixture.config.generation = pin.clone();
+    fixture.request["generation"] = serde_json::to_value(pin)?;
+    fixture.request["operations"] = json!([{"op":"search_multimodal","id":"search",
+        "query":fs::read_to_string(&fixture.config.query.path)?,"max_concurrent_batches":1,
+        "window_bytes":1024,"max_visual_candidates":8,"min_score":0.5}]);
+    fixture.refresh()?;
+    let preparation = fixture.seal_preparation()?;
+    assert_eq!(preparation["preparation"]["reserved_calls"], 2);
+    assert_eq!(
+        preparation["preparation"]["envelopes"][0]["stage"],
+        "document_routing"
+    );
+    assert_eq!(
+        preparation["preparation"]["envelopes"][1]["stage"],
+        "full_pool_reranking"
+    );
+    let (endpoint, server) = mock(
+        2,
+        None,
+        &fixture.config.expected_actual_model,
+        Arc::new(|_| Ok(())),
+    )
+    .await?;
+    let result = run_rich(&fixture, &endpoint).await?;
+    assert_eq!(server.await??.len(), 2);
+    assert_eq!(result["status"], "completed");
+    let evidence = fixture.base.read_output("reader-evidence.json")?;
+    let entries = evidence["operations"][0]["entries"].as_array().unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["evidence"]["kind"] == "native_text")
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["evidence"]["kind"] == "visual_region")
+    );
+    assert_eq!(evidence["actual_image_delivery"], false);
+    assert_eq!(
+        evidence["operations"][0]["coverage"]["delivered_set_sufficiency"],
+        "unassessed"
+    );
+    Ok(())
+}

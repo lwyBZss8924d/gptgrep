@@ -1,16 +1,23 @@
-//! Trusted host bootstrap for a limited native-text pipeline pilot.
+//! Trusted host bootstrap for source-bound text and rich-batch retrieval.
 //! This binary does not ingest, launch a reader, initialize a budget, or own money admission.
 use anyhow::{Result, ensure};
 use clap::Parser;
+use gptgrep_core::rich_batch::{
+    PreparedRichBatch, RichBatchGeneration, RichBatchOperation, RichBatchRequest,
+    RichBatchResponse, RichBatchStatus, prepare_rich_batch_with_reader,
+};
 use gptgrep_core::{
-    GenerationPin, RichGenerationReader, RichTextAttempt, RichTextSearchOptions,
+    EvidenceRef, GenerationPin, RichGenerationReader, RichTextAttempt, RichTextSearchOptions,
     RichTextSearchReport, prepare_rich_text_search,
 };
-use gptgrep_jev::{ExecutionContext, ExecutionSnapshot, JevClient, RunClockAnchor};
+use gptgrep_jev::{
+    ExecutionContext, ExecutionSnapshot, JevClient, PreparedDecision, RunClockAnchor,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
@@ -25,7 +32,7 @@ const EVIDENCE_CAP: usize = 1048576;
 const ACCOUNT_CAP: usize = 262144;
 
 #[derive(Parser)]
-#[command(about = "Trusted v2 text Decisions bootstrap; default is nonexecuting")]
+#[command(about = "Trusted v2 Decisions bootstrap; default is nonexecuting")]
 struct Cli {
     #[arg(long, requires = "config_sha256")]
     config: Option<PathBuf>,
@@ -35,6 +42,12 @@ struct Cli {
     execute: bool,
     #[arg(long)]
     preflight: bool,
+    /// Select the closed rich-batch host bootstrap contract.
+    #[arg(long)]
+    rich: bool,
+    /// Prepare source-bound envelopes without credentials, reservations or sends.
+    #[arg(long, requires_all = ["rich", "config"], conflicts_with = "execute")]
+    prepare_rich: bool,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -263,6 +276,9 @@ fn lock_path(ledger: &Path) -> Result<PathBuf> {
 // Check an existing immutable initialization without adopting/sampling its clock.
 // No missing journal/lock is created by this front door.
 fn verify_initialization(input: &ContextInput) -> Result<()> {
+    verify_initialization_calls(input, 2)
+}
+fn verify_initialization_calls(input: &ContextInput, calls: u32) -> Result<()> {
     bounded_read(&input.ledger, 131072)?;
     let lock = bounded_read(&lock_path(&input.ledger)?, 4096)?;
     ensure!(
@@ -292,14 +308,17 @@ fn verify_initialization(input: &ContextInput) -> Result<()> {
             && before.max_submissions == input.max_submissions
             && before
                 .logical_reservations
-                .checked_add(2)
+                .checked_add(calls as usize)
                 .is_some_and(|n| n <= input.max_submissions as usize),
         "rich_helper_expected_context"
     );
     Ok(())
 }
 fn join_existing(input: &ContextInput) -> Result<ExecutionContext> {
-    verify_initialization(input)?;
+    join_existing_calls(input, 2)
+}
+fn join_existing_calls(input: &ContextInput, calls: u32) -> Result<ExecutionContext> {
+    verify_initialization_calls(input, calls)?;
     let context = ExecutionContext::new(
         &input.run_id,
         &input.plan_digest,
@@ -346,7 +365,19 @@ struct ReservedOutput {
 }
 impl ReservedOutput {
     fn create(bound: &Bound) -> Result<Self> {
-        let dir = &bound.config.output_dir;
+        Self::create_at(
+            &bound.config.output_dir,
+            &bound.config_sha256,
+            &bound.config.query.sha256,
+            &bound.config.generation,
+        )
+    }
+    fn create_at(
+        dir: &Path,
+        config_sha256: &str,
+        query_sha256: &str,
+        generation: &GenerationPin,
+    ) -> Result<Self> {
         clean_path(dir, false)?;
         fs::DirBuilder::new().mode(0o700).create(dir)?;
         let mut claim = OpenOptions::new()
@@ -354,7 +385,7 @@ impl ReservedOutput {
             .create_new(true)
             .mode(0o600)
             .open(dir.join("consumed.json"))?;
-        claim.write_all(&serde_json::to_vec(&json!({"schema_version":"gptgrep.rich_helper.once.v1","config_sha256":bound.config_sha256,"query_sha256":bound.config.query.sha256,"generation":bound.config.generation,"retry":"forbidden"}))?)?;
+        claim.write_all(&serde_json::to_vec(&json!({"schema_version":"gptgrep.rich_helper.once.v1","config_sha256":config_sha256,"query_sha256":query_sha256,"generation":generation,"retry":"forbidden"}))?)?;
         claim.sync_all()?;
         let create = |name: &str, cap| -> Result<File> {
             let file = OpenOptions::new()
@@ -383,7 +414,7 @@ impl ReservedOutput {
         Ok(Self {
             accounting,
             evidence,
-            dir: dir.clone(),
+            dir: dir.to_path_buf(),
         })
     }
 }
@@ -631,29 +662,676 @@ where
         }
     }
 }
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RichConfig {
+    schema_version: String,
+    corpus_root: PathBuf,
+    generation: GenerationPin,
+    query: InputFile,
+    request: InputFile,
+    expected_actual_model: String,
+    context: ContextInput,
+    max_calls: u32,
+    /// Integrity binding only. The private coordinator owns dollar admission.
+    expected_preparation_sha256: Option<String>,
+    output_dir: PathBuf,
+}
+struct RichBound {
+    config: RichConfig,
+    config_path: PathBuf,
+    config_sha256: String,
+    query: String,
+    request: RichBatchRequest,
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RichEvidenceEntry {
+    candidate_id: String,
+    evidence: EvidenceRef,
+    score: f64,
+    confidence: Option<f64>,
+    literal_anchor: Option<bool>,
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RichEvidenceOperation {
+    id: String,
+    kind: String,
+    entries: Vec<RichEvidenceEntry>,
+    coverage: Value,
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RichEvidence {
+    schema_version: String,
+    status: String,
+    generation: GenerationPin,
+    query_sha256: String,
+    config_sha256: String,
+    request_sha256: String,
+    preparation_sha256: String,
+    operations: Vec<RichEvidenceOperation>,
+    actual_image_delivery: bool,
+    citation_authority: bool,
+}
+fn rich_operation(op: &RichBatchOperation) -> Result<(&str, &str, &str)> {
+    match op {
+        RichBatchOperation::SearchMultimodal {
+            id,
+            query,
+            max_concurrent_batches,
+            ..
+        } => {
+            ensure!(*max_concurrent_batches == 1, "rich_helper_serial_required");
+            Ok((id, "search_multimodal", query))
+        }
+        RichBatchOperation::Rerank {
+            id,
+            query,
+            max_concurrent_batches,
+            ..
+        } => {
+            ensure!(*max_concurrent_batches == 1, "rich_helper_serial_required");
+            Ok((id, "rerank", query))
+        }
+        _ => anyhow::bail!("rich_helper_paid_operations_only"),
+    }
+}
+fn rich_file(input: &InputFile, cap: usize) -> Result<Vec<u8>> {
+    ensure!(
+        valid_sha(&input.sha256) && input.bytes > 0 && input.bytes <= cap as u64,
+        "rich_helper_input_bound"
+    );
+    let bytes = bounded_read(&input.path, cap)?;
+    ensure!(
+        bytes.len() as u64 == input.bytes && digest(&bytes) == input.sha256,
+        "rich_helper_input_binding"
+    );
+    Ok(bytes)
+}
+fn bind_rich(path: &Path, sha: &str) -> Result<RichBound> {
+    ensure!(valid_sha(sha), "rich_helper_config_digest");
+    let bytes = bounded_read(path, CONFIG_CAP)?;
+    ensure!(digest(&bytes) == sha, "rich_helper_config_binding");
+    let config: RichConfig = decode(&bytes)?;
+    ensure!(
+        config.schema_version == "gptgrep.harbor.rich_batch_helper.v1"
+            && (1..=200).contains(&config.max_calls)
+            && (1..=200).contains(&config.context.max_submissions)
+            && valid_sha(&config.context.initialization_sha256)
+            && valid_sha(&config.context.original_clock_anchor_sha256)
+            && valid_sha(&config.context.plan_digest)
+            && config.max_calls <= config.context.max_submissions
+            && config
+                .expected_preparation_sha256
+                .as_ref()
+                .is_none_or(|s| valid_sha(s))
+            && config
+                .expected_actual_model
+                .starts_with("openai/gpt-6-luna-decisions-")
+            && config.expected_actual_model.len() <= 128
+            && config
+                .expected_actual_model
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"/.-_".contains(&b)),
+        "rich_helper_config_fields"
+    );
+    clean_path(&config.corpus_root, true)?;
+    clean_path(&config.context.ledger, true)?;
+    clean_path(&config.output_dir, false)?;
+    for input in [
+        path,
+        &config.query.path,
+        &config.request.path,
+        &config.context.ledger,
+    ] {
+        ensure!(
+            !input.starts_with(&config.output_dir),
+            "rich_helper_output_overlap"
+        );
+    }
+    ensure!(
+        !config.output_dir.starts_with(&config.corpus_root)
+            && !config.corpus_root.starts_with(&config.output_dir),
+        "rich_helper_output_overlap"
+    );
+    let query = String::from_utf8(rich_file(&config.query, 8192)?)?;
+    ensure!(!query.trim().is_empty(), "rich_helper_query_empty");
+    let request: RichBatchRequest = decode(&rich_file(&config.request, CONFIG_CAP)?)?;
+    ensure!(
+        matches!(&request.generation, RichBatchGeneration::Exact(pin) if pin == &config.generation)
+            && !request.operations.is_empty()
+            && request.operations.len() <= 8
+            && request.budget.max_decisions_submissions == config.max_calls
+            && request.budget.max_output_bytes <= ACCOUNT_CAP - CONFIG_CAP - 32768,
+        "rich_helper_request_binding"
+    );
+    let mut ids = BTreeSet::new();
+    for op in &request.operations {
+        let (id, _, text) = rich_operation(op)?;
+        ensure!(
+            text == query
+                && !id.is_empty()
+                && id.len() <= 64
+                && ids.insert(id)
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+            "rich_helper_operation_query_binding"
+        );
+    }
+    verify_initialization_calls(&config.context, config.max_calls)?;
+    Ok(RichBound {
+        config,
+        config_path: path.into(),
+        config_sha256: sha.into(),
+        query,
+        request,
+    })
+}
+fn envelope(operation: &str, stage: &str, index: usize, request: &PreparedDecision) -> Value {
+    json!({"operation":operation,"stage":stage,"index":index,
+        "requested_model":request.requested_model(),"body_sha256":request.body_sha256(),
+        "body_bytes":request.body_bytes(),"question_count":request.question_count()})
+}
+fn prepared_rich(
+    bound: &RichBound,
+    client: JevClient,
+) -> Result<(RichGenerationReader, PreparedRichBatch, Value, String)> {
+    let reader = RichGenerationReader::open_pinned_with_cache_budget(
+        &bound.config.corpus_root,
+        &bound.config.generation,
+        &bound.request.budget.cache,
+    )?;
+    let prepared = prepare_rich_batch_with_reader(&reader, bound.request.clone(), Some(client))?;
+    let searches: BTreeMap<_, _> = prepared.prepared_searches().collect();
+    let reranks: BTreeMap<_, _> = prepared.prepared_reranks().collect();
+    let mut envelopes = Vec::new();
+    for (position, op) in bound.request.operations.iter().enumerate() {
+        let (id, kind, _) = rich_operation(op)?;
+        let before = envelopes.len();
+        if kind == "search_multimodal" {
+            let search = searches
+                .get(id)
+                .ok_or_else(|| anyhow::anyhow!("rich_helper_paid_item_not_prepared"))?;
+            for (i, request) in search.routing_requests().enumerate() {
+                envelopes.push(envelope(id, "document_routing", i, request));
+            }
+            for (i, request) in search.rerank_pool_requests().enumerate() {
+                envelopes.push(envelope(id, "full_pool_reranking", i, request));
+            }
+        } else {
+            let rerank = reranks
+                .get(id)
+                .ok_or_else(|| anyhow::anyhow!("rich_helper_paid_item_not_prepared"))?;
+            for (i, request) in rerank.requests().enumerate() {
+                envelopes.push(envelope(id, "exact_reranking", i, request));
+            }
+        }
+        let calls = envelopes.len() - before;
+        ensure!(
+            calls > 0 && prepared.item_call_shares().get(position) == Some(&calls),
+            "rich_helper_paid_item_share"
+        );
+    }
+    ensure!(
+        searches.len() + reranks.len() == bound.request.operations.len()
+            && envelopes.len() == prepared.reserved_calls()
+            && (1..=bound.config.max_calls as usize).contains(&envelopes.len()),
+        "rich_helper_call_bound"
+    );
+    let plan = json!({
+        "schema_version":"gptgrep.harbor.rich_preparation.v1",
+        "corpus_root":bound.config.corpus_root,"generation":bound.config.generation,
+        "query_sha256":bound.config.query.sha256,"request_sha256":bound.config.request.sha256,
+        "requested_model":MODEL,"expected_actual_model":bound.config.expected_actual_model,
+        "context":bound.config.context,"max_calls":bound.config.max_calls,
+        "batch_budget":bound.request.budget,"generation_resources":reader.manifest()?.resource_budget,
+        "reserved_calls":prepared.reserved_calls(),"envelopes":envelopes,
+        "rerank_binding":"full_pool_envelopes_are_conservative_actual_subsets_are_bound_by_terminal_receipts",
+        "money_authority":"external_owner_only"
+    });
+    let plan_bytes = serde_json::to_vec(&plan)?;
+    ensure!(
+        plan_bytes.len() <= CONFIG_CAP,
+        "rich_helper_preparation_output_bound"
+    );
+    let sha = digest(&plan_bytes);
+    Ok((reader, prepared, plan, sha))
+}
+fn rich_prepare_only(bound: &RichBound) -> Result<Value> {
+    let context = join_existing_calls(&bound.config.context, bound.config.max_calls)?;
+    let before = context.snapshot()?;
+    let client = JevClient::new("unused-preparation-only", Some(MODEL))?
+        .with_execution_context(context.clone());
+    let (_, _, plan, sha) = prepared_rich(bound, client)?;
+    ensure!(
+        context.snapshot()? == before,
+        "rich_helper_preparation_consumed_context"
+    );
+    context.check_deadline()?;
+    Ok(
+        json!({"schema_version":"gptgrep.harbor.rich_preparation_result.v1","status":"prepared",
+        "preparation":plan,"preparation_sha256":sha,"execution_authorized":false,
+        "effects":{"credentials":0,"reservations":0,"submissions":0,"context_consumption":0,"output_writes":0}}),
+    )
+}
+fn validate_rich_coverage(kind: &str, value: &Value) -> Result<()> {
+    let (counts, flags, fixed): (&[&str], &[&str], (&str, &str)) = match kind {
+        "search_multimodal" => (
+            &[
+                "scoped_documents",
+                "routed_documents",
+                "selected_documents",
+                "available_text_artifacts",
+                "inspected_text_artifacts",
+                "omitted_text_artifacts",
+                "scanned_text_bytes",
+                "potential_text_candidates",
+                "potential_visual_candidates",
+                "available_visual_candidates",
+                "omitted_visual_candidates",
+                "visual_pages_in_scope",
+                "visual_pages_without_rendition",
+                "union_text_candidates",
+                "union_visual_candidates",
+                "filtered_candidates",
+            ],
+            &[
+                "lexical_truncated",
+                "lexical_query_terms_truncated",
+                "visual_enumeration_complete",
+                "selected_visual_artifact_bytes_verified",
+                "semantic_scope_complete",
+            ],
+            ("delivered_set_sufficiency", "unassessed"),
+        ),
+        "rerank" => (
+            &[
+                "supplied_candidates",
+                "text_candidates",
+                "visual_candidates",
+                "scored_candidates",
+            ],
+            &["complete"],
+            ("scope", "supplied_candidate_pool_only"),
+        ),
+        _ => anyhow::bail!("rich_helper_evidence_operation"),
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("rich_helper_coverage"))?;
+    ensure!(
+        object.len() == counts.len() + flags.len() + 1
+            && counts
+                .iter()
+                .all(|key| object.get(*key).and_then(Value::as_u64).is_some())
+            && flags
+                .iter()
+                .all(|key| object.get(*key).and_then(Value::as_bool).is_some())
+            && object.get(fixed.0).and_then(Value::as_str) == Some(fixed.1),
+        "rich_helper_coverage"
+    );
+    Ok(())
+}
+fn validate_rich_reference(reader: &RichGenerationReader, evidence: &EvidenceRef) -> Result<()> {
+    match evidence {
+        EvidenceRef::NativeText { .. } | EvidenceRef::OcrText { .. } => {
+            reader.validate_text_evidence(evidence)
+        }
+        EvidenceRef::VisualRegion { rendition_id, .. } => {
+            let visual = reader.visual_reader()?;
+            let file = visual.open_rendition(rendition_id, &reader.manifest()?.resource_budget)?;
+            ensure!(
+                serde_json::to_value(&file.candidate().evidence)?
+                    == serde_json::to_value(evidence)?,
+                "rich_helper_visual_reference"
+            );
+            visual.validate()
+        }
+    }
+}
+// Recheck only emitted references; Reader::validate alone does not bind raw sources.
+fn validate_rich_delivery_sources(
+    reader: &RichGenerationReader,
+    evidence: &RichEvidence,
+) -> Result<()> {
+    for operation in &evidence.operations {
+        for entry in &operation.entries {
+            validate_rich_reference(reader, &entry.evidence)?;
+        }
+    }
+    reader.validate()
+}
+fn rich_evidence(
+    bound: &RichBound,
+    reader: &RichGenerationReader,
+    response: &RichBatchResponse,
+    preparation_sha: &str,
+) -> Result<RichEvidence> {
+    ensure!(
+        response.generation == bound.config.generation
+            && response.items.len() == bound.request.operations.len()
+            && response.coverage.failed == 0
+            && response.coverage.not_executed == 0,
+        "rich_helper_batch_incomplete"
+    );
+    let mut operations = Vec::new();
+    for (op, item) in bound.request.operations.iter().zip(&response.items) {
+        let (id, kind, _) = rich_operation(op)?;
+        ensure!(
+            item.id == id && item.status == RichBatchStatus::Ok && item.error.is_none(),
+            "rich_helper_batch_item_failed"
+        );
+        let result = item
+            .result
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("rich_helper_result_missing"))?;
+        ensure!(
+            result["generation"] == serde_json::to_value(&bound.config.generation)?
+                && result["query"] == bound.query
+                && result["accounting_complete"] == true,
+            "rich_helper_result_binding"
+        );
+        let coverage = result["coverage"].clone();
+        validate_rich_coverage(kind, &coverage)?;
+        let entries = result[if kind == "rerank" {
+            "ranked_candidates"
+        } else {
+            "hits"
+        }]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("rich_helper_hits"))?;
+        ensure!(entries.len() <= 128, "rich_helper_evidence_count");
+        let mut kept = Vec::new();
+        for entry in entries {
+            let reference = if kind == "rerank" {
+                &entry["evidence"]
+            } else if entry["content"]["kind"] == "text" {
+                &entry["content"]["window"]["evidence"]
+            } else {
+                &entry["content"]["candidate"]["evidence"]
+            };
+            let evidence: EvidenceRef = serde_json::from_value(reference.clone())?;
+            validate_rich_reference(reader, &evidence)?;
+            let candidate_id = entry["candidate_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("rich_helper_candidate"))?;
+            ensure!(valid_sha(candidate_id), "rich_helper_candidate");
+            let score = entry["score"]
+                .as_f64()
+                .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+                .ok_or_else(|| anyhow::anyhow!("rich_helper_score"))?;
+            let confidence = if entry["confidence"].is_null() {
+                None
+            } else {
+                Some(
+                    entry["confidence"]
+                        .as_f64()
+                        .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+                        .ok_or_else(|| anyhow::anyhow!("rich_helper_confidence"))?,
+                )
+            };
+            kept.push(RichEvidenceEntry {
+                candidate_id: candidate_id.into(),
+                evidence,
+                score,
+                confidence,
+                literal_anchor: entry["content"]["literal_anchor"].as_bool(),
+            });
+        }
+        operations.push(RichEvidenceOperation {
+            id: id.into(),
+            kind: kind.into(),
+            entries: kept,
+            coverage,
+        });
+    }
+    reader.validate()?;
+    Ok(RichEvidence {
+        schema_version: "gptgrep.harbor.rich_helper_evidence.v2".into(),
+        status: "completed".into(),
+        generation: bound.config.generation.clone(),
+        query_sha256: bound.config.query.sha256.clone(),
+        config_sha256: bound.config_sha256.clone(),
+        request_sha256: bound.config.request.sha256.clone(),
+        preparation_sha256: preparation_sha.into(),
+        operations,
+        actual_image_delivery: false,
+        citation_authority: false,
+    })
+}
+fn rich_attempts_valid(response: &RichBatchResponse, expected_model: &str) -> Result<usize> {
+    let mut total = 0usize;
+    for item in &response.items {
+        let result = item
+            .result
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("rich_helper_result_missing"))?;
+        ensure!(
+            matches!(
+                result["schema_version"].as_str(),
+                Some("gptgrep.rich_multimodal_search.v1" | "gptgrep.rich_rerank.response.v1")
+            ),
+            "rich_helper_result_schema"
+        );
+        let attempts = result["attempts"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("rich_helper_attempts_missing"))?;
+        ensure!(!attempts.is_empty(), "rich_helper_attempts_missing");
+        for attempt in attempts {
+            ensure!(
+                attempt["requested_model"] == MODEL
+                    && attempt["returned_model"] == expected_model
+                    && attempt["response_status"] == "validated"
+                    && attempt["failure"].is_null()
+                    && attempt["prepared_request_sha256"]
+                        .as_str()
+                        .is_some_and(valid_sha)
+                    && attempt["encoded_request_bytes"]
+                        .as_u64()
+                        .is_some_and(|n| n > 0)
+                    && attempt["usage"]["usage_observed"] == true
+                    && attempt["usage"]["complete_usage_sha256"]
+                        .as_str()
+                        .is_some_and(valid_sha),
+                "rich_helper_model_or_usage_not_admitted"
+            );
+            for name in ["input_tokens", "output_tokens"] {
+                let field = &attempt["usage"][name];
+                ensure!(
+                    field["presence"] == "reported" && field["value"].as_u64().is_some(),
+                    "rich_helper_usage_missing"
+                );
+            }
+            let cost = &attempt["usage"]["cost"];
+            ensure!(
+                cost["presence"] == "reported"
+                    && cost["value"]
+                        .as_f64()
+                        .is_some_and(|n| n.is_finite() && n >= 0.0),
+                "rich_helper_cost_missing"
+            );
+            total += 1;
+        }
+    }
+    Ok(total)
+}
+async fn execute_rich<F>(bound: RichBound, started: Instant, client_factory: F) -> Result<Value>
+where
+    F: FnOnce(ExecutionContext) -> Result<JevClient>,
+{
+    execute_rich_with_finalization_hook(bound, started, client_factory, |_, _| Ok(())).await
+}
+async fn execute_rich_with_finalization_hook<F, H>(
+    bound: RichBound,
+    started: Instant,
+    client_factory: F,
+    finalization_hook: H,
+) -> Result<Value>
+where
+    F: FnOnce(ExecutionContext) -> Result<JevClient>,
+    H: Fn(&ExecutionContext, FinalizationPoint) -> Result<()>,
+{
+    let expected = bound
+        .config
+        .expected_preparation_sha256
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("rich_helper_preparation_binding_required"))?
+        .clone();
+    let mut output = ReservedOutput::create_at(
+        &bound.config.output_dir,
+        &bound.config_sha256,
+        &bound.config.query.sha256,
+        &bound.config.generation,
+    )?;
+    let mut account = json!({"schema_version":"gptgrep.harbor.rich_batch_accounting.v1","status":"admission",
+        "config_sha256":bound.config_sha256,"generation":bound.config.generation,
+        "query_sha256":bound.config.query.sha256,"request_sha256":bound.config.request.sha256,
+        "preparation_sha256":expected,"helper_logical_accounting_complete":false,
+        "reader_must_not_start":true,"money_authority":"external_owner_only",
+        "money_settlement":false,"actual_provider_requests":null,
+        "excluded_as_indexing":false,"timing_scope":"all_query_dependent_helper_work_is_treatment_retrieval"});
+    save(&mut output.accounting, &account, ACCOUNT_CAP)?;
+    let result = async {
+        let context = join_existing_calls(&bound.config.context, bound.config.max_calls)?;
+        let before = context.snapshot()?;
+        let (reader, prepared, plan, sha) =
+            prepared_rich(&bound, client_factory(context.clone())?)?;
+        ensure!(sha == expected, "rich_helper_preparation_changed");
+        let reserved = prepared.reserved_calls();
+        account["preparation"] = plan;
+        account["execution_before"] = serde_json::to_value(&before)?;
+        account["status"] = json!("running");
+        save(&mut output.accounting, &account, ACCOUNT_CAP)?;
+        let outcome = prepared.execute().await;
+        account["batch"] = match &outcome {
+            Ok(value) => serde_json::to_value(value)?,
+            Err(value) => serde_json::to_value(value)?,
+        };
+        account["retrieval_wall_ms"] = json!(started.elapsed().as_millis());
+        // Preserve actual subset hashes, byte bounds and usage before deciding delivery.
+        save(&mut output.accounting, &account, ACCOUNT_CAP)?;
+        let response = outcome?;
+        let after = context.snapshot()?;
+        account["execution_after"] = serde_json::to_value(&after)?;
+        let actual = rich_attempts_valid(&response, &bound.config.expected_actual_model)?;
+        let unchanged = before.scope == after.scope
+            && before.run_id == after.run_id
+            && before.plan_digest == after.plan_digest
+            && before.max_submissions == after.max_submissions
+            && before.deadline_unix_ms == after.deadline_unix_ms
+            && before.active_or_quarantined_slots == after.active_or_quarantined_slots
+            && before.quarantined_slots == after.quarantined_slots;
+        ensure!(
+            actual > 0
+                && actual <= reserved
+                && unchanged
+                && after
+                    .logical_reservations
+                    .checked_sub(before.logical_reservations)
+                    == Some(actual)
+                && after
+                    .send_start_observations
+                    .checked_sub(before.send_start_observations)
+                    == Some(actual)
+                && after
+                    .terminal_submissions
+                    .checked_sub(before.terminal_submissions)
+                    == Some(actual)
+                && after
+                    .submission_observations
+                    .checked_sub(before.submission_observations)
+                    == Some(actual as u64),
+            "rich_helper_context_delta"
+        );
+        let evidence = rich_evidence(&bound, &reader, &response, &sha)?;
+        bind_rich(&bound.config_path, &bound.config_sha256)?;
+        finalization_hook(&context, FinalizationPoint::BeforeEvidence)?;
+        context.check_deadline()?;
+        validate_rich_delivery_sources(&reader, &evidence)?;
+        context.check_deadline()?;
+        let evidence_value = serde_json::to_value(&evidence)?;
+        account["reader_evidence_sha256"] = json!(digest(&serde_json::to_vec(&evidence_value)?));
+        account["helper_logical_accounting_complete"] = json!(true);
+        account["reader_must_not_start"] = json!(false);
+        account["status"] = json!("completed");
+        account["logical_calls_observed"] = json!(actual);
+        save(&mut output.evidence, &evidence_value, EVIDENCE_CAP)?;
+        save(&mut output.accounting, &account, ACCOUNT_CAP)?;
+        finalization_hook(&context, FinalizationPoint::AfterAccounting)?;
+        context.check_deadline()?;
+        validate_rich_delivery_sources(&reader, &evidence)?;
+        context.check_deadline()?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if result.is_err() {
+        account["status"] = json!("failed");
+        account["helper_logical_accounting_complete"] = json!(false);
+        account["reader_must_not_start"] = json!(true);
+        account["code"] = json!("rich_helper_failed_no_reader_delivery");
+        save(
+            &mut output.evidence,
+            &json!({"status":"unavailable","reader_must_not_start":true}),
+            EVIDENCE_CAP,
+        )?;
+        save(&mut output.accounting, &account, ACCOUNT_CAP)?;
+    }
+    Ok(account)
+}
 fn discovery() -> Value {
     json!({"schema_version":"gptgrep.harbor.rich_helper_frontdoor.v1","requested_model":MODEL,"max_calls":2,"default":"preflight","effects":0,"execution":"explicit --execute --config PATH --config-sha256 SHA","context":"existing_same_host_ledger_and_original_anchor_required","output":"separate_private_accounting_and_source_bound_reader_evidence","qualification":"controlled_bootstrap_pipeline_not_interactive_tool_or_utility"})
 }
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let cli = Cli::parse();
-    let result = match (&cli.config, &cli.config_sha256) {
-        (Some(path), Some(sha)) => {
-            let started = Instant::now();
-            match bind(path, sha) {
+    let result = if cli.rich {
+        match (&cli.config, &cli.config_sha256) {
+            (Some(path), Some(sha)) => match bind_rich(path, sha) {
                 Ok(bound) if cli.execute => {
-                    execute_bound(bound, started, |context| {
+                    execute_rich(bound, Instant::now(), |context| {
                         Ok(JevClient::from_env(Some(MODEL))?.with_execution_context(context))
                     })
                     .await
                 }
+                Ok(bound) if cli.prepare_rich => rich_prepare_only(&bound),
                 Ok(bound) => Ok(
-                    json!({"schema_version":"gptgrep.harbor.rich_helper_preflight.v1","config_sha256":bound.config_sha256,"generation":bound.config.generation,"query_sha256":bound.config.query.sha256,"requested_model":MODEL,"max_calls":2,"effects":{"clock_adoption":0,"ledger_join_or_initialization":0,"credentials":0,"provider":0,"output_writes":0}}),
+                    json!({"schema_version":"gptgrep.harbor.rich_batch_helper_preflight.v1",
+                    "status":"bound","config_sha256":bound.config_sha256,
+                    "generation":bound.config.generation,"query_sha256":bound.config.query.sha256,
+                    "request_sha256":bound.config.request.sha256,"max_calls":bound.config.max_calls,
+                    "prepared":false,"money_authority":"external_owner_only","effects":0}),
                 ),
                 Err(_) => Err(anyhow::anyhow!("rich_helper_input_not_admitted")),
-            }
+            },
+            _ => Ok(
+                json!({"schema_version":"gptgrep.harbor.rich_batch_helper_frontdoor.v1",
+                "default":"nonexecuting","preparation":"--rich --prepare-rich --config PATH --config-sha256 SHA",
+                "execution":"--rich --execute --config PATH --config-sha256 SHA",
+                "money_authority":"external_owner_required_before_execution","effects":0}),
+            ),
         }
-        _ => Ok(discovery()),
+    } else {
+        match (&cli.config, &cli.config_sha256) {
+            (Some(path), Some(sha)) => {
+                let started = Instant::now();
+                match bind(path, sha) {
+                    Ok(bound) if cli.execute => {
+                        execute_bound(bound, started, |context| {
+                            Ok(JevClient::from_env(Some(MODEL))?.with_execution_context(context))
+                        })
+                        .await
+                    }
+                    Ok(bound) => Ok(
+                        json!({"schema_version":"gptgrep.harbor.rich_helper_preflight.v1","config_sha256":bound.config_sha256,"generation":bound.config.generation,"query_sha256":bound.config.query.sha256,"requested_model":MODEL,"max_calls":2,"effects":{"clock_adoption":0,"ledger_join_or_initialization":0,"credentials":0,"provider":0,"output_writes":0}}),
+                    ),
+                    Err(_) => Err(anyhow::anyhow!("rich_helper_input_not_admitted")),
+                }
+            }
+            _ => Ok(discovery()),
+        }
     };
     match result {
         Ok(value) => {

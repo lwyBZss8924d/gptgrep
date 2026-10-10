@@ -133,6 +133,47 @@ fn inventory_bytes(root: &Path, count: &mut usize) -> Result<u64> {
     }
     Ok(bytes)
 }
+// This boundary must never return filesystem paths or arbitrary error chains.
+// The locked anyhow version preserves these existing literal inventory errors
+// as &'static str; unknown errors remain a closed, redacted cause.
+fn inventory_failure(error: anyhow::Error, cap: u64, entries: usize) -> anyhow::Error {
+    let cause = if let Some(error) = error.downcast_ref::<std::io::Error>() {
+        match error.kind() {
+            std::io::ErrorKind::NotFound => "missing",
+            std::io::ErrorKind::PermissionDenied => "io_permission_denied",
+            std::io::ErrorKind::Interrupted => "io_interrupted",
+            std::io::ErrorKind::InvalidInput => "io_invalid_input",
+            std::io::ErrorKind::InvalidData => "io_invalid_data",
+            std::io::ErrorKind::WouldBlock => "io_would_block",
+            std::io::ErrorKind::TimedOut => "io_timed_out",
+            std::io::ErrorKind::NotADirectory => "io_not_a_directory",
+            std::io::ErrorKind::IsADirectory => "io_is_a_directory",
+            std::io::ErrorKind::OutOfMemory => "io_out_of_memory",
+            _ => "io_other",
+        }
+    } else {
+        match error.downcast_ref::<&'static str>().copied() {
+            Some("resource_limit: Office conversion file count") => "entry_limit",
+            Some("Office staging symlink rejected") => "symlink",
+            Some("Office staging special file rejected") => "special",
+            Some("Office staging length overflow") => "arithmetic",
+            _ => "unknown",
+        }
+    };
+    anyhow::anyhow!(
+        "Office conversion staging inventory failed: cause={cause}, observed_bytes=unavailable, cap_bytes={cap}, entries_visited={entries}"
+    )
+}
+fn check_staging(root: &Path, cap: u64) -> Result<()> {
+    let mut entries = 0;
+    let bytes = inventory_bytes(root, &mut entries)
+        .map_err(|error| inventory_failure(error, cap, entries))?;
+    ensure!(
+        bytes <= cap,
+        "resource_limit: Office conversion staging exceeded: cause=logical_bytes, observed_bytes={bytes}, cap_bytes={cap}, entries_visited={entries}"
+    );
+    Ok(())
+}
 async fn drain(mut pipe: impl tokio::io::AsyncRead + Unpin) -> Result<()> {
     let mut buffer = [0u8; 4096];
     let mut count = 0u64;
@@ -209,9 +250,8 @@ async fn convert(
                 }
                 _ = tokio::time::sleep_until(deadline) => {break Err(anyhow::anyhow!("Office conversion deadline exceeded"));}
                 _ = tokio::time::sleep(Duration::from_millis(20)) => {
-                    match inventory_bytes(work, &mut 0) {
-                        Ok(bytes) if bytes <= cap => {},
-                        _ => break Err(anyhow::anyhow!("resource_limit: Office conversion staging exceeded")),
+                    if let Err(error) = check_staging(work, cap) {
+                        break Err(error);
                     }
                     match child.try_wait() {
                         Ok(Some(exit)) => status = Some(exit),
@@ -231,10 +271,7 @@ async fn convert(
         let _ = child.wait().await;
     }
     result?;
-    ensure!(
-        inventory_bytes(work, &mut 0)? <= cap,
-        "resource_limit: Office final staging admission"
-    );
+    check_staging(work, cap).context("Office final staging admission failed")?;
     let files = fs::read_dir(&output)?.collect::<std::io::Result<Vec<_>>>()?;
     ensure!(
         files.len() == 1,
@@ -341,6 +378,87 @@ mod tests {
     }
     fn quote(path: &Path) -> String {
         format!("'{}'", path.display().to_string().replace('\'', "'\"'\"'"))
+    }
+    #[test]
+    fn staging_admission_reports_measured_bytes_and_keeps_exact_cap() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::create_dir(dir.path().join("private-directory"))?;
+        fs::write(
+            dir.path().join("private-directory/private-document"),
+            b"data",
+        )?;
+        check_staging(dir.path(), 4)?;
+        let error = check_staging(dir.path(), 3).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "resource_limit: Office conversion staging exceeded: cause=logical_bytes, observed_bytes=4, cap_bytes=3, entries_visited=2"
+        );
+        assert!(!format!("{error:#?}").contains("private-"));
+        Ok(())
+    }
+    #[test]
+    fn staging_missing_and_symlink_failures_are_not_reported_as_byte_overruns() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let missing = check_staging(&dir.path().join("private-missing"), 64).unwrap_err();
+        assert_eq!(
+            missing.to_string(),
+            "Office conversion staging inventory failed: cause=missing, observed_bytes=unavailable, cap_bytes=64, entries_visited=0"
+        );
+        std::os::unix::fs::symlink("private-target", dir.path().join("private-link"))?;
+        let link = check_staging(dir.path(), 64).unwrap_err();
+        assert_eq!(
+            link.to_string(),
+            "Office conversion staging inventory failed: cause=symlink, observed_bytes=unavailable, cap_bytes=64, entries_visited=1"
+        );
+        for error in [missing, link] {
+            assert!(!format!("{error:#?}").contains("private-"));
+            assert!(!error.to_string().contains("staging exceeded"));
+        }
+        Ok(())
+    }
+    #[test]
+    fn staging_entry_limit_keeps_the_rejected_entry_count() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join("private-document"), b"data")?;
+        let mut entries = 8192;
+        let error = inventory_bytes(dir.path(), &mut entries).unwrap_err();
+        assert_eq!(entries, 8193);
+        assert_eq!(
+            inventory_failure(error, 64, entries).to_string(),
+            "Office conversion staging inventory failed: cause=entry_limit, observed_bytes=unavailable, cap_bytes=64, entries_visited=8193"
+        );
+        Ok(())
+    }
+    #[test]
+    fn staging_inventory_error_causes_are_closed_and_redact_context() {
+        for (message, cause) in [
+            ("Office staging special file rejected", "special"),
+            ("Office staging length overflow", "arithmetic"),
+            ("private-path-and-document-content", "unknown"),
+        ] {
+            let error = inventory_failure(anyhow::Error::msg(message), 64, 7);
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Office conversion staging inventory failed: cause={cause}, observed_bytes=unavailable, cap_bytes=64, entries_visited=7"
+                )
+            );
+            assert!(!format!("{error:#?}").contains("private-"));
+        }
+        let error = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "private-path-and-document-content",
+        ))
+        .context("private-outer-context");
+        let diagnostic = inventory_failure(error, 64, 7);
+        assert_eq!(
+            diagnostic.to_string(),
+            "Office conversion staging inventory failed: cause=io_permission_denied, observed_bytes=unavailable, cap_bytes=64, entries_visited=7"
+        );
+        assert!(!format!("{diagnostic:#?}").contains("private-"));
+        let opaque = inventory_failure(anyhow::anyhow!("private-{}", "dynamic-content"), 64, 7);
+        assert!(opaque.to_string().contains("cause=unknown,"));
+        assert!(!format!("{opaque:#?}").contains("private-"));
     }
     #[test]
     fn one_conversion_is_retained_for_extract_render_finalize_and_raw_identity() -> Result<()> {
