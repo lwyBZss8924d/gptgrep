@@ -34,9 +34,10 @@ workstation-specific account aliases and routing are not part of the public prod
 
 ## Initial release acceptance
 
-The first experimental publication requires the long-horizon comparison contract
-below: a real, reproducible minimum advantage over PageIndex Flash plus GPT-5.6.
-The engineering checks in this section are necessary and do not replace that gate.
+The first experimental publication requires the retained first-release comparison
+contract below: a real, reproducible minimum advantage over PageIndex Flash plus
+GPT-5.6. This tag gate is separate from main Goal convergence. The engineering
+checks in this section are necessary and do not replace that gate.
 
 1. A real mixed document fixture can be parsed, indexed, searched and cited end to
    end by the release build. Tree spans are valid and deterministic.
@@ -67,12 +68,56 @@ The project may evolve autonomously within this direction. New global registrati
 automatic ingestion of private histories, changes to other projects, and broad
 model-training/research experiments are outside this repository's routine authority.
 
-## Long-horizon research goal
+## Main Goal convergence: same-Codex SEARCH comparison
 
-The research-preview program must demonstrate a useful measured advantage over a
-live PageIndex Flash baseline on the pinned PageIndex-OSS-Benchmark tasks. A source
-release, passing process, synthetic smoke or GPTgrep-only corpus run does not meet
-this goal. Retain the same corpus/task cohort, pinned source revisions, declared prompt
+The main optimization Goal is a measured advantage of the same Codex agent with
+GPTgrep over bare Codex on one complete frozen task cohort. Bare Codex receives
+raw documents only, with no pre-parsed text, OCR, tree or index; it may use the
+same ordinary reading, extraction and rendering tools during its query budget.
+GPTgrep receives those documents and its frozen prebuilt index. Match the base
+agent, runtime, tools other than GPTgrep, model/effort/tier, task scope and budgets.
+All pre-query build, parse, OCR, enrichment and index costs are excluded. Count
+all question-dependent work in SEARCH, including the baseline's on-demand raw
+processing and GPTgrep's online routing/Decisions work. This is a comparison of
+actual product configurations, not isolated search-algorithm causality.
+
+Preregister higher task-level answer equivalence as the default primary claim:
+GPTgrep accuracy minus bare-Codex accuracy must be greater than zero. An efficiency
+claim instead requires a separate configuration selected before results, quality
+at least equal to baseline, and improvement in one preselected query cost-per-
+correct-answer or failure-aware time-to-correct metric. The latter caps incorrect
+answers and failures at the declared matching query deadline, retains Judge
+unknowns, and is unavailable if the treatment has no confirmed correct answers.
+A zero-correct baseline remains comparable at its declared deadlines.
+Do not choose the winning metric after scoring.
+Keep operational failures as zero in the fixed denominator. Judge unavailability
+is unknown, not zero or an omitted task; report bounds and whether unresolved
+labels could reverse the conclusion. Common document/page/quote support is an
+auxiliary measure where available, not a requirement for baseline GPTgrep IDs.
+
+Use the complete pinned 62-task/34-document historical development cohort as the
+default compatibility comparison; a new execution is not an unseen holdout.
+A broader fresh cohort is optional future evidence. Small pilots, fewer tool
+calls and weighted composites cannot replace the complete selected comparison.
+Report paired uncertainty without imposing a significance or power gate. Internal
+INDEX/lexical/tree/Decisions/visual ablations are optional diagnostics and need
+not each win. No PageIndex third arm is required for this main comparison.
+
+The protocol is `docs/design/agentic-search-evaluation.md`. Main Goal convergence
+and first-release permission are separate: the retained G5 conditions below
+remain mandatory for the first tag, not for this same-Codex Goal's convergence.
+This replaces only the PageIndex-superiority dependency of comparative
+convergence. Existing D1-D7 implementation, verification and source-delivery
+obligations remain: G0 source/license, G1 correctness/freshness/independent review,
+G2 actual native/provider outcomes and G6 source/PoUW/backup are shared engineering
+requirements. A comparison win does not complete unfinished code or delivery.
+
+## Retained first-release PageIndex comparison
+
+The first research-preview release retains its measured-advantage requirement over
+the pinned PageIndex Flash baseline. A source release, passing process, synthetic
+smoke or GPTgrep-only corpus run does not meet this first-tag gate. Retain the same
+corpus/task cohort, pinned source revisions, declared prompt
 and tool budgets, judge and failure denominators for each comparison. The
 benchmark repository's original local-OSS `results.json` is a separately labelled
 native reference: PageIndex Flash plus GPT-5.6 Luna/high reports 60/62 and
@@ -143,14 +188,18 @@ labels, gold annotations or previous judge state. Synthetic metamorphic checks
 should vary file names, page placement, section order, question wording and facts
 to establish that improvements are general. Protocol-provided document scope is
 permitted only when supplied consistently to both systems and clearly labelled.
-Run the complete 62-task/34-document cohort as the live A/B benchmark. Offline
-fixtures validate implementation; small or synthetic live smokes do not satisfy
-the A/B requirement or first-release gate. Do not tune on held-out test answers or relabel
+For the retained first-release comparison, run the complete 62-task/34-document
+cohort as the live A/B benchmark. Offline fixtures validate implementation; small
+or synthetic live smokes do not satisfy that A/B requirement or first-release gate. Do not tune on held-out test answers or relabel
 failures as excluded successes. Report quality, citation fidelity, ingestion
 coverage, latency, token usage and available cost as separate measures.
 Retain per-task retrieval and tool-failure signals so an observed gap can become a
 specific issue, falsifiable optimization and paired rerun. Adapter startup or
 backend differences alone cannot establish retrieval superiority.
 
-The comparison contract is `workspace/harness-config/goal-contract.json`. The
-native outer Goal remains active until that contract's actual acceptance is met.
+The comparison contract is `workspace/harness-config/goal-contract.json`. Its
+`main_goal_acceptance` determines comparative convergence alongside the shared
+engineering and source-delivery obligations; `first_release_gate` and its scoped
+G3-G5 comparison conditions determine first-tag
+permission. Satisfying either does not claim satisfaction of the other. Preserve
+the actual outcomes and pending release status separately.

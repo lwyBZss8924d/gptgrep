@@ -2,13 +2,101 @@
   "schema_version": "gptgrep.goal.v1",
   "id": "GPTGREP-RESEARCH-PREVIEW",
   "status": "active",
-  "objective": "Build and iteratively optimize a Rust-first GPTgrep system with measured live advantages over the PageIndex Flash baseline",
+  "objective": "Build and iteratively optimize Rust-first GPTgrep with measured SEARCH advantages over raw-only bare Codex using the same base agent; retain PageIndex G5 separately for the first release",
   "authority": "User project ownership mandate; routine implementation, harness, CI and releases authorized within the agreed direction",
   "host_defaults": {
     "model": "gpt-5.6-luna",
     "experimental_query_planner_model": "gpt-6-luna",
     "model_reasoning_effort": "max",
     "service_tier": "fast"
+  },
+  "acceptance_scopes": {
+    "main_goal_convergence": "main_goal_acceptance",
+    "first_release_only": {
+      "gate_ids": [
+        "G3",
+        "G4",
+        "G5"
+      ],
+      "contract_fields": [
+        "advantage_rule",
+        "release_policy",
+        "first_release_gate",
+        "live_execution_rule"
+      ]
+    },
+    "historical_and_first_release_reference": "benchmark",
+    "legacy_host_defaults": "Retained compatibility metadata; the main comparison uses the explicit matched_runtime in main_goal_acceptance, not the historical model in host_defaults",
+    "separation": "Main Goal convergence does not grant first-tag permission; pending PageIndex/G5 conditions do not block same-Codex SEARCH convergence",
+    "shared_engineering_gate_ids": [
+      "G0",
+      "G1",
+      "G2",
+      "G6"
+    ],
+    "existing_delivery_obligations": "D1-D7 implementation, verification and source-delivery obligations remain; comparative convergence does not complete unfinished code, PoUW or backup"
+  },
+  "main_goal_acceptance": {
+    "status": "pending_complete_paired_live_comparison",
+    "protocol": "docs/design/agentic-search-evaluation.md",
+    "estimand": "Actual query experience: raw-only bare Codex versus the same Codex with GPTgrep and a frozen prebuilt index; not isolated algorithm causality",
+    "default_cohort": {
+      "source": "benchmark.repository at benchmark.revision, bound by benchmark.questions_sha256",
+      "task_count": 62,
+      "document_count": 34,
+      "exposure": "historical_development_compatibility_not_unseen",
+      "complete_frozen_cohort_required": true,
+      "pilot_substitution": false,
+      "broader_fresh_cohort": "optional future evidence, not a dependency"
+    },
+    "matched_runtime": {
+      "model": "gpt-6-luna",
+      "model_reasoning_effort": "max",
+      "service_tier": "fast",
+      "policy": "Freeze the same actual reader/base-agent/runtime/common tools and declared resources in both arms; bind judge settings separately and identically"
+    },
+    "arms": {
+      "baseline": "Raw documents only, no precomputed parse/OCR/tree/index; ordinary permitted inspection, extraction, rendering and search tools remain available during the online query budget",
+      "treatment": "Same raw documents and base agent/tools, plus GPTgrep tools and a frozen index built from raw documents alone"
+    },
+    "treatment_feature_profile": {
+      "declaration": "Freeze exact commands, preparation mode, enabled route/rerank provider/model and available tree/structure/text/OCR/visual paths",
+      "actual_observation": "Distinguish configured availability from actual use, failure or unknown in the trace",
+      "deterministic_harbor_pilot": "Deterministic rich-batch tools without Luna Decisions are protocol/tool-use development evidence only, not a full routing/reranking or System One helper claim",
+      "claim_scope": "No requirement that every mechanism be enabled or win; report the capabilities actually configured and observed"
+    },
+    "cost_time_boundary": {
+      "excluded": "All pre-query build, parse, render, OCR, enrichment, tree/index preparation costs; judge costs reported separately",
+      "included": "All question-dependent query work, including baseline on-demand raw-document processing and treatment routing/Decisions, retrieval, reading and answering",
+      "accounting": "Retain allowed failed/retried attempts, observed usage/cost and nulls; API-price equivalents are not ChatGPT subscription bills"
+    },
+    "default_primary": {
+      "metric": "task_answer_equivalence",
+      "comparison": "Q_treatment - Q_baseline > 0",
+      "denominator": "All tasks in the frozen paired cohort",
+      "selection": "Preregister before scoring; do not switch metrics or pick best-of task answers after results"
+    },
+    "efficiency_alternative": {
+      "default_selected": false,
+      "selection": "A separate preregistered configuration before results, never an automatic fallback from the default quality claim",
+      "quality_constraint": "Q_treatment >= Q_baseline",
+      "resource_metric": "Exactly one preselected query_cost_per_correct_answer or query_latency endpoint; lower is better",
+      "cost_per_correct": "Sum all selected query-attempt costs divided by confirmed correct answers; unavailable with zero correct answers or incomplete required cost observations",
+      "latency": "Predeclare mean capped time-to-correct: confirmed correct completion before the matching query deadline uses actual duration; incorrect answers and operational failures use that deadline. Judge unknowns remain unresolved. If the treatment has zero confirmed correct answers this endpoint is unavailable; a zero-correct baseline remains comparable at its declared deadlines. Report actual wall time separately from the capped metric",
+      "improvement_threshold": "Strictly lower selected metric; any practical minimum must be declared before results, not imposed as a new default gate"
+    },
+    "failure_and_unknown_policy": {
+      "operational_failure": "Zero score for startup/reader/timeout/missing-answer failure; an empty failed response is not intentional correct abstention",
+      "judge_unknown": "Keep unknown in the fixed denominator; no zero-imputation or omission; report bounds and paired sensitivity, or resolve judging on retained answers",
+      "claim_with_unknowns": "Do not claim the selected advantage if permissible unresolved outcomes can reverse it"
+    },
+    "grounding": "Auxiliary common document/page/quote support where both arms can be assessed; baseline does not require GPTgrep issued IDs; missing common support is unknown",
+    "uncertainty": "Report paired and document-grouped uncertainty where estimable; disclose small/degenerate samples. No required significance, power target or every-slice win",
+    "diagnostics": "INDEX and lexical/tree/Decisions/visual/OCR mechanism ablations are optional explanations, not independent win gates; do not claim an unused rich navigation overlay",
+    "judge_and_integrity": "Freeze rubric and bind each verdict to exact answer/configuration; blind arm identity; isolate gold and prior judge state from fresh readers; retain historical exposure/splits",
+    "stop_rule": "Complete the frozen cohort or declared budget and report partial/failure outcomes; a single pilot or favorable early subset is not completion",
+    "pageindex_third_arm_required": false,
+    "first_release_gate_is_main_goal_dependency": false
   },
   "benchmark": {
     "repository": "https://github.com/VectifyAI/PageIndex-OSS-Benchmark",
