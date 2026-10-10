@@ -332,7 +332,7 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
             ),
             evidence.state(question)?,
             crate::rich_text::final_schema(evidence.max_citations()),
-            crate::rich_text::tools(),
+            crate::rich_text::tools(evidence.document.as_deref()),
             65536,
         ),
         Workflow::RichMultimodal { question, evidence } => (
@@ -342,7 +342,7 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
             ),
             evidence.state(question)?,
             crate::rich_multimodal::final_schema(evidence.max_citations()),
-            crate::rich_multimodal::tools(),
+            crate::rich_multimodal::tools(evidence.document.as_deref()),
             65536,
         ),
         Workflow::Completion {
@@ -367,6 +367,10 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
     } else {
         format!("{instructions}\n\n{}", retrieval::limits_guidance())
     };
+    if workflow.rich().is_some() {
+        instructions.push('\n');
+        instructions.push_str(crate::rich_text::DOCUMENT_DISCOVERY_GUIDANCE);
+    }
     if let Workflow::Retrieval { evidence, .. } = &workflow
         && let Some(guidance) = evidence.evidence_role_guidance()
     {

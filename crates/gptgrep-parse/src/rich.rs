@@ -826,10 +826,7 @@ pub(crate) fn extract_sync(
             "capability_unavailable: XFA/AcroForm preparation needs a bounded packet/appearance adapter"
         );
         let total = doc.page_count();
-        ensure!(
-            total > 0 && total as u32 <= crate::MAX_NATIVE_PAGES,
-            "native page count is outside supported complete-document limits"
-        );
+        ensure!(total > 0, "native document contains no pages");
         let metadata = crate::document_metadata::extract(
             &doc,
             &prepared.summary,
@@ -842,10 +839,7 @@ pub(crate) fn extract_sync(
         )?;
         (total, metadata)
     };
-    ensure!(
-        total > 0 && total as u32 <= crate::MAX_NATIVE_PAGES,
-        "native page count is outside supported complete-document limits"
-    );
+    ensure!(total > 0, "native document contains no pages");
     let document_metadata_size = encoded_size(&document_metadata, budget.document_metadata_bytes)?;
     admit_staging(&mut staged, document_metadata_size, &budget)?;
     let document_metadata_artifact = write_json(
@@ -1495,9 +1489,22 @@ fn projection_xy_scratch_upper(x_span: f64, y_span: f64, items: u64) -> Result<u
         .context("resource_limit: projection XY scratch overflow")
 }
 
+struct ProjectionAdmission {
+    text_upper: u64,
+    working_upper: u64,
+}
+
 /// Bound sparse text, projected copies and absolute-span scratch before either
 /// native classification or finalization calls the unchanged pure projector.
 fn admit_projection(pages: &[Page], budget: &ResourceBudget, held_upper: u64) -> Result<u64> {
+    Ok(projection_admission(pages, budget, held_upper)?.text_upper)
+}
+
+fn projection_admission(
+    pages: &[Page],
+    budget: &ResourceBudget,
+    held_upper: u64,
+) -> Result<ProjectionAdmission> {
     let mut total = 0u64;
     let mut scratch = 0u64;
     for page in pages {
@@ -1600,19 +1607,57 @@ fn admit_projection(pages: &[Page], budget: &ResourceBudget, held_upper: u64) ->
             .and_then(|n| n.checked_add(copies))
             .context("resource_limit: projection document scratch overflow")?;
     }
+    let working_upper = held_upper
+        .checked_add(
+            total
+                .checked_mul(4)
+                .context("projection working overflow")?,
+        )
+        .and_then(|n| n.checked_add(scratch))
+        .context("projection held working overflow")?;
     ensure!(
-        held_upper
-            .checked_add(
-                total
-                    .checked_mul(4)
-                    .context("projection working overflow")?
-            )
-            .and_then(|n| n.checked_add(scratch))
-            .context("projection held working overflow")?
-            <= budget.owned_working_bytes,
-        "resource_limit: complete projection working admission including XY scratch and copies"
+        working_upper <= budget.owned_working_bytes,
+        "resource_limit: complete projection working admission including XY scratch and copies: estimated_bytes={working_upper}, held_bytes={held_upper}, projected_text_bytes={total}, scratch_bytes={scratch}, limit_bytes={}",
+        budget.owned_working_bytes
     );
-    Ok(total)
+    Ok(ProjectionAdmission {
+        text_upper: total,
+        working_upper,
+    })
+}
+
+fn admit_final_projection(
+    pages: &[Page],
+    budget: &ResourceBudget,
+    held_upper: u64,
+    native_allocation_upper: u64,
+    outcome_bytes: u64,
+) -> Result<()> {
+    let projection = projection_admission(pages, budget, held_upper)?;
+    // Preserve the conservative allowance for document signals, block/layout
+    // copies, headings and canonical text. It is working memory, not JSON size.
+    let extra_working_upper = native_allocation_upper
+        .checked_mul(2)
+        .and_then(|native| {
+            projection
+                .text_upper
+                .checked_mul(8)
+                .and_then(|text| native.checked_add(text))
+        })
+        .and_then(|total| total.checked_add(outcome_bytes))
+        .context("resource_limit: finalization working allowance overflow")?;
+    let working_upper = projection
+        .working_upper
+        .checked_add(extra_working_upper)
+        .context("resource_limit: complete final working bound overflow")?;
+    ensure!(
+        working_upper <= budget.owned_working_bytes,
+        "resource_limit: complete final working admission: estimated_bytes={working_upper}, projection_bytes={}, extra_bytes={extra_working_upper}, native_allocation_bytes={native_allocation_upper}, projected_text_bytes={}, outcome_bytes={outcome_bytes}, limit_bytes={}",
+        projection.working_upper,
+        projection.text_upper,
+        budget.owned_working_bytes
+    );
+    Ok(())
 }
 
 pub fn finalize_document(
@@ -1775,24 +1820,29 @@ pub fn finalize_document(
         }
         native_page.coverage = CoverageState::ValidatedOcr;
     }
-    let projected_text_upper = admit_projection(&candidate.raw_pages, budget, final_owned_upper)?;
-    // Reserve native records plus escaped text, line/block copies and OCR
-    // records before the complete pure metadata stage. Keep the bound stricter
-    // than the sink checks for persisted JSON below.
-    let final_metadata_upper = candidate
-        .metadata_admitted_upper
-        .checked_mul(2)
-        .and_then(|native| {
-            projected_text_upper
-                .checked_mul(8)
-                .and_then(|projection| native.checked_add(projection))
+    let native_metadata_bytes = candidate
+        .artifacts
+        .iter()
+        .filter(|artifact| {
+            matches!(
+                artifact.kind,
+                ArtifactKind::NativeMetadata | ArtifactKind::OcrRegions
+            )
         })
-        .and_then(|total| total.checked_add(outcome_bytes))
-        .context("resource_limit: final metadata bound overflow")?;
+        .try_fold(0u64, |total, artifact| total.checked_add(artifact.bytes))
+        .context("resource_limit: retained native/OCR metadata length overflow")?;
     ensure!(
-        final_metadata_upper <= budget.document_metadata_bytes,
-        "resource_limit: complete final metadata admission"
+        native_metadata_bytes <= budget.document_metadata_bytes,
+        "resource_limit: retained native/OCR metadata admission: retained_bytes={native_metadata_bytes}, limit_bytes={}",
+        budget.document_metadata_bytes
     );
+    admit_final_projection(
+        &candidate.raw_pages,
+        budget,
+        final_owned_upper,
+        candidate.metadata_admitted_upper,
+        outcome_bytes,
+    )?;
     let mut projected = stages::project(candidate.raw_pages);
     let signals = stages::document_signals(&projected, true);
     let mut headings = Vec::new();
@@ -1925,22 +1975,13 @@ pub fn finalize_document(
     for page in &projected {
         encoded_size(page, budget.page_layout_bytes)?;
     }
-    let retained_metadata = candidate
-        .artifacts
-        .iter()
-        .filter(|artifact| {
-            matches!(
-                artifact.kind,
-                ArtifactKind::NativeMetadata | ArtifactKind::OcrRegions
-            )
-        })
-        .try_fold(layout_size, |total, artifact| {
-            total.checked_add(artifact.bytes)
-        })
+    let retained_metadata = native_metadata_bytes
+        .checked_add(layout_size)
         .context("resource_limit: retained metadata length overflow")?;
     ensure!(
         retained_metadata <= budget.document_metadata_bytes,
-        "resource_limit: retained complete metadata"
+        "resource_limit: retained complete metadata: retained_bytes={retained_metadata}, native_ocr_bytes={native_metadata_bytes}, layout_bytes={layout_size}, limit_bytes={}",
+        budget.document_metadata_bytes
     );
     admit_staging(&mut candidate.document_staging_used, layout_size, budget)?;
     candidate.artifacts.push(write_json(
@@ -2136,7 +2177,36 @@ mod boundary_tests {
             text * 2
         );
         budget.owned_working_bytes -= 1;
-        assert!(admit_projection(&[page.clone(), page], &budget, held).is_err());
+        assert!(admit_projection(&[page.clone(), page.clone()], &budget, held).is_err());
+        let native = 128;
+        let outcomes = 64;
+        let final_allowance = native * 2 + text * 8 + outcomes;
+        budget.owned_working_bytes = held + one + final_allowance;
+        admit_final_projection(std::slice::from_ref(&page), &budget, held, native, outcomes)
+            .unwrap();
+        budget.owned_working_bytes -= 1;
+        // Each allowance fits separately; only their simultaneous sum exceeds
+        // this limit. No pure projection or finalization should have begun.
+        assert!(held + one <= budget.owned_working_bytes);
+        assert!(final_allowance <= budget.owned_working_bytes);
+        let error =
+            admit_final_projection(std::slice::from_ref(&page), &budget, held, native, outcomes)
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("complete final working admission")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("estimated_bytes={}", held + one + final_allowance))
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("limit_bytes={}", budget.owned_working_bytes))
+        );
     }
 
     #[test]

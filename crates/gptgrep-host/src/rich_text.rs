@@ -26,6 +26,7 @@ const MAX_CITATIONS: usize = 8;
 const SEED_HITS: usize = 3;
 const MAX_TOOL_OUTPUT: usize = 131072;
 pub(crate) const NATIVE_METADATA_TOOL: &str = "gptgrep_inspect_native_metadata";
+pub(crate) const DOCUMENT_DISCOVERY_GUIDANCE: &str = "For document arguments, use the admitted path in the tool schema enum or documents[].path from gptgrep_catalog, never documents[].id. Discover artifact_id and resource_id values from existing tool results and use them only in their matching parameters.";
 const MAX_NATIVE_ARGUMENTS: usize = 20480;
 const MAX_NATIVE_ITEM_OUTPUT: usize = 16384;
 const MAX_NATIVE_BATCH_OUTPUT: usize = 32768;
@@ -1200,7 +1201,11 @@ pub(crate) fn allowed(tool: &str) -> bool {
             | "gptgrep_render"
     )
 }
-pub(crate) fn tools() -> Value {
+pub(crate) fn tools(document: Option<&str>) -> Value {
+    let mut document_schema = json!({"type":"string","description":"Exact admitted document path (gptgrep_catalog documents[].path), not documents[].id or an artifact/resource ID."});
+    if let Some(document) = document {
+        document_schema["enum"] = json!([document]);
+    }
     let native_item_fields: std::collections::BTreeSet<_> = [
         gptgrep_core::NATIVE_OBJECT_FIELDS,
         gptgrep_core::NATIVE_SEGMENT_FIELDS,
@@ -1220,7 +1225,7 @@ pub(crate) fn tools() -> Value {
         ),
         (
             "gptgrep_inspect_artifact",
-            json!({"document":{"type":"string"},"page_size":{"type":"integer","minimum":1,"maximum":8},"cursor":{"type":"string"}}),
+            json!({"document":document_schema,"page_size":{"type":"integer","minimum":1,"maximum":8},"cursor":{"type":"string"}}),
             vec!["document"],
         ),
         (
@@ -1239,7 +1244,7 @@ pub(crate) fn tools() -> Value {
         ),
         (
             "gptgrep_search_text",
-            json!({"query":{"type":"string"},"document":{"type":"string"},"literal":{"type":"boolean"},"case_insensitive":{"type":"boolean"},"cursor":{"type":"string"}}),
+            json!({"query":{"type":"string"},"document":document_schema,"literal":{"type":"boolean"},"case_insensitive":{"type":"boolean"},"cursor":{"type":"string"}}),
             vec!["query"],
         ),
         (
@@ -1254,7 +1259,12 @@ pub(crate) fn tools() -> Value {
         ),
     ];
     json!([{"type":"namespace","name":"gptgrep","description":"Source-bound v2 native/OCR text and non-citable native metadata; images unavailable",
-        "tools":fields.into_iter().map(|(name,properties,required)|json!({"type":"function","name":name,"description":if name == NATIVE_METADATA_TOOL { "Inspect freshly verified page metadata. Discover metadata_artifact.id with inspect_artifact. Geometry and character/path/image placement are non-citable metadata, not visible pixels or citation bounds. Closed fields depend on collection; path_segments requires object_id. Whole rows and cursor must fit the selected quota." } else { name },
+        "tools":fields.into_iter().map(|(name,properties,required)|json!({"type":"function","name":name,"description":if name == NATIVE_METADATA_TOOL { "Inspect freshly verified page metadata. Discover metadata_artifact.id with inspect_artifact. Geometry and character/path/image placement are non-citable metadata, not visible pixels or citation bounds. Closed fields depend on collection; path_segments requires object_id. Whole rows and cursor must fit the selected quota." } else { match name {
+                "gptgrep_catalog" => "List admitted documents. Use documents[].path for document arguments; documents[].id is not a document path.",
+                "gptgrep_inspect_artifact" => "Inspect a document path and discover source artifact and page metadata IDs for subsequent tools.",
+                "gptgrep_search_text" => "Search saved native/OCR text. The optional document argument is a document path; omission retains the admitted scope.",
+                _ => name,
+            } },
             "inputSchema":{"type":"object","additionalProperties":false,"properties":properties,"required":required}})).collect::<Vec<_>>()}])
 }
 pub(crate) fn final_schema(maximum: usize) -> Value {

@@ -213,16 +213,33 @@ async fn aggregate_bootstrap_metadata_is_separate_from_per_candidate_bounds() ->
     Ok(())
 }
 async fn fixture(color: u8) -> Result<(tempfile::TempDir, RichEvidence, Vec<u8>, String)> {
+    fixture_with_scope(color, false).await
+}
+
+async fn fixture_with_scope(
+    color: u8,
+    scoped: bool,
+) -> Result<(tempfile::TempDir, RichEvidence, Vec<u8>, String)> {
     let (temp, reader, png, id) = generation(color).await?;
     let context = crate::rich_text::tests::context(2)?;
     let (endpoint, server) = crate::rich_text::tests::mock(2, Arc::new(|_| Ok(())), false).await?;
+    let document = if scoped {
+        Some(reader.manifest()?.documents[0].document.path.clone())
+    } else {
+        None
+    };
+    let config = HostConfig {
+        document: document.clone(),
+        ..config()
+    };
     let mut options = RichMultimodalHostOptions::default();
     options.retrieval.require_shared_ledger = false;
+    options.retrieval.document = document.clone();
     let prepared = prepare_rich_multimodal_host(
         reader,
         crate::rich_text::tests::client(&endpoint, context)?,
         "same neutral question",
-        &config(),
+        &config,
         &options,
     )?;
     let initial = prepared.bootstrap.execute().await?;
@@ -231,7 +248,7 @@ async fn fixture(color: u8) -> Result<(tempfile::TempDir, RichEvidence, Vec<u8>,
         initial,
         8,
         prepared.deadline,
-        None,
+        document,
         options.retrieval.resources,
     )?;
     Ok((temp, evidence, png, id))
@@ -467,11 +484,15 @@ async fn drive(
     let (read, write) = tokio::io::split(host);
     let task = tokio::spawn(native_fixture(server, id, mode));
     let deadline = evidence.deadline;
+    let config = HostConfig {
+        document: evidence.document.clone(),
+        ..config()
+    };
     let result = protocol::run_observed_budget(
         read,
         write,
         Path::new("."),
-        &config(),
+        &config,
         protocol::Workflow::RichMultimodal {
             question: "same neutral question",
             evidence,
@@ -494,6 +515,25 @@ async fn drive(
         }
     }
 }
+
+#[tokio::test]
+async fn rich_document_discovery_thread_start_scoped_and_unscoped() -> Result<()> {
+    for scoped in [false, true] {
+        let (_temp, mut evidence, _png, id) = fixture_with_scope(11, scoped).await?;
+        let path = evidence.reader.manifest()?.documents[0]
+            .document
+            .path
+            .clone();
+        let (outcome, frames) = drive(&mut evidence, id, Mode::Image).await?;
+        crate::rich_text::tests::assert_document_discovery_thread_start(
+            &frames,
+            scoped.then_some(path.as_str()),
+        )?;
+        assert_eq!(finish(&evidence, &outcome.answer)?.citations.len(), 1);
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn actual_rpc_image_and_crop_delivery_mint_only_fresh_exact_identities() -> Result<()> {
     for mode in [Mode::Image, Mode::Crop] {
@@ -565,8 +605,8 @@ async fn native_metadata_shared_schema_and_actual_multimodal_rpc_never_mint_cita
             .unwrap()
     }
     assert_eq!(
-        native_tool(&tools()),
-        native_tool(&crate::rich_text::tools())
+        native_tool(&tools(None)),
+        native_tool(&crate::rich_text::tools(None))
     );
     let (_temp, reader) = crate::rich_text::tests::native_metadata_generation(false).await?;
     let execution = crate::rich_text::tests::context(2)?;

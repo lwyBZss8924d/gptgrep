@@ -20,6 +20,9 @@ use std::{
     sync::Arc,
 };
 
+#[path = "cohort_projection.rs"]
+pub(super) mod cohort_projection;
+
 pub(super) const EXPORT_SCHEMA: &str = "gptgrep.harbor.export.v2";
 const MAX_FILES: usize = 4096;
 const ENGINE_FILES: [&str; 7] = [
@@ -191,7 +194,9 @@ struct Native {
     page_window: u32,
     dpi: f64,
     render_pages: bool,
-    max_document_pages: usize,
+    /// Deprecated compatibility input; ignored for document admission.
+    #[serde(default, rename = "max_document_pages")]
+    _legacy_max_document_pages: Option<usize>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -437,11 +442,10 @@ fn admit_held(corpus_file: Arc<Held>, bytes: &[u8]) -> Result<AdmittedCorpus> {
             || controls.seal_inventory_files == 0
             || controls.seal_inventory_files > MAX_FILES
             || controls.native.page_window == 0
-            || controls.native.page_window > 100
+            || controls.native.page_window > 25
             || !controls.native.dpi.is_finite()
             || controls.native.dpi <= 0.0
             || !controls.native.render_pages
-            || controls.native.max_document_pages == 0
             || controls.hard_limits.native_wall
             || controls.hard_limits.native_rss
             || controls.hard_limits.total_index_publication_bytes
@@ -572,7 +576,6 @@ fn admit_held(corpus_file: Arc<Held>, bytes: &[u8]) -> Result<AdmittedCorpus> {
                 || !d.ocr_tasks.is_empty()
                 || !d.ocr_results.is_empty()
                 || d.pages.is_empty()
-                || d.pages.len() > controls.native.max_document_pages
                 || d.pages.iter().any(|p| {
                     !matches!(
                         p.coverage,

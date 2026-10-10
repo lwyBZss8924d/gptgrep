@@ -30,9 +30,9 @@ unchanged. The pure crate's stage-coverage table records the verified merge
 operators and the remaining Flash-specific layout work.
 
 Native documents are parsed in 25-page batches. GPTgrep overrides LiteParse's
-default 1,000-page limit, checks its explicit 100,000-page resource ceiling before
-parsing, and requires complete, ordered source page coverage. Page errors or
-truncation fail ingestion. Batching bounds parser intermediates; the final
+default 1,000-page limit with PDFium's signed 32-bit representation bound,
+without a whole-document page-count policy. Complete, ordered source page coverage
+is required. Page errors or truncation fail ingestion. Batching bounds parser intermediates; the final
 canonical document still holds all extracted text in memory. PDFium is
 process-serialized upstream; spawning async tasks does not imply parallel native
 PDF extraction.

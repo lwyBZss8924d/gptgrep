@@ -92,6 +92,24 @@ fn validate(value: &serde_json::Value) -> Result<()> {
 }
 
 #[test]
+fn native_page_ordinals_use_pdfium_representation_not_a_document_policy_cap() -> Result<()> {
+    let budget = ResourceBudget::default();
+    for ordinal in [100_001, i32::MAX as u32] {
+        let mut value = envelope(vec![]);
+        value["page"]["page_number"] = json!(ordinal);
+        value["native_text_metadata"]["page"] = json!(ordinal);
+        let bytes = serde_json::to_vec(&value)?;
+        validate_native_text_metadata(&bytes, &summary(), ordinal, &budget)?;
+    }
+    for ordinal in [0, i32::MAX as u32 + 1] {
+        let error = validate_native_text_metadata(b"{}", &summary(), ordinal, &budget)
+            .expect_err("unrepresentable physical page must be rejected");
+        assert!(error.to_string().contains("native physical page invalid"));
+    }
+    Ok(())
+}
+
+#[test]
 fn v7_unclipped_characters_preserve_signed_outside_and_zero_area_without_changing_v6() {
     let make = || {
         let mut space = observed(' ', -7.0, 301.0, b"Helvetica", 32);
@@ -962,8 +980,11 @@ async fn synthetic_v6_complete_metadata_and_document_signals_are_window_1_25_inv
     ];
     for i in 0..count {
         objects.push(format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 220] /Resources << /Font << /F1 {font} 0 R >> >> /Contents {} 0 R >>",4+i*2));
+        // A heading alone is sparse native text and correctly requires OCR.
+        // Keep this native-only fixture readable and populated across the page.
+        let body = "0 -18 Td (Ordinary native text stays readable.) Tj ".repeat(8);
         let content = format!(
-            "BT /F1 12 Tf 30 180 Td (Native page {} Alpha Beta) Tj ET",
+            "BT /F1 12 Tf 30 180 Td (Native page {} Alpha Beta) Tj {body} ET",
             i + 1
         );
         objects.push(format!(
@@ -992,7 +1013,7 @@ async fn synthetic_v6_complete_metadata_and_document_signals_are_window_1_25_inv
     let a = crate::extract_native(
         &first,
         &crate::NativeOptions {
-            render_pages: false,
+            render_pages: true,
             page_window: 1,
             ..Default::default()
         },
@@ -1002,16 +1023,63 @@ async fn synthetic_v6_complete_metadata_and_document_signals_are_window_1_25_inv
     let b = crate::extract_native(
         &second,
         &crate::NativeOptions {
-            render_pages: false,
+            render_pages: true,
             page_window: 25,
             ..Default::default()
         },
         &budget,
     )
     .await?;
-    assert_eq!(a.pages().len(), 27);
+    assert_eq!(a.pages().len(), count);
+    assert_eq!(b.pages().len(), count);
+    for candidate in [&a, &b] {
+        for page in candidate.pages() {
+            assert_eq!(
+                page.coverage,
+                crate::CoverageState::Native,
+                "page {}: {:?}",
+                page.number,
+                page.complexity.reasons
+            );
+            assert!(!page.complexity.needs_ocr);
+        }
+    }
+    assert!(a.plan().tasks.is_empty() && b.plan().tasks.is_empty());
+    for (candidate, prepared) in [(&a, &first), (&b, &second)] {
+        let last = candidate.pages().last().context("final native page")?;
+        assert_eq!(last.number, count as u32);
+        let text = std::fs::read_to_string(
+            prepared
+                .staging_root()
+                .join(&last.native_text.relative_path),
+        )?;
+        assert!(text.contains("Native page 27 Alpha Beta"));
+        assert_eq!(last.renditions.len(), 1);
+        assert!(
+            prepared
+                .staging_root()
+                .join(&last.renditions[0].artifact.relative_path)
+                .is_file()
+        );
+    }
+    // Batch size does not change the native rendering/metadata profile.
     assert_eq!(a.native_profile_sha256(), b.native_profile_sha256());
-    for (ap, bp) in a.pages().iter().zip(b.pages()) {
+    for (ordinal, (ap, bp)) in a.pages().iter().zip(b.pages()).enumerate() {
+        assert_eq!(ap.number, ordinal as u32 + 1);
+        assert_eq!(bp.number, ap.number);
+        assert_eq!(ap.renditions.len(), 1);
+        assert_eq!(bp.renditions.len(), 1);
+        assert_eq!(
+            ap.renditions[0].artifact.sha256,
+            bp.renditions[0].artifact.sha256
+        );
+        let text =
+            std::fs::read_to_string(first.staging_root().join(&ap.native_text.relative_path))?;
+        assert!(text.contains(&format!("Native page {} Alpha Beta", ordinal + 1)));
+        assert_eq!(
+            text.matches("Ordinary native text stays readable.").count(),
+            8
+        );
         let av = std::fs::read(
             first
                 .staging_root()
@@ -1046,6 +1114,101 @@ async fn synthetic_v6_complete_metadata_and_document_signals_are_window_1_25_inv
             serde_json::to_value(&bp.complexity)?
         );
     }
+    // An actual working-byte limit still rejects before document metadata or
+    // page/raster outputs. Prepared source bytes are permitted in staging.
+    let limited = crate::prepare_document(
+        &path,
+        &directory.path().join("stage-limited-working-bytes"),
+        &crate::PreparationOptions,
+        &budget,
+    )
+    .await?;
+    let inventory = || -> Result<Vec<std::path::PathBuf>> {
+        let mut files = std::fs::read_dir(limited.staging_root())?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        files.sort();
+        Ok(files)
+    };
+    let before = inventory()?;
+    assert_eq!(before, vec![limited.prepared_path().to_path_buf()]);
+    let mut tight = budget.clone();
+    tight.owned_working_bytes = 8192;
+    let error = crate::extract_native(&limited, &crate::NativeOptions::default(), &tight)
+        .await
+        .expect_err("working-byte admission must still reject");
+    assert!(
+        error
+            .to_string()
+            .contains("resource_limit: complete document metadata/working admission"),
+        "{error:#}"
+    );
+    assert_eq!(inventory()?, before);
+    // Bound actual retained JSON separately from allocation estimates. Reuse
+    // this prepared source, retaining both rendered candidates for comparison.
+    let metadata_candidate = crate::extract_native(
+        &limited,
+        &crate::NativeOptions {
+            render_pages: false,
+            ..Default::default()
+        },
+        &budget,
+    )
+    .await?;
+    let retained_bytes = metadata_candidate
+        .artifacts()
+        .iter()
+        .filter(|artifact| artifact.kind == crate::ArtifactKind::NativeMetadata)
+        .try_fold(0u64, |total, artifact| total.checked_add(artifact.bytes))
+        .context("fixture metadata byte sum overflow")?;
+    let mut metadata_budget = budget.clone();
+    metadata_budget.document_metadata_bytes = retained_bytes
+        .checked_sub(1)
+        .context("fixture must retain native metadata")?;
+    assert!(metadata_budget.document_metadata_bytes < budget.document_metadata_bytes);
+    for artifact in metadata_candidate
+        .artifacts()
+        .iter()
+        .filter(|artifact| artifact.kind == crate::ArtifactKind::NativeMetadata)
+    {
+        assert!(artifact.bytes <= metadata_budget.document_metadata_bytes);
+    }
+    for page in metadata_candidate.pages() {
+        let bytes = std::fs::read(
+            limited
+                .staging_root()
+                .join(&page.metadata_artifact.relative_path),
+        )?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let count = u32::try_from(
+            value["native_text_metadata"]["native_char_count"]
+                .as_u64()
+                .context("fixture native character count")?,
+        )?;
+        // Ensure validation can reach the aggregate actual-byte gate rather
+        // than failing an earlier per-page character-allocation admission.
+        character_allocation_bound(count, &metadata_budget)?;
+    }
+    let before_metadata_failure = inventory()?;
+    let error = crate::finalize_document(
+        metadata_candidate,
+        vec![],
+        crate::OcrMode::Off,
+        &metadata_budget,
+    )
+    .expect_err("actual retained metadata cap must still reject");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "resource_limit: retained native/OCR metadata admission: retained_bytes={retained_bytes}, limit_bytes={}",
+            metadata_budget.document_metadata_bytes
+        )
+    );
+    assert_eq!(inventory()?, before_metadata_failure);
+    assert!(before_metadata_failure.iter().all(|path| {
+        let name = path.file_name().unwrap().to_string_lossy();
+        !name.ends_with("-layout.json") && !name.ends_with("-merged.txt")
+    }));
     let a = crate::finalize_document(a, vec![], crate::OcrMode::Off, &budget)?;
     let b = crate::finalize_document(b, vec![], crate::OcrMode::Off, &budget)?;
     assert_eq!(
@@ -1057,6 +1220,8 @@ async fn synthetic_v6_complete_metadata_and_document_signals_are_window_1_25_inv
         serde_json::to_value(&b.pages)?
     );
     assert_eq!(a.unmapped_merged_lines, b.unmapped_merged_lines);
+    assert!(a.document.text.contains("Native page 27 Alpha Beta"));
+    assert!(b.document.text.contains("Native page 27 Alpha Beta"));
     Ok(())
 }
 

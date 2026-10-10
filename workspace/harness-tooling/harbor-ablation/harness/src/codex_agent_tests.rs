@@ -628,9 +628,20 @@ mod generation {
                 capabilities,
             });
         }
-        assert_eq!(texts.len(), 1);
-        fs::write(staging_path.join("fixture.txt"), texts[0])?;
-        let mut document = gptgrep_parse::parse_path(&staging_path.join("fixture.txt")).await?;
+        fs::write(staging_path.join("fixture.txt"), texts.concat())?;
+        let mut document = if texts.len() == 1 {
+            gptgrep_parse::parse_path(&staging_path.join("fixture.txt")).await?
+        } else {
+            let inputs: Vec<_> = texts
+                .iter()
+                .enumerate()
+                .map(|(index, text)| gptgrep_pageindex::PageInput {
+                    number: index as u32 + 1,
+                    text: (*text).into(),
+                })
+                .collect();
+            gptgrep_pageindex::from_pages("synthetic", &inputs, &[], &[], RICH_PARSER)?
+        };
         document.title = "synthetic".into();
         document.parser = RICH_PARSER.into();
         create(
@@ -689,17 +700,34 @@ mod generation {
             Self::with_text("ordinary MOCK copper fixture\n").await
         }
         async fn with_text(text: &str) -> Self {
+            Self::with_pages(&[text]).await
+        }
+        async fn with_pages(texts: &[&str]) -> Self {
+            Self::with_documents(texts, 1).await
+        }
+        async fn with_documents(texts: &[&str], count: usize) -> Self {
             let mut f = Fixture::new("open('child-marker','w').write('MOCK')\n");
             let raw = f.root.join("app/raw");
-            let (stage, parsed) = parsed_fixture(&raw, &[text]).await.unwrap();
             let mut writer = RichGenerationWriter::begin(&raw, ResourceBudget::default()).unwrap();
-            writer
-                .add_document(
-                    "document.pdf",
-                    &stage.path().canonicalize().unwrap(),
-                    parsed,
-                )
-                .unwrap();
+            for index in 0..count {
+                let name = if index == 0 {
+                    "document.pdf".to_owned()
+                } else {
+                    format!("document-{index}.pdf")
+                };
+                if index != 0 {
+                    let path = raw.join(&name);
+                    fs::copy(raw.join("document.pdf"), &path).unwrap();
+                    f.value["raw_documents"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!({"path":path,"sha256":sha(&fs::read(&path).unwrap())}));
+                }
+                let (stage, parsed) = parsed_fixture(&raw, texts).await.unwrap();
+                writer
+                    .add_document(&name, &stage.path().canonicalize().unwrap(), parsed)
+                    .unwrap();
+            }
             let pin = writer.publish().unwrap();
             RichGenerationReader::open_pinned(&raw, &pin)
                 .unwrap()
@@ -975,13 +1003,60 @@ mod generation {
     async fn generation_inventory_and_size_caps_are_preadmitted() {
         let mut g = Generated::new().await;
         let entry = g.capabilities["generation_binding"]["inventory"][0].clone();
-        g.capabilities["generation_binding"]["inventory"] = json!(vec![entry; 257]);
+        g.capabilities["generation_binding"]["inventory"] =
+            json!(vec![entry; MAX_GENERATION_FILES + 1]);
         g.save();
         assert_eq!(g.rejected(), "generation_binding");
         let mut g = Generated::new().await;
         g.capabilities["generation_binding"]["inventory"][0]["bytes"] = json!(67_108_865u64);
         g.save();
         assert_eq!(g.rejected(), "generation_file_limit_or_digest");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn complete_inventory_above_pilot_counts_admits_and_unlisted_entries_refuse() {
+        // Tiny synthetic artifacts exercise the real writer/index/reader, without a large PDF.
+        // Two 140-page documents yield >512 files, >256 artifacts per document,
+        // and >256 actual indexed text files, while each document stays below 256 pages.
+        let g = Generated::with_documents(&["small synthetic native text\n"; 140], 2).await;
+        let entries = g.capabilities["generation_binding"]["inventory"]
+            .as_array()
+            .unwrap();
+        assert!(entries.len() > 512 && entries.len() <= MAX_GENERATION_FILES);
+        assert!(
+            entries
+                .iter()
+                .filter(|entry| entry["path"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("artifact-text/"))
+                .count()
+                > 256
+        );
+        let bytes = serde_json::to_vec(&g.capabilities).unwrap();
+        assert!(bytes.len() > 65_536 && bytes.len() <= MAX_CAPABILITY_BYTES);
+        admit(&g.f.path, &g.f.control(), false).unwrap();
+        assert!(!g.f.root.join("out/native-run.claim").exists());
+        assert!(!g.f.root.join("app/child-marker").exists());
+        let extra = g.root.join("unlisted.txt");
+        fs::write(&extra, b"unlisted").unwrap();
+        assert_eq!(g.rejected(), "generation_inventory_mismatch");
+        fs::remove_file(extra).unwrap();
+        let extra_dir = g.f.root.join("app/raw/unlisted-dir");
+        fs::create_dir(&extra_dir).unwrap();
+        assert_eq!(g.rejected(), "raw_inventory_mismatch");
+        fs::remove_dir(extra_dir).unwrap();
+        admit(&g.f.path, &g.f.control(), false).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capability_metadata_budget_is_checked_before_deserialization() {
+        let mut g = Generated::new().await;
+        let path = g.f.root.join("capabilities.json");
+        let bytes = vec![b' '; MAX_CAPABILITY_BYTES + 1];
+        fs::write(&path, &bytes).unwrap();
+        g.f.value["treatment_capabilities"] = json!({"path":path,"sha256":sha(&bytes)});
+        assert_eq!(g.rejected(), "input_size_or_kind");
     }
 
     #[tokio::test(flavor = "current_thread")]

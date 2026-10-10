@@ -317,7 +317,7 @@ fn controls() -> Controls {
             page_window: 25,
             dpi: 72.0,
             render_pages: true,
-            max_document_pages: 25,
+            _legacy_max_document_pages: Some(25),
         },
         resource_budget: ResourceBudget::default(),
         hard_limits: HardControls {
@@ -650,6 +650,30 @@ async fn unsupported_hard_controls_and_raw_bytes_fail_before_native_writer() -> 
         };
         c.raw_group_bytes = 1;
     })?;
+    assert!(f.inputs().is_err());
+    assert_eq!(f.current()?, pointer);
+    assert!(!f.output.exists());
+    Ok(())
+}
+#[tokio::test]
+async fn legacy_document_page_control_is_optional_ignored_and_bound_by_original_bytes() -> Result<()>
+{
+    let f = Fixture::new().await?;
+    let pointer = f.current()?;
+    let original = fs::read(&f.controls)?;
+    let decoded: Controls = serde_json::from_slice(&original)?;
+    assert_eq!(serde_json::to_vec(&decoded)?, original);
+    for legacy in [None, Some(0), Some(1), Some(25), Some(usize::MAX)] {
+        f.change_controls(|c| c.native._legacy_max_document_pages = legacy)?;
+        assert!(f.inputs().is_ok());
+        assert_eq!(f.current()?, pointer);
+    }
+    f.change_controls(|c| c.native._legacy_max_document_pages = None)?;
+    let omitted = fs::read(&f.controls)?;
+    let value: Value = serde_json::from_slice(&omitted)?;
+    assert!(value["native"].get("max_document_pages").is_none());
+    assert_ne!(digest(&original), digest(&omitted));
+    f.change_controls(|c| c.native.page_window = 26)?;
     assert!(f.inputs().is_err());
     assert_eq!(f.current()?, pointer);
     assert!(!f.output.exists());

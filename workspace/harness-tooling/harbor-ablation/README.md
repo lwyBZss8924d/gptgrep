@@ -193,11 +193,15 @@ descriptors; replacing an input path cannot change its admitted identity.
 Controls use `schema_version="gptgrep.harbor.native-controls.v1"`, the same
 `group_id`, `observation_wall_seconds` (1–180), `raw_group_bytes` (at most 64 MiB),
 `seal_inventory_bytes` (at most 1 GiB), `seal_inventory_files` (at most 4096),
-`native={page_window,dpi,render_pages,max_document_pages}`, the full parser
+`native={page_window,dpi,render_pages}`, the full parser
 `resource_budget`, and `hard_limits={native_wall,native_rss,total_index_publication_bytes}`.
-Page window and document page count are 1–25, DPI is positive and at most 300,
-and rendering must be enabled. Resource selections may only tighten the frozen
-parser limits. The coordinator uses one shared original ResourceBudget across
+Page window is 1–25, DPI is positive and at most 300, and rendering must be
+enabled. There is no whole-document page-count admission limit: every page must
+be processed, with PDFium integer representation and actual resource limits
+still enforced. The optional legacy `native.max_document_pages` field is
+deprecated and ignored, including when supplied in older controls. Its original
+bytes remain part of the controls digest; omitting it changes that digest.
+Resource selections may only tighten the frozen parser limits. The coordinator uses one shared original ResourceBudget across
 preparation, extraction, finalization and writer import; counters are not reset
 between documents. Every hard-limit switch must be false. Unsupported requested
 hard guarantees fail before writer creation.

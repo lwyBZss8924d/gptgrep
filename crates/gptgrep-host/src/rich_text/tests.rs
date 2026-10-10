@@ -259,18 +259,40 @@ async fn prepared_fixture() -> Result<(
     ExecutionContext,
     tokio::task::JoinHandle<Result<Vec<Value>>>,
 )> {
+    prepared_fixture_with_scope(false).await
+}
+
+async fn prepared_fixture_with_scope(
+    scoped: bool,
+) -> Result<(
+    tempfile::TempDir,
+    PreparedRichTextHost,
+    ExecutionContext,
+    tokio::task::JoinHandle<Result<Vec<Value>>>,
+)> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().canonicalize()?;
     publish(&root, &["alpha\r\n中 tail\n"]).await?;
     let reader = RichGenerationReader::open(&root)?;
     let execution = context(2)?;
     let (endpoint, server) = mock(2, Arc::new(|_| Ok(())), false).await?;
+    let document = if scoped {
+        Some(reader.manifest()?.documents[0].document.path.clone())
+    } else {
+        None
+    };
+    let config = HostConfig {
+        document: document.clone(),
+        ..Default::default()
+    };
+    let mut options = RichTextHostOptions::default();
+    options.retrieval.document = document;
     let prepared = prepare_rich_text_host(
         reader,
         client(&endpoint, execution.clone())?,
         "source claim",
-        &HostConfig::default(),
-        &RichTextHostOptions::default(),
+        &config,
+        &options,
     )?;
     Ok((dir, prepared, execution, server))
 }
@@ -681,6 +703,75 @@ async fn drive_fixture(
         }
     }
 }
+
+pub(crate) fn assert_document_discovery_thread_start(
+    frames: &[Value],
+    document: Option<&str>,
+) -> Result<()> {
+    let start = frames
+        .iter()
+        .find(|frame| frame["method"] == "thread/start")
+        .context("thread/start was emitted")?;
+    let params = &start["params"];
+    let instructions = params["baseInstructions"]
+        .as_str()
+        .context("base instructions")?;
+    assert!(instructions.contains(DOCUMENT_DISCOVERY_GUIDANCE));
+    let tools = params["dynamicTools"][0]["tools"]
+        .as_array()
+        .context("rich tools")?;
+    for name in ["gptgrep_inspect_artifact", "gptgrep_search_text"] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .context("document tool")?;
+        let schema = &tool["inputSchema"];
+        let property = &schema["properties"]["document"];
+        assert_eq!(property["type"], "string");
+        let description = property["description"]
+            .as_str()
+            .context("document description")?;
+        assert!(description.contains("documents[].path"));
+        assert!(description.contains("not documents[].id"));
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(
+            schema["required"],
+            if name == "gptgrep_inspect_artifact" {
+                json!(["document"])
+            } else {
+                json!(["query"])
+            }
+        );
+        match document {
+            Some(path) => {
+                assert_eq!(property["enum"], json!([path]));
+                let validator = jsonschema::validator_for(property)?;
+                assert!(validator.is_valid(&json!(path)));
+                assert!(!validator.is_valid(&json!(format!("different/{path}"))));
+            }
+            None => assert!(property.get("enum").is_none()),
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn rich_document_discovery_thread_start_scoped_and_unscoped() -> Result<()> {
+    for scoped in [false, true] {
+        let (_dir, prepared, _execution, server) = prepared_fixture_with_scope(scoped).await?;
+        let mut evidence = genuine(prepared).await?;
+        assert_eq!(server.await??.len(), 2);
+        let path = evidence.reader.manifest()?.documents[0]
+            .document
+            .path
+            .clone();
+        let (outcome, frames) = drive_fixture(&mut evidence, NativeMode::Normal).await?;
+        assert_document_discovery_thread_start(&frames, scoped.then_some(path.as_str()))?;
+        assert_eq!(evidence.finish(&outcome.answer)?.citations.len(), 1);
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn genuine_handle_actual_rpc_tool_before_ack_and_exact_unicode_citation() -> Result<()> {
     let (_dir, prepared, execution, server) = prepared_fixture().await?;
@@ -1451,7 +1542,7 @@ fn selected_generated_schema_validates_text_tools_and_native_request_ids() -> Re
         "schema fixture byte cap"
     );
     let mut schema: Value = serde_json::from_slice(&fs::read(path)?)?;
-    for tool in tools().as_array().unwrap() {
+    for tool in tools(None).as_array().unwrap() {
         schema["$ref"] = json!("#/definitions/v2/DynamicToolSpec");
         jsonschema::validator_for(&schema)?
             .validate(tool)
@@ -1950,7 +2041,7 @@ fn native_metadata_closed_arguments_and_tool_specific_limits() -> Result<()> {
         assert_eq!(argument_limit(tool), 4096);
         assert!(measure(&maximum, argument_limit(tool)).is_err());
     }
-    let toolset = tools();
+    let toolset = tools(None);
     let tool = toolset[0]["tools"]
         .as_array()
         .unwrap()

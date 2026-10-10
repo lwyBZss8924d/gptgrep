@@ -72,8 +72,9 @@ pub use rich_text::{
 
 pub const NATIVE_PARSER: &str = "liteparse-2.15.1/layout-v1";
 pub const LITEPARSE_REVISION: &str = "ab8879623ee45a0b7a775d12b42a9a7ae9dab16b";
-/// An explicit resource limit, checked before parsing. Never silently truncate.
-pub const MAX_NATIVE_PAGES: u32 = 100_000;
+/// PDFium represents page counts and indices with signed 32-bit integers.
+/// This is a format/runtime representation bound, not a document resource policy.
+pub const MAX_NATIVE_PAGES: u32 = i32::MAX as u32;
 
 const TEXT_EXTENSIONS: &[&str] = &[
     "md", "mdx", "markdown", "txt", "rst", "adoc", "log", "json", "jsonl", "yaml", "yml", "toml",
@@ -182,7 +183,7 @@ async fn parse_native(path: PathBuf, title: String) -> Result<ParsedDocument> {
     ensure!(total > 0, "document contains no pages: {}", path.display());
     ensure!(
         total <= MAX_NATIVE_PAGES,
-        "document has {total} pages, exceeding the explicit {MAX_NATIVE_PAGES}-page limit; no partial index was accepted"
+        "document page count cannot be represented by PDFium; no partial index was accepted"
     );
     let mut pages = Vec::new();
     let mut headings = Vec::new();

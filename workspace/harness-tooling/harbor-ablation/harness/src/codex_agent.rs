@@ -15,6 +15,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 type Result<T> = std::result::Result<T, &'static str>;
+// Match the native prebuild's bounded inventory and receipt metadata admission.
+// These bound metadata work, independently of page count and retained file bytes.
+const MAX_GENERATION_FILES: usize = 4096;
+const MAX_CAPABILITY_BYTES: usize = 1_048_576;
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 extern "C" fn interrupt(_: libc::c_int) {
     INTERRUPTED.store(true, Ordering::Relaxed);
@@ -336,45 +340,6 @@ fn fresh_outputs(control: &Control, phase_reserved: bool) -> Result<()> {
     Ok(())
 }
 
-fn raw_inventory(
-    root: &Path,
-    result: &mut BTreeSet<PathBuf>,
-    depth: usize,
-    visited: &mut usize,
-    verified_generation: &BTreeSet<PathBuf>,
-) -> Result<()> {
-    if depth > 8 || result.len() > 256 {
-        return Err("raw_inventory_limit");
-    }
-    for entry in fs::read_dir(root).map_err(|_| "raw_directory")? {
-        *visited += 1;
-        if *visited > 512 {
-            return Err("raw_inventory_limit");
-        }
-        let entry = entry.map_err(|_| "raw_entry")?;
-        let kind = entry.file_type().map_err(|_| "raw_kind")?;
-        if kind.is_symlink() {
-            return Err("raw_symlink");
-        }
-        if kind.is_dir() {
-            raw_inventory(
-                &entry.path(),
-                result,
-                depth + 1,
-                visited,
-                verified_generation,
-            )?;
-        } else if kind.is_file() {
-            if !verified_generation.contains(&entry.path()) {
-                result.insert(entry.path());
-            }
-        } else {
-            return Err("raw_kind");
-        }
-    }
-    Ok(())
-}
-
 fn generation_relative(path: &Path) -> Result<()> {
     if path.as_os_str().is_empty()
         || path.to_str().is_none()
@@ -434,34 +399,63 @@ fn generation_file(path: &Path, expected: &GenerationFile) -> Result<()> {
     Ok(())
 }
 
+fn inventory_directories(root: &Path, files: &BTreeSet<PathBuf>) -> Result<BTreeSet<PathBuf>> {
+    let mut dirs = BTreeSet::new();
+    for path in files {
+        generation_relative(path.strip_prefix(root).map_err(|_| "generation_path")?)?;
+        let mut parent = path.parent();
+        while let Some(dir) = parent.filter(|dir| *dir != root) {
+            dirs.insert(dir.to_path_buf());
+            parent = dir.parent();
+        }
+    }
+    Ok(dirs)
+}
+
+/// Visit only declared entries; metadata bounds the complete file/ancestor sets.
+/// An iterative walk avoids making directory depth an additional page policy.
 fn generation_tree(
     root: &Path,
-    files: &mut BTreeSet<PathBuf>,
-    dirs: &mut BTreeSet<PathBuf>,
-    depth: usize,
-    visited: &mut usize,
+    expected_files: &BTreeSet<PathBuf>,
+    expected_dirs: &BTreeSet<PathBuf>,
 ) -> Result<()> {
-    if depth > 8 {
-        return Err("generation_inventory_limit");
+    path_custody(root, false)?;
+    let limit = expected_files
+        .len()
+        .checked_add(expected_dirs.len())
+        .ok_or("generation_inventory_limit")?;
+    let mut visited = 0usize;
+    let mut files = BTreeSet::new();
+    let mut dirs = BTreeSet::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(dir).map_err(|_| "generation_directory")? {
+            visited = visited.checked_add(1).ok_or("generation_inventory_limit")?;
+            let entry = entry.map_err(|_| "generation_entry")?;
+            let kind = entry.file_type().map_err(|_| "generation_kind")?;
+            if kind.is_symlink() {
+                return Err("generation_symlink");
+            }
+            let path = entry.path();
+            if visited > limit {
+                return Err("generation_inventory_mismatch");
+            }
+            if kind.is_dir() {
+                if !expected_dirs.contains(&path) || !dirs.insert(path.clone()) {
+                    return Err("generation_inventory_mismatch");
+                }
+                pending.push(path);
+            } else if kind.is_file() {
+                if !expected_files.contains(&path) || !files.insert(path) {
+                    return Err("generation_inventory_mismatch");
+                }
+            } else {
+                return Err("generation_kind");
+            }
+        }
     }
-    for entry in fs::read_dir(root).map_err(|_| "generation_directory")? {
-        *visited += 1;
-        if *visited > 512 {
-            return Err("generation_inventory_limit");
-        }
-        let entry = entry.map_err(|_| "generation_entry")?;
-        let kind = entry.file_type().map_err(|_| "generation_kind")?;
-        if kind.is_symlink() {
-            return Err("generation_symlink");
-        }
-        if kind.is_dir() {
-            dirs.insert(entry.path());
-            generation_tree(&entry.path(), files, dirs, depth + 1, visited)?;
-        } else if kind.is_file() {
-            files.insert(entry.path());
-        } else {
-            return Err("generation_kind");
-        }
+    if files != *expected_files || dirs != *expected_dirs {
+        return Err("generation_inventory_mismatch");
     }
     Ok(())
 }
@@ -472,8 +466,9 @@ fn treatment_generation(control: &Control) -> Result<BTreeSet<PathBuf>> {
         (Some(reference), "treatment") => reference,
         _ => return Err("arm_capabilities"),
     };
-    let value: CapabilityReferences = serde_json::from_slice(&asset(reference, 65_536, false)?)
-        .map_err(|_| "capability_schema")?;
+    let value: CapabilityReferences =
+        serde_json::from_slice(&asset(reference, MAX_CAPABILITY_BYTES, false)?)
+            .map_err(|_| "capability_schema")?;
     if value.schema_version != 2
         || [
             &value.generation_v2,
@@ -490,7 +485,7 @@ fn treatment_generation(control: &Control) -> Result<BTreeSet<PathBuf>> {
     }
     let binding = &value.generation_binding;
     if binding.inventory.is_empty()
-        || binding.inventory.len() > 256
+        || binding.inventory.len() > MAX_GENERATION_FILES
         || !digest_shape(&binding.current_sha256)
         || !digest_shape(&binding.pin.manifest_sha256)
         || binding.pin.generation.is_empty()
@@ -519,7 +514,6 @@ fn treatment_generation(control: &Control) -> Result<BTreeSet<PathBuf>> {
     let root = state.join("generations").join(&binding.pin.generation);
     let mut names = BTreeSet::new();
     let mut admitted_files = BTreeSet::from([current_path.clone()]);
-    let mut expected_dirs = BTreeSet::new();
     let mut total = 0u64;
     for entry in &binding.inventory {
         generation_relative(&entry.path)?;
@@ -532,19 +526,10 @@ fn treatment_generation(control: &Control) -> Result<BTreeSet<PathBuf>> {
             .ok_or("generation_total")?;
         let path = root.join(&entry.path);
         generation_file(&path, entry)?;
-        let mut parent = path.parent();
-        while let Some(dir) = parent.filter(|v| *v != state) {
-            expected_dirs.insert(dir.to_path_buf());
-            parent = dir.parent();
-        }
         admitted_files.insert(path);
     }
-    let mut actual_files = BTreeSet::new();
-    let mut actual_dirs = BTreeSet::new();
-    generation_tree(&state, &mut actual_files, &mut actual_dirs, 0, &mut 0)?;
-    if actual_files != admitted_files || actual_dirs != expected_dirs {
-        return Err("generation_inventory_mismatch");
-    }
+    let expected_dirs = inventory_directories(&state, &admitted_files)?;
+    generation_tree(&state, &admitted_files, &expected_dirs)?;
     let reader = gptgrep_core::RichGenerationReader::open_pinned(&control.raw_dir, &binding.pin)
         .map_err(|_| "generation_reader")?;
     let manifest = reader.manifest().map_err(|_| "generation_reader")?;
@@ -569,8 +554,7 @@ fn treatment_generation(control: &Control) -> Result<BTreeSet<PathBuf>> {
                 .map_err(|_| "generation_source_metadata")?
                 .len()
                 != doc.document.source_bytes
-            || doc.artifacts.len() > 256
-            || doc.pages.len() > 256
+            || doc.artifacts.len() > names.len()
         {
             return Err("generation_sources");
         }
@@ -610,7 +594,7 @@ fn treatment_generation(control: &Control) -> Result<BTreeSet<PathBuf>> {
                 );
             }
         }
-        if expected.len() > 256 {
+        if expected.len() > names.len() {
             return Err("generation_inventory_limit");
         }
     }
@@ -641,7 +625,7 @@ fn treatment_generation(control: &Control) -> Result<BTreeSet<PathBuf>> {
     }
     reader
         .verify_index_content(&gptgrep_core::IndexContentLimits {
-            max_files: 256,
+            max_files: u32::try_from(indexed.len()).map_err(|_| "generation_index_content")?,
             max_control_bytes: 1_048_576,
             max_index_bytes: 134_217_728,
             max_file_bytes: 67_108_864,
@@ -659,12 +643,7 @@ fn treatment_generation(control: &Control) -> Result<BTreeSet<PathBuf>> {
     if snapshot(&current_path, 4096, false)? != current_bytes {
         return Err("generation_current_changed");
     }
-    actual_files.clear();
-    actual_dirs.clear();
-    generation_tree(&state, &mut actual_files, &mut actual_dirs, 0, &mut 0)?;
-    if actual_files != admitted_files || actual_dirs != expected_dirs {
-        return Err("generation_inventory_mismatch");
-    }
+    generation_tree(&state, &admitted_files, &expected_dirs)?;
     Ok(admitted_files)
 }
 
@@ -686,12 +665,14 @@ fn verify_raw_inputs(control: &Control) -> Result<()> {
         }
     }
     let verified = treatment_generation(control)?;
-    let mut actual = BTreeSet::new();
-    raw_inventory(&control.raw_dir, &mut actual, 0, &mut 0, &verified)?;
-    if actual != declared {
-        return Err("raw_inventory_mismatch");
-    }
-    Ok(())
+    let expected_files = declared.union(&verified).cloned().collect();
+    let expected_dirs = inventory_directories(&control.raw_dir, &expected_files)?;
+    generation_tree(&control.raw_dir, &expected_files, &expected_dirs).map_err(
+        |error| match error {
+            "generation_symlink" | "symlink_path" => "raw_symlink",
+            _ => "raw_inventory_mismatch",
+        },
+    )
 }
 
 fn admit(path: &Path, expected: &str, run: bool) -> Result<Admitted> {
@@ -798,7 +779,7 @@ fn admit(path: &Path, expected: &str, run: bool) -> Result<Admitted> {
         .as_ref()
         .map(|reference| {
             let refs: CapabilityReferences =
-                serde_json::from_slice(&asset(reference, 65_536, false)?)
+                serde_json::from_slice(&asset(reference, MAX_CAPABILITY_BYTES, false)?)
                     .map_err(|_| "capability_schema")?;
             Ok::<ToolContext, &'static str>(ToolContext {
                 root: control.raw_dir.to_string_lossy().into_owned(),

@@ -21,6 +21,38 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Project every pinned source row into reader-only and separate grader inputs.
+    ProjectCohort {
+        #[arg(long)]
+        questions: PathBuf,
+        #[arg(long)]
+        questions_sha256: String,
+        #[arg(long)]
+        sources_lock: PathBuf,
+        #[arg(long)]
+        sources_lock_sha256: String,
+        #[arg(long)]
+        mapping: PathBuf,
+        #[arg(long)]
+        mapping_sha256: String,
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
+    /// Bind one frozen cohort batch to its validated reader export; never selects rows.
+    BindCohortGraders {
+        #[arg(long)]
+        cohort: PathBuf,
+        #[arg(long)]
+        cohort_sha256: String,
+        #[arg(long)]
+        batch: String,
+        #[arg(long)]
+        reader_export: PathBuf,
+        #[arg(long)]
+        reader_export_sha256: String,
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
     ReportPaired {
         #[arg(long)]
         input: PathBuf,
@@ -832,6 +864,38 @@ fn verifier(
 }
 fn run(command: Command) -> Result<()> {
     match command {
+        Command::ProjectCohort {
+            questions,
+            questions_sha256,
+            sources_lock,
+            sources_lock_sha256,
+            mapping,
+            mapping_sha256,
+            output_dir,
+        } => production_export::cohort_projection::project(
+            &questions,
+            &questions_sha256,
+            &sources_lock,
+            &sources_lock_sha256,
+            &mapping,
+            &mapping_sha256,
+            &output_dir,
+        )?,
+        Command::BindCohortGraders {
+            cohort,
+            cohort_sha256,
+            batch,
+            reader_export,
+            reader_export_sha256,
+            output_dir,
+        } => production_export::cohort_projection::bind(
+            &cohort,
+            &cohort_sha256,
+            &batch,
+            &reader_export,
+            &reader_export_sha256,
+            &output_dir,
+        )?,
         Command::ReportPaired {
             input,
             input_sha256,

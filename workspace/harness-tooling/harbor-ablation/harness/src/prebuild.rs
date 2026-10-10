@@ -111,7 +111,13 @@ struct NativeControls {
     page_window: usize,
     dpi: f32,
     render_pages: bool,
-    max_document_pages: usize,
+    /// Deprecated compatibility input; page counts do not limit document admission.
+    #[serde(
+        default,
+        rename = "max_document_pages",
+        skip_serializing_if = "Option::is_none"
+    )]
+    _legacy_max_document_pages: Option<usize>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -389,7 +395,6 @@ fn controls_valid(c: &Controls) -> Result<()> {
     );
     ensure!(
         (1..=25).contains(&c.native.page_window)
-            && (1..=25).contains(&c.native.max_document_pages)
             && c.native.dpi.is_finite()
             && c.native.dpi > 0.0
             && c.native.dpi <= 300.0
@@ -747,9 +752,7 @@ impl VerifiedSnapshot {
                 "raw_pdf_preparation_binding"
             );
             ensure!(
-                doc.pages.len() <= inputs.controls.value.native.max_document_pages
-                    && doc.ocr_tasks.is_empty()
-                    && doc.ocr_results.is_empty(),
+                doc.ocr_tasks.is_empty() && doc.ocr_results.is_empty(),
                 "native_only_coverage_required"
             );
             native_coverage(
@@ -1136,10 +1139,6 @@ async fn build_native(inputs: Inputs, output: &Path) -> Result<String> {
         )
         .await?;
         inputs.fresh()?;
-        ensure!(
-            candidate.pages().len() <= n.max_document_pages,
-            "native_document_page_limit"
-        );
         native_coverage(&candidate.plan().pages, &candidate.plan().blockers)?;
         ensure!(
             candidate.plan().tasks.is_empty(),

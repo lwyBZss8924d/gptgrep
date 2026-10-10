@@ -634,8 +634,8 @@ fn into_report(
     })
 }
 
-pub(crate) fn tools() -> Value {
-    let mut tools = crate::rich_text::tools();
+pub(crate) fn tools(document: Option<&str>) -> Value {
+    let mut tools = crate::rich_text::tools(document);
     tools[0]["description"] =
         json!("Source-bound text and images; only actual completed deliveries issue citation IDs");
     for tool in tools[0]["tools"].as_array_mut().expect("fixed tools") {
