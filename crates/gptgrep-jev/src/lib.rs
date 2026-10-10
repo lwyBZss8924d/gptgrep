@@ -7,6 +7,8 @@ mod clock;
 mod execution;
 mod failure;
 mod input;
+#[cfg(test)]
+mod observer_tests;
 mod roles;
 mod validation;
 pub use clock::RunClockAnchor;
@@ -142,6 +144,32 @@ pub struct DecisionResponse {
     pub provider: Option<String>,
 }
 
+/// Metadata derived from the exact bytes handed to the HTTP request builder.
+/// This contains no request text, image bytes or authorization headers.
+pub struct DecisionRequestObservation<'a> {
+    pub requested_model: &'a str,
+    pub body_sha256: &'a str,
+    pub body_bytes: usize,
+    pub question_count: usize,
+}
+
+/// Optional synchronous admission/accounting callbacks for a trusted caller.
+/// `send_started` runs after SDK admission and immediately before HTTP send.
+/// It records a conservative send attempt, not proof of provider receipt.
+/// `validated_response` receives the complete typed response before callers
+/// consume or project its usage. Returning an error stops the operation.
+/// Cancellation may drop the future without `failed`; implementations must
+/// retain unresolved liabilities when their owned request permits are dropped.
+pub trait DecisionObserver: Send + Sync {
+    fn send_started(&self, request: &DecisionRequestObservation<'_>) -> Result<()>;
+    fn validated_response(
+        &self,
+        request: &DecisionRequestObservation<'_>,
+        response: &DecisionResponse,
+    ) -> Result<()>;
+    fn failed(&self, request: &DecisionRequestObservation<'_>) -> Result<()>;
+}
+
 /// Credentials are deliberately excluded from Debug and serialization.
 #[derive(Clone)]
 pub struct JevClient {
@@ -151,6 +179,7 @@ pub struct JevClient {
     authorization: HeaderValue,
     identity: Arc<()>,
     execution: ExecutionContext,
+    observer: Option<Arc<dyn DecisionObserver>>,
 }
 
 /// One exact validated Decisions request prepared before budget/network admission.
@@ -284,6 +313,7 @@ impl JevClient {
             authorization,
             identity: Arc::new(()),
             execution: ExecutionContext::compatibility(),
+            observer: None,
         })
     }
 
@@ -296,6 +326,14 @@ impl JevClient {
 
     pub fn execution_context(&self) -> &ExecutionContext {
         &self.execution
+    }
+
+    /// Install before preparing requests. Existing prepared identities are
+    /// invalidated so a request cannot bypass a newly attached observer.
+    pub fn with_decision_observer(mut self, observer: Arc<dyn DecisionObserver>) -> Self {
+        self.observer = Some(observer);
+        self.identity = Arc::new(());
+        self
     }
 
     /// Evaluate a bounded set of independent typed questions.
@@ -349,6 +387,13 @@ impl JevClient {
         let remaining = self.execution.remaining()?;
         let deadline = captured + remaining;
         let digest = format!("{:x}", Sha256::digest(&body));
+        let observation = DecisionRequestObservation {
+            requested_model: &self.model,
+            body_sha256: &digest,
+            body_bytes: body.len(),
+            question_count: questions.as_object().map_or(0, |questions| questions.len()),
+        };
+        let mut observer_started = false;
         let submitted = async {
             self.execution.observe_submission().await?;
             let mut reservation = self.execution.reserve(&digest, &self.model).await?;
@@ -361,6 +406,14 @@ impl JevClient {
                 tokio::time::Instant::now() < deadline,
                 "Jev request deadline expired before send; reserved submission remains charged"
             );
+            if let Some(observer) = &self.observer {
+                observer_started = true;
+                observer.send_started(&observation)?;
+                ensure!(
+                    tokio::time::Instant::now() < deadline,
+                    "Jev request deadline expired during send admission; reservation remains charged"
+                );
+            }
             let mut response = self
                 .http
                 .post(self.endpoint.clone())
@@ -399,11 +452,22 @@ impl JevClient {
                     }
                 });
             reservation.terminal().await?;
+            if let (Some(observer), Ok(response)) = (&self.observer, &result) {
+                observer.validated_response(&observation, response)?;
+            }
             result
         };
-        tokio::time::timeout_at(deadline, submitted)
-            .await
-            .map_err(|_| DecisionFailure::deadline())?
+        let result = match tokio::time::timeout_at(deadline, submitted).await {
+            Ok(result) => result,
+            Err(_) => Err(DecisionFailure::deadline().into()),
+        };
+        if observer_started
+            && result.is_err()
+            && let Some(observer) = &self.observer
+        {
+            observer.failed(&observation)?;
+        }
+        result
     }
 
     /// Prepare the unchanged absolute relevance rubric before paid admission.
