@@ -912,26 +912,26 @@ pub(crate) fn extract_sync(
             let text_page = page_obj.text()?;
             let count = text_page.char_count();
             ensure!(count >= 0, "PDFium char count failed");
-            // Count admission covers every native character, including all
-            // geometryless whitespace/controls, plus run/word numeric DTOs.
-            // Variable font bytes are length-admitted before allocation.
-            let glyph_bound = (count as u64)
-                .checked_mul(2048)
-                .context("resource_limit: native char bound overflow")?;
-            ensure!(
-                glyph_bound <= budget.page_layout_bytes,
-                "resource_limit: native char count rejected before glyph allocation"
-            );
+            // Reserve every native character/run/word before allocation.
+            // This conservative estimate is charged to document/working memory;
+            // the actual serialized page still has its independent byte cap.
+            let glyph_bound =
+                native_text_metadata::character_allocation_bound(count as u32, &budget)?;
             let label_bound = match &document_metadata.page_labels[index].label {
                 FeatureState::Present(label) => label.len() as u64 * 12,
                 _ => 1024,
             };
-            let base_bound = glyph_bound + annotation_bound + label_bound + 16_384;
+            let base_bound = annotation_bound + label_bound + 16_384;
             ensure!(
                 base_bound < budget.page_layout_bytes,
                 "resource_limit: page character admission"
             );
-            admit_native_estimate(&mut metadata_used, &mut owned_upper, base_bound, &budget)?;
+            admit_native_estimate(
+                &mut metadata_used,
+                &mut owned_upper,
+                glyph_bound + base_bound,
+                &budget,
+            )?;
             let graphics = crate::native_graphics::collect(
                 &prepared.summary,
                 &native_profile_sha256,
@@ -1041,12 +1041,7 @@ pub(crate) fn extract_sync(
                                 .checked_add(bytes)
                                 .context("resource_limit: page font metadata sum overflow")?;
                             ensure!(
-                                object_bound
-                                    + glyph_bound
-                                    + annotation_bound
-                                    + label_bound
-                                    + 16_384
-                                    + next
+                                object_bound + annotation_bound + label_bound + 16_384 + next
                                     <= budget.page_layout_bytes,
                                 "resource_limit: page font metadata admission"
                             );
@@ -1214,13 +1209,7 @@ pub(crate) fn extract_sync(
                 budget.page_layout_bytes,
             )?;
             ensure!(
-                object_bound
-                    + glyph_bound
-                    + annotation_bound
-                    + label_bound
-                    + 16_384
-                    + binding_bytes
-                    + font_bound
+                object_bound + annotation_bound + label_bound + 16_384 + binding_bytes + font_bound
                     <= budget.page_layout_bytes,
                 "resource_limit: native metadata classifier/frame binding admission"
             );

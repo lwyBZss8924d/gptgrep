@@ -1059,3 +1059,176 @@ async fn synthetic_v6_complete_metadata_and_document_signals_are_window_1_25_inv
     assert_eq!(a.unmapped_merged_lines, b.unmapped_merged_lines);
     Ok(())
 }
+
+#[test]
+fn native_character_allocation_accepts_large_complete_stream_with_exact_page_json_cap() -> Result<()>
+{
+    const COUNT: u32 = 2200;
+    let budget = ResourceBudget::default();
+    let allocation_bound = character_allocation_bound(COUNT, &budget)?;
+    assert!(allocation_bound > budget.page_layout_bytes);
+    let alphabet = ['A', 'é', ' ', '\t', '\n'];
+    let expected: String = (0..COUNT)
+        .map(|ordinal| alphabet[(ordinal % alphabet.len() as u32) as usize])
+        .collect();
+    let mut observed_count = 0;
+    let characters = collect_characters(
+        COUNT,
+        1500.0,
+        300.0,
+        &budget,
+        NativeBoundsPolicy::UnclippedV7,
+        |ordinal| {
+            observed_count += 1;
+            let c = alphabet[(ordinal % alphabet.len() as u32) as usize];
+            Ok(if c.is_whitespace() || c.is_control() {
+                geometryless(c, false)
+            } else {
+                observed(
+                    c,
+                    10.0 + (ordinal % 100) as f32 * 5.0,
+                    10.0 + (ordinal / 100) as f32 * 12.0,
+                    b"Helvetica",
+                    0,
+                )
+            })
+        },
+    )?;
+    assert_eq!(observed_count, COUNT);
+    assert_eq!(characters.len(), COUNT as usize);
+    assert_eq!(
+        characters.iter().map(character).collect::<String>(),
+        expected
+    );
+    for (ordinal, value) in characters.iter().enumerate() {
+        assert_eq!(value.ordinal as usize, ordinal);
+    }
+    let mut value = envelope(characters);
+    value["capabilities"]["native_character_geometry"] =
+        json!(FeatureState::Present(UNCLIPPED_GEOMETRY));
+    let encoded = crate::resource::encoded_size(&value, budget.page_layout_bytes)?;
+    let bytes = serde_json::to_vec(&value)?;
+    assert_eq!(encoded, bytes.len() as u64);
+    assert!(encoded <= budget.page_layout_bytes);
+    assert!(encoded < allocation_bound);
+    validate_native_text_metadata(&bytes, &summary(), 1, &budget)?;
+    validate_native_text_metadata_unclipped(&bytes, &summary(), 1, &budget)?;
+
+    let mut tight = budget.clone();
+    tight.page_layout_bytes = encoded - 1;
+    assert!(crate::resource::encoded_size(&value, tight.page_layout_bytes).is_err());
+    assert!(validate_native_text_metadata(&bytes, &summary(), 1, &tight).is_err());
+    assert!(validate_native_text_metadata_unclipped(&bytes, &summary(), 1, &tight).is_err());
+    Ok(())
+}
+
+#[test]
+fn native_character_allocation_rejects_document_and_working_bounds_before_observation() -> Result<()>
+{
+    const COUNT: u32 = 2200;
+    let original = ResourceBudget::default();
+    let bound = character_allocation_bound(COUNT, &original)?;
+    let mut document_limited = original.clone();
+    document_limited.document_metadata_bytes = bound - 1;
+    let mut working_limited = original.clone();
+    working_limited.owned_working_bytes = bound * 4 - 1;
+    for (count, budget) in [
+        (COUNT, document_limited),
+        (COUNT, working_limited),
+        (u32::MAX, original),
+    ] {
+        assert!(character_allocation_bound(count, &budget).is_err());
+        let mut observed_count = 0;
+        assert!(
+            collect_characters(
+                count,
+                1500.0,
+                300.0,
+                &budget,
+                NativeBoundsPolicy::UnclippedV7,
+                |_| {
+                    observed_count += 1;
+                    Ok(geometryless(' ', false))
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(observed_count, 0);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn synthetic_pdf_over_2048_characters_passes_exact_metadata_cap_and_finalization()
+-> Result<()> {
+    let directory = tempfile::tempdir()?;
+    const LINES: usize = 40;
+    let line = "Ordinary lines preserve complete characters and bounded metadata.";
+    assert!(line.is_ascii() && (60..=70).contains(&line.len()));
+    assert!(line.len() * LINES > 2048);
+    let mut content = String::from("BT /F1 8 Tf 40 740 Td 12 TL\n");
+    for row in 0..LINES {
+        if row != 0 {
+            content.push_str("T*\n");
+        }
+        content.push_str(&format!("({line}) Tj\n"));
+    }
+    content.push_str("ET");
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".into(),
+        format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+    ];
+    let path = directory.path().join("ordinary-multiline.pdf");
+    std::fs::write(&path, crate::tests::pdf_objects(&objects))?;
+    let budget = ResourceBudget::default();
+    let prepared = crate::prepare_document(
+        &path,
+        &directory.path().join("staging"),
+        &crate::PreparationOptions,
+        &budget,
+    )
+    .await?;
+    let candidate = crate::extract_native(
+        &prepared,
+        &crate::NativeOptions {
+            render_pages: false,
+            ..Default::default()
+        },
+        &budget,
+    )
+    .await?;
+    assert_eq!(candidate.pages().len(), 1);
+    let artifact = &candidate.pages()[0].metadata_artifact;
+    let bytes = std::fs::read(prepared.staging_root().join(&artifact.relative_path))?;
+    assert!(bytes.len() as u64 <= budget.page_layout_bytes);
+    crate::validate_native_graphics_metadata(
+        &bytes,
+        prepared.summary(),
+        candidate.native_profile_sha256(),
+        1,
+        &budget,
+    )?;
+    validate_native_text_metadata_unclipped(&bytes, prepared.summary(), 1, &budget)?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let stream: NativeTextMetadata = serde_json::from_value(value["native_text_metadata"].clone())?;
+    assert!(stream.native_char_count > 2048);
+    assert_eq!(stream.characters.len(), stream.native_char_count as usize);
+    for (ordinal, value) in stream.characters.iter().enumerate() {
+        assert_eq!(value.ordinal as usize, ordinal);
+    }
+    let native_text = stream.characters.iter().map(character).collect::<String>();
+    assert_eq!(native_text.matches(line).count(), LINES);
+    let final_document = crate::finalize_document(candidate, vec![], crate::OcrMode::Off, &budget)?;
+    assert_eq!(
+        final_document
+            .document
+            .text
+            .matches("Ordinary lines")
+            .count(),
+        LINES
+    );
+    Ok(())
+}
