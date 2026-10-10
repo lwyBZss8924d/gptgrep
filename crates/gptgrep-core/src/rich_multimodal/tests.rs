@@ -956,6 +956,188 @@ async fn bounded_concurrent_batches_share_one_global_context() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn normalized_lexical_windows_short_text_keeps_one_full_typed_candidate() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    let window_bytes = 128;
+    let text = format!("{} needle aa needle bb needle", "prefix ".repeat(8));
+    assert!(text.len() < window_bytes);
+    let previous_starts: BTreeSet<_> = text
+        .match_indices("needle")
+        .map(|(offset, _)| offset.saturating_sub(window_bytes / 4))
+        .collect();
+    assert_eq!(previous_starts.len(), 3);
+    assert!(!previous_starts.contains(&0));
+    publish_charts(&root, 1, &text)?;
+    let reader = RichGenerationReader::open(&root)?;
+    let locations = reader.text_window_locations("needle", None, window_bytes, &|| Ok(()))?;
+    let lexical: Vec<_> = locations.windows.iter().filter(|row| row.lexical).collect();
+    assert_eq!(lexical.len(), 1);
+    assert_eq!(lexical[0].offset, 0);
+    assert!(
+        locations
+            .windows
+            .iter()
+            .any(|row| !row.lexical && row.offset == 0)
+    );
+    let execution = context(2)?;
+    let prepared = prepare_rich_multimodal_search(
+        reader.clone(),
+        client("http://127.0.0.1:1/unused", execution.clone())?,
+        "needle",
+        &RichMultimodalSearchOptions {
+            window_bytes,
+            max_visual_candidates: 1,
+            ..Default::default()
+        },
+    )?;
+    let text_entries: Vec<_> = prepared
+        .pool
+        .iter()
+        .filter(|entry| matches!(entry.content, RichMultimodalContent::Text { .. }))
+        .collect();
+    assert_eq!(text_entries.len(), 1);
+    let entry = text_entries[0];
+    assert!(entry.lexical && entry.structural);
+    let RichMultimodalContent::Text {
+        window,
+        literal_anchor,
+    } = &entry.content
+    else {
+        unreachable!()
+    };
+    assert!(*literal_anchor);
+    assert_eq!(window.text, text);
+    assert_eq!(binding(window).byte_start, 0);
+    assert_eq!(binding(window).byte_end, text.len());
+    assert!(matches!(window.evidence, EvidenceRef::NativeText { .. }));
+    reader.validate_text_evidence(&window.evidence)?;
+    assert_eq!(prepared.routing_requests().count(), 1);
+    let pools: Vec<_> = prepared.rerank_pool_requests().collect();
+    assert_eq!(pools.len(), 1);
+    assert_eq!(pools[0].question_count(), 2);
+    assert_eq!(execution.snapshot()?.logical_reservations, 0);
+    assert_eq!(execution.snapshot()?.submission_observations, 0);
+    Ok(())
+}
+
+#[test]
+fn normalized_lexical_windows_utf8_tail_contains_previous_window() -> Result<()> {
+    let window_bytes = 32;
+    for scalar in ['é', '界', '🦀'] {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().canonicalize()?;
+        let prefix = "p".repeat(window_bytes * 3);
+        let suffix = format!(
+            "{} needle",
+            "s".repeat(window_bytes + 1 - scalar.len_utf8() - 7)
+        );
+        let text = format!("{prefix}{scalar}{suffix}");
+        let tail = text.len() - window_bytes;
+        assert!(!text.is_char_boundary(tail));
+        let found = text.find("needle").unwrap();
+        let mut previous_start = found.saturating_sub(window_bytes / 4);
+        while !text.is_char_boundary(previous_start) {
+            previous_start += 1;
+        }
+        assert!(previous_start > tail);
+        publish(&root, &[&text])?;
+        let reader = RichGenerationReader::open(&root)?;
+        let artifact = reader.manifest()?.documents[0].pages[0].native_text.clone();
+        let previous = reader.read_text(&artifact.id, previous_start, window_bytes)?;
+        let locations = reader.text_window_locations("needle", None, window_bytes, &|| Ok(()))?;
+        let lexical: Vec<_> = locations.windows.iter().filter(|row| row.lexical).collect();
+        assert_eq!(lexical.len(), 1);
+        let start = lexical[0].offset;
+        assert_eq!(start, prefix.len() + scalar.len_utf8());
+        assert!(start < previous_start && text.is_char_boundary(start));
+        let window = reader.read_text(&artifact.id, start, window_bytes)?;
+        assert!(window.text.len() <= window_bytes);
+        assert!(window.text.ends_with(&previous.text));
+        assert!(window.text.contains("needle"));
+        assert_eq!(binding(&window).byte_end, text.len());
+        assert!(text.is_char_boundary(binding(&window).byte_end));
+        assert!(window.next_offset.is_none());
+        reader.validate_text_evidence(&window.evidence)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn normalized_lexical_windows_long_document_keeps_distinct_middle_offsets() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    let window_bytes = 128;
+    let positions = [window_bytes, window_bytes * 3];
+    let mut bytes = vec![b'x'; window_bytes * 8];
+    for position in positions {
+        bytes[position..position + 6].copy_from_slice(b"needle");
+    }
+    let text = String::from_utf8(bytes)?;
+    publish(&root, &[&text])?;
+    let reader = RichGenerationReader::open(&root)?;
+    let artifact = reader.manifest()?.documents[0].pages[0].native_text.clone();
+    let locations = reader.text_window_locations("needle", None, window_bytes, &|| Ok(()))?;
+    let lexical: Vec<_> = locations.windows.iter().filter(|row| row.lexical).collect();
+    assert_eq!(
+        lexical.iter().map(|row| row.offset).collect::<Vec<_>>(),
+        positions.map(|position| position - window_bytes / 4)
+    );
+    assert!(
+        locations
+            .windows
+            .iter()
+            .any(|row| !row.lexical && row.offset == 0)
+    );
+    for location in lexical {
+        let window = reader.read_text(&artifact.id, location.offset, window_bytes)?;
+        assert_eq!(window.text.len(), window_bytes);
+        assert!(window.text.contains("needle"));
+        assert!(window.next_offset.is_some());
+        reader.validate_text_evidence(&window.evidence)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn normalized_lexical_windows_keep_native_and_ocr_artifacts_distinct() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    publish_saved_ocr(&root)?;
+    let prepared = prepare_rich_multimodal_search(
+        RichGenerationReader::open(&root)?,
+        client("http://127.0.0.1:1/unused", context(2)?)?,
+        "Native label",
+        &Default::default(),
+    )?;
+    let windows: Vec<_> = prepared
+        .pool
+        .iter()
+        .filter_map(|entry| match &entry.content {
+            RichMultimodalContent::Text { window, .. } => Some(window),
+            RichMultimodalContent::Visual { .. } => None,
+        })
+        .collect();
+    assert_eq!(windows.len(), 2);
+    assert!(
+        windows
+            .iter()
+            .any(|window| matches!(window.evidence, EvidenceRef::NativeText { .. }))
+    );
+    assert!(
+        windows
+            .iter()
+            .any(|window| matches!(window.evidence, EvidenceRef::OcrText { .. }))
+    );
+    assert!(windows.iter().all(|window| binding(window).byte_start == 0));
+    assert_ne!(
+        binding(windows[0]).artifact_id,
+        binding(windows[1]).artifact_id
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn distinct_windows_of_same_artifact_have_distinct_typed_units() -> Result<()> {
     let dir = tempfile::tempdir()?;

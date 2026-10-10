@@ -1083,7 +1083,10 @@ impl RichGenerationReader {
                                 lexical_truncated = true;
                                 break;
                             }
-                            let mut start = found.start().saturating_sub(window_bytes / 4);
+                            let mut start = found
+                                .start()
+                                .saturating_sub(window_bytes / 4)
+                                .min(text.len().saturating_sub(window_bytes));
                             while !text.is_char_boundary(start) {
                                 start += 1;
                             }
