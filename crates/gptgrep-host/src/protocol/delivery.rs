@@ -172,11 +172,8 @@ impl Handle {
         );
         let arguments = frame["params"]["arguments"].take();
         crate::rich_text::measure(&arguments, crate::rich_text::argument_limit(&tool))?;
-        if tool == "gptgrep_render" && self.visual_enabled() {
-            RenderRequest::parse(&arguments)?;
-        } else {
-            crate::rich_text::validate_arguments(&tool, &arguments)?;
-        }
+        // Argument semantics are checked only after this attempt has consumed
+        // its IDs and call slot. The decoder, scope and byte cap stay terminal.
         let mut state = self
             .0
             .lock()

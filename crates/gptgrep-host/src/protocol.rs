@@ -526,7 +526,25 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
                 evidence.tool_called();
                 evidence.validate()?;
                 let operation = async {
-                    if pending.tool == "gptgrep_read_artifact" {
+                    let arguments_valid =
+                        if pending.tool == "gptgrep_render" && handle.visual_enabled() {
+                            delivery::RenderRequest::parse(&pending.arguments).is_ok()
+                        } else {
+                            crate::rich_text::validate_arguments(&pending.tool, &pending.arguments)
+                                .is_ok()
+                        };
+                    if !arguments_valid {
+                        // An admitted argument error consumes the original call,
+                        // deadline and transport budgets without issuing evidence.
+                        // Scope/source failures are never converted into a reply.
+                        evidence.validate_argument_scope(&pending.tool, &pending.arguments)?;
+                        evidence.validate()?;
+                        let result = crate::rich_text::argument_error(&pending.tool);
+                        rpc.send(json!({"id":pending.rpc_id.value(),"result":result}))
+                            .await?;
+                        evidence.validate()?;
+                        handle.close(pending)?;
+                    } else if pending.tool == "gptgrep_read_artifact" {
                         let window = evidence.read(&pending.arguments)?;
                         let reserved = handle.reserve(&pending, window, &evidence.reader)?;
                         let result = reserved.result()?;

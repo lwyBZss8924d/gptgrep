@@ -654,6 +654,49 @@ impl RichEvidence {
             result,
         })
     }
+    /// Preserve explicit resource scope even when another argument is invalid.
+    /// This inspects manifest identities only; it cannot read or grant evidence.
+    pub(crate) fn validate_argument_scope(&self, tool: &str, args: &Value) -> Result<()> {
+        if let Some(scope) = &self.document {
+            match tool {
+                "gptgrep_inspect_artifact" | "gptgrep_search_text" => {
+                    if let Some(document) = args["document"].as_str().filter(|s| !s.is_empty()) {
+                        ensure!(document == scope, "host_rich_document_scope");
+                    }
+                }
+                "gptgrep_catalog" => {
+                    ensure!(args["cursor"].is_null(), "host_rich_scoped_catalog_cursor");
+                }
+                _ => {}
+            }
+        }
+        if let Some(id) = args["artifact_id"].as_str().filter(|s| !s.is_empty()) {
+            match tool {
+                "gptgrep_read_artifact" => self.ensure_artifact(id)?,
+                NATIVE_METADATA_TOOL => self.ensure_native_metadata_artifact(id)?,
+                _ => {}
+            }
+        }
+        if tool == "gptgrep_render"
+            && self.multimodal.is_some()
+            && let Some(id) = args["resource_id"].as_str().filter(|s| !s.is_empty())
+        {
+            let manifest = self.reader.manifest()?;
+            ensure!(
+                manifest.documents.iter().any(|document| {
+                    self.document
+                        .as_ref()
+                        .is_none_or(|scope| scope == &document.document.path)
+                        && document
+                            .pages
+                            .iter()
+                            .any(|page| page.renditions.iter().any(|image| image.artifact.id == id))
+                }),
+                "host_rich_visual_resource_unavailable"
+            );
+        }
+        Ok(())
+    }
     pub(crate) fn metadata_tool(&self, tool: &str, args: &Value) -> Result<Value> {
         validate_arguments(tool, args)?;
         self.validate()?;
@@ -1133,6 +1176,16 @@ fn bounded_json_string(value: &impl Serialize, limit: usize) -> Result<String> {
     Ok(String::from_utf8(buffer.bytes)?)
 }
 
+pub(crate) fn argument_error(tool: &str) -> Value {
+    let message = match tool {
+        "gptgrep_inspect_artifact" => {
+            "Use a nonempty document path and page_size from 1 through 8, as declared in the tool schema."
+        }
+        "gptgrep_catalog" => "Use page_size from 1 through 8, as declared in the tool schema.",
+        _ => "Use arguments matching the declared tool schema and its bounds.",
+    };
+    json!({"success":false,"contentItems":[{"type":"inputText","text":json!({"error":{"code":"invalid_arguments","message":message}}).to_string()}]})
+}
 pub(crate) fn tool_error(code: &str) -> Value {
     json!({"success":false,"contentItems":[{"type":"inputText","text":json!({"error":{"code":code}}).to_string()}]})
 }

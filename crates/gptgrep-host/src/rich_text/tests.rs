@@ -397,7 +397,24 @@ async fn emit(writer: &mut (impl tokio::io::AsyncWrite + Unpin), value: Value) -
     Ok(())
 }
 #[derive(Clone, Copy)]
+enum ArgumentMode {
+    PageLimit,
+    EmptyDocument,
+    UnknownField,
+    ReplayRpc,
+    ReplayCall,
+    Budget,
+    ForeignThread,
+    ForeignTurn,
+    Namespace,
+    Document,
+    ScopedCursor,
+    Artifact,
+    Oversized,
+}
+#[derive(Clone, Copy)]
 enum NativeMode {
+    Arguments(ArgumentMode),
     Normal,
     BootstrapCitation,
     ForbiddenNamespace,
@@ -468,6 +485,97 @@ async fn native_mock(
                     emit(&mut write,json!({"method":"turn/completed","params":{"threadId":"ordinary-thread","turn":{"id":"ordinary-turn","status":"completed","error":null,"items":[{"type":"agentMessage","text":answer}]}}})).await?;
                     return Ok(sent);
                 }
+                if let NativeMode::Arguments(case) = mode {
+                    // Bind the genuine turn before trying any malformed scope.
+                    emit(
+                        &mut write,
+                        json!({"id":4,"result":{"turn":{"id":"ordinary-turn"}}}),
+                    )
+                    .await?;
+                    let mut call = json!({"id":"argument-request","method":"item/tool/call","params":{
+                        "threadId":"ordinary-thread","turnId":"ordinary-turn","callId":"argument-call",
+                        "namespace":"gptgrep","tool":"gptgrep_inspect_artifact",
+                        "arguments":{"document":"source.pdf","page_size":9}}});
+                    match case {
+                        ArgumentMode::EmptyDocument => {
+                            call["params"]["arguments"] = json!({"document":"","page_size":1});
+                        }
+                        ArgumentMode::UnknownField => {
+                            call["params"]["arguments"] =
+                                json!({"document":"source.pdf","extra":true});
+                        }
+                        ArgumentMode::ForeignThread => {
+                            call["params"]["threadId"] = json!("other-thread")
+                        }
+                        ArgumentMode::ForeignTurn => call["params"]["turnId"] = json!("other-turn"),
+                        ArgumentMode::Namespace => call["params"]["namespace"] = json!("other"),
+                        ArgumentMode::Document => {
+                            call["params"]["arguments"]["document"] = json!("other.pdf")
+                        }
+                        ArgumentMode::ScopedCursor => {
+                            call["params"]["tool"] = json!("gptgrep_catalog");
+                            call["params"]["arguments"] = json!({"page_size":0,"cursor":"opaque"});
+                        }
+                        ArgumentMode::Artifact => {
+                            call["params"]["tool"] = json!("gptgrep_read_artifact");
+                            call["params"]["arguments"] =
+                                json!({"artifact_id":"unknown-artifact","max_bytes":0});
+                        }
+                        ArgumentMode::Oversized => {
+                            call["params"]["arguments"]["cursor"] = json!("x".repeat(4096))
+                        }
+                        _ => {}
+                    }
+                    emit(&mut write, call).await?;
+                    let rejected = line(&mut read).await?;
+                    ensure!(
+                        rejected["id"] == "argument-request",
+                        "argument reply identity"
+                    );
+                    ensure!(
+                        rejected["result"]["success"] == false,
+                        "argument rejection envelope"
+                    );
+                    let body: Value = serde_json::from_str(
+                        rejected["result"]["contentItems"][0]["text"]
+                            .as_str()
+                            .context("argument error text")?,
+                    )?;
+                    ensure!(
+                        body["error"]["code"] == "invalid_arguments",
+                        "closed argument error code"
+                    );
+                    ensure!(
+                        body.get("issued_id").is_none(),
+                        "argument errors grant no citation"
+                    );
+                    ensure!(
+                        body["error"]["message"]
+                            .as_str()
+                            .is_some_and(|message| message.contains("nonempty document")
+                                && message.contains("1 through 8")),
+                        "schema correction hint"
+                    );
+                    sent.push(rejected);
+                    let corrected = json!({"id":if matches!(case,ArgumentMode::ReplayRpc){"argument-request"}else{"corrected-request"},
+                        "method":"item/tool/call","params":{"threadId":"ordinary-thread","turnId":"ordinary-turn",
+                        "callId":if matches!(case,ArgumentMode::ReplayCall){"argument-call"}else{"corrected-call"},
+                        "namespace":"gptgrep","tool":"gptgrep_inspect_artifact","arguments":{"document":"source.pdf","page_size":1}}});
+                    emit(&mut write, corrected).await?;
+                    if matches!(
+                        case,
+                        ArgumentMode::ReplayRpc | ArgumentMode::ReplayCall | ArgumentMode::Budget
+                    ) {
+                        return Ok(sent);
+                    }
+                    let corrected = line(&mut read).await?;
+                    ensure!(
+                        corrected["id"] == "corrected-request"
+                            && corrected["result"]["success"] == true,
+                        "same-turn corrected tool succeeds"
+                    );
+                    sent.push(corrected);
+                }
                 let tool = if matches!(mode, NativeMode::Render) {
                     "gptgrep_render"
                 } else {
@@ -493,7 +601,9 @@ async fn native_mock(
                         "namespace":"gptgrep","tool":"gptgrep_read_artifact","arguments":{"artifact_id":artifact,"offset":0,"max_bytes":2048}}})).await?;
                     return Ok(sent);
                 }
-                emit(&mut write,json!({"id":4,"result":{"turn":{"id":if matches!(mode,NativeMode::ReselectTurn){"other-turn"}else{"ordinary-turn"}}}})).await?;
+                if !matches!(mode, NativeMode::Arguments(_)) {
+                    emit(&mut write,json!({"id":4,"result":{"turn":{"id":if matches!(mode,NativeMode::ReselectTurn){"other-turn"}else{"ordinary-turn"}}}})).await?;
+                }
                 let citations = if matches!(mode, NativeMode::Render) {
                     vec![]
                 } else {
@@ -539,11 +649,20 @@ async fn drive_fixture(
     let (read, write) = tokio::io::split(host);
     let task = tokio::spawn(native_mock(server, artifact, mode));
     let deadline = evidence.deadline;
+    let config = HostConfig {
+        max_tool_calls: if matches!(mode, NativeMode::Arguments(ArgumentMode::Budget)) {
+            1
+        } else {
+            HostConfig::default().max_tool_calls
+        },
+        document: evidence.document.clone(),
+        ..Default::default()
+    };
     let result = protocol::run_observed_budget(
         read,
         write,
         Path::new("."),
-        &HostConfig::default(),
+        &config,
         protocol::Workflow::RichText {
             question: "source claim",
             evidence,
@@ -633,6 +752,124 @@ async fn actual_dispatch_rejects_namespace_id_replay_and_turn_reselection() -> R
     }
     Ok(())
 }
+#[tokio::test]
+async fn invalid_tool_arguments_reply_then_correct_same_turn_and_preserve_citation_custody()
+-> Result<()> {
+    for case in [
+        ArgumentMode::PageLimit,
+        ArgumentMode::EmptyDocument,
+        ArgumentMode::UnknownField,
+    ] {
+        let (_dir, prepared, execution, server) = prepared_fixture().await?;
+        let mut evidence = genuine(prepared).await?;
+        server.await??;
+        let (outcome, frames) = drive_fixture(&mut evidence, NativeMode::Arguments(case)).await?;
+        assert_eq!(outcome.turn_id, "ordinary-turn");
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame["method"] == "turn/start")
+                .count(),
+            1
+        );
+        assert_eq!(evidence.calls, 4); // Invalid inspect, corrected inspect and two reads.
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame["result"]["success"] == false)
+                .count(),
+            1
+        );
+        assert_eq!(execution.snapshot()?.logical_reservations, 2); // Original bootstrap only.
+        let final_value = evidence.finish(&outcome.answer)?;
+        assert_eq!(final_value.citations.len(), 1);
+        assert_eq!(final_value.citations[0].quote, "中");
+        let error_citation = protocol::RichCitationRequest {
+            issued_id: "argument-request".into(),
+            offset: 0,
+            length: 5,
+            quote: "alpha".into(),
+        };
+        assert!(
+            evidence
+                .delivery
+                .as_ref()
+                .unwrap()
+                .resolve(&[error_citation], &evidence.reader, 8)
+                .is_err()
+        );
+        let report = evidence.into_report(
+            final_value,
+            vec![],
+            crate::ModelUsage::default(),
+            MAX_OUTPUT,
+            None,
+        )?;
+        assert_eq!(report.tool_calls, 4);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_tool_arguments_consume_budget_and_both_replay_ids() -> Result<()> {
+    for (case, code) in [
+        (ArgumentMode::ReplayRpc, "host_rich_call_replayed"),
+        (ArgumentMode::ReplayCall, "host_rich_call_replayed"),
+        (ArgumentMode::Budget, "host_rich_tool_budget"),
+    ] {
+        let (_dir, prepared, _execution, server) = prepared_fixture().await?;
+        let mut evidence = genuine(prepared).await?;
+        server.await??;
+        let error = drive_fixture(&mut evidence, NativeMode::Arguments(case))
+            .await
+            .err()
+            .context("terminal replay or budget")?;
+        assert_eq!(error.to_string(), code);
+        assert_eq!(evidence.calls, 1);
+        assert_eq!(evidence.delivery.as_ref().unwrap().retained_bytes(), 0);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_tool_arguments_do_not_recover_scope_or_size_failures() -> Result<()> {
+    for (case, calls, code) in [
+        (
+            ArgumentMode::ForeignThread,
+            0,
+            "Dynamic tool call came from a different thread",
+        ),
+        (
+            ArgumentMode::ForeignTurn,
+            0,
+            "Codex event changed turn identity",
+        ),
+        (ArgumentMode::Namespace, 0, "host_rich_tool_allowlist"),
+        (ArgumentMode::Document, 1, "host_rich_document_scope"),
+        (
+            ArgumentMode::ScopedCursor,
+            1,
+            "host_rich_scoped_catalog_cursor",
+        ),
+        (ArgumentMode::Artifact, 1, "host_rich_artifact_unavailable"),
+        (ArgumentMode::Oversized, 0, "host_rich_output_budget"),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().canonicalize()?;
+        publish(&root, &["alpha\r\n中 tail\n"]).await?;
+        let (mut evidence, _execution) =
+            native_metadata_evidence(RichGenerationReader::open(&root)?, true).await?;
+        let error = drive_fixture(&mut evidence, NativeMode::Arguments(case))
+            .await
+            .err()
+            .context("terminal scope or size")?;
+        assert!(error.to_string().contains(code), "{error}");
+        assert_eq!(evidence.calls, calls);
+        assert_eq!(evidence.delivery.as_ref().unwrap().retained_bytes(), 0);
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn whole_bounds_and_absent_finite_context_fail_before_admission() -> Result<()> {
     let dir = tempfile::tempdir()?;
