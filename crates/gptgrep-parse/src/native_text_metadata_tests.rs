@@ -1140,7 +1140,7 @@ async fn synthetic_v6_complete_metadata_and_document_signals_are_window_1_25_inv
     assert!(
         error
             .to_string()
-            .contains("resource_limit: complete document metadata/working admission"),
+            .contains("resource_limit: native retained plus active working admission"),
         "{error:#}"
     );
     assert_eq!(inventory()?, before);
@@ -1288,20 +1288,49 @@ fn native_character_allocation_accepts_large_complete_stream_with_exact_page_jso
 }
 
 #[test]
-fn native_character_allocation_rejects_document_and_working_bounds_before_observation() -> Result<()>
-{
+fn native_character_allocation_separates_retained_json_and_rejects_working_bounds_before_observation()
+-> Result<()> {
     const COUNT: u32 = 2200;
     let original = ResourceBudget::default();
     let bound = character_allocation_bound(COUNT, &original)?;
     let mut document_limited = original.clone();
     document_limited.document_metadata_bytes = bound - 1;
+    // The character estimate reserves current-page allocations, not retained
+    // JSON bytes. A smaller document wire budget must not reject this observer
+    // when its working allocation is admitted and its actual JSON still fits.
+    assert_eq!(character_allocation_bound(COUNT, &document_limited)?, bound);
+    let mut observed_count = 0;
+    let characters = collect_characters(
+        COUNT,
+        1500.0,
+        300.0,
+        &document_limited,
+        NativeBoundsPolicy::UnclippedV7,
+        |_| {
+            observed_count += 1;
+            Ok(geometryless(' ', false))
+        },
+    )?;
+    assert_eq!(observed_count, COUNT);
+    assert_eq!(characters.len(), COUNT as usize);
+    let value = envelope(characters);
+    let wire = crate::resource::encoded_size(&value, original.page_layout_bytes)?;
+    assert!(wire < document_limited.document_metadata_bytes);
+    let mut wire_limited = original.clone();
+    wire_limited.document_metadata_bytes = wire;
+    assert_eq!(
+        crate::resource::encoded_size(&value, wire_limited.document_metadata_bytes)?,
+        wire
+    );
+    wire_limited.document_metadata_bytes -= 1;
+    assert!(crate::resource::encoded_size(&value, wire_limited.document_metadata_bytes).is_err());
+    assert_eq!(character_allocation_bound(COUNT, &wire_limited)?, bound);
+
+    // Working bytes and impossible counts still reject before the first
+    // observation. Cumulative retained JSON is tested at extraction's ledger.
     let mut working_limited = original.clone();
     working_limited.owned_working_bytes = bound * 4 - 1;
-    for (count, budget) in [
-        (COUNT, document_limited),
-        (COUNT, working_limited),
-        (u32::MAX, original),
-    ] {
+    for (count, budget) in [(COUNT, working_limited), (u32::MAX, original)] {
         assert!(character_allocation_bound(count, &budget).is_err());
         let mut observed_count = 0;
         assert!(

@@ -28,6 +28,8 @@ use crate::ocr::{
 };
 use crate::resource::{LimitedWriter, ResourceBudget, encoded_size};
 
+#[path = "native_memory.rs"]
+mod native_memory;
 #[path = "native_text_metadata.rs"]
 pub(crate) mod native_text_metadata;
 
@@ -764,31 +766,6 @@ pub(crate) fn admit_staging(used: &mut u64, bytes: u64, budget: &ResourceBudget)
     Ok(())
 }
 
-fn admit_native_estimate(
-    metadata_used: &mut u64,
-    owned_upper: &mut u64,
-    bytes: u64,
-    budget: &ResourceBudget,
-) -> Result<()> {
-    let metadata = metadata_used
-        .checked_add(bytes)
-        .context("resource_limit: native metadata sum overflow")?;
-    let owned = owned_upper
-        .checked_add(
-            bytes
-                .checked_mul(4)
-                .context("resource_limit: native working bound overflow")?,
-        )
-        .context("resource_limit: native working sum overflow")?;
-    ensure!(
-        metadata <= budget.document_metadata_bytes && owned <= budget.owned_working_bytes,
-        "resource_limit: complete document metadata/working admission"
-    );
-    *metadata_used = metadata;
-    *owned_upper = owned;
-    Ok(())
-}
-
 pub(crate) fn extract_sync(
     prepared: PreparedDocument,
     options: NativeOptions,
@@ -808,9 +785,13 @@ pub(crate) fn extract_sync(
     let mut artifacts = Vec::new();
     let mut tasks = Vec::new();
     let mut annotation_counts = Vec::new();
+    let mut coverage_plan = Vec::new();
+    let mut blockers = Vec::new();
     let mut staged = prepared.summary.prepared_bytes;
-    let mut metadata_used = 0u64;
-    let mut owned_upper = 0u64;
+    let mut admission = native_memory::NativeAdmission::new(
+        native_memory::fixed_owned(&prepared, &native_profile_sha256)?,
+        &budget,
+    )?;
     let input = PdfInput::Path(
         prepared
             .prepared_path
@@ -833,14 +814,13 @@ pub(crate) fn extract_sync(
             total as u32,
             &options,
             &budget,
-            &mut |bytes| {
-                admit_native_estimate(&mut metadata_used, &mut owned_upper, bytes, &budget)
-            },
+            &mut |bytes| admission.reserve_native(bytes, &budget),
         )?;
         (total, metadata)
     };
     ensure!(total > 0, "native document contains no pages");
     let document_metadata_size = encoded_size(&document_metadata, budget.document_metadata_bytes)?;
+    admission.admit_metadata(document_metadata_size, &budget)?;
     admit_staging(&mut staged, document_metadata_size, &budget)?;
     let document_metadata_artifact = write_json(
         &prepared.staging_root,
@@ -855,6 +835,50 @@ pub(crate) fn extract_sync(
         budget.document_metadata_bytes,
     )?;
     artifacts.push(document_metadata_artifact.clone());
+    // Every outer candidate vector has a known page-count ceiling. Reserve its
+    // storage once, while document extraction's temporary allocation allowance
+    // is still active, so a later page cannot trigger uncharged growth overlap.
+    let page_slots = total as usize;
+    // Two native artifacts, optionally one raster and two OCR artifacts, plus
+    // document metadata and the final layout/merged-text pair. Reserving final
+    // slots here also prevents OCR from reallocating the whole artifact vector.
+    let artifact_slots = page_slots
+        .checked_mul(if options.render_pages { 5 } else { 2 })
+        .and_then(|n| n.checked_add(3))
+        .context("resource_limit: native artifact slot overflow")?;
+    let slot_reservation = native_memory::candidate_slot_reservation(page_slots, artifact_slots)?;
+    admission.reserve_owned(slot_reservation, &budget)?;
+    raw_pages.try_reserve_exact(page_slots)?;
+    pages.try_reserve_exact(page_slots)?;
+    tasks.try_reserve_exact(page_slots)?;
+    annotation_counts.try_reserve_exact(page_slots)?;
+    coverage_plan.try_reserve_exact(page_slots)?;
+    blockers.try_reserve_exact(page_slots)?;
+    artifacts.try_reserve_exact(artifact_slots - artifacts.len())?;
+    let slots_owned = native_memory::candidate_slots_owned(
+        &raw_pages,
+        &pages,
+        &tasks,
+        &annotation_counts,
+        &coverage_plan,
+        &blockers,
+        &artifacts,
+    )?;
+    ensure!(
+        slots_owned <= slot_reservation,
+        "resource_limit: native vector capacity admission"
+    );
+    let document_owned = native_memory::document_owned(&document_metadata)?
+        .checked_add(
+            native_memory::artifact_owned(&document_metadata_artifact)?
+                .checked_mul(2)
+                .context("resource_limit: native document artifact copies overflow")?,
+        )
+        .and_then(|n| n.checked_add(slots_owned))
+        .context("resource_limit: retained native document overflow")?;
+    // document_metadata::extract has returned; its outline/getter temporaries
+    // and PDFium document scope have ended. Only these retained products remain.
+    admission.finish_phase(document_owned, &budget)?;
     for start in (0..total as usize).step_by(options.page_window) {
         // This scope ends before the async extraction function returns. No
         // Document, Page, TextPage, Bitmap or Library appears in a public DTO.
@@ -862,6 +886,8 @@ pub(crate) fn extract_sync(
         let doc = stages::open(&lib, &input, None, &[])?;
         ensure!(doc.page_count() == total, "prepared page count changed");
         for index in start..(start + options.page_window).min(total as usize) {
+            let first_artifact = artifacts.len();
+            let first_task = tasks.len();
             let number = index as u32 + 1;
             let page_obj = doc.page(index as i32)?;
             let annotation_count = page_obj.annotation_count();
@@ -907,8 +933,8 @@ pub(crate) fn extract_sync(
             let count = text_page.char_count();
             ensure!(count >= 0, "PDFium char count failed");
             // Reserve every native character/run/word before allocation.
-            // This conservative estimate is charged to document/working memory;
-            // the actual serialized page still has its independent byte cap.
+            // This conservative estimate belongs to the active page. Retained
+            // candidate storage and actual serialized metadata have other ledgers.
             let glyph_bound =
                 native_text_metadata::character_allocation_bound(count as u32, &budget)?;
             let label_bound = match &document_metadata.page_labels[index].label {
@@ -920,12 +946,7 @@ pub(crate) fn extract_sync(
                 base_bound < budget.page_layout_bytes,
                 "resource_limit: page character admission"
             );
-            admit_native_estimate(
-                &mut metadata_used,
-                &mut owned_upper,
-                glyph_bound + base_bound,
-                &budget,
-            )?;
+            admission.reserve_native(glyph_bound + base_bound, &budget)?;
             let graphics = crate::native_graphics::collect(
                 &prepared.summary,
                 &native_profile_sha256,
@@ -998,7 +1019,7 @@ pub(crate) fn extract_sync(
                         }
                     })
                 },
-                |bytes| admit_native_estimate(&mut metadata_used, &mut owned_upper, bytes, &budget),
+                |bytes| admission.reserve_native(bytes, &budget),
             )?;
             let object_count = graphics.header.top_level_count;
             let object_bound = graphics.charged_bytes;
@@ -1039,12 +1060,7 @@ pub(crate) fn extract_sync(
                                     <= budget.page_layout_bytes,
                                 "resource_limit: page font metadata admission"
                             );
-                            admit_native_estimate(
-                                &mut metadata_used,
-                                &mut owned_upper,
-                                bytes,
-                                &budget,
-                            )?;
+                            admission.reserve_native(bytes, &budget)?;
                             font_bound = next;
                             Ok(())
                         },
@@ -1089,7 +1105,20 @@ pub(crate) fn extract_sync(
                 crate::native_graphics::derive_layout(&graphics.header, &graphics.objects)?;
             raw.content_bounds = content_bounds;
             raw.vector_graphics = Some(vector_graphics);
-            admit_projection(std::slice::from_ref(&raw), &budget, owned_upper)?;
+            let held_before_projection = admission.held_upper()?;
+            let projection =
+                projection_admission(std::slice::from_ref(&raw), &budget, held_before_projection)?;
+            // Projected output remains live while native metadata is cloned,
+            // rasterized and turned into OCR tasks. Keep its whole admitted
+            // stage allowance until drop(projected), including conservative
+            // scratch that the pure stage may have already released.
+            admission.reserve_owned(
+                projection
+                    .working_upper
+                    .checked_sub(held_before_projection)
+                    .context("resource_limit: native projection allowance underflow")?,
+                &budget,
+            )?;
             let projected = stages::project(vec![raw.clone()]);
             if vector_count > 0
                 && !complexity
@@ -1207,7 +1236,7 @@ pub(crate) fn extract_sync(
                     <= budget.page_layout_bytes,
                 "resource_limit: native metadata classifier/frame binding admission"
             );
-            admit_native_estimate(&mut metadata_used, &mut owned_upper, binding_bytes, &budget)?;
+            admission.reserve_native(binding_bytes, &budget)?;
             let metadata = crate::NativePageMetadata {
                 page: raw.clone(),
                 objects: graphics.objects,
@@ -1224,6 +1253,7 @@ pub(crate) fn extract_sync(
                 ),
             };
             let metadata_size = encoded_size(&metadata, budget.page_layout_bytes)?;
+            admission.admit_metadata(metadata_size, &budget)?;
             admit_staging(&mut staged, metadata_size, &budget)?;
             let metadata_artifact = write_json(
                 &prepared.staging_root,
@@ -1254,7 +1284,7 @@ pub(crate) fn extract_sync(
                 let (pixel_width, pixel_height) = (pixel_width as u32, pixel_height as u32);
                 let pixels = budget.admit_image(pixel_width, pixel_height, 0)?;
                 ensure!(
-                    owned_upper + pixels * 8 + budget.image_file_bytes
+                    admission.held_upper()? + pixels * 8 + budget.image_file_bytes
                         <= budget.owned_working_bytes,
                     "resource_limit: raster+metadata working admission"
                 );
@@ -1382,25 +1412,40 @@ pub(crate) fn extract_sync(
                 capabilities,
             });
             raw_pages.push(raw);
+            let native_page = pages.last().expect("just retained native page");
+            coverage_plan.push((number, native_page.coverage.clone()));
+            let blocker = if native_page.coverage == CoverageState::RequiredOcr
+                && native_page.renditions.is_empty()
+            {
+                blockers.push(format!(
+                    "page {} requires OCR but no admitted rendition was requested",
+                    number
+                ));
+                blockers.last()
+            } else {
+                None
+            };
+            let retained_owned = native_memory::retained_page_owned(
+                raw_pages.last().expect("just retained raw page"),
+                native_page,
+                &artifacts[first_artifact..],
+                &tasks[first_task..],
+                blocker,
+            )?;
+            // The character/font/object trees and metadata's raw-page clone are
+            // still live through rendering and task creation. Release their
+            // reservation only after dropping those trees and projected copies.
+            drop(metadata);
+            drop(projected);
+            drop(text_page);
+            drop(page_obj);
+            admission.finish_phase(retained_owned, &budget)?;
         }
     }
     prepared.verify(&budget)?;
-    let blockers = pages
-        .iter()
-        .filter(|page| page.coverage == CoverageState::RequiredOcr && page.renditions.is_empty())
-        .map(|page| {
-            format!(
-                "page {} requires OCR but no admitted rendition was requested",
-                page.number
-            )
-        })
-        .collect();
     let plan = OcrPlan {
         tasks,
-        pages: pages
-            .iter()
-            .map(|page| (page.number, page.coverage.clone()))
-            .collect(),
+        pages: coverage_plan,
         blockers,
     };
     let mut candidate = NativeCandidate {
@@ -1412,8 +1457,8 @@ pub(crate) fn extract_sync(
         prepared,
         raw_pages,
         document_staging_used: staged,
-        native_owned_upper: owned_upper,
-        metadata_admitted_upper: metadata_used,
+        native_owned_upper: admission.retained_owned(),
+        metadata_admitted_upper: admission.metadata_bytes(),
         execution_budget: budget,
         frozen_integrity_sha256: String::new(),
         annotation_counts,
@@ -1496,6 +1541,7 @@ struct ProjectionAdmission {
 
 /// Bound sparse text, projected copies and absolute-span scratch before either
 /// native classification or finalization calls the unchanged pure projector.
+#[cfg(test)]
 fn admit_projection(pages: &[Page], budget: &ResourceBudget, held_upper: u64) -> Result<u64> {
     Ok(projection_admission(pages, budget, held_upper)?.text_upper)
 }
@@ -1630,13 +1676,13 @@ fn admit_final_projection(
     pages: &[Page],
     budget: &ResourceBudget,
     held_upper: u64,
-    native_allocation_upper: u64,
+    native_retained_upper: u64,
     outcome_bytes: u64,
 ) -> Result<()> {
     let projection = projection_admission(pages, budget, held_upper)?;
     // Preserve the conservative allowance for document signals, block/layout
     // copies, headings and canonical text. It is working memory, not JSON size.
-    let extra_working_upper = native_allocation_upper
+    let extra_working_upper = native_retained_upper
         .checked_mul(2)
         .and_then(|native| {
             projection
@@ -1652,7 +1698,7 @@ fn admit_final_projection(
         .context("resource_limit: complete final working bound overflow")?;
     ensure!(
         working_upper <= budget.owned_working_bytes,
-        "resource_limit: complete final working admission: estimated_bytes={working_upper}, projection_bytes={}, extra_bytes={extra_working_upper}, native_allocation_bytes={native_allocation_upper}, projected_text_bytes={}, outcome_bytes={outcome_bytes}, limit_bytes={}",
+        "resource_limit: complete final working admission: estimated_bytes={working_upper}, projection_bytes={}, extra_bytes={extra_working_upper}, native_retained_bytes={native_retained_upper}, projected_text_bytes={}, outcome_bytes={outcome_bytes}, limit_bytes={}",
         projection.working_upper,
         projection.text_upper,
         budget.owned_working_bytes
@@ -1677,7 +1723,20 @@ pub fn finalize_document(
         outcomes.len() <= candidate.pages.len(),
         "unexpected OCR result count"
     );
+    let final_artifact_count = outcomes
+        .len()
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(2))
+        .and_then(|n| n.checked_add(candidate.artifacts.len()))
+        .context("resource_limit: final artifact count overflow")?;
+    ensure!(
+        final_artifact_count <= candidate.artifacts.capacity(),
+        "resource_limit: final artifact capacity was not admitted"
+    );
     let outcome_bytes = encoded_size(&outcomes, budget.document_metadata_bytes)?;
+    // A short OCR line still creates a full TextItem, independently of wire
+    // length. Admit replacement slots and line/sort scratch before mutation.
+    let ocr_replacement_upper = native_memory::ocr_replacement_working_upper(&outcomes)?;
     let final_owned_upper = candidate
         .native_owned_upper
         .checked_add(
@@ -1685,6 +1744,7 @@ pub fn finalize_document(
                 .checked_mul(8)
                 .context("resource_limit: OCR finalization working overflow")?,
         )
+        .and_then(|n| n.checked_add(ocr_replacement_upper))
         .context("resource_limit: native/OCR working overflow")?;
     ensure!(
         final_owned_upper <= budget.owned_working_bytes,
@@ -1724,6 +1784,7 @@ pub fn finalize_document(
         &outcomes,
     ))?);
     let mut raw_ocr = Vec::new();
+    raw_ocr.try_reserve_exact(outcomes.len())?;
     for result in &outcomes {
         let page = candidate
             .raw_pages
@@ -1799,7 +1860,17 @@ pub fn finalize_document(
             .iter_mut()
             .find(|page| page.number == result.page)
             .expect("validated page");
+        let replacement_lines = result
+            .regions
+            .iter()
+            .try_fold(0usize, |n, region| {
+                n.checked_add(region.text.lines().count())
+            })
+            .context("resource_limit: OCR replacement line count overflow")?;
         page.text_items.clear();
+        // Old backing slots remain covered by the native retained bound; the
+        // complete new array was admitted above, including overlap on growth.
+        page.text_items.try_reserve_exact(replacement_lines)?;
         for region in ordered {
             let lines = region.text.lines().collect::<Vec<_>>();
             let height = region.bbox.height / lines.len().max(1) as f64;
@@ -1840,7 +1911,7 @@ pub fn finalize_document(
         &candidate.raw_pages,
         budget,
         final_owned_upper,
-        candidate.metadata_admitted_upper,
+        candidate.native_owned_upper,
         outcome_bytes,
     )?;
     let mut projected = stages::project(candidate.raw_pages);

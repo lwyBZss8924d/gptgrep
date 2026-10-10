@@ -216,8 +216,8 @@ fn validate_character(
 
 /// Conservative reservation for native character/run/word storage, including
 /// controls and geometryless characters. This is an allocation estimate, not a
-/// measurement of the serialized page. Keep its document and 4x working limits
-/// independent of the exact per-page JSON cap enforced by the bounded writer.
+/// measurement of the serialized page. Keep its active-page 4x working limit
+/// independent of exact retained JSON caps enforced by the bounded writer.
 pub(super) fn character_allocation_bound(count: u32, budget: &ResourceBudget) -> Result<u64> {
     budget.validate()?;
     let bytes = u64::from(count)
@@ -227,16 +227,15 @@ pub(super) fn character_allocation_bound(count: u32, budget: &ResourceBudget) ->
         .checked_mul(4)
         .context("resource_limit: native character working estimate overflow")?;
     ensure!(
-        bytes <= budget.document_metadata_bytes && owned <= budget.owned_working_bytes,
-        "resource_limit: native character allocation admission: count={count}, estimated_metadata_bytes={bytes}, estimated_owned_bytes={owned}, document_limit_bytes={}, owned_limit_bytes={}",
-        budget.document_metadata_bytes,
+        owned <= budget.owned_working_bytes,
+        "resource_limit: native character allocation admission: count={count}, estimated_allocation_bytes={bytes}, estimated_owned_bytes={owned}, owned_limit_bytes={}",
         budget.owned_working_bytes,
     );
     Ok(bytes)
 }
 
-/// extract_sync also charges this reservation against the remaining cumulative
-/// document/working budget before this vector. Per-font bytes have their own
+/// extract_sync also charges this reservation alongside prior retained pages
+/// against the active working budget before this vector. Per-font bytes have their own
 /// pre-allocation getter callback. Tests use the same retention seam.
 pub(super) fn collect_characters(
     count: u32,
