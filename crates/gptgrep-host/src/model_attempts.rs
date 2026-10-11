@@ -28,6 +28,9 @@ pub struct ModelAttempt {
     pub usage: Option<Value>,
     pub elapsed_ms: u128,
     pub server_retry_notifications: usize,
+    /// Opt-in, payload-free tool observations retained on success and failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_ptc: Option<crate::NativePtcReport>,
     pub accounting_complete: bool,
     /// Bounded host codes or sanitized structured protocol errors; never provider text.
     pub error: Option<Value>,
@@ -174,6 +177,10 @@ struct Tracking {
 
 impl ModelAttemptTracker {
     pub fn reserve(accounting: &Accounting, role: &str, config: &HostConfig) -> Result<Self> {
+        anyhow::ensure!(
+            !config.native_ptc || role == "final_reader",
+            "host_native_ptc_requires_final_reader"
+        );
         let attempt = ModelAttempt {
             attempt_id: format!("{role}-1"),
             role: role.into(),
@@ -190,6 +197,9 @@ impl ModelAttemptTracker {
             usage: None,
             elapsed_ms: 0,
             server_retry_notifications: 0,
+            native_ptc: config
+                .native_ptc
+                .then(|| crate::NativePtcReport::empty(config.max_tool_calls)),
             accounting_complete: false,
             error: None,
         };
@@ -301,6 +311,10 @@ impl ModelAttemptObserver {
 
     pub fn retries(&self, count: usize) -> Result<()> {
         self.update(|attempt| attempt.server_retry_notifications = count)
+    }
+
+    pub fn native_ptc(&self, report: crate::NativePtcReport) -> Result<()> {
+        self.update(|attempt| attempt.native_ptc = Some(report))
     }
 
     pub fn process_completed(&self) -> Result<()> {

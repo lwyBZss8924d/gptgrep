@@ -1021,19 +1021,25 @@ mod tests {
                 .contains("resource_limit: bounded writer admission failed"),
             "{error:#}"
         );
-        // Extraction has passed projection and written native text, but has
-        // not admitted or written the complete page metadata artifact.
+        // Projection fits, while complete page metadata refuses by one byte.
+        // Both native page outputs now share pre-write admission.
         let native_text = &baseline.pages[0].native_text;
-        crate::artifact::read_bounded(
-            &prepared.staging_root.join(&native_text.relative_path),
-            native_text.bytes,
-            &native_text.sha256,
-        )?;
+        assert!(
+            !prepared
+                .staging_root
+                .join(&native_text.relative_path)
+                .exists()
+        );
         assert!(
             !prepared
                 .staging_root
                 .join(&baseline.pages[0].metadata_artifact.relative_path)
                 .exists()
+        );
+        crate::rich_tests::assert_only_prepared_and_valid_document_metadata(
+            &prepared,
+            &short_budget,
+            1,
         );
         Ok(())
     }
@@ -1212,8 +1218,8 @@ mod tests {
         short_budget.owned_working_bytes /= 2;
         short_budget.document_staging_bytes = STAGING_BYTES;
         short_budget.page_layout_bytes = wire - 1;
-        // Smaller counting serializations must pass. Native text is also
-        // written before the complete metadata serializer reaches this limit.
+        // Smaller counting serializations must pass before the complete
+        // metadata serializer rejects and before either page output is written.
         super::super::projection_admission(std::slice::from_ref(&metadata.page), &short_budget, 0)?;
         crate::resource::encoded_size(&metadata.page.text_items, wire - 1)?;
         crate::resource::encoded_size(
@@ -1240,19 +1246,22 @@ mod tests {
                 .contains("resource_limit: bounded writer admission failed"),
             "{error:#}"
         );
-        assert_eq!(
-            crate::artifact::read_bounded(
-                &prepared.staging_root.join(&native_text.relative_path),
-                native_text.bytes,
-                &native_text.sha256,
-            )?,
-            text_bytes
+        assert!(
+            !prepared
+                .staging_root
+                .join(&native_text.relative_path)
+                .exists()
         );
         assert!(
             !prepared
                 .staging_root
                 .join(&baseline.pages[0].metadata_artifact.relative_path)
                 .exists()
+        );
+        crate::rich_tests::assert_only_prepared_and_valid_document_metadata(
+            &prepared,
+            &short_budget,
+            1,
         );
         Ok(())
     }

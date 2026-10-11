@@ -1,0 +1,6 @@
+{
+  "schema": "gptgrep.harbor.materialization.v1",
+  "cohort": null,
+  "runtime": null,
+  "judge_contract": null
+}

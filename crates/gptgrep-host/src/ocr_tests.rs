@@ -29,7 +29,7 @@ pub(crate) struct Fixture {
     pub image: Vec<u8>,
 }
 impl Fixture {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         fs::write(
@@ -101,7 +101,7 @@ impl Fixture {
         rebind(&mut task);
         Self { dir, task, image }
     }
-    fn page(&self) -> PreparedPage {
+    pub(crate) fn page(&self) -> PreparedPage {
         PreparedPage::new(self.task.clone(), self.dir.path()).unwrap()
     }
     fn image_args(&self) -> Value {
@@ -601,7 +601,11 @@ async fn runtime_failure_retry_and_closed_stream_keep_denominators() {
             6
         );
         let serialized = serde_json::to_value(typed).unwrap();
-        assert_eq!(serialized.as_object().unwrap().len(), 5);
+        assert_eq!(serialized.as_object().unwrap().len(), 6);
+        assert_eq!(
+            serialized["diagnostics"]["schema_version"],
+            "gptgrep.codex.error-diagnostics.v1"
+        );
         assert_eq!(typed.server_retry_notifications, 0);
         assert!(serde_json::to_vec(typed).unwrap().len() <= 2048);
         for safe in [
@@ -1011,6 +1015,15 @@ async fn runtime_error_known_variants_preserve_only_safe_observations() {
         assert_eq!(typed.http_status_code, status);
         assert_eq!(typed.will_retry, Some(false));
         assert!(typed.usage.is_none());
+        let diagnostic = typed.diagnostics.as_ref().unwrap();
+        assert_eq!(
+            diagnostic["schema_version"],
+            "gptgrep.codex.error-diagnostics.v1"
+        );
+        assert_eq!(diagnostic["native_error_shape_valid"], true);
+        assert_eq!(diagnostic["message"]["bytes"], 7);
+        let serialized = serde_json::to_string(typed).unwrap();
+        assert!(!serialized.contains("private"));
         assert_eq!(budget.quarantined_slots, 1);
     }
 }
@@ -1249,6 +1262,7 @@ for line in sys.stdin:
                     .unwrap(),
                 tool_policy_sha256: crate::OcrRuntimeProfile::tool_policy_sha256().unwrap(),
                 accepted_image_qualification_sha256: accepted.then(|| HASH.into()),
+                native_viewer: None,
             },
             transport: crate::OcrImageTransport::DynamicImages,
         },

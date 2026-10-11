@@ -19,6 +19,7 @@ mod geometry;
 mod image_prepare;
 #[cfg(test)]
 mod image_prepare_tests;
+mod native_crop;
 pub mod native_graphics;
 mod ocr;
 mod ocr_compat;
@@ -40,14 +41,19 @@ pub use geometry::{AffineTransform, BoundingBox, PageGeometry};
 pub use image_prepare::image_preparation_profile_digest;
 pub use liteparse::stages::PageComplexityStats as NativePageComplexity;
 pub use liteparse::types::{Page as NativeLayoutPage, WordBox as NativeWordBox};
+pub use native_crop::{
+    NativeOcrCrop, NativeOcrCropProof, create_native_ocr_crop, validate_native_crop_proof,
+    validate_native_crop_proof_metadata, validate_native_crop_set,
+};
 pub use native_graphics::{
     NATIVE_GRAPHICS_RECIPE, NativePageMetadata, native_graphics_profile_digest,
     native_metadata_working_upper, validate_native_graphics_metadata,
 };
 pub use ocr::{
-    OcrExecutor, OcrImage, OcrImageDelivery, OcrPageResult, OcrProfile, OcrReceipt, OcrRegion,
-    OcrRegionResult, OcrRegionStatus, OcrResultStatus, OcrTask, OcrTaskBudget, ocr_profile_digest,
-    ocr_task_digest, validate_ocr_result, validate_ocr_result_metadata, validate_ocr_task,
+    OcrExecutor, OcrImage, OcrImageDelivery, OcrNativeImageDelivery, OcrNativeImageReference,
+    OcrPageResult, OcrProfile, OcrReceipt, OcrRegion, OcrRegionResult, OcrRegionStatus,
+    OcrResultStatus, OcrTask, OcrTaskBudget, ocr_profile_digest, ocr_task_digest,
+    validate_ocr_result, validate_ocr_result_metadata, validate_ocr_task,
     validate_ocr_task_metadata, validate_rendition, validate_rendition_metadata,
 };
 pub use ocr_compat::{

@@ -16,10 +16,12 @@ pub use enrich_accounting::EnrichCallSummary;
 mod ocr;
 mod ocr_accounting;
 mod ocr_compat;
+mod ocr_native;
 mod ocr_protocol;
 mod ocr_service;
 #[cfg(test)]
 mod ocr_tests;
+pub mod parse_agent_driver;
 mod process_group;
 mod protocol;
 mod transport;
@@ -38,12 +40,15 @@ pub use ocr_accounting::{
 pub use ocr_compat::{
     CompatibilityRuntimeProfile, mode_policy_digest as compatibility_mode_policy_digest,
 };
+pub use ocr_native::{NativeOcrProbeAdmission, NativeOcrQualification, NativeViewerRuntimeProfile};
 pub use ocr_service::{
     ForegroundOcrControl, ForegroundOcrOptions, PreparedForegroundOcr, PreparedOcrTaskCatalog,
     prepare_foreground_ocr, validate_token_env_name,
 };
 mod jev_accounting;
 mod model_attempts;
+mod native_ptc;
+pub use native_ptc::{NativeCommandStatus, NativePtcReport, NativeToolKind, NativeToolObservation};
 mod navigation;
 mod query_plan;
 mod retrieval;
@@ -99,6 +104,12 @@ pub struct HostConfig {
     /// Optional canonical existing state directory with an existing logs child.
     /// Authentication and profile selection continue to use codex_home.
     pub codex_state_dir: Option<PathBuf>,
+    /// Explicit existing named permission profile. Legacy read-only mode is used
+    /// when omitted; a selected profile must be acknowledged before a turn.
+    pub permission_profile: Option<String>,
+    /// Opt in to native shell/exec and view_image for the final retrieval reader.
+    /// Requires a named permission profile; native budgets are observed after execution may start.
+    pub native_ptc: bool,
     pub model: String,
     pub reasoning_effort: String,
     pub service_tier: String,
@@ -125,6 +136,8 @@ impl Default for HostConfig {
                     PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".codex")
                 }),
             codex_state_dir: None,
+            permission_profile: None,
+            native_ptc: false,
             model: DEFAULT_MODEL.into(),
             reasoning_effort: DEFAULT_REASONING_EFFORT.into(),
             service_tier: DEFAULT_SERVICE_TIER.into(),
@@ -446,6 +459,7 @@ fn planner_runtime_config(config: &HostConfig, query_config: &QueryPlanConfig) -
     let mut planner = config.clone();
     planner.navigation = None;
     planner.source_continuation = false;
+    planner.native_ptc = false;
     planner.model = query_config.planner_model.clone();
     planner.service_tier = DEFAULT_SERVICE_TIER.into();
     planner.max_input_bytes = config.max_input_bytes.min(query_plan::MAX_PLAN_INPUT_BYTES);
@@ -473,6 +487,7 @@ async fn run_process_until(
         tokio::time::Instant::now() < deadline,
         "host_deadline_exceeded"
     );
+    let native_ptc = workflow.native_ptc_enabled(config)?;
     let transport = transport::TransportBudget::new(protocol::MAX_TOTAL_BYTES);
     let trace = trace::Trace::open(config.trace_path.as_deref())?;
     let home = config
@@ -494,6 +509,25 @@ async fn run_process_until(
         &home,
         config.codex_state_dir.as_deref(),
     )?;
+    if native_ptc {
+        for override_value in native_ptc::STARTUP_OVERRIDES {
+            command.arg("-c").arg(override_value);
+        }
+    }
+    if let Some(profile) = &config.permission_profile {
+        command
+            .arg("-c")
+            .arg(format!(
+                "default_permissions={}",
+                serde_json::to_string(profile)?
+            ))
+            .arg("-c")
+            .arg("cli_auth_credentials_store=\"file\"")
+            .arg("-c")
+            .arg("forced_login_method=\"chatgpt\"")
+            .arg("-c")
+            .arg("model_provider=\"openai\"");
+    }
     ensure!(
         tokio::time::Instant::now() < deadline,
         "host_deadline_exceeded"
@@ -703,7 +737,17 @@ fn process_command(
 }
 
 fn validate_config(config: &HostConfig, question: &str) -> Result<()> {
+    native_ptc::enabled(config, false)?;
     native_state_paths(config.codex_state_dir.as_deref())?;
+    if let Some(profile) = &config.permission_profile {
+        ensure!(
+            !profile.is_empty()
+                && profile.len() <= 128
+                && profile.bytes().all(|byte| byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'_' | b'-' | b':' | b'.')),
+            "Invalid Codex permission profile"
+        );
+    }
     ensure!(
         !question.trim().is_empty() && question.len() <= 8192,
         "Question must contain 1..8192 bytes"

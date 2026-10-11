@@ -1280,21 +1280,6 @@ pub(crate) fn extract_sync(
                 "native_content_bounds_semantics".into(),
                 FeatureState::Present(crate::native_graphics::CONTENT_BOUNDS_SEMANTICS.into()),
             );
-            let name = format!("{}-p{number}-native.txt", prepared.summary.source_sha256);
-            admit_staging(&mut staged, text.len() as u64, &budget)?;
-            let native_text = write_bytes(
-                &prepared.staging_root,
-                &name,
-                ArtifactBinding {
-                    source: &prepared.summary.source_sha256,
-                    profile: &native_profile_sha256,
-                    kind: ArtifactKind::NativeText,
-                    page: Some(number),
-                },
-                text.as_bytes(),
-                "text/plain; charset=utf-8",
-                budget.page_layout_bytes,
-            )?;
             // Bind the original source-only classifier inputs/output and frame
             // in retained metadata. Admit the added held/serialized copy before
             // cloning complexity/geometry or constructing the metadata DTO.
@@ -1325,7 +1310,27 @@ pub(crate) fn extract_sync(
             };
             let metadata_size = encoded_size(&metadata, budget.page_layout_bytes)?;
             admission.admit_metadata(metadata_size, &budget)?;
-            admit_staging(&mut staged, metadata_size, &budget)?;
+            // Admit the complete native page pair before either output exists.
+            // A later document metadata refusal retains the independently
+            // admitted document snapshot, without a partial page text artifact.
+            let page_staging = metadata_size
+                .checked_add(text.len() as u64)
+                .context("resource_limit: native page staging overflow")?;
+            admit_staging(&mut staged, page_staging, &budget)?;
+            let name = format!("{}-p{number}-native.txt", prepared.summary.source_sha256);
+            let native_text = write_bytes(
+                &prepared.staging_root,
+                &name,
+                ArtifactBinding {
+                    source: &prepared.summary.source_sha256,
+                    profile: &native_profile_sha256,
+                    kind: ArtifactKind::NativeText,
+                    page: Some(number),
+                },
+                text.as_bytes(),
+                "text/plain; charset=utf-8",
+                budget.page_layout_bytes,
+            )?;
             let metadata_artifact = write_json(
                 &prepared.staging_root,
                 &format!("{}-p{number}-native.json", prepared.summary.source_sha256),

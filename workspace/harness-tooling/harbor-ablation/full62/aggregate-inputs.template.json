@@ -1,0 +1,6 @@
+{
+  "schema": "gptgrep.harbor.aggregate-inputs.v1",
+  "export": null,
+  "results": [],
+  "template_note": "Remove this note when materializing. Supply exactly 124 unique task_name records, each with answer, judgment, operation and grounding FilePins or explicit null. Missing outputs are retained; missing or duplicate binding records are rejected."
+}

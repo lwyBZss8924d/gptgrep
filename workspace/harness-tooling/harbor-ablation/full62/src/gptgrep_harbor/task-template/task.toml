@@ -1,0 +1,29 @@
+schema_version = "1.4"
+artifacts = ["/answer/answer.json"]
+
+[task]
+name = "gptgrep-private/{task_name}"
+version = "0.1.0"
+
+[metadata]
+benchmark = "private-full62-paired"
+historical_development_cohort = true
+
+[agent]
+timeout_sec = {reader_timeout}
+
+[environment]
+cpus = {cpus}
+memory_mb = {memory_mb}
+storage_mb = {storage_mb}
+network_mode = "public"
+
+[verifier]
+timeout_sec = {judge_timeout}
+environment_mode = "separate"
+
+[verifier.environment]
+cpus = {cpus}
+memory_mb = {memory_mb}
+storage_mb = {storage_mb}
+network_mode = "public"

@@ -36,6 +36,10 @@ struct Evidence {
     signature: Option<&'static str>,
     http_status_code: Option<u16>,
     conflicting: bool,
+    /// Whitelisted parameter words observed in a structured request error.
+    /// These are diagnostic hints, not a cause classification or provider text.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    request_subject_hints: Vec<&'static str>,
 }
 
 pub(super) fn project(error: &Value, info: Option<CodexErrorInfo>, valid: bool) -> Option<Value> {
@@ -54,6 +58,7 @@ pub(super) fn project(error: &Value, info: Option<CodexErrorInfo>, valid: bool) 
                 signature: None,
                 http_status_code: None,
                 conflicting: false,
+                request_subject_hints: Vec::new(),
             });
         }
     }
@@ -120,6 +125,14 @@ fn inspect(text: &str, source: &'static str) -> Option<Evidence> {
             signature: signature.map(|(name, _)| name),
             http_status_code: status,
             conflicting,
+            request_subject_hints: if error_type == Some("invalid_request_error") {
+                body["message"]
+                    .as_str()
+                    .map(request_subject_hints)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            },
         });
     }
     let (signature, classification) = message_signature(text)?;
@@ -133,7 +146,51 @@ fn inspect(text: &str, source: &'static str) -> Option<Evidence> {
         signature: Some(signature),
         http_status_code: None,
         conflicting: false,
+        request_subject_hints: Vec::new(),
     })
+}
+
+fn request_subject_hints(text: &str) -> Vec<&'static str> {
+    if text.len() > FIELD_LIMIT {
+        return Vec::new();
+    }
+    const NAMES: &[&str] = &[
+        "model",
+        "reasoning",
+        "effort",
+        "summary",
+        "service_tier",
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+        "output_schema",
+        "response_format",
+        "text",
+        "format",
+        "input",
+        "content",
+        "instructions",
+        "include",
+        "store",
+        "stream",
+        "max_output_tokens",
+        "temperature",
+        "top_p",
+        "previous_response_id",
+        "truncation",
+        "context_management",
+        "namespace",
+        "function",
+        "image",
+    ];
+    NAMES
+        .iter()
+        .copied()
+        .filter(|name| {
+            text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .any(|word| word.eq_ignore_ascii_case(name))
+        })
+        .collect()
 }
 
 /// Recognize a complete JSON error or a bounded native HTTP error wrapper.
@@ -430,6 +487,21 @@ fn merge(classes: impl IntoIterator<Item = Class>) -> (Class, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_subject_hints_are_closed_deduplicated_and_do_not_classify_cause() {
+        let message = json!({"type":"invalid_request_error",
+            "message":"Unrecognized request mentioning MODEL, model and parallel_tool_calls; private-value", "param":null,"code":null}).to_string();
+        let result = diagnostic(json!(message), Value::Null);
+        assert_eq!(result["classification"], "request");
+        assert_eq!(
+            result["evidence"][0]["request_subject_hints"],
+            json!(["model", "parallel_tool_calls"])
+        );
+        assert!(!result.to_string().contains("private-value"));
+        assert!(request_subject_hints(&"model ".repeat(FIELD_LIMIT)).is_empty());
+        assert!(request_subject_hints("model_secret image_private unknown_field").is_empty());
+    }
 
     fn diagnostic(message: Value, details: Value) -> Value {
         project(

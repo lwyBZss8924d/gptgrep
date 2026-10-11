@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gptgrep-harbor-full62"
+version = "0.1.0"
+description = "Private runtime-loaded paired GPTgrep and bare Codex Harbor adapter"
+requires-python = ">=3.12"
+dependencies = ["harbor==0.24.0"]
+
+[project.scripts]
+gptgrep-harbor-full62 = "gptgrep_harbor.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gptgrep_harbor"]

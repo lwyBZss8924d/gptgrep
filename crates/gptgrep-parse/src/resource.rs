@@ -57,7 +57,9 @@ impl Default for ResourceBudget {
 }
 
 impl ResourceBudget {
-    pub(crate) fn ensure_same_invocation_within(&self, admitted: &Self) -> Result<()> {
+    /// Verify shared staging custody and limits before transferring a product
+    /// to another component of the same invocation.
+    pub fn ensure_same_invocation_within(&self, admitted: &Self) -> Result<()> {
         self.validate()?;
         ensure!(
             Arc::ptr_eq(&self.staging_used, &admitted.staging_used),

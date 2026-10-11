@@ -286,8 +286,8 @@ impl ForegroundOcrControl {
                 .transpose()?,
             prepared_root: prepared,
             raw_results_dir: resolve(&base, &control.raw_results_dir)?,
+            transport: runtime.transport(),
             runtime_profile: runtime,
-            transport: crate::OcrImageTransport::DynamicImages,
         };
         prepare_foreground_ocr(
             ForegroundOcrOptions {

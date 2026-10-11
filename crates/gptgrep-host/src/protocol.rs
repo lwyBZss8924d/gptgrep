@@ -117,8 +117,27 @@ pub(crate) fn base_config() -> Value {
     Value::Object(values)
 }
 
-/// Startup overrides contain only primitive values and empty arrays, never profile contents.
+/// Startup overrides contain primitives, string arrays, or a string-valued
+/// table for finite filesystem permissions. Keep quoted path keys in the TOML
+/// value: the Codex override key parser does not parse TOML quoted-key syntax.
 pub(crate) fn toml_override(value: &Value) -> Result<String> {
+    if let Value::Object(entries) = value {
+        ensure!(
+            entries.values().all(Value::is_string),
+            "Unsupported startup override table"
+        );
+        let entries = entries
+            .iter()
+            .map(|(key, value)| {
+                Ok(format!(
+                    "{} = {}",
+                    serde_json::to_string(key)?,
+                    serde_json::to_string(value)?
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(format!("{{ {} }}", entries.join(", ")));
+    }
     ensure!(
         matches!(value, Value::Bool(_) | Value::Number(_) | Value::String(_))
             || value
@@ -176,6 +195,10 @@ pub(crate) enum Workflow<'a> {
 }
 
 impl Workflow<'_> {
+    pub(crate) fn native_ptc_enabled(&self, config: &HostConfig) -> Result<bool> {
+        crate::native_ptc::enabled(config, matches!(self, Self::Completion { .. }))
+    }
+
     fn rich(&self) -> Option<&crate::rich_text::RichEvidence> {
         match self {
             Self::RichText { evidence, .. } | Self::RichMultimodal { evidence, .. } => {
@@ -258,6 +281,12 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
     deadline: Instant,
 ) -> Result<Outcome> {
     let is_completion = matches!(&workflow, Workflow::Completion { .. });
+    let native_ptc_enabled = workflow.native_ptc_enabled(config)?;
+    let mut native_ptc = if native_ptc_enabled {
+        Some(crate::native_ptc::Tracker::new(config.max_tool_calls)?)
+    } else {
+        None
+    };
     let mut rpc = Rpc {
         reader: BufReader::new(BudgetedReader::new(reader, transport.clone())),
         writer: Arc::new(AsyncMutex::new(writer)),
@@ -291,6 +320,10 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
         .as_object()
         .ok_or_else(|| anyhow!("Codex effective configuration unavailable"))?;
     let mut thread_config = base_config();
+    if native_ptc_enabled {
+        thread_config["features.shell_tool"] = json!(true);
+        thread_config["features.view_image"] = json!(true);
+    }
     let mut disabled = serde_json::Map::new();
     if let Some(servers) = configuration.get("mcp_servers") {
         let servers = servers
@@ -388,20 +421,25 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
         config.source_continuation,
         !is_completion,
     );
-    let thread = rpc
-        .request(
-            3,
-            "thread/start",
-            json!({
-                "model":config.model,"modelProvider":"openai","allowProviderModelFallback":false,"cwd":cwd,
-                "serviceTier":config.service_tier,
-                "approvalPolicy":"never","sandbox":"read-only","ephemeral":true,"environments":[],
-                "runtimeWorkspaceRoots":[],"selectedCapabilityRoots":[],
-                "config":thread_config,"baseInstructions":instructions,
-                "dynamicTools":tools
-            }),
-        )
-        .await?;
+    if native_ptc_enabled {
+        instructions = crate::native_ptc::instructions(instructions);
+    }
+    let mut thread_params = json!({
+        "model":config.model,"modelProvider":"openai","allowProviderModelFallback":false,"cwd":cwd,
+        "serviceTier":config.service_tier,
+        "approvalPolicy":"never","sandbox":"read-only","ephemeral":true,"environments":[],
+        "runtimeWorkspaceRoots":[],"selectedCapabilityRoots":[],
+        "config":thread_config,"baseInstructions":instructions,
+        "dynamicTools":tools
+    });
+    if let Some(profile) = &config.permission_profile {
+        thread_params
+            .as_object_mut()
+            .expect("thread parameters")
+            .remove("sandbox");
+        thread_params["permissions"] = json!(profile);
+    }
+    let thread = rpc.request(3, "thread/start", thread_params).await?;
     let thread_id = identifier(&thread["thread"]["id"])?;
     let model = identifier(&thread["model"])?;
     let provider = identifier(&thread["modelProvider"])?;
@@ -414,10 +452,32 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
         thread["approvalPolicy"] == "never",
         "Codex did not accept the required approval policy"
     );
-    ensure!(
-        thread["sandbox"]["type"] == "readOnly" && thread["sandbox"]["networkAccess"] == false,
-        "Codex did not accept the required read-only sandbox"
-    );
+    if let Some(profile) = &config.permission_profile {
+        // Profile provenance plus the compatibility envelope is not proof of
+        // granular filesystem enforcement. Named profiles with finite writes
+        // can project to workspaceWrite without any broad legacy writable root.
+        ensure!(
+            thread["activePermissionProfile"]["id"].as_str() == Some(profile.as_str()),
+            "Codex did not acknowledge the requested permission profile"
+        );
+        let sandbox = &thread["sandbox"];
+        let finite_named_projection = sandbox["type"] == "workspaceWrite"
+            && sandbox["writableRoots"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+            && sandbox["excludeTmpdirEnvVar"] == true
+            && sandbox["excludeSlashTmp"] == true;
+        ensure!(
+            sandbox["networkAccess"] == false
+                && (sandbox["type"] == "readOnly" || finite_named_projection),
+            "Codex did not accept the required named permission sandbox envelope"
+        );
+    } else {
+        ensure!(
+            thread["sandbox"]["type"] == "readOnly" && thread["sandbox"]["networkAccess"] == false,
+            "Codex did not accept the required read-only sandbox"
+        );
+    }
     let effort = thread["reasoningEffort"].as_str().map(str::to_owned);
     if let Some(ref value) = effort {
         ensure!(
@@ -458,7 +518,11 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
                 })?;
         }
     }
-    let mut warnings=vec!["Codex has no public dynamic-tools-only allowlist. Configurable integrations and environment access are disabled; any unexpected server request is denied.".into()];
+    let mut warnings = if native_ptc_enabled {
+        vec![crate::native_ptc::WARNING.into()]
+    } else {
+        vec!["Codex has no public dynamic-tools-only allowlist. Configurable integrations and environment access are disabled; any unexpected server request is denied.".into()]
+    };
     if effort.is_none() {
         warnings.push("Codex did not report effective thread reasoning effort; the requested effort is explicitly sent on turn/start.".into());
     }
@@ -470,13 +534,21 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
     if let Some(evidence) = workflow.rich() {
         evidence.validate()?;
     }
-    rpc.send(json!({"id":4,"method":"turn/start","params":{
+    let mut turn_params = json!({
         "threadId":thread_id,"model":config.model,"effort":config.reasoning_effort,
         "serviceTier":config.service_tier,
         "approvalPolicy":"never","sandboxPolicy":{"type":"readOnly","networkAccess":false},
         "input":[{"type":"text","text":prompt.to_string(),"text_elements":[]}],"outputSchema":schema
-    }}))
-    .await?;
+    });
+    if let Some(profile) = &config.permission_profile {
+        turn_params
+            .as_object_mut()
+            .expect("turn parameters")
+            .remove("sandboxPolicy");
+        turn_params["permissions"] = json!(profile);
+    }
+    rpc.send(json!({"id":4,"method":"turn/start","params":turn_params}))
+        .await?;
     if let Some(evidence) = workflow.rich() {
         evidence.validate()?;
     }
@@ -514,6 +586,25 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
             );
             bind_turn(&mut turn_id, &params["turnId"])?;
             observe_turn(options.observer, &turn_id)?;
+            if let Some(native) = native_ptc.as_mut() {
+                let allowed = params["tool"].as_str().is_some_and(|tool| {
+                    if workflow.rich().is_some() {
+                        crate::rich_text::allowed(tool)
+                    } else {
+                        retrieval::allowed(tool)
+                    }
+                });
+                ensure!(
+                    params["namespace"] == "gptgrep" && allowed,
+                    "host_native_ptc_dynamic_tool_not_allowed"
+                );
+                let charged = native.charge_dynamic(&params["callId"]);
+                native.publish(options.observer)?;
+                if let Err(error) = charged {
+                    rpc.deny(id.clone()).await?;
+                    return Err(error);
+                }
+            }
             if let Some(evidence) = workflow.rich_mut() {
                 let handle = evidence
                     .delivery
@@ -688,6 +779,20 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
                 observe_turn(options.observer, &turn_id)?;
                 let item = &message["params"]["item"];
                 let kind = item["type"].as_str().unwrap_or("");
+                if let Some(native) = native_ptc.as_mut() {
+                    if crate::native_ptc::NativeToolKind::parse(item).is_some() {
+                        let event = if method == Some("item/started") {
+                            crate::native_ptc::ItemEvent::Started
+                        } else {
+                            crate::native_ptc::ItemEvent::Completed
+                        };
+                        let observed = native.observe(item, event);
+                        native.publish(options.observer)?;
+                        observed?;
+                        continue;
+                    }
+                    native.check_non_native(item)?;
+                }
                 validate_workflow_item(item, workflow.rich().is_some())?;
                 ensure!(
                     !(is_completion && kind == "dynamicToolCall"),
@@ -731,24 +836,45 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
                 {
                     return Err(failure(HostProtocolErrorKind::IdentityMismatch).into());
                 }
-                observe_turn(options.observer, &turn_id)?;
-                match turn["status"].as_str() {
-                    Some("completed") if turn["error"].is_null() => {}
+                let terminal_failure = match turn["status"].as_str() {
+                    Some("completed") if turn["error"].is_null() => None,
                     Some("failed") => {
                         let kind = if turn["error"].is_null() || parsed.valid {
                             HostProtocolErrorKind::FailedTurn
                         } else {
                             HostProtocolErrorKind::MalformedError
                         };
-                        return Err(failure(kind).into());
+                        Some(failure(kind))
                     }
-                    Some("interrupted") => {
-                        return Err(failure(HostProtocolErrorKind::InterruptedTurn).into());
+                    Some("interrupted") => Some(failure(HostProtocolErrorKind::InterruptedTurn)),
+                    _ => Some(failure(HostProtocolErrorKind::InvalidTurnStatus)),
+                };
+                if let Some(primary) = terminal_failure {
+                    // This trusted terminal frame may be the only observation
+                    // of native items. Preserve its primary error even when
+                    // snapshot projection or observer persistence fails.
+                    if let Some(native) = native_ptc.as_mut() {
+                        let _ = observe_turn(options.observer, &turn_id);
+                        native.observe_failure_snapshot(&turn["items"]);
+                        let _ = native.publish(options.observer);
+                    } else {
+                        observe_turn(options.observer, &turn_id)?;
                     }
-                    _ => return Err(failure(HostProtocolErrorKind::InvalidTurnStatus).into()),
+                    return Err(primary.into());
                 }
+                observe_turn(options.observer, &turn_id)?;
                 if let Some(items) = turn["items"].as_array() {
                     for item in items {
+                        if let Some(native) = native_ptc.as_mut() {
+                            if crate::native_ptc::NativeToolKind::parse(item).is_some() {
+                                let observed = native
+                                    .observe(item, crate::native_ptc::ItemEvent::FinalSnapshot);
+                                native.publish(options.observer)?;
+                                observed?;
+                                continue;
+                            }
+                            native.check_non_native(item)?;
+                        }
                         validate_workflow_item(item, workflow.rich().is_some())?;
                         ensure!(
                             !(is_completion && item["type"] == "dynamicToolCall"),
@@ -762,6 +888,11 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
                             answer = Some(text.to_owned());
                         }
                     }
+                }
+                if let Some(native) = native_ptc.as_mut() {
+                    let completed = native.finish();
+                    native.publish(options.observer)?;
+                    completed?;
                 }
                 break;
             }
@@ -1170,3 +1301,11 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Rpc<R, W> {
 
 #[cfg(test)]
 mod transport_tests;
+
+#[cfg(test)]
+#[path = "protocol_permissions_tests.rs"]
+mod permissions_tests;
+
+#[cfg(test)]
+#[path = "native_ptc_tests.rs"]
+mod native_ptc_tests;

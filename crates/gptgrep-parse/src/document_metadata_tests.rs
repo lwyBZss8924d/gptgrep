@@ -177,7 +177,19 @@ async fn native_metadata_refuses_oversized_values_invalid_destinations_and_docum
             .is_err(),
             "case {case}"
         );
-        assert_eq!(budget.staging_used(), prepared.summary().prepared_bytes);
+        if case == "budget" {
+            // The valid document snapshot is independently retained before
+            // subsequent page metadata exceeds the document-wide allowance.
+            crate::rich_tests::assert_only_prepared_and_valid_document_metadata(
+                &prepared, &budget, 2,
+            );
+            continue;
+        }
+        assert_eq!(
+            budget.staging_used(),
+            prepared.summary().prepared_bytes,
+            "case {case}"
+        );
         assert!(
             !std::fs::read_dir(prepared.staging_root())
                 .unwrap()

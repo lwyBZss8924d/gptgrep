@@ -11,6 +11,19 @@ Local Codex workflows default to `gpt-6-luna`, reasoning effort `max`, and servi
 tier `fast`. Account selection belongs to the caller's private runtime environment;
 workstation-specific account aliases and routing are not part of the public product.
 
+The final retrieval reader may explicitly opt into native PTC with
+`gptgrep ask --native-ptc --codex-permissions PROFILE`, where PROFILE is an
+existing named permission profile acknowledged by the runtime. The default is
+off; pure completion and query planners cannot enable it. This option allows
+generic native shell/exec, Python/Pillow and image viewing within that profile,
+while web, MCP, Code Mode and permission overrides remain prohibited. Observed
+native command/image items and GPTgrep dynamic calls share `max_tool_calls`.
+App-server item notifications may arrive after execution starts, so native
+accounting is not a pre-execution guard or a hard execution limit. Native
+output grants no citation authority: answers still require GPTgrep-delivered
+source windows or successful read/render issued IDs. Source preparation or
+compilation does not establish native runtime enforcement.
+
 ## User contract
 
 - Index an explicit document directory, preserving exact source hashes and page/line

@@ -124,6 +124,7 @@ pub fn validate_compatibility_result(
         receipt.model == task.profile.model
             && receipt.profile_sha256 == crate::ocr_profile_digest(&task.profile)?
             && receipt.image_deliveries.len() == 1
+            && receipt.image_deliveries[0].native.is_none()
             && receipt.image_deliveries[0].artifact_id == task.image.artifact.id
             && receipt.image_deliveries[0].artifact_sha256 == task.image.artifact.sha256
             && receipt.image_deliveries[0].mime == task.image.artifact.mime
@@ -213,6 +214,7 @@ mod tests {
                     width: 2,
                     height: 3,
                     tool_response_sha256: HASH.into(),
+                    native: None,
                 }],
             },
         }

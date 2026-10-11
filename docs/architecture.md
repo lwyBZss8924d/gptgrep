@@ -53,12 +53,26 @@ The host profile defaults are `model = "gpt-6-luna"` and
 helper settings; they do not change the development agent's model. Runtime
 `CODEX_HOME` selects an existing Codex configuration and authentication directory. The program does not read/copy auth
 files, change global profiles, or perform an interactive login.
+Native OCR and document-agent children explicitly select Codex-managed ChatGPT
+authentication and the file credential store in this account home. The authorized
+device login cache is reused while per-run state, logs and temporary files remain
+separate. The selected Codex runtime owns token renewal. Named filesystem
+permissions grant source images to model tools and keep the credential home
+outside those grants; startup never combines them with legacy sandbox settings.
 An optional `--codex-state-dir` selects a separate existing canonical directory
 for native SQLite state and its existing `logs` child for logs. Authentication
 continues to use `--codex-home`; callers route temporary and protocol trace files separately.
+`--codex-permissions PROFILE` explicitly selects an existing named permission
+profile on both the thread and turn. The host requires its acknowledged profile
+ID before starting a turn and omits legacy sandbox overrides for that selection.
+It requires network access to remain disabled and accepts the native read-only
+projection or a workspace-write projection with no legacy writable roots and both
+temporary-directory exclusions enabled. The acknowledgment and projection checks
+identify the selected policy; actual filesystem denials require runtime verification.
 
 Active-turn failures retain `host_protocol.diagnostics` (also available inside a
 model-attempt protocol error) and matching private-trace `error_diagnostics`.
+OCR runtime errors retain the same closed projection in `diagnostics`.
 `gptgrep.codex.error-diagnostics.v1` distinguishes typed native variants, fixed
 allowlisted error codes/types/parameter families from structured provider errors,
 and explicitly labelled anchored message signatures. It can identify tool
@@ -77,10 +91,38 @@ fixed anchored error signatures. An HTTP envelope permits an empty suffix or
 optionally followed by `, request id: ` and a 1–128-character ASCII identifier
 containing only letters, digits, underscores or hyphens. Quotes, backslashes,
 JSON braces and angle brackets are rejected in the URL; any other suffix or
-second JSON value leaves the error unknown. It performs no arbitrary substring JSON or
-keyword search. Native retry handling, the original deadline, tool limits and
+second JSON value leaves the error unknown. Cause classification performs no
+arbitrary substring JSON or keyword search. Structured `invalid_request_error`
+messages may also report deduplicated words from a fixed API parameter allowlist
+as `request_subject_hints`; these hints do not establish the cause and never
+retain arbitrary words. Native retry handling, the original deadline, tool limits and
 unknown usage accounting are unchanged. These diagnostics cannot recover the
 cause of an earlier run whose error content was already discarded.
+
+## Prepared-document agent
+
+`gptgrep-core::parse_agent` owns one invocation's registered source pins,
+opaque document/artifact/task handles, complete native extraction and shared
+parser budget. Its foreground NDJSON facade supports complete paginated
+inventories and bounded windows. Closing a handle invalidates its crop custody
+even when reopening identical source bytes produces the same content-bound task
+digest. JSON cannot provide paid OCR results or admit new source paths.
+
+`gptgrep-host::parse_agent_driver` coordinates a selected standalone Codex
+app-server document turn over that typed backend. The document limit is 64
+tools, one turn and 900 seconds. Required page OCR uses separate qualified page
+children, each retaining eight tools, one turn and 180 seconds. Metadata and
+parser completeness cover every original page; observed model inspection remains
+separate and may be partial.
+
+The CLI exposes `parse-agent serve`, `run`, `agent` and `qualify`. Explicit
+parse-agent index controls pin one document control for every selected supported
+source. The generation writer consumes verified owned products without reparsing,
+shares the original parser/OCR context, rechecks source pins and inventory, and
+publishes only after complete admission. The portable native-viewer derivative
+and its upstream license are under [patches/codex-native-viewer](../patches/codex-native-viewer/README.md).
+Its native Page and Document qualifications remain independent of the existing
+mediated DynamicImages transport and of compilation.
 
 ## Ingestion and snapshot consistency
 
@@ -201,6 +243,36 @@ Jev coverage and usage alongside Codex usage, and the overall deadline includes
 initial retrieval. Empty or stale scopes do not establish successful reranking.
 Summary and retrieval use actual source evidence; model-produced citations must
 resolve to evidence issued during that run and remain fresh at completion.
+
+`HostConfig.native_ptc` (default false) and the Ask-only `--native-ptc` flag
+enable generic native shell/exec, Python/Pillow and `view_image` for the final
+retrieval reader. A selected existing `permission_profile` is required before
+startup; the current profile acknowledgment, approval-never and network-disabled
+envelope checks are unchanged. Only shell and image-view feature flags are
+enabled. MCP, web, Code Mode/code_mode_host and other integrations stay disabled;
+the reader must not request additional permissions, install tools or start
+services. Query planners clear the flag, and pure completion rejects it before
+starting a process or sending RPC.
+
+`native_ptc::Tracker` observes only `commandExecution` and `imageView` items
+after thread/turn binding and finite ID/status validation. Started/completed and
+the final snapshot of one ID count once; replays, changed kinds and inconsistent
+terminal statuses fail. These observations and validated direct GPTgrep request
+IDs share the original `max_tool_calls`. An over-budget dynamic call is denied
+before dispatch. The first observed native excess is retained and stops the host,
+but item notifications may follow execution startup. This is observation-based
+accounting, not pre-execution admission or a hard execution limit; it makes no
+claim about the runtime's native guard or OS process completion.
+
+Existing model-attempt reports retain `native_ptc` only when selected, including
+on failure: combined/native/dynamic counts, finite lifecycle/status fields and
+SHA-256 item identifiers, with at most `max_tool_calls + 1` native entries.
+Commands, outputs, image paths, cwd, process IDs and raw item payloads are absent
+from this metadata. Existing GPTgrep tool receipts keep their original meaning.
+Shell output and processed images do not mint citations; only actual GPTgrep
+source delivery and the original successful read/render issued IDs authorize
+the unchanged text/visual citation checks. The independent Page/Document
+parse-agent guards and runtime-profile contracts are outside this option.
 
 Authentication, source retrieval, inference, citation validation and task
 acceptance are separate outcomes. A successful child process is insufficient.

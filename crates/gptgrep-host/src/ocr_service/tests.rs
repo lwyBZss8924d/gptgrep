@@ -644,6 +644,7 @@ async fn compatibility_mode_uses_real_mediated_image_and_binds_language_schema_r
             transport: crate::ocr_protocol::TransportBudget::new(16_777_216),
         },
         Some(task.clone()),
+        None,
     )
     .await
     .unwrap();

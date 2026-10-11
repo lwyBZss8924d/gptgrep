@@ -74,6 +74,7 @@ fn offline_ocr(task: &OcrTask) -> Result<OcrPageResult> {
                     width: image.width,
                     height: image.height,
                     tool_response_sha256: "4".repeat(64),
+                    native: None,
                 })
                 .collect(),
             usage: None,

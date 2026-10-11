@@ -1,6 +1,9 @@
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use gptgrep_core::SearchOptions;
+
+mod parse_agent;
+mod parse_agent_index;
 use serde_json::{Value, json};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -128,6 +131,11 @@ struct HostArgs {
         help = "Canonical existing native state directory with an existing logs child; account home stays unchanged"
     )]
     codex_state_dir: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Existing named Codex permission profile; selected on thread and turn without legacy sandbox overrides"
+    )]
+    codex_permissions: Option<String>,
     #[arg(long, default_value = "gpt-6-luna")]
     model: String,
     #[arg(long, default_value = "max")]
@@ -163,6 +171,8 @@ impl HostArgs {
                 .codex_home
                 .unwrap_or_else(|| gptgrep_host::HostConfig::default().codex_home),
             codex_state_dir: self.codex_state_dir,
+            permission_profile: self.codex_permissions,
+            native_ptc: false,
             model: self.model,
             jev_model: None,
             decisions_execution: None,
@@ -333,6 +343,64 @@ enum OcrCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum ParseAgentCommand {
+    /// Bounded foreground NDJSON toolbox for an external Codex/PTC agent.
+    Serve {
+        #[arg(long, value_name = "FILE")]
+        config: PathBuf,
+        #[arg(long, value_name = "SHA256")]
+        expected_control_sha256: String,
+    },
+    /// Complete deterministic parsing with optional qualified per-page OCR.
+    Run {
+        #[arg(long, value_name = "FILE")]
+        config: PathBuf,
+        #[arg(long, value_name = "SHA256")]
+        expected_control_sha256: String,
+        #[arg(long, value_name = "ALIAS")]
+        source: String,
+        #[arg(long, value_enum, default_value = "off")]
+        mode: IndexOcr,
+        #[arg(long, value_name = "FILE")]
+        output: PathBuf,
+    },
+    /// Launch one explicitly admitted Codex document turn over a prepared source.
+    Agent {
+        #[arg(long, value_name = "FILE")]
+        config: PathBuf,
+        #[arg(long, value_name = "SHA256")]
+        expected_control_sha256: String,
+        #[arg(long, value_name = "FILE")]
+        document_agent_control: PathBuf,
+        #[arg(long, value_name = "SHA256")]
+        expected_document_agent_control_sha256: String,
+        #[arg(long, value_name = "ALIAS")]
+        source: String,
+        #[arg(long, value_name = "FILE")]
+        output: PathBuf,
+    },
+    /// Produce private native-document qualification evidence, never publication.
+    Qualify {
+        #[arg(long, value_name = "FILE")]
+        config: PathBuf,
+        #[arg(long, value_name = "SHA256")]
+        expected_control_sha256: String,
+        #[arg(long, value_name = "FILE")]
+        document_agent_control: PathBuf,
+        #[arg(long, value_name = "SHA256")]
+        expected_document_agent_control_sha256: String,
+        #[arg(long, value_name = "ALIAS")]
+        source: String,
+        #[arg(long, value_name = "FILE")]
+        qualification_request: PathBuf,
+        #[arg(long, value_name = "SHA256")]
+        expected_qualification_request_sha256: String,
+        #[arg(long, value_name = "PRIVATE_FILE")]
+        evidence_output: PathBuf,
+    },
+}
+
 #[derive(Debug)]
 struct OcrServeError(&'static str);
 impl std::fmt::Display for OcrServeError {
@@ -344,6 +412,11 @@ impl std::error::Error for OcrServeError {}
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// In-package document toolbox and explicit parse/OCR orchestration.
+    ParseAgent {
+        #[command(subcommand)]
+        command: ParseAgentCommand,
+    },
     /// Explicit foreground OCR; ordinary search never starts it.
     Ocr {
         #[command(subcommand)]
@@ -392,6 +465,21 @@ enum Command {
             help = "Apply PageIndex scan-cost merging to native paginated documents"
         )]
         optimize_merge: bool,
+        #[arg(long, value_name = "FILE", requires_all = ["expected_parse_agent_config_sha256", "document_agent_controls", "expected_document_agent_controls_sha256"],
+            conflicts_with_all = ["optimize_merge", "rich", "ocr", "plan_only", "resume", "ocr_run_id", "ocr_runtime_profile", "ocr_codex_bin", "ocr_codex_home", "ocr_codex_state_dir", "ocr_max_pages", "ocr_timeout_seconds", "page_window", "expected_plan_sha256"],
+            help = "Use one exact prepared-document invocation for complete typed v2 indexing")]
+        parse_agent_config: Option<PathBuf>,
+        #[arg(long, value_name = "SHA256", requires = "parse_agent_config")]
+        expected_parse_agent_config_sha256: Option<String>,
+        #[arg(
+            long,
+            value_name = "FILE",
+            requires = "parse_agent_config",
+            help = "Closed pinned registry selecting one independently admitted document control per source alias"
+        )]
+        document_agent_controls: Option<PathBuf>,
+        #[arg(long, value_name = "SHA256", requires = "parse_agent_config")]
+        expected_document_agent_controls_sha256: Option<String>,
         #[command(flatten)]
         rich: RichIndexArgs,
     },
@@ -535,6 +623,12 @@ enum Command {
     /// Run a bounded local Codex retrieval workflow and validate returned citations.
     Ask {
         question: String,
+        #[arg(
+            long,
+            requires = "codex_permissions",
+            help = "Opt in to native shell/Python/Pillow/view_image for the final reader; shares the observed tool budget and requires an existing named permission profile"
+        )]
+        native_ptc: bool,
         #[arg(default_value = ".")]
         root: PathBuf,
         #[arg(
@@ -583,7 +677,7 @@ enum Command {
         #[arg(long, requires = "multimodal")]
         min_score: Option<f64>,
         #[command(flatten)]
-        host: HostArgs,
+        host: Box<HostArgs>,
     },
     /// Summarize one verified node through the local Codex host.
     Summarize {
@@ -640,7 +734,7 @@ fn contract() -> Value {
             "status":{"usage":"gptgrep status ROOT --json","scope":"existing indexed files; index discovers new files"},
             "parse":{"usage":"gptgrep parse FILE --json","effect":"local parser"},
             "judge":{"usage":"gptgrep judge --input FILE [--model MODEL] --json","input":{"state":"JSON","questions":"Choice/Noul/Score map"},"effect":"explicit remote Decisions call"},
-            "ask":{"usage":"gptgrep ask QUESTION ROOT [--codex-home HOME] [--codex-bin codex] [--experimental-query-plan] [--planner-model MODEL] [--navigation-overlay-sha256 SHA --navigation-max-jev-calls N --navigation-max-request-bytes BYTES] [--experimental-evidence-roles] --json","effect":"required Jev routing/reranking followed by bounded local Codex reasoning","options":{"jev-model":{"type":"string","default":gptgrep_jev::DEFAULT_MODEL},"document":{"type":"string"},"navigation-overlay-sha256":{"type":"string","requires":["experimental-query-plan","document"],"effect":"require exact completed source-bound overlay and full Jev hint scan before planned retrieval","report_schema":"gptgrep.navigation-query.v1","citation_authority":false},"navigation-max-jev-calls":{"type":"integer","requires":"navigation-overlay-sha256","minimum":1,"maximum":128,"default":32},"navigation-max-request-bytes":{"type":"integer","requires":"navigation-overlay-sha256","minimum":1,"maximum":8388608,"default":2097152},"experimental-query-plan":{"type":"boolean","default":false,"effect":"one extra no-tools Luna planner turn; up to two alternate retrieval queries; bounded parallel routes and final Jev reranking against the original question","limits":{"alternate_queries":2,"routing_concurrency":2,"union_candidates":24,"planner_timeout_seconds":45},"accounting":"model_attempts reports planner and reader separately; legacy usage is reader-only; overall timeout is shared"},"planner-model":{"type":"string","default":"gpt-6-luna","requires":"experimental-query-plan","effect":"select the query-planner Codex model independently from the final reader"},"experimental-evidence-roles":{"type":"boolean","default":false,"requires":"experimental-query-plan","effect":"one additional Choice per union candidate in the same mandatory Jev decision; source-bound role ordering and continuation hints","limits":{"union_candidates":24,"final_questions":48,"complete_request_bytes":65536},"sufficiency":"unassessed","accounting":"extra judgments and tokens are measured within the existing request; discarded-candidate metadata stays private and is not citable"}},"defaults":{"model":"gpt-6-luna","reasoning_effort":"max","service_tier":"fast","timeout_seconds":180,"max_tool_calls":12}},
+            "ask":{"usage":"gptgrep ask QUESTION ROOT [--codex-home HOME] [--codex-bin codex] [--native-ptc --codex-permissions NAME] [--experimental-query-plan] [--planner-model MODEL] [--navigation-overlay-sha256 SHA --navigation-max-jev-calls N --navigation-max-request-bytes BYTES] [--experimental-evidence-roles] --json","effect":"required Jev routing/reranking followed by bounded local Codex reasoning","options":{"native-ptc":{"type":"boolean","default":false,"requires":"codex-permissions","effect":"native shell/exec/Python/Pillow and view_image for final retrieval reader only; planner and completion remain restricted","budget":"shares max_tool_calls with GPTgrep dynamic tools; native item events are post-start observations, not a pre-execution guard or hard execution limit","accounting":"bounded payload-free model_attempts[].native_ptc metadata; existing tool_calls remains GPTgrep-only","citation_authority":false},"jev-model":{"type":"string","default":gptgrep_jev::DEFAULT_MODEL},"document":{"type":"string"},"navigation-overlay-sha256":{"type":"string","requires":["experimental-query-plan","document"],"effect":"require exact completed source-bound overlay and full Jev hint scan before planned retrieval","report_schema":"gptgrep.navigation-query.v1","citation_authority":false},"navigation-max-jev-calls":{"type":"integer","requires":"navigation-overlay-sha256","minimum":1,"maximum":128,"default":32},"navigation-max-request-bytes":{"type":"integer","requires":"navigation-overlay-sha256","minimum":1,"maximum":8388608,"default":2097152},"experimental-query-plan":{"type":"boolean","default":false,"effect":"one extra no-tools Luna planner turn; up to two alternate retrieval queries; bounded parallel routes and final Jev reranking against the original question","limits":{"alternate_queries":2,"routing_concurrency":2,"union_candidates":24,"planner_timeout_seconds":45},"accounting":"model_attempts reports planner and reader separately; legacy usage is reader-only; overall timeout is shared"},"planner-model":{"type":"string","default":"gpt-6-luna","requires":"experimental-query-plan","effect":"select the query-planner Codex model independently from the final reader"},"experimental-evidence-roles":{"type":"boolean","default":false,"requires":"experimental-query-plan","effect":"one additional Choice per union candidate in the same mandatory Jev decision; source-bound role ordering and continuation hints","limits":{"union_candidates":24,"final_questions":48,"complete_request_bytes":65536},"sufficiency":"unassessed","accounting":"extra judgments and tokens are measured within the existing request; discarded-candidate metadata stays private and is not citable"}},"defaults":{"model":"gpt-6-luna","reasoning_effort":"max","service_tier":"fast","timeout_seconds":180,"max_tool_calls":12}},
             "summarize":{"usage":"gptgrep summarize DOCUMENT_ID:NODE_ID --root ROOT [host options] --json","effect":"required Jev retrieval in the selected document, then model-written summary with issued evidence citations"},
             "host-complete":{"usage":"gptgrep host-complete --input FILE_OR_DASH [host options] --json","input":{"instructions":"string","state":"JSON","schema":"JSON Schema object"},"effect":"explicit schema-validated local Codex completion; no citation assertion","defaults":{"max_input_bytes":262144,"service_tier":"fast"},"hard_max_input_bytes":1048576},
             "doctor":{"usage":"gptgrep doctor --json","effect":"local capability probe"}
@@ -648,6 +742,45 @@ fn contract() -> Value {
         "search_output":{"fields":["schema_version","query","mode","document_scope","root","generation","index_used","source_fresh","minimum_relevance_score","hits","coverage","metrics","warnings"],"hit_fields":["path","node_id","title","line_start","line_end","page_start","page_end","match_line","match_column","byte_start","byte_end","column_start","node_offset","next_offset","node_coverage","coordinate_system","text","text_truncated","score","confidence","literal_anchor","source_sha256","source_fresh","citation"]},
         "bounds":{"source_file_bytes":67108864,"jev_candidates":24,"semantic_routing_documents":32},
         "limitations":["No full PageIndex Flash parity claim", "OCR requires explicit rich ingestion and an accepted native runtime profile", "Office conversion requires LibreOffice", "Semantic routing and evidence snippets have explicit budgets", "Generative synthesis requires explicit local Codex host mode", "Relevance floor is operational policy, not calibrated confidence; hybrid exact-token anchors are retained"]
+    });
+    contract["commands"]["parse-agent"] = json!({
+        "serve_usage":"gptgrep parse-agent serve --config CONTROL_JSON --expected-control-sha256 SHA",
+        "run_usage":"gptgrep parse-agent run --config CONTROL_JSON --expected-control-sha256 SHA --source ALIAS --mode off|auto --output FILE",
+        "agent_usage":"gptgrep parse-agent agent --config CONTROL_JSON --expected-control-sha256 SHA --document-agent-control DOCUMENT_CONTROL_JSON --expected-document-agent-control-sha256 SHA --source ALIAS --output FILE",
+        "qualify_usage":"gptgrep parse-agent qualify --config CONTROL_JSON --expected-control-sha256 SHA --document-agent-control DOCUMENT_CONTROL_JSON --expected-document-agent-control-sha256 SHA --source ALIAS --qualification-request PURPOSE_JSON --expected-qualification-request-sha256 SHA --evidence-output PRIVATE_FILE",
+        "serve_transport":"foreground NDJSON on stdin/stdout; complete LF frame includes delimiter",
+        "toolbox_request_schema":"gptgrep.parse-toolbox.request.v1",
+        "toolbox_reply_schema":"gptgrep.parse-toolbox.reply.v1",
+        "control_schema":"gptgrep.parse-agent.control.v1",
+        "product_schema":"gptgrep.parse-agent.product.v1",
+        "control_authority":"exact operator snapshot registers source aliases, admitted paths/resources and original optional OCR context; model JSON cannot authorize them",
+        "input_limits":{"control_bytes":65536,"request_bytes":65536,"reply_bytes":4194304,"artifact_window_bytes":32768},
+        "operations":["prepare","extract_native","inspect_pages","inspect_artifacts","read_metadata_window","read_artifact","inspect_images","crop","inspect_ocr_plan","finalize","close"],
+        "ptc_ocr_operation":"execute_ocr through the selected original qualified executor; no JSON OCR-result submission",
+        "completeness":"native extraction traverses every original page through processing windows; metadata/text inventories use source-bound continuations",
+        "run_behavior":"deterministic complete parser stages and optional qualified per-page OCR; auto incomplete returns2 without complete product",
+        "document_agent":"agent explicitly launches one selected standalone Codex app-server document turn with gptgrep_parse.toolbox; serve/run remain external PTC and deterministic surfaces",
+        "document_limits":{"native_tools":64,"native_turns":1,"native_seconds":900,"native_image_bytes":33554432,"rpc_bytes":33554432,"page_ocr_tools":8,"page_ocr_turns":1,"page_ocr_seconds":180},
+        "requested_profile":{"model":"gpt-6-luna","effort":"max","service_tier":"fast","normalized_service_tier":"priority","actual_served_profile_verified":false},
+        "images":"complete toolbox images/crops are mediated; direct document view_image requires its own accepted binary/profile/guard qualification and a complete pre-turn native image catalogue; crop child augmentation remains separate",
+        "qualification":"qualify is a pinned private evidence purpose with no product/index transfer; its output is not an accepted qualification record",
+        "publication":"serve/run/agent create no generation; explicit index control registry consumes verified owned products once through the generation writer"
+    });
+    contract["commands"]["index"]["parse_agent"] = json!({
+        "usage":"gptgrep index ROOT --parse-agent-config CONTROL_JSON --expected-parse-agent-config-sha256 SHA --document-agent-controls REGISTRY_JSON --expected-document-agent-controls-sha256 SHA",
+        "controls_schema":"gptgrep.parse-agent.index-controls.v1",
+        "registry_fields":["schema","parse_agent_config","controls"],
+        "control_row_fields":["source_alias","document_control"],
+        "file_pin_fields":["path","bytes","sha256"],
+        "limits":{"registry_bytes":65536,"source_aliases":64,"document_control_bytes":65536,"total_document_control_bytes":1048576},
+        "preflight":"all source aliases must equal the complete supported corpus inventory; every independently pinned source control, actual binary/profile/permissions and product-purpose native qualification is checked before the first turn",
+        "shared_context":"one loaded invocation, original clock/OCR ledger/request quota and shared ResourceBudget continue across all sources; declared document tool/RPC caps are summed explicitly",
+        "publication":"manager moves each complete verified RichParsedDocument to the generation writer without reparse; complete source inventory and pins are checked again before publish",
+        "coverage":"all original parser pages/metadata and required OCR; model inspection windows/pages are reported separately and need not cover every metadata byte",
+        "unsupported":"excluded unsupported file count is reported separately; max-files refuses excess supported sources without truncation",
+        "conflicts":["legacy rich/OCR controls","optimize-merge","decisions-budget"],
+        "omitted":"original deterministic index behavior is unchanged",
+        "outcome_schema":"gptgrep.parse-agent.index.v1"
     });
     contract["commands"]["ocr"] = json!({
         "usage":"gptgrep ocr serve --config CONTROL_JSON [--token-env ENV_NAME] [--expected-control-sha256 SHA] [--initialize-ledger]",
@@ -833,6 +966,14 @@ fn contract() -> Value {
     contract["commands"]["ask"]["options"]["min-score"] =
         json!({"type":"number","minimum":0,"maximum":1,"default":0.5,"requires":"multimodal"});
     contract["commands"]["ask"]["options"]["multimodal"]["host_bounds"] = json!({"rerank_report_bytes":524288,"candidate_metadata_bytes":32768,"bootstrap_candidate_metadata_bytes":524288,"image_result_frame_bytes":1048576,"complete_output_reserved_before_calls":true});
+    for command in ["ask", "summarize", "host-complete"] {
+        contract["commands"][command]["options"]["codex-permissions"] = json!({
+            "type":"string","default":null,
+            "validation":"1 to 128 ASCII letters, digits, underscores, hyphens or colons",
+            "effect":"selects a named native permission profile and requires the matching activePermissionProfile acknowledgment before a turn; omits legacy sandbox overrides",
+            "qualification":"the acknowledgment records profile provenance; actual filesystem enforcement requires runtime validation"
+        });
+    }
     for command in ["ask", "summarize", "host-complete", "enrich"] {
         contract["commands"][command]["options"]["codex-state-dir"] = json!({
             "type":"path","default":null,
@@ -845,7 +986,7 @@ fn contract() -> Value {
 }
 
 fn llms() -> &'static str {
-    "# GPTgrep\n\nLocal vectorless retrieval helper for agents. No MCP server.\n\n1. gptgrep index ./docs --json\n1r. gptgrep index ./documents --ocr auto --plan-only --json\n1n. gptgrep index ./native-documents --ocr off --json\n1a. gptgrep enrich ./docs --ledger-path /path/to/private/enrich.jsonl --max-builder-calls 100 --max-jev-calls 100 --plan-only --json\n2. gptgrep search 'concept in natural language' ./docs --json\n3. gptgrep search 'pattern' ./docs --mode regex --json\n4. gptgrep tree manual.pdf --root ./docs --json\n5. gptgrep read DOCUMENT_ID:NODE_ID --root ./docs --json\n6. gptgrep batch --root ./docs --input operations.json --json\n7. gptgrep batch --rich --root ./docs --input rich-operations.json\n\nBatch accepts gptgrep.batch.request.v1 JSON, pins one generation and preserves operation order. Local search/catalog/tree/read operations share bounded output reservations. Batch hybrid/semantic are currently rejected before provider work; inspect each item status and coverage.\n\nRich batch request shape: send one JSON object, not a bare operation array. schema_version and operations are required. generation defaults to the string CURRENT; budget may be omitted or partially specified, with defaults shown by --schema. Every operation requires the discriminator op and a unique id (1..128 UTF-8 bytes, no control characters). Unknown fields are rejected. Start with this local request in rich-operations.json:\n\n```json\n{\n  \"schema_version\": \"gptgrep.batch.rich.request.v1\",\n  \"generation\": \"CURRENT\",\n  \"budget\": {\n    \"max_operations\": 1,\n    \"max_output_bytes\": 16384,\n    \"max_decisions_submissions\": 0\n  },\n  \"operations\": [\n    {\n      \"op\": \"inspect_documents\",\n      \"id\": \"documents-1\",\n      \"fields\": [\n        \"path\",\n        \"title\",\n        \"pages\"\n      ],\n      \"page_size\": 5\n    }\n  ]\n}\n```\n\nRun gptgrep batch --rich --root ./docs --input rich-operations.json. For a follow-up, copy the exact response generation object and use a returned document path; operations cannot refer to another item in the same batch. Replace both generation fields and manual.pdf in this template before running it:\n\n```json\n{\n  \"schema_version\": \"gptgrep.batch.rich.request.v1\",\n  \"generation\": {\n    \"generation\": \"replace-with-returned-generation\",\n    \"manifest_sha256\": \"0000000000000000000000000000000000000000000000000000000000000000\"\n  },\n  \"budget\": {\n    \"max_operations\": 1,\n    \"max_output_bytes\": 16384,\n    \"max_decisions_submissions\": 0\n  },\n  \"operations\": [\n    {\n      \"op\": \"inspect_pages\",\n      \"id\": \"pages-1\",\n      \"document\": \"manual.pdf\",\n      \"fields\": [\n        \"page\",\n        \"native_text\",\n        \"metadata_artifact\"\n      ],\n      \"page_size\": 1\n    }\n  ]\n}\n```\n\nThe zero max_decisions_submissions allowance keeps these examples local. Read item status and coverage; retain the exact generation and operation options when using a returned cursor. Inspect commands.batch.rich.required_operation_fields in --schema output for other operations.\n\nFor a separately published v2 generation, batch --rich accepts gptgrep.batch.rich.request.v1 with inspect_documents, inspect_pages, inspect_native_metadata, read_artifact, search_artifacts, inspect_visual, read_visual and explicit search_multimodal. Document/page enumeration returns indexed metadata only. inspect_native_metadata takes a page metadata artifact_id, closed fields and item_fields, collection, optional path object_id, page_size, max_output_bytes and coverage.cursor. It returns verified structural geometry/characters/words with mandatory source and artifact identities; it is metadata_only and never citation authority. Object summaries and selected path segments paginate independently; old geometry is rebuild_required and an indivisible first row that cannot fit is output_budget_insufficient. Text read/search preserve typed native/OCR evidence; their cursors bind generation and operation options. Search pages cover a bounded max_hits window; inspect truncation and exhaustion. Opt-in inspect_visual takes scope (document_ids, first_page, last_page), query, max_candidates and its own cursor; use result.next_cursor and retain the batch output budget and per-item reservation when continuing. read_visual takes rendition_id and returns complete image_base64 plus pinned candidate metadata; no image byte windows, truncation or cursor. Both visual operations reuse the generation resource budget and report actual_image_delivery=false and citation_authority=false. They establish local observations, not model delivery or citation rights. The seven deterministic operations remain local and perform zero model submissions. search_multimodal requires mandatory document routing then source-bound text/visual reranking on the same finite Decisions context. All complete item output shares and worst-case call shares are prepared before the first submit. budget.max_decisions_submissions defaults to8 (hard cap200); no operation borrows a later share. Paid results have no inference cursor, preserve partial attempt receipts, and grant no reader citation rights. Required paid failure stops later paid items while independent local items may continue. model_submissions is null when exact batch attribution is unavailable; scheduled attempts and shared context snapshots are separate. Numeric cost telemetry is a labelled lossy finite_f64 projection with full usage SHA; missing cost remains null. Explicit rerank --root ROOT --input FILE_OR_DASH accepts gptgrep.rich_rerank.request.v1 with query and unique {id,evidence} candidates. It resolves exact pinned native/OCR text windows and visual refs, scores only that supplied pool using the same rubric, and creates neither routing-pass nor citation rights. The equivalent rich batch rerank operation shares the same prepaid output/call reservations. Caller text/image bytes/URLs, implicit dependencies and inference cursors are rejected.\n\nJev routing/reranking is required by default search, ask and summarize. OPENROUTER_API_KEY must be supplied for model-assisted runs; failures never silently downgrade to local retrieval. Explicit regex/lexical and enrich --plan-only remain offline. Enrich is an explicit Codex/Jev step that creates non-citable navigation hints after local indexing. Use --document RELATIVE_PATH to scope before candidate budgets. The default Decisions model is openai/gpt-6-luna-decisions; native Codex defaults separately to gpt-6-luna/max/fast. Hybrid/semantic and judge send bounded data to OpenRouter Decisions. Judge input accepts state/questions or typed input.text/input.images with explicit source bindings and local PNG/JPEG paths. --decisions-budget FILE joins an existing original-clock shared budget; it never initializes or resets a ledger. Without the file, paid calls share their single-invocation bounded client context. Explicit --model typesafe/jev-1.13 remains text-only. Inspect coverage, source_fresh, coordinate_system and text_truncated before citing evidence. The main agent performs reasoning and controls follow-up reads. Use search QUERY ROOT --multimodal or ask QUESTION ROOT --multimodal on a published v2 rich generation. Both retain one generation and one finite Decisions context, perform mandatory document routing, and rerank a union of text and independent visual candidates. Scope with --document PATH; bound --window-bytes, --max-visual-candidates, --max-concurrent-batches, --max-image-bytes, --max-image-pixels, --max-metadata-bytes and --max-output-bytes. --multimodal-timeout limits the same invocation and never extends an existing shared deadline. Search returns gptgrep.rich_multimodal_search.v1 JSON with model-exposure-only evidence and no citation rights. Ask uses native gpt-6-luna/max/fast, accepts --max-citations 1..8, and issues typed text/image citations only after actual complete reader delivery and freshness checks. Inspect coverage/truncation and actual observations; implementation and offline mocks do not qualify actual image influence/native runtime. No legacy generation, regex/lexical, grep-window or planning fallback is allowed. Foreground OCR is native-CLI-only: gptgrep ocr serve --config CONTROL_JSON --token-env GPTGREP_OCR_SERVE_TOKEN. It uses explicit server-held task custody, qualified native gpt-6-luna/max/fast, a finite original-anchor phase and authenticated loopback only. The optional --initialize-ledger creates or joins the exact namespace without reset or renewal. /ocr is separately qualified PNG multipart compatibility with model-reported uncalibrated confidence and no generation authority. Ordinary queries never start OCR; listener/native qualification remains pending. Rich ingestion supports lossless UTF-8 text/Markdown, PDF, PNG and restricted baseline JPEG. Office uses one bounded LibreOffice conversion; a working converter is required and real Office runtime qualification remains pending. The full JPEG family remains unsupported. New files require reindexing. --schema provides the command contract.\n"
+    "# GPTgrep\n\nLocal vectorless retrieval helper for agents. No MCP server.\n\n1. gptgrep index ./docs --json\n1r. gptgrep index ./documents --ocr auto --plan-only --json\n1n. gptgrep index ./native-documents --ocr off --json\n1a. gptgrep enrich ./docs --ledger-path /path/to/private/enrich.jsonl --max-builder-calls 100 --max-jev-calls 100 --plan-only --json\n2. gptgrep search 'concept in natural language' ./docs --json\n3. gptgrep search 'pattern' ./docs --mode regex --json\n4. gptgrep tree manual.pdf --root ./docs --json\n5. gptgrep read DOCUMENT_ID:NODE_ID --root ./docs --json\n6. gptgrep batch --root ./docs --input operations.json --json\n7. gptgrep batch --rich --root ./docs --input rich-operations.json\n\nBatch accepts gptgrep.batch.request.v1 JSON, pins one generation and preserves operation order. Local search/catalog/tree/read operations share bounded output reservations. Batch hybrid/semantic are currently rejected before provider work; inspect each item status and coverage.\n\nRich batch request shape: send one JSON object, not a bare operation array. schema_version and operations are required. generation defaults to the string CURRENT; budget may be omitted or partially specified, with defaults shown by --schema. Every operation requires the discriminator op and a unique id (1..128 UTF-8 bytes, no control characters). Unknown fields are rejected. Start with this local request in rich-operations.json:\n\n```json\n{\n  \"schema_version\": \"gptgrep.batch.rich.request.v1\",\n  \"generation\": \"CURRENT\",\n  \"budget\": {\n    \"max_operations\": 1,\n    \"max_output_bytes\": 16384,\n    \"max_decisions_submissions\": 0\n  },\n  \"operations\": [\n    {\n      \"op\": \"inspect_documents\",\n      \"id\": \"documents-1\",\n      \"fields\": [\n        \"path\",\n        \"title\",\n        \"pages\"\n      ],\n      \"page_size\": 5\n    }\n  ]\n}\n```\n\nRun gptgrep batch --rich --root ./docs --input rich-operations.json. For a follow-up, copy the exact response generation object and use a returned document path; operations cannot refer to another item in the same batch. Replace both generation fields and manual.pdf in this template before running it:\n\n```json\n{\n  \"schema_version\": \"gptgrep.batch.rich.request.v1\",\n  \"generation\": {\n    \"generation\": \"replace-with-returned-generation\",\n    \"manifest_sha256\": \"0000000000000000000000000000000000000000000000000000000000000000\"\n  },\n  \"budget\": {\n    \"max_operations\": 1,\n    \"max_output_bytes\": 16384,\n    \"max_decisions_submissions\": 0\n  },\n  \"operations\": [\n    {\n      \"op\": \"inspect_pages\",\n      \"id\": \"pages-1\",\n      \"document\": \"manual.pdf\",\n      \"fields\": [\n        \"page\",\n        \"native_text\",\n        \"metadata_artifact\"\n      ],\n      \"page_size\": 1\n    }\n  ]\n}\n```\n\nThe zero max_decisions_submissions allowance keeps these examples local. Read item status and coverage; retain the exact generation and operation options when using a returned cursor. Inspect commands.batch.rich.required_operation_fields in --schema output for other operations.\n\nFor a separately published v2 generation, batch --rich accepts gptgrep.batch.rich.request.v1 with inspect_documents, inspect_pages, inspect_native_metadata, read_artifact, search_artifacts, inspect_visual, read_visual and explicit search_multimodal. Document/page enumeration returns indexed metadata only. inspect_native_metadata takes a page metadata artifact_id, closed fields and item_fields, collection, optional path object_id, page_size, max_output_bytes and coverage.cursor. It returns verified structural geometry/characters/words with mandatory source and artifact identities; it is metadata_only and never citation authority. Object summaries and selected path segments paginate independently; old geometry is rebuild_required and an indivisible first row that cannot fit is output_budget_insufficient. Text read/search preserve typed native/OCR evidence; their cursors bind generation and operation options. Search pages cover a bounded max_hits window; inspect truncation and exhaustion. Opt-in inspect_visual takes scope (document_ids, first_page, last_page), query, max_candidates and its own cursor; use result.next_cursor and retain the batch output budget and per-item reservation when continuing. read_visual takes rendition_id and returns complete image_base64 plus pinned candidate metadata; no image byte windows, truncation or cursor. Both visual operations reuse the generation resource budget and report actual_image_delivery=false and citation_authority=false. They establish local observations, not model delivery or citation rights. The seven deterministic operations remain local and perform zero model submissions. search_multimodal requires mandatory document routing then source-bound text/visual reranking on the same finite Decisions context. All complete item output shares and worst-case call shares are prepared before the first submit. budget.max_decisions_submissions defaults to8 (hard cap200); no operation borrows a later share. Paid results have no inference cursor, preserve partial attempt receipts, and grant no reader citation rights. Required paid failure stops later paid items while independent local items may continue. model_submissions is null when exact batch attribution is unavailable; scheduled attempts and shared context snapshots are separate. Numeric cost telemetry is a labelled lossy finite_f64 projection with full usage SHA; missing cost remains null. Explicit rerank --root ROOT --input FILE_OR_DASH accepts gptgrep.rich_rerank.request.v1 with query and unique {id,evidence} candidates. It resolves exact pinned native/OCR text windows and visual refs, scores only that supplied pool using the same rubric, and creates neither routing-pass nor citation rights. The equivalent rich batch rerank operation shares the same prepaid output/call reservations. Caller text/image bytes/URLs, implicit dependencies and inference cursors are rejected.\n\nJev routing/reranking is required by default search, ask and summarize. OPENROUTER_API_KEY must be supplied for model-assisted runs; failures never silently downgrade to local retrieval. Explicit regex/lexical and enrich --plan-only remain offline. Enrich is an explicit Codex/Jev step that creates non-citable navigation hints after local indexing. Use --document RELATIVE_PATH to scope before candidate budgets. The default Decisions model is openai/gpt-6-luna-decisions; native Codex defaults separately to gpt-6-luna/max/fast. Hybrid/semantic and judge send bounded data to OpenRouter Decisions. Judge input accepts state/questions or typed input.text/input.images with explicit source bindings and local PNG/JPEG paths. --decisions-budget FILE joins an existing original-clock shared budget; it never initializes or resets a ledger. Without the file, paid calls share their single-invocation bounded client context. Explicit --model typesafe/jev-1.13 remains text-only. Inspect coverage, source_fresh, coordinate_system and text_truncated before citing evidence. The main agent performs reasoning and controls follow-up reads. Use search QUERY ROOT --multimodal or ask QUESTION ROOT --multimodal on a published v2 rich generation. Both retain one generation and one finite Decisions context, perform mandatory document routing, and rerank a union of text and independent visual candidates. Scope with --document PATH; bound --window-bytes, --max-visual-candidates, --max-concurrent-batches, --max-image-bytes, --max-image-pixels, --max-metadata-bytes and --max-output-bytes. --multimodal-timeout limits the same invocation and never extends an existing shared deadline. Search returns gptgrep.rich_multimodal_search.v1 JSON with model-exposure-only evidence and no citation rights. Ask uses native gpt-6-luna/max/fast, accepts --max-citations 1..8, and issues typed text/image citations only after actual complete reader delivery and freshness checks. Inspect coverage/truncation and actual observations; implementation and offline mocks do not qualify actual image influence/native runtime. No legacy generation, regex/lexical, grep-window or planning fallback is allowed. Foreground OCR is native-CLI-only: gptgrep ocr serve --config CONTROL_JSON --token-env GPTGREP_OCR_SERVE_TOKEN. It uses explicit server-held task custody, qualified native gpt-6-luna/max/fast, a finite original-anchor phase and authenticated loopback only. The optional --initialize-ledger creates or joins the exact namespace without reset or renewal. /ocr is separately qualified PNG multipart compatibility with model-reported uncalibrated confidence and no generation authority. Ordinary queries never start OCR; listener/native qualification remains pending. Rich ingestion supports lossless UTF-8 text/Markdown, PDF, PNG and restricted baseline JPEG. Office uses one bounded LibreOffice conversion; a working converter is required and real Office runtime qualification remains pending. The full JPEG family remains unsupported. New files require reindexing. --schema provides the command contract.\n\nUse gptgrep parse-agent serve --config CONTROL_JSON --expected-control-sha256 SHA for a bounded foreground LiteParse toolbox. An external Codex/PTC agent can prepare a registered source, extract all native pages, inspect complete page/artifact/metadata inventories through continuations, read full images or crops, request qualified per-page OCR, and finalize. The exact control snapshot owns source aliases, budgets, paths and original OCR context; model JSON cannot admit a source path or submit paid OCR results. For deterministic complete parsing use gptgrep parse-agent run --config CONTROL_JSON --expected-control-sha256 SHA --source ALIAS --mode off|auto --output FILE. Auto refuses incomplete required OCR; off reports required_ocr_complete honestly. The product file contains complete RichParsedDocument fields and is not generation publication. Serve and run remain independently usable deterministic/external PTC surfaces. Explicit gptgrep parse-agent agent --config CONTROL_JSON --expected-control-sha256 SHA --document-agent-control DOCUMENT_CONTROL_JSON --expected-document-agent-control-sha256 SHA --source ALIAS --output FILE launches the selected standalone Codex app-server document turn with the bounded gptgrep_parse.toolbox. It requests gpt-6-luna/max/fast (normalized priority); actual served identity remains unknown. Literal native document view_image requires its own accepted binary/profile/guard qualification, complete source-bound pre-turn image catalogue and private image-only permission scope. Document limits are 64 tools/1 turn/900 seconds, separate from the original per-page OCR 8 tools/1 turn/180 seconds. Complete verified parser extraction, artifact metadata and required OCR cover every original page; actual model inspection is partial coverage, not a full metadata-read requirement. Dynamic images/crops remain mediated transport; native crop child augmentation is separate. For complete typed indexing use gptgrep index ROOT --parse-agent-config CONTROL_JSON --expected-parse-agent-config-sha256 SHA --document-agent-controls REGISTRY_JSON --expected-document-agent-controls-sha256 SHA. The closed gptgrep.parse-agent.index-controls.v1 registry pins the config and one distinct admitted document control per registered source alias. All controls and the complete supported corpus inventory are checked before any turn, then pins/inventory are rechecked before publish. One invocation retains the original clock, OCR context, request quota and shared ResourceBudget across source transfers; the generation writer consumes owned verified products without reparse. Unsupported file counts are reported separately and excess supported files are refused, never truncated. Omit all four flags to retain ordinary index behavior; do not mix legacy rich/OCR or optimize-merge controls. Explicit parse-agent qualify accepts a pinned private qualification purpose and writes evidence only to a fresh private file with --evidence-output; that evidence is not accepted qualification or publication. Native page OCR profiles and old DynamicImages qualifications remain separate.\n"
 }
 
 fn emit(value: &Value) -> Result<()> {
@@ -1049,7 +1190,7 @@ async fn run_rich_index(
     if mode == gptgrep_parse::OcrMode::Auto && ingest.needs_ocr_executor() {
         let profile = profile
             .context("live OCR requires --ocr-runtime-profile with accepted image qualification")?;
-        if profile.accepted_image_qualification_sha256.is_none() {
+        if !profile.image_qualification_accepted() {
             bail!("ocr_runtime_image_qualification_required");
         }
         let home = args
@@ -1088,7 +1229,7 @@ async fn run_rich_index(
                         prepared_root,
                         raw_results_dir: raw.clone(),
                         runtime_profile: profile.clone(),
-                        transport: gptgrep_host::OcrImageTransport::DynamicImages,
+                        transport: profile.transport(),
                     },
                     context.clone(),
                 )?,
@@ -1121,6 +1262,107 @@ async fn run(cli: Cli) -> Result<i32> {
         return Ok(0);
     };
     match command {
+        Command::ParseAgent { command } => {
+            if cli.decisions_budget.is_some() {
+                bail!("parse_agent_incompatible_decisions_budget");
+            }
+            return match command {
+                ParseAgentCommand::Serve {
+                    config,
+                    expected_control_sha256,
+                } => parse_agent::serve(&config, &expected_control_sha256).await,
+                ParseAgentCommand::Run {
+                    config,
+                    expected_control_sha256,
+                    source,
+                    mode,
+                    output,
+                } => {
+                    let mode = match mode {
+                        IndexOcr::Off => gptgrep_parse::OcrMode::Off,
+                        IndexOcr::Auto => gptgrep_parse::OcrMode::Auto,
+                    };
+                    parse_agent::run(&config, &expected_control_sha256, &source, mode, &output)
+                        .await
+                }
+                ParseAgentCommand::Agent {
+                    config,
+                    expected_control_sha256,
+                    document_agent_control,
+                    expected_document_agent_control_sha256,
+                    source,
+                    output,
+                } => {
+                    let control = gptgrep_host::parse_agent_driver::load_document_control(
+                        &document_agent_control,
+                        &expected_document_agent_control_sha256,
+                    )?;
+                    gptgrep_host::parse_agent_driver::preflight_document_agent_control(&control)?;
+                    let product = parse_agent::agent(
+                        &config,
+                        &expected_control_sha256,
+                        &document_agent_control,
+                        &expected_document_agent_control_sha256,
+                        &source,
+                        &output,
+                    )
+                    .await?;
+                    control
+                        .original_clock
+                        .remaining()
+                        .map_err(|_| anyhow::anyhow!("document_original_deadline_after_output"))?;
+                    let document = product.document()?;
+                    let outcome = product.outcome();
+                    emit(
+                        &json!({"schema":"gptgrep.parse-agent.agent.v1","status":"complete",
+                        "source_sha256":document.summary.source_sha256,"original_pages":document.pages.len(),
+                        "model_inspected_pages":outcome.verified_product.delivered_pages,
+                        "native_viewer_enabled":outcome.native_viewer_enabled,
+                        "native_image_influence_qualified":outcome.native_image_influence_qualified,
+                        "actual_served_profile_verified":false,"publication_authorized":false}),
+                    )?;
+                    Ok(0)
+                }
+                ParseAgentCommand::Qualify {
+                    config,
+                    expected_control_sha256,
+                    document_agent_control,
+                    expected_document_agent_control_sha256,
+                    source,
+                    qualification_request,
+                    expected_qualification_request_sha256,
+                    evidence_output,
+                } => {
+                    parse_agent_index::preflight_private_qualification_output(&evidence_output)?;
+                    let control = gptgrep_host::parse_agent_driver::load_document_control(
+                        &document_agent_control,
+                        &expected_document_agent_control_sha256,
+                    )?;
+                    let evidence = parse_agent::qualify_image_source(
+                        &config,
+                        &expected_control_sha256,
+                        &document_agent_control,
+                        &expected_document_agent_control_sha256,
+                        &source,
+                        &qualification_request,
+                        &expected_qualification_request_sha256,
+                    )
+                    .await?;
+                    let purpose_sha256 = evidence.purpose_sha256().to_owned();
+                    parse_agent_index::write_private_qualification(
+                        evidence,
+                        &evidence_output,
+                        &control,
+                    )?;
+                    emit(
+                        &json!({"schema":"gptgrep.native-document.private-qualification-output.v1",
+                        "status":"private_evidence_written","purpose_sha256":purpose_sha256,
+                        "qualification_accepted":false,"publication_authorized":false}),
+                    )?;
+                    Ok(0)
+                }
+            };
+        }
         Command::Ocr { command } => {
             if cli.decisions_budget.is_some() {
                 return Err(OcrServeError("ocr_serve_incompatible_decisions_budget").into());
@@ -1306,8 +1548,64 @@ async fn run(cli: Cli) -> Result<i32> {
             root,
             max_files,
             optimize_merge,
+            parse_agent_config,
+            expected_parse_agent_config_sha256,
+            document_agent_controls,
+            expected_document_agent_controls_sha256,
             rich,
         } => {
+            if parse_agent_config.is_some()
+                || expected_parse_agent_config_sha256.is_some()
+                || document_agent_controls.is_some()
+                || expected_document_agent_controls_sha256.is_some()
+            {
+                if optimize_merge
+                    || rich.rich
+                    || rich.ocr.is_some()
+                    || rich.plan_only
+                    || rich.resume
+                    || rich.ocr_run_id.is_some()
+                    || rich.ocr_runtime_profile.is_some()
+                    || rich.ocr_codex_home.is_some()
+                    || rich.ocr_codex_state_dir.is_some()
+                    || rich.ocr_codex_bin != "codex"
+                    || rich.ocr_max_pages != 24
+                    || rich.ocr_timeout_seconds != 1800
+                    || rich.page_window != 25
+                    || rich.expected_plan_sha256.is_some()
+                    || cli.decisions_budget.is_some()
+                {
+                    bail!("parse_agent_index_incompatible_legacy_options");
+                }
+                let (Some(config), Some(config_sha), Some(controls), Some(controls_sha)) = (
+                    parse_agent_config,
+                    expected_parse_agent_config_sha256,
+                    document_agent_controls,
+                    expected_document_agent_controls_sha256,
+                ) else {
+                    bail!("parse_agent_index_complete_control_selection_required");
+                };
+                let report = parse_agent_index::index(
+                    &root,
+                    max_files,
+                    &config,
+                    &config_sha,
+                    &controls,
+                    &controls_sha,
+                )
+                .await?;
+                if cli.json {
+                    emit(&serde_json::to_value(&report)?)?;
+                } else {
+                    println!(
+                        "Indexed {} verified parser products ({} bytes); excluded {} unsupported files",
+                        report.indexed_files,
+                        report.source_bytes,
+                        report.excluded_unsupported_files
+                    );
+                }
+                return Ok(0);
+            }
             if rich.rich || rich.ocr.is_some() || rich.plan_only {
                 if optimize_merge {
                     bail!(
@@ -1588,6 +1886,7 @@ async fn run(cli: Cli) -> Result<i32> {
         }
         Command::Ask {
             question,
+            native_ptc,
             root,
             host,
             jev_model,
@@ -1644,6 +1943,7 @@ async fn run(cli: Cli) -> Result<i32> {
                     timeout,
                 )?;
                 let mut config = host.config();
+                config.native_ptc = native_ptc;
                 config.document = document;
                 config.timeout_secs = timeout;
                 // The explicit client already owns the selected model/context.
@@ -1661,6 +1961,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 return Ok(0);
             }
             let mut config = host.config();
+            config.native_ptc = native_ptc;
             config.jev_model = jev_model;
             config.decisions_execution = decisions_context(cli.decisions_budget.as_deref())?;
             config.document = document;
@@ -1936,6 +2237,131 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod query_plan_cli_tests {
     use super::*;
+
+    #[test]
+    fn parse_agent_index_controls_are_closed_and_preserve_ordinary_index_defaults() {
+        let ordinary = Cli::try_parse_from(["gptgrep", "index", "."]).unwrap();
+        let Some(Command::Index {
+            max_files,
+            optimize_merge,
+            parse_agent_config,
+            rich,
+            ..
+        }) = ordinary.command
+        else {
+            panic!("ordinary index remains reachable");
+        };
+        assert_eq!(max_files, 100000);
+        assert!(!optimize_merge);
+        assert!(parse_agent_config.is_none());
+        assert!(!rich.rich);
+        assert!(rich.ocr.is_none());
+        assert!(
+            Cli::try_parse_from([
+                "gptgrep",
+                "index",
+                ".",
+                "--parse-agent-config",
+                "control.json"
+            ])
+            .is_err()
+        );
+        let selected = vec![
+            "gptgrep",
+            "index",
+            ".",
+            "--parse-agent-config",
+            "control.json",
+            "--expected-parse-agent-config-sha256",
+            "sha",
+            "--document-agent-controls",
+            "registry.json",
+            "--expected-document-agent-controls-sha256",
+            "sha",
+        ];
+        assert!(
+            Cli::try_parse_from(selected.clone()).is_ok(),
+            "legacy default-valued flags are not explicit conflicts"
+        );
+        for extra in [
+            vec!["--optimize-merge"],
+            vec!["--rich"],
+            vec!["--ocr", "off"],
+            vec!["--ocr-codex-bin", "codex"],
+            vec!["--page-window", "25"],
+        ] {
+            let mut arguments = selected.clone();
+            arguments.extend(extra);
+            assert!(
+                Cli::try_parse_from(arguments).is_err(),
+                "explicit legacy options cannot silently coexist"
+            );
+        }
+    }
+    #[test]
+    fn document_agent_and_private_qualification_have_explicit_pinned_front_doors() {
+        let selected = vec![
+            "gptgrep",
+            "parse-agent",
+            "agent",
+            "--config",
+            "control.json",
+            "--expected-control-sha256",
+            "sha",
+            "--document-agent-control",
+            "document.json",
+            "--expected-document-agent-control-sha256",
+            "sha",
+            "--source",
+            "registered",
+            "--output",
+            "product.json",
+        ];
+        let parsed = Cli::try_parse_from(selected).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::ParseAgent {
+                command: ParseAgentCommand::Agent { .. }
+            })
+        ));
+        let qualifier = [
+            "gptgrep",
+            "parse-agent",
+            "qualify",
+            "--config",
+            "control.json",
+            "--expected-control-sha256",
+            "sha",
+            "--document-agent-control",
+            "document.json",
+            "--expected-document-agent-control-sha256",
+            "sha",
+            "--source",
+            "registered",
+            "--qualification-request",
+            "purpose.json",
+            "--expected-qualification-request-sha256",
+            "sha",
+            "--evidence-output",
+            "private-fixture.json",
+        ];
+        assert!(Cli::try_parse_from(qualifier).is_ok());
+        let contract = contract();
+        assert_eq!(
+            contract["commands"]["index"]["parse_agent"]["controls_schema"],
+            "gptgrep.parse-agent.index-controls.v1"
+        );
+        assert_eq!(
+            contract["commands"]["parse-agent"]["document_limits"]["native_tools"],
+            64
+        );
+        assert_eq!(
+            contract["commands"]["parse-agent"]["document_limits"]["page_ocr_tools"],
+            8
+        );
+        assert!(llms().contains("--document-agent-controls"));
+        assert!(llms().contains("partial coverage"));
+    }
 
     #[test]
     fn rich_batch_discovery_examples_match_request_parser() {
@@ -2545,3 +2971,6 @@ mod multimodal_cli_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod native_ptc_cli_tests;

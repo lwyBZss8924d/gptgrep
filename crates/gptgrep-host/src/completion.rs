@@ -93,6 +93,7 @@ pub(crate) async fn complete_json_until(
     deadline: Option<tokio::time::Instant>,
     options: protocol::RunOptions<'_>,
 ) -> Result<CompletionReport> {
+    crate::native_ptc::enabled(config, true)?;
     validate_config(config, "complete_json")?;
     let (validator, input_bytes) = prepare(instructions, &state, &schema, config.max_input_bytes)?;
     let completed = run_process_until(

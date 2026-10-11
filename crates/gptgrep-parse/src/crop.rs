@@ -76,6 +76,52 @@ pub struct CropOutput {
     pub admission: CropAdmission,
 }
 
+/// Select a tighter PNG decoder allocation limit from the complete original
+/// raster geometry. crop.rs separately charges that entire selected limit plus
+/// unfilter/scratch rows. Charging the frozen 32MiB maximum for a tiny raster
+/// would exceed the toolbox's 32MiB operation allowance before any crop exists.
+/// Limits only decrease; ancillary PNG decoding that cannot fit fails closed.
+pub(crate) fn decoder_budget(
+    parent: &crate::OcrImage,
+    admitted: &ResourceBudget,
+) -> Result<ResourceBudget> {
+    let width = u64::from(parent.width);
+    let height = u64::from(parent.height);
+    let rgba = width
+        .checked_mul(height)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| anyhow::anyhow!("native_crop_decoder_bound_overflow"))?;
+    let unfilter = width
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(1))
+        .and_then(|n| n.checked_mul(height))
+        .and_then(|n| n.checked_mul(2))
+        .and_then(|n| n.checked_add(16_384))
+        .ok_or_else(|| anyhow::anyhow!("native_crop_decoder_bound_overflow"))?;
+    let scratch = width
+        .checked_mul(32)
+        .ok_or_else(|| anyhow::anyhow!("native_crop_decoder_bound_overflow"))?;
+    let chunks = parent
+        .artifact
+        .bytes
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(65_536))
+        .ok_or_else(|| anyhow::anyhow!("native_crop_decoder_bound_overflow"))?;
+    let selected = rgba
+        .max(unfilter)
+        .max(scratch)
+        .max(chunks)
+        .min(admitted.image_pixel_buffer_bytes);
+    ensure!(
+        rgba <= selected && unfilter <= selected && scratch <= selected,
+        "native_crop_decoder_pixel_limit"
+    );
+    let mut budget = admitted.clone();
+    budget.image_pixel_buffer_bytes = selected;
+    budget.ensure_same_invocation_within(admitted)?;
+    Ok(budget)
+}
+
 /// `image` and `page_size` must come from the caller's pinned, source-validated
 /// manifest. `source` is an owned regular-file handle opened under that caller's
 /// path-custody policy. Its bytes are independently reverified here. No path is
@@ -102,6 +148,8 @@ pub fn crop_rendition(
         "image/jpeg" => bail!(JPEG_UNAVAILABLE),
         _ => bail!("capability_unavailable: crop MIME"),
     }
+    let selected_budget = decoder_budget(image, budget)?;
+    let budget = &selected_budget;
     ensure!(image.artifact.id.len() <= 256, "crop_parent_id_limit");
     ensure!(
         page_size.0.is_finite()
@@ -204,13 +252,44 @@ pub fn crop_rendition(
         "crop_output_incomplete"
     );
     budget.admit_image(pixels.width, pixels.height, writer.bytes.len() as u64)?;
+    let recipe = recipe_for(image, selected, page_size)?;
+    let recipe_sha256 = sha(&serde_json::to_vec(&recipe)?);
+    let sha256 = sha(&writer.bytes);
+    Ok(CropOutput {
+        png: writer.bytes,
+        sha256,
+        recipe,
+        recipe_sha256,
+        admission,
+    })
+}
+
+/// Shared pure geometry for encoding and portable custody verification.
+pub(crate) fn recipe_for(
+    image: &OcrImage,
+    selected: BoundingBox,
+    page_size: (f64, f64),
+) -> Result<CropRecipe> {
+    ensure!(
+        page_size.0.is_finite()
+            && page_size.1.is_finite()
+            && page_size.0 > 0.0
+            && page_size.1 > 0.0,
+        "crop_invalid_page_size"
+    );
+    selected.validate(page_size.0, page_size.1)?;
+    ensure!(
+        selected.x + selected.width <= page_size.0 && selected.y + selected.height <= page_size.1,
+        "crop_outside_page"
+    );
+    let pixels = pixel_crop(image, selected)?;
     let raster_to_crop = AffineTransform {
         e: -f64::from(pixels.x),
         f: -f64::from(pixels.y),
         ..AffineTransform::IDENTITY
     };
     let page_to_crop = compose(raster_to_crop, image.page_to_raster)?;
-    let recipe = CropRecipe {
+    Ok(CropRecipe {
         schema_version: "gptgrep.crop.recipe.v1".into(),
         parent_artifact_id: image.artifact.id.clone(),
         parent_sha256: image.artifact.sha256.clone(),
@@ -226,15 +305,6 @@ pub fn crop_rendition(
         decoder: "image-0.25.10/png-0.18.1/8bit-restricted-v2".into(),
         encoder: "image-0.25.10/png-0.18.1/fdeflate-0.3.7/rgba8-uncompressed-no-filter-v1".into(),
         pixel_rule: "outward floor/ceil; endpoint roundoff clamp at 1e-7 raster pixels; no resize, reorientation or color management".into(),
-    };
-    let recipe_sha256 = sha(&serde_json::to_vec(&recipe)?);
-    let sha256 = sha(&writer.bytes);
-    Ok(CropOutput {
-        png: writer.bytes,
-        sha256,
-        recipe,
-        recipe_sha256,
-        admission,
     })
 }
 

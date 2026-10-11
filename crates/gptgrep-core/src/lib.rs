@@ -7,6 +7,7 @@ pub mod batch;
 mod custody;
 mod derived_visual;
 mod evidence_roles;
+pub mod parse_agent;
 pub mod rich_batch;
 pub use gptgrep_index::{IndexContentLimits, IndexContentReport};
 mod rich_decisions;

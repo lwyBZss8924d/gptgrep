@@ -1,0 +1,9 @@
+{
+  "platform": "linux/amd64",
+  "common_image": null,
+  "common_build_provenance": {
+    "build_metadata": null,
+    "material_kind": "moby-classic-chain-id-v1"
+  },
+  "product_bundle": {"archive": null, "release_metadata": null}
+}

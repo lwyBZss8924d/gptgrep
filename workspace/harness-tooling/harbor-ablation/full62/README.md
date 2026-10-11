@@ -1,0 +1,230 @@
+## GPTgrep full62 → Harbor Adapter
+
+Portable adapter for the private paired SEARCH comparison. This package contains the adapter, agent, reader, verifier, aggregation source, a uv lockfile and synthetic regressions. It includes no private tasks, corpus, credentials or experimental results. Synthetic tests run against the installed Harbor 0.24.0 interfaces; the actual 124-trial comparison remains unrun.
+
+## Overview
+
+The complete frozen historical development cohort supplies 62 tasks over 34 documents at runtime. Each task produces a GPTgrep arm and a raw-document native Codex arm: 124 Harbor trials, 62 paired outcomes. No task is selected by its content, answer, filename pattern or evidence location. This is a compatibility comparison and is not an unseen holdout.
+
+Both SEARCH arms bind one native Codex reader binary and request `gpt-6-luna`, `max`, `fast`. The native metadata convention normalizes requested `fast` and reported `priority` to `priority`; neither proves the actually served profile. GPTgrep-specific tools are the intended treatment difference. The runtime records both exact permitted tool sets, shared generic raw-document capabilities, sandbox/account/budget rules and observed qualification mismatches. INDEX may use a different independently admitted helper; its identity is not required to equal the SEARCH reader binary.
+
+The primary outcome is frozen question/reference answer equivalence. Every task stays in its arm's denominator of 62. Operational failures and missing outputs are zero; valid answers with unavailable judging are unknown, with bounds. Prebuilt INDEX work and judging remain outside primary SEARCH reward and cost. Their ledgers remain necessary for whole-experiment accounting.
+
+## What is GPTgrep full62?
+
+This is the repository's same-Codex SEARCH comparison defined in `SPEC.md` and its runtime-selected frozen cohort. It compares actual configurations, not a claim of isolated search-algorithm causality. Raw Codex receives raw documents only and may perform ordinary extraction/rendering during its query deadline; GPTgrep receives the same raw documents plus its prebuilt raw-only index. The private cohort's source/license/custody remains with the project owner. No dataset publication or redistribution is performed here.
+
+## Adapter Features
+
+- Real Harbor `BaseAgent.setup/run` integration, using the installed 0.24.0 API.
+- Stock Docker environments and a separate verifier built from `tests/Dockerfile`; no custom environment implementation is needed.
+- Runtime-loaded finite document/index lists and strict file digests. No discovery or downloads.
+- Concrete GPTgrep `ask` and bare `codex exec --json` entrypoints. Image/account/schema qualification is required before any run.
+- A bounded answer envelope crosses into the primary verifier. Native operational records remain in `/logs/agent/operational.json`, outside transferred artifacts. Gold/reference data exists only in the separate verifier build context.
+- Complete-answer judging; no truncation to fit a judge. Unavailable or invalid judging retains unknown.
+- Fixed-denominator paired cells, unknown bounds, document-cluster bootstrap, McNemar diagnostic, failure-aware time, usage/cost unknowns and optional separately produced grounding sidecars.
+- The complete synthetic 124-task conversion is checked with Harbor's real `JobConfig`, `TaskConfig`, verifier resolver and `BaseAgent`. Docker, native permission effectiveness and model behavior require the selected runtime qualification.
+
+## Generated Task Structure
+
+```text
+datasets/gptgrep-full62/
+  q-<runtime-pair-hash>-gptgrep/
+    task.toml
+    instruction.md                 # Original question only
+    environment/
+      Dockerfile
+      .dockerignore                # Explicit image input allowlist
+      docker-compose.yaml          # Runtime-only auth and treatment budget mounts
+      config.toml                  # Identical named permissions for both readers
+      codex-native                 # Pinned native CLI environment wrapper
+      reader.json                  # Reader bindings, never reference answer
+      gptgrep_harbor/               # Concrete sandbox programs
+      corpus/                      # Finite raw documents + GPTgrep-only index
+    solution/solve.sh              # Explicit no-oracle exit; no gold answer
+    tests/
+      Dockerfile                   # Dedicated verifier image, bundles /tests
+      test.sh
+      judge.json                   # Question/reference/format/frozen rubric
+      gptgrep_harbor/
+  q-<runtime-pair-hash>-raw-only/
+    ...                            # Raw documents; no index or GPTgrep binary
+datasets/gptgrep-full62.export.json # 124 immutable paired bindings
+datasets/gptgrep-full62.job.json    # Concrete Harbor job config
+```
+
+Source is a uv-managed Python package under `src/gptgrep_harbor/`, with finite task templates and synthetic tests under `tests/`. Both image build contexts are separate; the reader Dockerfile never copies its parent task directory. Harbor automatically transfers `/logs/artifacts/`; this adapter leaves that directory empty. Primary artifacts declare only `/answer/answer.json`.
+
+## Run Evaluation / Harness
+
+The following benchmark commands require the project's selected runtime, account, finance and independent review. Keep caches, uv state, image layers, build contexts, jobs and temporary files on registered external storage. The package neither starts Docker nor supplies a finance allocation.
+
+### Running with Datasets Registry
+
+This private cohort is not registered or distributed. Use the local runtime materialization below. Do not substitute another similarly named dataset.
+
+### Using Job Configurations
+
+After accepted materialization produces a job file and root separately admits the experiment:
+
+```sh
+harbor run -c /admitted/external/datasets/gptgrep-full62.job.json
+```
+
+The generated job selects `gptgrep_harbor.agent:PairedNativeAgent`, Docker, one concurrent trial, `n_attempts=1`, and `retry.max_retries=0`. Do not override the selected agent/model, add MCP servers/skills, resume trajectories, append instructions, change environment overlays, or resume a consumed job. No third arm is required. Environment variable maps contain `${NAME}` references only; values are supplied privately at invocation and are never serialized by the adapter.
+
+### Build the common native-tool foundation
+
+`base-image/Dockerfile` builds a concrete shared foundation: Python 3.13, POSIX shell, uv, **Pillow 12.3.0**, Poppler `pdftotext`/`pdftoppm`, and the pinned Codex CLI 0.162.1. Pillow supports ordinary image decode, crop, resize and contrast operations. Poppler gives the bare reader ordinary PDF text extraction and page rendering. The `common` target serves both raw-reader and Judge images. A separate treatment context adds the complete current Linux release bundle to that exact existing common image. Corpus, index, questions and credentials enter no base-image context.
+
+Root first fills `base-image/build.template.json` in its admitted external input directory. Select immutable image references for an official Python 3.13 **slim-bookworm** base and the uv binary image, an exact Debian snapshot timestamp and matching `poppler-utils` package version, the target Linux platform, and an exact `{path,bytes,sha256}` pin for the official native binary. The required `native_sandbox_helper` input separately pins the bundled Linux `bwrap` binary, its provenance record and the `COPYING.bubblewrap` and `LICENSE.codex` files from the same official Codex release. The provenance uses `gptgrep.native-sandbox-helper.v1` and binds `release_tag`, `source_commit`, `archive`, `binary` and `licenses`; the archive records the canonical official release URL, asset name, bytes and SHA-256. Preparation verifies the supplied pins, Linux ELF architecture and release/platform joins before creating its output directory. These are caller-verified provenance inputs; source validation cannot prove the native CLI's embedded helper digest is compatible. That requires an actual offline native filesystem probe. Set `gptgrep_binary` to null: single-product-binary staging is rejected because the Linux product also needs its bundled PDFium library and relative launcher. The source provides no fabricated image/package/product pin. The chosen snapshot fixes package resolution; the build installs that exact Poppler version. Pillow's `requirements.lock` was generated with uv and contains distribution SHA-256 hashes; the build requires a matching binary wheel.
+
+From this source directory, with the selected external Python/uv environment:
+
+```sh
+python3 -B base-image/prepare.py \
+  --inputs /admitted/external/inputs/base-build.json \
+  --output-dir /admitted/external/build-contexts/full62-base
+```
+
+The command first requires repository `@sha256:` digests for the Python and uv `FROM` inputs; bare configuration IDs cannot be used there. It verifies the finite supplied native-binary and sandbox-helper pins, stages only the allowlisted recipe, lock, probe, binaries, helper provenance and licenses, and prints a shell-quoted `docker buildx build --load --platform ... --target common` command. It executes no Docker command. Root runs that exact command through the selected external Docker storage and gateway configuration, then records the resulting immutable image identity. The printed `:local` tag is a build handle; it must be replaced by a verified digest reference in runtime inputs. No push/publication is part of this front door.
+
+To enroll the product after the common image exists, fill `base-image/treatment.template.json` with its full local configuration ID, pinned original build metadata, platform and exact archive plus release-metadata pins. Run `python3 -B base-image/prepare.py --treatment --inputs /admitted/external/inputs/treatment.json --output-dir /admitted/external/build-contexts/treatment`. This source-only frontdoor verifies every declared release file, the embedded release metadata and checksum list, the launcher/ELF/PDFium joins, Linux architecture and complete license inventory. It rejects missing or extra members, unsafe paths, links, special files and digest mismatches before extraction. It stages the complete verified payload and returns all context pins plus `runtime_product` fields. It invokes no Docker command or supplied executable.
+
+The resulting context derives only from the selected existing common image. It installs no packages or native tools. Its build checks the entire installed bundle and invokes the relative launcher with `--version`. Use the existing `gptgrep_harbor.local_images.LocalImageBuilder.build` frontdoor with the returned context rows and common-build provenance for this single derivative; its local-alias custody checks are the same as the role-image frontdoor below. Actual Docker execution still requires the selected workload admission. Preserve the returned product-provenance pin in `runtime.gptgrep_bundle.provenance`, use the returned launcher pin as `gptgrep_binary_pin`, and select the verified derivative ID as `images.gptgrep`. Runtime validates all installed files and rejects the old single-ELF configuration. Bundle enrollment does not establish native permissions, model connectivity or benchmark acceptance.
+
+The build runs an offline probe that verifies Python/Pillow/native/Poppler versions, records executable hashes and locked requirements, and exercises generated-pixel PNG decode/crop/resize/contrast. It writes `/usr/local/share/full62-base/provenance.json`. Root extracts and pins those bytes from the actual common image, records the image digest in `base_tool_environment.image`, and supplies the host provenance pin as `base_tool_environment.provenance`. Image references accept a full local Docker configuration ID (`sha256:` followed by 64 lowercase hexadecimal characters) or an existing repository reference ending in `@sha256:` and the full digest. Mutable tags and abbreviated IDs are rejected. A local configuration ID requires the image to be available in the selected Docker daemon; it does not assert a published registry digest. `images.raw_only` and `images.judge` must equal that common identity; `images.gptgrep` selects its treatment derivative. All three generated role configurations bind the same provenance digest. Startup checks the installed Python/Pillow versions, generic executable hashes/paths and native-binary join. This binding records the installed tools; actual PDF behavior and native model-tool permissions still need the selected runtime qualification.
+
+BuildKit has an [open upstream issue with local configuration IDs in `FROM`](https://github.com/moby/buildkit/issues/2204). For a local-image run, preparation also pins each complete generated role context. Before starting Harbor, use the separate build frontdoor on the admitted Docker daemon and external output storage:
+
+```sh
+gptgrep-harbor-full62 build-local-images \
+  --export /absolute/dataset.export.json --export-sha256 <sha256> \
+  --base-builds /absolute/base-builds.json --base-builds-sha256 <sha256> \
+  --dataset /absolute/dataset --output-dir /absolute/fresh-image-build-output \
+  --docker /absolute/path/to/docker --timeout-seconds 120
+```
+
+The pinned `base-builds.json` object maps every distinct selected base configuration ID to `{"build_metadata": {"path": "/absolute/original-build-metadata.json", "bytes": 1234, "sha256": "<sha256>"}, "material_kind": "moby-classic-chain-id-v1"}`. Each metadata file must bind `containerimage.config.digest` to its map key. This version supports the Moby classic `overlay2` layer store. It derives the expected local BuildKit material from the freshly inspected layer diffIDs using [OCI ChainID](https://github.com/opencontainers/image-spec/blob/v1.1.1/identity/chainid.go); it does not accept a supplied material digest. A local material ChainID identifies filesystem layers, while the pinned build metadata and direct alias inspections separately bind the exact image configuration. Unsupported modes and digest mismatches fail.
+
+The Docker client requires explicit `DOCKER_HOST` (a local Unix socket), `DOCKER_CONFIG`, `BUILDX_CONFIG`, `HOME`, and `TMPDIR`; their storage and the daemon backing must already be admitted. The frontdoor verifies the pinned task contexts and creates fresh local aliases for the selected full image IDs. These aliases are build inputs only. All role builds must use one Docker engine identity. Each retains the existing source/config/corpus copy rules, checks daemon and alias identity before and after, checks the derived local material in BuildKit provenance, and verifies the derived image's parent filesystem layers. No image is pushed or pruned. Aliases, outputs and failures are retained without automatic retry.
+
+After all 248 role images succeed, the frontdoor freshly inspects every exact derived ID, platform and complete layer list in the same engine before enrolling any task. It then records those configuration IDs in the reader and separate verifier `docker_image` fields and writes an accepted result. Harbor uses its supported prebuilt-image path with those immutable IDs. Start Harbor only after that complete result, with `force_build=false`; otherwise the original role Dockerfiles can still reach BuildKit's unsupported ID syntax. Source and synthetic checks of this frontdoor do not establish actual Docker/Harbor runtime qualification.
+
+The container native path is `/usr/local/bin/codex`; use it for both `codex_binary` and `reader_base_binary.path`, retaining the selected binary's exact bytes/SHA. Its bundled helper is adjacent at `/usr/local/bin/codex-resources/bwrap`; helper provenance and both licenses are installed under `/usr/local/share/full62-sandbox-helper`. Common provenance retains the six existing `binaries` and records `bwrap` separately in `native_sandbox_helpers`. Startup requires that metadata and streams the installed helper and license pins, including the helper's executable, non-setuid mode. The offline image probe records `native_helper_digest_compatibility_verified=false`: neither the build nor startup hashing establishes effective filesystem enforcement. The treatment entrypoint is `/opt/full62-product/gptgrep`, with `gptgrep.bin` and `lib/libpdfium.so` alongside it. The complete bundle provenance is installed at `/usr/local/share/full62-product/provenance.json`; the shared common provenance remains unchanged. Both provenance documents contain portable paths and exact component identities for review.
+
+The shared `generic_capabilities` list includes `python3`, `POSIX shell`, `Pillow==12.3.0`, `pdftotext`, and `pdftoppm`. Both Reader profiles enable the native `shell_tool` and `view_image` features; `code_mode`, `code_mode_host`, `code_mode_only` and `code_mode_prewarm` remain disabled, and direct-only namespaces remain empty. The Judge disables shell and image tools too. These native tools use the existing named filesystem/network profile, model, account and budget rules. A portable current Linux LiteParse pin remains pending owner selection; adding it later requires the same generic tool installation in both reader arms. The current product binary and PDF/LiteParse qualification are Root-owned runtime work.
+
+Both readers validate the same in-container native binary pin and observe `codex --version` before inference. This round selects Codex CLI **0.162.1**, release `rust-v0.162.1`, source commit `092d3acd6bec3e3a14bdc7e7a2810ab628ab759d`. The exact Linux binary pin and immutable images remain runtime inputs.
+
+The baseline invokes `codex exec --json -- -` with `default_permissions="full62_reader"`, passing the complete UTF-8 prompt through stdin. The Judge uses the same stdin transport with its independent profile. Native prompts never enter argv. No legacy `--sandbox` or `sandbox_mode` override is used. Both reader images receive identical configuration bytes: ChatGPT file auth, OpenAI provider, no interactive approvals, disabled web search, read-only raw corpus, a bounded-purpose temporary working directory, and explicit denies for credentials, evaluator files, logs, answer output and finance controls. Native model-tool network access is disabled; the native client still needs its separately qualified provider connection through the selected gateway. These are requested settings, not proof of effective sandbox enforcement. The runtime review must verify both arms' effective permissions and generic raw-document tools.
+
+The runtime explicitly requires `native_ptc=true` and `codex_permissions="full62_reader"`, and passes both fields to the two Reader configurations. GPTgrep uses `--decisions-budget /opt/full62-private/decisions-budget.json ask --native-ptc ... --codex-bin /opt/full62/codex-native --codex-permissions full62_reader`. This opt-in grants native tools only to FinalRetrieval; the product API default remains false, and planner/Judge sessions receive no PTC grant. The Raw reader's native argv remains unchanged and selects the same named profile through its shared config. The product passes that named profile on `thread/start` and `turn/start`, omits their legacy sandbox overrides, and requires the returned `activePermissionProfile.id` to match before a turn. Profile provenance does not establish effective filesystem enforcement. Compiled/live permission equality remains a separate runtime check. The wrapper hashes the native CLI, rejects legacy sandbox/policy overrides, removes product credentials and shell startup overrides, then executes the pinned CLI. SEARCH uses the shared official release CLI. The separately patched native INDEX/OCR app-server stays outside SEARCH images and primary SEARCH timing; its qualifications do not prove stock CLI image transport.
+
+The runtime must explicitly select `reader_mode`: `rich_multimodal` invokes `ask --multimodal` and requires `gptgrep.rich_multimodal.host.v1`; `legacy_text` retains the older text host response contract. There is no automatic fallback between modes. Current parse-agent typed INDEX generations use `rich_multimodal`. Its retrieval model must be `openai/gpt-6-luna-decisions` or the dated `openai/gpt-6-luna-decisions-20261006` variant. The `--document` argument comes from the indexed source-relative path, independently of evaluation IDs. The adapter retains the entire product response in the private agent log, including generation, text/visual citations, metadata and delivery observations; it transfers only the complete answer envelope to the primary Judge.
+
+Every selected question must fit **min(8,192, `max_input_bytes`) UTF-8 bytes**, matching the product's positional multimodal question front door. Adapter initialization checks all 62 rows before either arm is materialized, and each reader checks again before launch. An incompatible row rejects the entire selected manifest; there is no truncation, skipped task or mode fallback. The private row parser's 1 MiB bound does not represent reader capacity. The independent complete-answer bound is 1 MiB, and the complete native prompt bound is 4 MiB, including the frozen Judge rubric, question, reference, format and candidate answer. Oversize prompts fail before inference.
+
+The original query deadline covers native version checking, prompt delivery and the query; no retry renews it. Stdin writes and stdout/stderr reads are nonblocking and multiplexed under that deadline. Cancellation or timeout stops the spawned process group, with bounded termination cleanup. Transport receipts record submitted/sent byte counts and whether all bytes entered the pipe; this does not prove native consumption. `max_tool_calls` is treatment-specific. Raw native tool calls are observed, and total raw-provider input is not enforced by the stock CLI. The emitted `budget_scope` records those limits explicitly. GPTgrep's payload-free `model_attempts.native_ptc` observations pass through unchanged, including command failures. Native counts remain observations rather than a hard pre-execution tool guard, and native commands are not added to GPTgrep's issued-tool or document-citation accounting. No shared tool-call counter or identical provider-context budget is claimed.
+
+Raw-reader and Judge accounting is extracted before process and final-answer acceptance. Valid completed-turn usage remains observable when an answer is missing or invalid, a later error occurs, or a suffix is malformed. Stream/answer/process flags identify incompleteness. Duplicate completions retain separate observations and leave scalar usage unknown instead of summing potentially duplicated receipts. At most 64 usage observations are retained, with an explicit omitted count and incomplete projection flag beyond that bound. Physical provider request count, total cost and served-profile identity remain unknown. Failed answer acceptance and unavailable judging retain their original zero/unknown scoring behavior.
+
+`auth.reader_file` and `auth.judge_file` are absolute references to the isolated owner's native `auth.json`. Each role's Compose file mounts only that file, read-only, at `/opt/full62-home/auth.json`; the native client reads it normally. The adapter checks mount metadata and never reads or hashes credential contents. The auth owner refreshes the cached device login outside trials. Credentials are excluded from Docker build contexts. API-key authentication and alternate OpenAI endpoints are rejected. `OPENROUTER_API_KEY` is a treatment-only process reference and is removed before every native Codex child; proxy and CA settings are preserved.
+
+The treatment's `decisions_budget` is a private file pin, capped at 16 KiB, supplied by the existing finance owner. `decisions_ledger_dir` mounts the owner's **original existing ledger directory** read/write at `/opt/full62-private/ledger`, preserving its journal, lock and atomic-replacement semantics. The pinned control's `ledger_path` must be directly beneath that container directory. A macOS ledger cannot be transplanted into Linux: the existing control checks clock kind, boot identity and time namespace. The owner must select an authorized context created through the product's existing execution front door in the target Linux namespace. This adapter does not initialize, copy, reset, read or reconcile finance ledgers. Both budget and ledger paths are denied to model tools.
+
+### Running Individual Trial
+
+Individual trial execution is a separate diagnostic workload and cannot replace the complete 62-pair comparison. This source packet grants no such workload. A separately admitted synthetic qualification may select an explicitly generated synthetic task through ordinary `harbor trial start`; no benchmark case is embedded in this source.
+
+## Usage: Create Task Directories
+
+The owner materializes `materialization.template.json` with three strict `{path,bytes,sha256}` pins: cohort projection, runtime contract and frozen primary judge contract. All paths must be physical absolute paths. Preserve the original frozen cohort pin in `source_cohort_sha256`.
+
+The cohort projection schema is `gptgrep.harbor.cohort.v1`, with exactly `schema`, `source_cohort_sha256`, and `tasks`. It has exactly 62 distinct rows containing only `pair_id`, `document_id`, `question`, `reference`, and `answer_format`, covering exactly 34 document IDs. This projection is evaluator-owned private input. No source author opened or generated actual rows.
+
+The judge contract schema is `gptgrep.harbor.primary-judge.v1`, with exactly `schema`, `prompt`, and `response_schema`. Root must derive it from the selected frozen primary judge, not write a new rubric. Its only formatting fields are `question`, `answer` (reference), `answer_format`, and `response` (complete candidate answer). The supported strict response schema has Boolean/string fields and requires Boolean `equivalent`; a different frozen schema requires a reviewed adapter change. No evidence annotations, raw documents, retrieval trace, other-arm output or extra evaluator rubric enter the primary prompt. Unsupported or oversized complete output is never silently truncated or called judged.
+
+Fill `runtime.template.json` from selected owner evidence. Its `admission` is the existing pinned runtime review with `accepted=true`, `scope=harbor_full62_paired_once`, matching run ID, source cohort, profile, platform, image digests, binary, assets and judge hashes. It records `native_cli_contract_qualified`, `named_permissions_qualified`, `reader_effective_permissions_equal`, `bare_image_excludes_gptgrep_and_indexes`, and `raw_only_index_provenance_verified`, and joins the exact `native_cli` object. `runtime_subject_sha256` hashes compact sorted UTF-8 JSON over all runtime fields except `admission` and `admitted`. These fields bind the selected evidence; setting them does not manufacture acceptance.
+
+`reader_base_binary` and `gptgrep_binary_pin` use strict in-container file pins. Both SEARCH arms hash the same native reader before launch; the treatment additionally hashes its product binary. `judge_profile` must preserve the independently selected frozen judge profile, identically for both arms; it is separate from the fixed SEARCH reader profile. It is not silently replaced with the reader's model.
+
+`documents` contains 34 `{document_id,relative_path,pin}` records; `index_files` contains finite `{relative_path,pin}` records. Their paths share the same in-container corpus root and must be unique. Both arms receive the same original document bytes. Only GPTgrep receives `index_files`. Index provenance must establish preparation from raw documents before question exposure. Index source/helper/build accounting remains separate.
+
+```sh
+gptgrep-harbor-full62 prepare \
+  --manifest /admitted/external/inputs/materialization.json \
+  --manifest-sha256 <exact-sha256> \
+  --output-dir /admitted/external/datasets/gptgrep-full62
+```
+
+The conventional `--limit`, `--task-ids` and `--overwrite` flags are recognized and deliberately rejected for this full-cohort protocol. Existing/partial output is preserved; choose a fresh successor namespace. `--output-dir` is required; the project selects its admitted external path explicitly.
+
+The materializer streams assets in bounded blocks and writes 124 private build contexts. Forecast their full duplication and image/job/lifecycle storage before launch: raw assets appear 124 times, index assets 62 times, plus source/metadata, build layers and retained runtime output. Declared Harbor resource requests are not observed enforcement or peak evidence.
+
+After the run, root creates an exact aggregate input list of 124 unique `task_name` records; every record has `answer`, `judgment`, `operation`, `grounding` pins or explicit null. Gold is not needed by aggregation. Missing output files become explicit null. An absent verifier with a valid retained answer remains unknown. Bindings must match the immutable export; missing binding records and duplicates are rejected.
+
+```sh
+gptgrep-harbor-full62 aggregate \
+  --inputs /admitted/external/results/aggregate-inputs.json \
+  --inputs-sha256 <exact-sha256> \
+  --output /admitted/external/results/paired-summary.json
+```
+
+Optional grounding uses a separately selected verifier, never primary reward mutation. Its bounded 64 KiB schema is `gptgrep.harbor.grounding.v1`, with the exact binding, `primary_label_modified=false`, and at most 64 metric entries. Absence remains unassessed. No FACTS study, mandatory extra grader, or new paid allocation is added.
+
+## Comparison with Original Benchmark (Parity)
+
+| Agent | Model | Metric | Number of Runs | Dataset Size | Original Benchmark Performance | Harbor Adapter Performance |
+|---|---|---|---:|---:|---|---|
+| Native paired source candidate | gpt-6-luna / max / fast requested | Answer-equivalence delta | 0 | 62 pairs / 34 documents | Not replayed | Not run |
+
+`parity_experiment.json` contains no benchmark measurements. Historical PageIndex evidence remains separate. The primary rubric and task semantics come from pinned runtime inputs. The complete-answer policy never silently truncates a response.
+
+The authoritative project aggregation uses all 62 tasks, four paired cells, and per-pair unknown extrema. It resamples 34 document clusters with replacement, preserving pairs and all tasks within each selected cluster, for 10,000 task-weighted bootstrap replicates. Seed is selected before results; 95% endpoints use linear/type-7 quantiles. McNemar is a diagnostic with document-dependence limits, not a significance gate. The default primary is positive answer-equivalence delta. This candidate does not silently select an efficiency criterion after scoring.
+
+`reward.json` includes lower/upper values and label availability. Unknown has no `answer_equivalence` scalar. Harbor's per-key means can therefore exclude unavailable labels and **must not be used as the project's primary point accuracy**. Use the separate paired summary. Operational failures emit known zero. Missing trials stay in the denominator.
+
+## Notes & Caveats
+
+Synthetic checks establish package and Harbor API behavior only. Selected-image qualification, the real 124 trials, independent results review and project delivery remain separate. No benchmark score, paid inference, finance acceptance or release acceptance follows from the synthetic suite.
+
+The installed source and Harbor docs establish the integration interfaces. Actual native event shapes, CLI request metadata, account projection, generic tools and sandbox behavior still need the selected binary/image qualification before run. Requested fast, reported priority and actually served identity remain distinct. The INDEX helper may be independently built/admitted without replacing the SEARCH native reader.
+
+Every outer query attempt and its observed wall duration is retained; there is no adapter retry. Partial failure output yields any parsable observed accounting. Unobserved model/provider retries and physical Decisions requests remain unknown. The final-reader token summary is a subset diagnostic and is never added to the model-turn ledger. Available reported retrieval cost is retained with its denomination unverified; missing native costs keep complete query cost and G5 normalization unavailable. INDEX and Judge costs remain separate. This adapter does not inspect unlisted financial ledgers.
+
+Failure-aware time assigns the original deadline to wrong/failed tasks, bounds unavailable judgments, and never sums overlapping model durations as query wall time. Generic account/financial enforcement is supplied by the selected sandbox/owner admission, not implemented as a second money owner here. The process controller bounds each stream at 4 MiB, imposes the query deadline and permits at most two seconds for group cleanup. Escaped daemon/service custody is not proved by process-group cleanup; selected sandbox teardown remains required.
+
+The materializer's `copy_asset` verifies finite supplied pins, not the semantic purity of a corpus or image. Independent source/image/index custody review establishes that no gold, task annotations or other-arm outputs are present. Complete source-only tests include malicious/missing binding cases but do not claim runtime sandbox isolation.
+
+The adapter summary is a bounded SEARCH projection, not an implementation claim for every proposed INDEX metric in `metric-schema.json`. Grounding, citation entailment, served-profile proof, provider-internal counts, complete normalized costs, G5, independent acceptance, first-release PageIndex comparison, publication and Goal completion remain separate.
+
+## Installation / Prerequisites
+
+Install with `uv sync --frozen` in the selected external environment, with `UV_PROJECT_ENVIRONMENT`, `UV_CACHE_DIR`, `UV_PYTHON_INSTALL_DIR`, `HOME`, `TMPDIR` and XDG state/cache/data roots explicitly set there. Python ≥3.12 and Harbor 0.24.0 are pinned by the project and `uv.lock`. Docker remains an independently managed prerequisite.
+
+Reader images need Linux Python 3.12+, the exact native Codex reader, the protocol's ordinary raw-document tools, and a clean isolated runtime/account. GPTgrep's image additionally needs the independently accepted Linux GPTgrep binary and its runtime dependencies. The judge base image needs Python and the selected native CLI, but no corpus/index. No credentials may be baked into images or task build contexts.
+
+With the selected storage/runtime environment in effect:
+
+```sh
+uv run --frozen python -B -m unittest discover -s tests -v
+```
+
+The suite uses authored synthetic fixtures under explicit `TMPDIR`, including a complete 124-task conversion and real Harbor schema checks. It never starts Docker or models. One bounded child test invokes the selected Python interpreter to verify a fractional remaining deadline; native/model execution is mocked in interface tests.
+
+## Troubleshooting
+
+A pin or physical-path mismatch stops materialization. Existing output or attempt markers stop reuse. Keep partial artifacts and select a fresh successor; do not erase a consumed attempt. Unknown judge labels, native costs and served metadata remain explicit. A failed cached login requires the auth owner to refresh outside the trial; it does not authorize an API-key fallback.
+
+## Citation
+
+Project authority remains in `SPEC.md` and `docs/architecture.md`. Harbor interfaces are documented in [Custom agents](https://docs.harborframework.com/agents/custom-agents), [Separate verifier](https://docs.harborframework.com/tasks/separate-verifier), [Artifacts](https://docs.harborframework.com/tasks/artifacts) and [Job configurations](https://docs.harborframework.com/jobs/configs). Named permissions are documented in [Codex permissions](https://developers.openai.com/codex/permissions). The private cohort's source citation remains runtime-owned.
+
+## Authors & Contributions
+
+Adopted from the retained source candidate into the project-owned Harbor tooling. Changes are confined to this package; the existing bridge, upstream Harbor sources and frozen candidate remain separate.
+
+## Acknowledgement
+
+No paid inference, external compute grant or upstream parity account was used during source preparation.

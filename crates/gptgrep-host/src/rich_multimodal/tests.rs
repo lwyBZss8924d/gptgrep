@@ -330,6 +330,18 @@ enum Mode {
     Forged,
     Replayed,
     Budget,
+    PtcImage,
+    PtcUnissued,
+    PtcWrongQuote,
+    PtcBudget,
+}
+impl Mode {
+    fn native_ptc(self) -> bool {
+        matches!(
+            self,
+            Self::PtcImage | Self::PtcUnissued | Self::PtcWrongQuote | Self::PtcBudget
+        )
+    }
 }
 async fn native_fixture(
     stream: tokio::io::DuplexStream,
@@ -362,8 +374,15 @@ async fn native_fixture(
             Some("thread/start") => {
                 assert_eq!(request["params"]["model"], "gpt-6-luna");
                 assert_eq!(request["params"]["serviceTier"], "fast");
-                emit(&mut write,json!({"id":3,"result":{"thread":{"id":"visual-thread"},"model":"gpt-6-luna","modelProvider":"openai",
-                    "approvalPolicy":"never","sandbox":{"type":"readOnly","networkAccess":false},"reasoningEffort":"max","serviceTier":"priority"}})).await?;
+                let mut result = json!({"thread":{"id":"visual-thread"},"model":"gpt-6-luna","modelProvider":"openai",
+                    "approvalPolicy":"never","sandbox":{"type":"readOnly","networkAccess":false},"reasoningEffort":"max","serviceTier":"priority"});
+                if mode.native_ptc() {
+                    result["activePermissionProfile"] = json!({"id":"native_ptc_reader"});
+                    assert_eq!(request["params"]["config"]["features.shell_tool"], true);
+                    assert_eq!(request["params"]["config"]["features.view_image"], true);
+                    assert_eq!(request["params"]["permissions"], "native_ptc_reader");
+                }
+                emit(&mut write, json!({"id":3,"result":result})).await?;
             }
             Some("turn/start") => {
                 assert_strict_citation_union(&request["params"]["outputSchema"]);
@@ -376,8 +395,35 @@ async fn native_fixture(
                     state["citation_status"],
                     "model_exposure_only_explicit_delivery_required"
                 );
+                if mode.native_ptc() {
+                    for (method, item) in [
+                        (
+                            "item/started",
+                            json!({"type":"commandExecution","id":"ptc-command","status":"inProgress","command":"private-command-sentinel"}),
+                        ),
+                        (
+                            "item/completed",
+                            json!({"type":"commandExecution","id":"ptc-command","status":"completed","aggregatedOutput":"private-output-sentinel"}),
+                        ),
+                        (
+                            "item/started",
+                            json!({"type":"imageView","id":"ptc-image","path":"/private/image-sentinel.png"}),
+                        ),
+                        (
+                            "item/completed",
+                            json!({"type":"imageView","id":"ptc-image","path":"/private/image-sentinel.png"}),
+                        ),
+                    ] {
+                        emit(
+                            &mut write,
+                            json!({"method":method,"params":{
+                            "threadId":"visual-thread","turnId":"visual-turn","item":item}}),
+                        )
+                        .await?;
+                    }
+                }
                 let mut text_citation = None;
-                if matches!(mode, Mode::Mixed) {
+                if matches!(mode, Mode::Mixed | Mode::PtcWrongQuote) {
                     let text_hit = state["initial_retrieval"]
                         .as_array()
                         .unwrap()
@@ -402,7 +448,8 @@ async fn native_fixture(
                     )?;
                     assert_eq!(body["window"]["text"], "alpha\r\n中 tail\n");
                     text_citation = Some(
-                        json!({"kind":"text","issued_id":body["issued_id"],"offset":7,"length":3,"quote":"中"}),
+                        json!({"kind":"text","issued_id":body["issued_id"],"offset":7,"length":3,
+                            "quote":if matches!(mode, Mode::PtcWrongQuote) { "伪" } else { "中" }}),
                     );
                     frames.push(response);
                 }
@@ -426,6 +473,10 @@ async fn native_fixture(
                     let response = line(&mut read).await?;
                     frames.push(response.clone());
                     assert_eq!(response["id"], -45);
+                    if matches!(mode, Mode::PtcBudget) {
+                        assert_eq!(response["error"]["code"], -32601);
+                        return Ok(frames);
+                    }
                     let body: Value = serde_json::from_str(
                         response["result"]["contentItems"][0]["text"]
                             .as_str()
@@ -459,6 +510,8 @@ async fn native_fixture(
                 .await?;
                 let citation = if matches!(mode, Mode::Forged) {
                     json!({"kind":"image","issued_id":issued,"rendition_sha256":"forged"})
+                } else if matches!(mode, Mode::PtcUnissued) {
+                    json!({"kind":"image","issued_id":"ptc-image"})
                 } else {
                     json!({"kind":"image","issued_id":issued})
                 };
@@ -484,10 +537,17 @@ async fn drive(
     let (read, write) = tokio::io::split(host);
     let task = tokio::spawn(native_fixture(server, id, mode));
     let deadline = evidence.deadline;
-    let config = HostConfig {
+    let mut config = HostConfig {
         document: evidence.document.clone(),
         ..config()
     };
+    if mode.native_ptc() {
+        config.native_ptc = true;
+        config.permission_profile = Some("native_ptc_reader".into());
+        if matches!(mode, Mode::PtcBudget) {
+            config.max_tool_calls = 2;
+        }
+    }
     let result = protocol::run_observed_budget(
         read,
         write,
@@ -961,5 +1021,46 @@ async fn exhausted_complete_frame_budget_fails_before_image_reservation() -> Res
     let registry = evidence.delivery.as_ref().unwrap();
     assert_eq!(registry.retained_bytes(), 0);
     assert_eq!(registry.unknown_entries(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_ptc_keeps_actual_render_delivery_as_the_only_image_citation_authority() -> Result<()>
+{
+    let (_temp, mut evidence, _png, id) = fixture(11).await?;
+    let (outcome, frames) = drive(&mut evidence, id, Mode::PtcImage).await?;
+    let final_value = finish(&evidence, &outcome.answer)?;
+    assert_eq!(final_value.citations.len(), 1);
+    assert!(matches!(
+        &final_value.citations[0],
+        RichMultimodalCitation::Image { .. }
+    ));
+    let render = frames.iter().find(|frame| frame["id"] == -45).unwrap();
+    assert_eq!(render["result"]["contentItems"][1]["type"], "inputImage");
+    assert_eq!(evidence.calls, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_ptc_does_not_allow_native_image_ids_or_wrong_source_quotes() -> Result<()> {
+    for mode in [Mode::PtcUnissued, Mode::PtcWrongQuote] {
+        let (_temp, mut evidence, _png, id) = fixture(11).await?;
+        let (outcome, frames) = drive(&mut evidence, id, mode).await?;
+        assert!(frames.iter().any(|frame| frame["id"] == -45
+            && frame["result"]["contentItems"][1]["type"] == "inputImage"));
+        assert!(finish(&evidence, &outcome.answer).is_err());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_ptc_shared_budget_denies_rich_render_before_it_mints_evidence() -> Result<()> {
+    let (_temp, mut evidence, _png, id) = fixture(11).await?;
+    let error = drive(&mut evidence, id, Mode::PtcBudget)
+        .await
+        .err()
+        .expect("combined budget");
+    assert_eq!(error.to_string(), "host_native_ptc_tool_budget_exhausted");
+    assert_eq!(evidence.calls, 0);
     Ok(())
 }

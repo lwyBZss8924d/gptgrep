@@ -1,0 +1,351 @@
+"""Runtime-only conversion of a pinned private cohort to 124 Harbor tasks."""
+from __future__ import annotations
+
+from pathlib import Path
+import re
+import string
+
+from .common import ARMS, MAX_READER_QUESTION_BYTES, PROFILE, canonical, copy_asset, digest, integer, parse, pinned, put, relative, require, sha
+from .runtime import (API_ENV, BASE_CAPABILITIES, BASE_TOOLS_PATH, CODEX_HOME, DECISIONS_BUDGET, DECISIONS_LEDGER_DIR, PASS_ENV, WORK_DIR, auth_compose, auth_paths,
+                      base_tools_identity, model_config, native_identity, validate_asset_path)
+from .product_bundle import PRODUCT_ENTRYPOINT, PRODUCT_PROVENANCE, bundle_identity
+
+
+def validate_cohort(cohort):
+    require(set(cohort) == {"schema", "source_cohort_sha256", "tasks"} and
+            cohort["schema"] == "gptgrep.harbor.cohort.v1", "cohort_schema")
+    digest(cohort["source_cohort_sha256"])
+    rows = cohort["tasks"]
+    require(isinstance(rows, list) and len(rows) == 62, "full62_required")
+    seen, documents = set(), set()
+    for row in rows:
+        require(set(row) == {"pair_id", "document_id", "question", "reference", "answer_format"}, "row_fields")
+        for field in row:
+            require(isinstance(row[field], str) and row[field] and len(row[field].encode()) <= 1048576,
+                    "bounded_row_string")
+        require(row["pair_id"] not in seen, "duplicate_pair")
+        seen.add(row["pair_id"])
+        documents.add(row["document_id"])
+    require(len(documents) == 34, "document34_required")
+    return rows
+
+
+def image(value):
+    # Docker config IDs bind local images without requiring registry publication.
+    require(isinstance(value, str) and re.fullmatch(r"(?:[a-zA-Z0-9./_:-]+@)?sha256:[0-9a-f]{64}", value),
+            "immutable_image")
+    return value
+
+
+def env_templates(values):
+    require(type(values) is dict and len(values) <= 24, "environment_map")
+    for key, value in values.items():
+        require(re.fullmatch(r"[A-Z][A-Z0-9_]{0,79}", key) and
+                isinstance(value, str) and re.fullmatch(r"\$\{[A-Z][A-Z0-9_]{0,79}\}", value),
+                "environment_reference_only")
+        require(key not in API_ENV, "api_auth_environment_forbidden")
+        require(key in PASS_ENV or key == "OPENROUTER_API_KEY", "environment_key_not_allowed")
+    return values
+
+
+def toml_string(value):
+    # JSON strings are valid TOML basic strings for the admitted ASCII metadata.
+    import json
+    return json.dumps(value, ensure_ascii=True)
+
+
+class Full62Adapter:
+    def __init__(self, manifest, manifest_sha256):
+        self.manifest_path = Path(manifest).absolute()
+        from .common import read
+        body = read(self.manifest_path)
+        require(sha(body) == digest(manifest_sha256), "manifest_pin")
+        self.manifest = parse(body)
+        require(self.manifest["schema"] == "gptgrep.harbor.materialization.v1", "materialization_schema")
+        self.cohort = parse(pinned(self.manifest["cohort"]))
+        self.runtime = parse(pinned(self.manifest["runtime"]))
+        self.judge = parse(pinned(self.manifest["judge_contract"]))
+        self.rows = validate_cohort(self.cohort)
+        self._validate_runtime()
+
+    def _validate_runtime(self):
+        runtime = self.runtime
+        require(runtime["schema"] == "gptgrep.harbor.runtime.v1" and runtime["profile"] == PROFILE,
+                "runtime_profile")
+        native_identity(runtime["native_cli"])
+        auth_paths(runtime["auth"])
+        require(runtime["codex_home"] == CODEX_HOME, "isolated_codex_home")
+        require(runtime.get("native_ptc") is True and runtime.get("codex_permissions") == "full62_reader",
+                "shared_native_reader_required")
+        require(runtime["reader_mode"] in ("rich_multimodal", "legacy_text"), "explicit_reader_mode")
+        if runtime["reader_mode"] == "rich_multimodal":
+            require(runtime["jev_model"] in ("openai/gpt-6-luna-decisions", "openai/gpt-6-luna-decisions-20261006"),
+                    "rich_decisions_model")
+        budget = runtime["decisions_budget"]
+        require(type(budget) is dict and set(budget) == {"path", "bytes", "sha256"}
+                and Path(budget["path"]).is_absolute(), "decisions_budget_pin")
+        integer(budget["bytes"], 1, 16384)
+        digest(budget["sha256"])
+        validate_asset_path(budget["path"])
+        ledger_dir = runtime["decisions_ledger_dir"]
+        require(isinstance(ledger_dir, str) and ledger_dir.startswith("/") and ledger_dir != "/" and
+                Path(ledger_dir).as_posix() == ledger_dir and ".." not in Path(ledger_dir).parts and
+                not any(c in ledger_dir for c in ("$", "\n", "\r", "\x00")), "ledger_directory_reference")
+        require(runtime["account_scope"] == "Dev/Test/Eval" and runtime["admitted"] is True,
+                "isolated_runtime_admission")
+        # This receipt is independently selected by root. Source preparation does
+        # not manufacture approval by setting these fields.
+        approval = parse(pinned(runtime["admission"]))
+        subject = {key: value for key, value in runtime.items() if key not in ("admission", "admitted")}
+        require(approval.get("accepted") is True and approval.get("scope") == "harbor_full62_paired_once"
+                and approval.get("run_id") == runtime["run_id"] and
+                approval.get("runtime_subject_sha256") == sha(canonical(subject)) and
+                approval.get("source_cohort_sha256") == self.cohort["source_cohort_sha256"] and
+                approval.get("profile") == PROFILE, "admission_join")
+        require(runtime["platform"] in ("linux/amd64", "linux/arm64"), "linux_binary_admission")
+        require(approval.get("platform") == runtime["platform"] and
+                approval.get("images") == runtime["images"] and
+                approval.get("native_cli_contract_qualified") is True and
+                approval.get("reader_base_binary") == runtime["reader_base_binary"] and
+                approval.get("bare_image_excludes_gptgrep_and_indexes") is True and
+                approval.get("raw_only_index_provenance_verified") is True,
+                "platform_and_isolation_admission")
+        require(approval.get("named_permissions_qualified") is True and
+                approval.get("reader_effective_permissions_equal") is True and
+                approval.get("native_cli") == runtime["native_cli"], "native_permissions_admission")
+        reader_pin = runtime["reader_base_binary"]
+        require(set(reader_pin) == {"path", "bytes", "sha256"} and
+                reader_pin["path"] == runtime["codex_binary"], "same_search_reader_binary")
+        integer(reader_pin["bytes"], 1, 2**30)
+        digest(reader_pin["sha256"])
+        product_pin = runtime["gptgrep_binary_pin"]
+        require(set(product_pin) == {"path", "bytes", "sha256"} and
+                product_pin["path"] == runtime["gptgrep_binary"], "product_binary_pin")
+        integer(product_pin["bytes"], 1, 2**31)
+        digest(product_pin["sha256"])
+        require(type(runtime["judge_profile"]) is dict and set(runtime["judge_profile"]) == set(PROFILE)
+                and all(isinstance(value, str) and 0 < len(value) <= 128
+                        for value in runtime["judge_profile"].values()), "frozen_judge_profile")
+        require(set(runtime["permitted_tools"]) == set(ARMS) and
+                all(isinstance(runtime["permitted_tools"][arm], list) and
+                    0 < len(runtime["permitted_tools"][arm]) <= 64 and
+                    all(isinstance(tool, str) and 0 < len(tool) <= 128
+                        for tool in runtime["permitted_tools"][arm]) for arm in ARMS), "finite_permitted_tools")
+        require(isinstance(runtime["generic_capabilities"], list) and
+                isinstance(runtime["qualification_mismatches"], list), "qualification_observations")
+        for role in ("gptgrep", "raw_only", "judge"):
+            image(runtime["images"][role])
+        base = runtime["base_tool_environment"]
+        require(set(base) == {"image", "provenance"}, "common_base_environment")
+        image(base["image"])
+        require(runtime["images"]["raw_only"] == runtime["images"]["judge"] == base["image"],
+                "shared_raw_judge_base")
+        require(runtime["gptgrep_binary"] == PRODUCT_ENTRYPOINT, "product_entrypoint_path")
+        bundle_identity(runtime.get("gptgrep_bundle"), runtime["platform"], product_pin, base["image"])
+        tools = base_tools_identity(base["provenance"])
+        require(tools["binaries"]["codex"] == runtime["reader_base_binary"] and
+                tools["build_inputs"]["platform"] == runtime["platform"], "common_base_runtime_join")
+        require(set(BASE_CAPABILITIES) <= set(runtime["generic_capabilities"]), "shared_generic_capabilities")
+        require(runtime["images"]["raw_only"] != runtime["images"]["gptgrep"], "distinct_raw_image")
+        for role in ("reader_env", "judge_env"):
+            env_templates(runtime[role])
+        require("OPENROUTER_API_KEY" not in runtime["judge_env"], "product_credential_in_judge")
+        require(runtime["primary_metric"] == "answer_equivalence_delta", "selected_primary_metric")
+        integer(runtime["bootstrap_seed"])
+        require(re.fullmatch(r"[a-z0-9][a-z0-9-]{0,79}", runtime["run_id"]), "run_id")
+        require(Path(runtime["jobs_dir"]).is_absolute(), "explicit_jobs_directory")
+        integer(runtime["max_asset_bytes"], 1, 2**40)
+        for key in ("deadline_seconds", "judge_deadline_seconds"):
+            integer(runtime[key], 1, 3600)
+        integer(runtime["max_tool_calls"], 1, 10000)
+        integer(runtime["max_input_bytes"], 1024, 1048576)
+        # Validate every selected row before run() can create either arm. The
+        # broad private row parser is not the product question capacity.
+        question_cap = min(MAX_READER_QUESTION_BYTES, runtime["max_input_bytes"])
+        require(all(len(row["question"].encode("utf-8")) <= question_cap for row in self.rows),
+                "selected_cohort_reader_question_bound")
+        for key in ("codex_binary", "gptgrep_binary", "codex_home"):
+            value = runtime[key]
+            require(isinstance(value, str) and value.startswith("/") and ".." not in Path(value).parts,
+                    "sandbox_absolute_path")
+        require(set(self.judge) == {"schema", "prompt", "response_schema"} and
+                self.judge["schema"] == "gptgrep.harbor.primary-judge.v1", "frozen_judge_contract")
+        fields = [field for _, field, _, _ in string.Formatter().parse(self.judge["prompt"]) if field]
+        require(set(fields) == {"question", "answer", "answer_format", "response"}, "primary_only_fields")
+        schema = self.judge["response_schema"]
+        require(schema.get("type") == "object" and "equivalent" in schema.get("required", []) and
+                schema.get("properties", {}).get("equivalent", {}).get("type") == "boolean" and
+                all(v.get("type") in ("boolean", "string") for v in schema["properties"].values()),
+                "supported_frozen_schema")
+        documents = runtime["documents"]
+        require(len(documents) == 34 and len({d["document_id"] for d in documents}) == 34 and
+                {d["document_id"] for d in documents} == {r["document_id"] for r in self.rows}, "document_join")
+        names = []
+        for row in documents + runtime["index_files"]:
+            names.append(relative(row["relative_path"]))
+            validate_asset_path(row["relative_path"])
+            validate_asset_path(row["pin"]["path"])
+            integer(row["pin"]["bytes"], 0, runtime["max_asset_bytes"])
+            digest(row["pin"]["sha256"])
+        require(len(names) == len(set(names)) and runtime["index_files"], "finite_assets_unique")
+        require(sum(r["pin"]["bytes"] for r in documents + runtime["index_files"]) <=
+                integer(runtime["max_assets_total_bytes"], 1), "asset_total_bound")
+        require(approval.get("assets_sha256") == sha(canonical(documents + runtime["index_files"])) and
+                approval.get("judge_sha256") == self.manifest["judge_contract"]["sha256"], "assets_judge_admission")
+
+    def run(self, output_dir, *, limit=None, task_ids=None, overwrite=False):
+        # No destructive overwrite: an interrupted or consumed output is retained.
+        require(not overwrite, "overwrite_forbidden_use_fresh_run")
+        require(limit is None and task_ids is None, "complete_paired_cohort_required")
+        root = Path(output_dir).absolute()
+        require(root.resolve() == root and not root.exists(), "fresh_physical_output")
+        # A runtime mount must not become a Docker build-context member. Do not
+        # resolve/stat/open the credential path to establish this lexical rule.
+        for key in ("reader_file", "judge_file"):
+            auth_file = Path(self.runtime["auth"][key])
+            require(not auth_file.is_relative_to(root), "auth_inside_task_output")
+        # Verify every finite payload before creating any task. No discovery scan.
+        # Copying streams 1 MiB blocks; no corpus-sized in-memory buffer.
+        assets = self.runtime["documents"] + self.runtime["index_files"]
+        for asset in assets:
+            copy_asset(asset["pin"], self.runtime["max_asset_bytes"])
+        require(not (root.parent / (root.name + ".export.json")).exists() and
+                not (root.parent / (root.name + ".job.json")).exists(), "fresh_companion_outputs")
+        root.mkdir(mode=0o700, parents=False)
+        package = Path(__file__).parent
+        exported = []
+        for row in self.rows:
+            document = next(d for d in self.runtime["documents"] if d["document_id"] == row["document_id"])
+            for arm in ARMS:
+                # Names derive from runtime identity; no benchmark ID appears in code.
+                name = "q-" + sha(row["pair_id"].encode())[:24] + "-" + arm.replace("_", "-")
+                task = root / name
+                require(not task.exists(), "task_name_collision")
+                binding = {"pair_id": row["pair_id"], "document_id": row["document_id"], "arm": arm,
+                           "cohort_sha256": self.manifest["cohort"]["sha256"],
+                           "runtime_sha256": self.manifest["runtime"]["sha256"],
+                           "judge_sha256": self.manifest["judge_contract"]["sha256"],
+                           "question_sha256": sha(row["question"].encode()),
+                           "document_sha256": document["pin"]["sha256"]}
+                contexts = self._task(task, package, row, document, binding)
+                record = {"task_name": name, "binding": binding}
+                if contexts is not None:
+                    record["local_image_contexts"] = contexts
+                exported.append(record)
+        index = {"schema": "gptgrep.harbor.export.v1", "cohort": self.manifest["cohort"],
+                 "runtime": self.manifest["runtime"], "judge_contract": self.manifest["judge_contract"],
+                 "source_cohort_sha256": self.cohort["source_cohort_sha256"], "tasks": exported,
+                 "expected_pairs": 62, "expected_documents": 34, "runtime_started": False}
+        # Kept adjacent, not beneath the dataset; Harbor sees only task directories.
+        put(root.parent / (root.name + ".export.json"), index)
+        job = {"job_name": self.runtime["run_id"], "jobs_dir": self.runtime["jobs_dir"],
+               "n_attempts": 1, "n_concurrent_trials": 1, "retry": {"max_retries": 0},
+               "datasets": [{"path": str(root)}], "environment": {"type": "docker", "delete": True},
+               "agents": [{"import_path": "gptgrep_harbor.agent:PairedNativeAgent",
+                           "model_name": PROFILE["model"], "env": self.runtime["reader_env"]}],
+               "verifier": {"env": self.runtime["judge_env"]}}
+        put(root.parent / (root.name + ".job.json"), job)
+        return index
+
+    def _task(self, task, package, row, document, binding):
+        runtime, arm = self.runtime, binding["arm"]
+        template = package / "task-template"
+        # Templates are finite source members, not a task-data discovery surface.
+        for name in ("solution/solve.sh", "tests/test.sh"):
+            put(task / name, (template / name).read_bytes())
+        put(task / "instruction.md", row["question"].encode())
+        reader = {"binding": binding, "profile": PROFILE,
+                  "base_tool_environment": {"image": runtime["base_tool_environment"]["image"],
+                      "provenance": {**runtime["base_tool_environment"]["provenance"], "path": BASE_TOOLS_PATH}},
+                  "native_cli": runtime["native_cli"],
+                  "native_config_sha256": sha(model_config(PROFILE, "reader")),
+                  "decisions_budget": {**runtime["decisions_budget"], "path": DECISIONS_BUDGET},
+                  "reader_base_binary": runtime["reader_base_binary"],
+                  "gptgrep_binary_pin": runtime["gptgrep_binary_pin"],
+                  "gptgrep_bundle": {"provenance": {**runtime["gptgrep_bundle"]["provenance"],
+                                                      "path": PRODUCT_PROVENANCE}},
+                  "permitted_tools": runtime["permitted_tools"][arm],
+                  "generic_capabilities": runtime["generic_capabilities"],
+                  "qualification_mismatches": runtime["qualification_mismatches"],
+                  "budget_scope": {"query_deadline": "shared", "instruction_bytes": "shared_local_cap",
+                      "reader_question_max_bytes": min(MAX_READER_QUESTION_BYTES, runtime["max_input_bytes"]),
+                      "tool_calls": "treatment_enforced_raw_observed_only",
+                      "total_provider_input": "not_enforced_by_raw_cli"},
+                  **{key: runtime[key] for key in ("platform", "codex_binary", "gptgrep_binary", "codex_home",
+                     "jev_model", "reader_mode", "native_ptc", "codex_permissions",
+                     "deadline_seconds", "max_tool_calls", "max_input_bytes")},
+                  "source_relative_path": document["relative_path"],
+                  "raw_document": "/data/corpus/" + document["relative_path"]}
+        put(task / "environment/reader.json", reader)
+        judge = {"binding": binding, "question": row["question"], "reference": row["reference"],
+                 "base_tool_environment": reader["base_tool_environment"],
+                 "answer_format": row["answer_format"], "contract": self.judge,
+                 "codex_binary": runtime["codex_binary"],
+                 "reader_base_binary": runtime["reader_base_binary"],
+                 "judge_profile": runtime["judge_profile"],
+                 "native_cli": runtime["native_cli"], "codex_home": CODEX_HOME,
+                 "native_config_sha256": sha(model_config(runtime["judge_profile"], "judge")),
+                 "judge_deadline_seconds": runtime["judge_deadline_seconds"]}
+        put(task / "tests/judge.json", judge)
+        for target in (task / "environment/gptgrep_harbor", task / "tests/gptgrep_harbor"):
+            for name in ("__init__.py", "common.py", "process.py", "native.py", "runtime.py", "product_bundle.py", "reader.py", "verifier.py"):
+                put(target / name, (package / name).read_bytes())
+        for asset in runtime["documents"] + (runtime["index_files"] if arm == "gptgrep" else []):
+            destination = task / "environment/corpus" / asset["relative_path"]
+            # Recheck immediately before copying; never traverse unlisted inputs.
+            copy_asset(asset["pin"], runtime["max_asset_bytes"], destination)
+            destination.chmod(0o444)
+        envdocker = ("FROM " + runtime["images"][arm] + "\n"
+                     "COPY gptgrep_harbor /opt/full62/gptgrep_harbor\n"
+                     "COPY reader.json /opt/full62/reader.json\n"
+                     "COPY codex-native /opt/full62/codex-native\n"
+                     "COPY corpus /data/corpus\n"
+                     "COPY config.toml " + CODEX_HOME + "/config.toml\n"
+                     "RUN mkdir -p " + WORK_DIR + " && chmod 700 " + CODEX_HOME + " " + WORK_DIR +
+                     " && chmod 755 /opt/full62/codex-native\n"
+                     "ENV PYTHONPATH=/opt/full62 PYTHONDONTWRITEBYTECODE=1 CODEX_HOME=" + CODEX_HOME + "\n"
+                     "WORKDIR /data/corpus\n")
+        judgedocker = ("FROM " + runtime["images"]["judge"] + "\n"
+                       "COPY gptgrep_harbor /tests/gptgrep_harbor\n"
+                       "COPY judge.json test.sh /tests/\n"
+                       "COPY config.toml " + CODEX_HOME + "/config.toml\n"
+                       "RUN mkdir -p " + WORK_DIR + " && chmod 700 " + CODEX_HOME + " " + WORK_DIR + "\n"
+                       "ENV PYTHONPATH=/tests PYTHONDONTWRITEBYTECODE=1 CODEX_HOME=" + CODEX_HOME + "\n"
+                       "WORKDIR " + WORK_DIR + "\n")
+        put(task / "environment/Dockerfile", envdocker.encode())
+        put(task / "tests/Dockerfile", judgedocker.encode())
+        put(task / "environment/codex-native", b"#!/usr/bin/env python3\nfrom gptgrep_harbor.runtime import native_wrapper\nnative_wrapper()\n")
+        for directory, role, auth_key in (("environment", "reader", "reader_file"),
+                                           ("tests", "judge", "judge_file")):
+            profile = PROFILE if role == "reader" else runtime["judge_profile"]
+            put(task / directory / "config.toml", model_config(profile, role))
+            compose = auth_compose(runtime["auth"][auth_key], runtime["platform"])
+            if role == "reader" and arm == "gptgrep":
+                compose["services"]["main"]["volumes"].append({"type": "bind",
+                    "source": runtime["decisions_budget"]["path"], "target": DECISIONS_BUDGET,
+                    "read_only": True, "bind": {"create_host_path": False}})
+                compose["services"]["main"]["volumes"].append({"type": "bind",
+                    "source": runtime["decisions_ledger_dir"], "target": DECISIONS_LEDGER_DIR,
+                    "read_only": False, "bind": {"create_host_path": False}})
+            put(task / directory / "docker-compose.yaml", compose)
+            # Credentials and arbitrary sibling files cannot enter either image.
+            allowed = ["gptgrep_harbor", "config.toml"] + (
+                ["reader.json", "codex-native", "corpus"] if role == "reader" else ["judge.json", "test.sh"])
+            ignore = ["**"]
+            for name in allowed:
+                ignore.append("!" + name)
+                if name in ("gptgrep_harbor", "corpus"):
+                    ignore.append("!" + name + "/**")
+            put(task / directory / ".dockerignore", ("\n".join(ignore) + "\n").encode())
+        text = (template / "task.toml").read_text().format(
+            task_name=task.name, reader_timeout=runtime["deadline_seconds"] + 10,
+            judge_timeout=runtime["judge_deadline_seconds"] + 10,
+            cpus=integer(runtime["resources"]["cpus"], 1, 64),
+            memory_mb=integer(runtime["resources"]["memory_mb"], 256, 1048576),
+            storage_mb=integer(runtime["resources"]["storage_mb"], 256, 1048576))
+        put(task / "task.toml", text.encode())
+        if any(value.startswith("sha256:") for value in runtime["images"].values()):
+            from .local_images import task_contexts
+            return task_contexts(task, {"environment": runtime["images"][arm],
+                                        "tests": runtime["images"]["judge"]}, runtime["platform"])
+        return None

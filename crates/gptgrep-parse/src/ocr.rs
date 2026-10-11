@@ -142,6 +142,45 @@ pub struct OcrImageDelivery {
     pub width: u32,
     pub height: u32,
     pub tool_response_sha256: String,
+    /// Native preparation can resize/re-encode the admitted source image.
+    /// The original fields above continue to describe the task artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<OcrNativeImageDelivery>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OcrNativeImageReference {
+    Inline { bytes: u64, sha256: String },
+    File { reference_sha256: String },
+}
+
+/// Portable custody evidence. Private paths, native IDs and upload references stay local.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OcrNativeImageDelivery {
+    pub schema_version: String,
+    pub admission_sha256: String,
+    pub task_sha256: String,
+    pub source_sha256: String,
+    pub prepared_sha256: String,
+    pub runtime_profile_sha256: String,
+    pub call_id_sha256: String,
+    pub source_receipt_sha256: String,
+    pub prepared_receipt_sha256: String,
+    pub assembled_receipt_sha256: String,
+    pub rendition_sha256: String,
+    pub prepared_image_sha256: String,
+    pub prepared_image_bytes: u64,
+    pub prepared_width: u32,
+    pub prepared_height: u32,
+    pub image_content_wire_charge: u64,
+    pub reference: OcrNativeImageReference,
+    pub local_assembly_verified: bool,
+    pub provider_ingestion_verified: bool,
+    /// Additional static native view; outer fields still name the original parent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_crop: Option<crate::NativeOcrCropProof>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -176,6 +215,17 @@ pub trait OcrExecutor: Send + Sync {
         &'a self,
         task: OcrTask,
     ) -> Pin<Box<dyn Future<Output = Result<OcrPageResult>> + Send + 'a>>;
+    /// Typed trusted source derivative; JSON cannot manufacture this opaque input.
+    fn execute_with_native_crops<'a>(
+        &'a self,
+        task: OcrTask,
+        crops: Vec<crate::NativeOcrCrop>,
+    ) -> Pin<Box<dyn Future<Output = Result<OcrPageResult>> + Send + 'a>> {
+        Box::pin(async move {
+            ensure!(crops.is_empty(), "OCR executor does not admit native crops");
+            self.execute(task).await
+        })
+    }
 }
 
 pub fn validate_ocr_task(task: &OcrTask) -> Result<()> {
@@ -340,9 +390,94 @@ pub fn validate_ocr_task_metadata(task: &OcrTask) -> Result<()> {
     Ok(())
 }
 
+fn validate_native_delivery(
+    task: &OcrTask,
+    runtime: &str,
+    delivery: &OcrImageDelivery,
+    native: &OcrNativeImageDelivery,
+) -> Result<()> {
+    ensure!(
+        task.budget.max_tool_calls == 8
+            && task.budget.max_turns == 1
+            && task.budget.max_seconds == 180
+            && task.budget.frame_bytes == 4 * 1024 * 1024
+            && task.budget.transport_bytes == 16 * 1024 * 1024,
+        "OCR native task budget changed"
+    );
+    let image = task
+        .images
+        .iter()
+        .find(|image| image.artifact.id == delivery.artifact_id)
+        .ok_or_else(|| anyhow::anyhow!("OCR unplanned native image"))?;
+    let rendition = if let Some(crop) = &native.native_crop {
+        crate::validate_native_crop_proof_metadata(task, crop)?;
+        ensure!(
+            crop.recipe.parent_artifact_id == image.artifact.id,
+            "OCR native crop parent delivery changed"
+        );
+        &crop.recipe_sha256
+    } else {
+        &image.artifact.profile_sha256
+    };
+    ensure!(
+        native.schema_version == "gptgrep.ocr.native-image-delivery.v1"
+            && native.task_sha256 == task.task_sha256
+            && native.source_sha256 == task.source_sha256
+            && native.prepared_sha256 == task.prepared_sha256
+            && native.runtime_profile_sha256 == runtime
+            && &native.rendition_sha256 == rendition
+            && native.assembled_receipt_sha256 == delivery.tool_response_sha256
+            && native.local_assembly_verified
+            && !native.provider_ingestion_verified,
+        "OCR native delivery binding"
+    );
+    for digest in [
+        &native.admission_sha256,
+        &native.call_id_sha256,
+        &native.source_receipt_sha256,
+        &native.prepared_receipt_sha256,
+        &native.assembled_receipt_sha256,
+        &native.prepared_image_sha256,
+    ] {
+        ensure!(valid_digest(digest), "OCR native delivery digest");
+    }
+    ensure!(
+        native.prepared_image_bytes > 0
+            && native.prepared_image_bytes <= 4 * 1024 * 1024
+            && native.prepared_width > 0
+            && native.prepared_height > 0
+            && u64::from(native.prepared_width) * u64::from(native.prepared_height)
+                <= 16 * 1024 * 1024
+            && native.image_content_wire_charge > native.prepared_image_bytes
+            && native.image_content_wire_charge <= 4 * 1024 * 1024,
+        "OCR native prepared image bounds"
+    );
+    match &native.reference {
+        OcrNativeImageReference::Inline { bytes, sha256 } => ensure!(
+            *bytes == native.prepared_image_bytes && *sha256 == native.prepared_image_sha256,
+            "OCR native inline payload changed"
+        ),
+        OcrNativeImageReference::File { reference_sha256 } => ensure!(
+            valid_digest(reference_sha256),
+            "OCR native file reference digest"
+        ),
+    }
+    Ok(())
+}
+
 pub fn validate_ocr_result(task: &OcrTask, result: &OcrPageResult) -> Result<()> {
     validate_ocr_task(task)?;
-    validate_ocr_result_metadata(task, result)
+    validate_ocr_result_metadata(task, result)?;
+    for delivery in &result.receipt.image_deliveries {
+        if let Some(crop) = delivery
+            .native
+            .as_ref()
+            .and_then(|native| native.native_crop.as_ref())
+        {
+            crate::validate_native_crop_proof(task, crop)?;
+        }
+    }
+    Ok(())
 }
 
 /// Validate result lineage and required regions without opening task paths.
@@ -376,6 +511,24 @@ pub fn validate_ocr_result_metadata(task: &OcrTask, result: &OcrPageResult) -> R
     );
     let mut previous_ordinal = 0;
     let mut delivered = BTreeSet::new();
+    let native_mode = result
+        .receipt
+        .image_deliveries
+        .first()
+        .is_some_and(|d| d.native.is_some());
+    let mut native_wire = 0u64;
+    let mut native_calls = BTreeSet::new();
+    let mut native_admission = None;
+    let mut crop_ids = BTreeSet::new();
+    let mut crop_parents = BTreeSet::new();
+    let mut image_bytes = task.images.iter().try_fold(0u64, |n, image| {
+        n.checked_add(image.artifact.bytes)
+            .ok_or_else(|| anyhow::anyhow!("OCR image sum overflow"))
+    })?;
+    let mut image_pixels = task.images.iter().try_fold(0u64, |n, image| {
+        n.checked_add(u64::from(image.width) * u64::from(image.height))
+            .ok_or_else(|| anyhow::anyhow!("OCR image sum overflow"))
+    })?;
     for delivery in &result.receipt.image_deliveries {
         ensure!(
             delivery.tool_ordinal > previous_ordinal
@@ -399,8 +552,67 @@ pub fn validate_ocr_result_metadata(task: &OcrTask, result: &OcrPageResult) -> R
                 && delivery.height == image.height,
             "OCR delivered image metadata mismatch"
         );
-        delivered.insert(&delivery.artifact_id);
+        ensure!(
+            delivery.native.is_some() == native_mode,
+            "OCR mixed image transports"
+        );
+        if let Some(native) = &delivery.native {
+            validate_native_delivery(
+                task,
+                &result.receipt.runtime_profile_sha256,
+                delivery,
+                native,
+            )?;
+            ensure!(
+                native_calls.insert(&native.call_id_sha256),
+                "OCR duplicate native call"
+            );
+            if let Some(admission) = native_admission {
+                ensure!(
+                    admission == &native.admission_sha256,
+                    "OCR native admission changed"
+                );
+            }
+            native_admission = Some(&native.admission_sha256);
+            native_wire = native_wire
+                .checked_add(native.image_content_wire_charge)
+                .ok_or_else(|| anyhow::anyhow!("OCR native transport overflow"))?;
+            ensure!(
+                native_wire <= 8 * 1024 * 1024,
+                "OCR native image transport limit"
+            );
+            if let Some(crop) = &native.native_crop {
+                ensure!(
+                    crop_ids.insert(&crop.derived_artifact_id)
+                        && crop_parents.insert(&crop.recipe.parent_artifact_id),
+                    "OCR duplicate native crop supplement"
+                );
+                image_bytes = image_bytes
+                    .checked_add(crop.png_bytes)
+                    .ok_or_else(|| anyhow::anyhow!("OCR image sum overflow"))?;
+                image_pixels = image_pixels
+                    .checked_add(u64::from(crop.width) * u64::from(crop.height))
+                    .ok_or_else(|| anyhow::anyhow!("OCR image sum overflow"))?;
+            }
+        }
+        // A supplemental crop never establishes observation of its original.
+        if delivery
+            .native
+            .as_ref()
+            .is_none_or(|native| native.native_crop.is_none())
+        {
+            delivered.insert(&delivery.artifact_id);
+        }
     }
+    ensure!(
+        task.images
+            .len()
+            .checked_add(crop_ids.len())
+            .is_some_and(|n| n <= task.budget.resources.images_per_page && n <= 8)
+            && image_bytes <= task.budget.resources.image_file_bytes_per_page
+            && image_pixels <= task.budget.resources.image_pixels_per_page,
+        "OCR native supplemental page budget"
+    );
     ensure!(
         task.images
             .iter()

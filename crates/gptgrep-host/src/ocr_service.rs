@@ -254,11 +254,7 @@ pub fn prepare_foreground_ocr(
         "ocr_service_catalog_root_binding"
     );
     ensure!(
-        config
-            .runtime_profile
-            .accepted_image_qualification_sha256
-            .is_some()
-            || catalog.tasks.is_empty(),
+        config.runtime_profile.image_qualification_accepted() || catalog.tasks.is_empty(),
         "ocr_service_full_task_qualification_required"
     );
     let spool = Arc::new(PrivateDirectory::existing(&options.spool_root)?);

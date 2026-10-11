@@ -1,9 +1,9 @@
-//! OCR uses an explicit mediated image handler; native viewers are not admitted.
+//! Source-bound OCR with separately qualified mediated and native image transports.
 use anyhow::{Result, anyhow, ensure};
 use base64::Engine;
 use gptgrep_parse::{
-    ArtifactKind, OcrExecutor, OcrImageDelivery, OcrPageResult, OcrReceipt, OcrRegionResult,
-    OcrResultStatus, OcrTask, ocr_profile_digest, validate_ocr_result_metadata,
+    ArtifactKind, NativeOcrCrop, OcrExecutor, OcrImageDelivery, OcrPageResult, OcrReceipt,
+    OcrRegionResult, OcrResultStatus, OcrTask, ocr_profile_digest, validate_ocr_result_metadata,
     validate_ocr_task_metadata,
 };
 use image::{ImageFormat, ImageReader, Limits};
@@ -49,6 +49,9 @@ pub struct OcrRuntimeProfile {
     pub operator_catalog_sha256: String,
     pub tool_policy_sha256: String,
     pub accepted_image_qualification_sha256: Option<String>,
+    /// Absent for immutable DynamicImages v1 profiles and their historical digests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_viewer: Option<crate::ocr_native::NativeViewerRuntimeProfile>,
 }
 
 impl OcrRuntimeProfile {
@@ -66,15 +69,18 @@ impl OcrRuntimeProfile {
             operator_catalog_sha256: Self::operator_catalog_sha256()?,
             tool_policy_sha256: Self::tool_policy_sha256()?,
             accepted_image_qualification_sha256: None,
+            native_viewer: None,
         };
         profile.validate()?;
         Ok(profile)
     }
     pub fn validate(&self) -> Result<()> {
-        ensure!(
-            self.schema_version == DESCRIPTOR_SCHEMA,
-            "ocr_runtime_profile_schema"
-        );
+        let schema = if self.native_viewer.is_some() {
+            crate::ocr_native::PROFILE_SCHEMA
+        } else {
+            DESCRIPTOR_SCHEMA
+        };
+        ensure!(self.schema_version == schema, "ocr_runtime_profile_schema");
         ensure!(
             self.source_revision.len() == 40
                 && self
@@ -87,9 +93,19 @@ impl OcrRuntimeProfile {
             valid_digest(&self.protocol_schema_sha256) && valid_digest(&self.codex_binary_sha256),
             "ocr_runtime_profile_digest"
         );
+        let (catalog, policy) = if self.native_viewer.is_some() {
+            (
+                crate::ocr_native::catalog_sha256()?,
+                crate::ocr_native::policy_sha256()?,
+            )
+        } else {
+            (
+                Self::operator_catalog_sha256()?,
+                Self::tool_policy_sha256()?,
+            )
+        };
         ensure!(
-            self.operator_catalog_sha256 == Self::operator_catalog_sha256()?
-                && self.tool_policy_sha256 == Self::tool_policy_sha256()?,
+            self.operator_catalog_sha256 == catalog && self.tool_policy_sha256 == policy,
             "ocr_runtime_tool_policy_changed"
         );
         ensure!(
@@ -98,7 +114,23 @@ impl OcrRuntimeProfile {
                 .is_none_or(valid_digest),
             "ocr_runtime_qualification_digest"
         );
+        if self.native_viewer.is_some() {
+            crate::ocr_native::validate_profile(self)?;
+        }
         Ok(())
+    }
+    pub fn image_qualification_accepted(&self) -> bool {
+        match &self.native_viewer {
+            Some(native) => native.accepted_qualification.is_some(),
+            None => self.accepted_image_qualification_sha256.is_some(),
+        }
+    }
+    pub fn transport(&self) -> OcrImageTransport {
+        if self.native_viewer.is_some() {
+            OcrImageTransport::NativeViewer
+        } else {
+            OcrImageTransport::DynamicImages
+        }
     }
     pub fn sha256(&self) -> Result<String> {
         self.validate()?;
@@ -106,7 +138,14 @@ impl OcrRuntimeProfile {
         // the same frozen runtime/tool descriptor without a circular receipt hash.
         let mut binding = self.clone();
         binding.accepted_image_qualification_sha256 = None;
-        Ok(hash(&serde_json::to_vec(&binding)?))
+        if let Some(native) = &mut binding.native_viewer {
+            native.accepted_qualification = None;
+        }
+        if binding.native_viewer.is_some() {
+            crate::ocr_native::profile_sha256(&binding)
+        } else {
+            Ok(hash(&serde_json::to_vec(&binding)?))
+        }
     }
     pub fn operator_catalog_sha256() -> Result<String> {
         Ok(hash(&serde_json::to_vec(&model_descriptor())?))
@@ -137,6 +176,7 @@ pub struct OcrHostExecutor {
     context: OcrExecutionContext,
     service_roots: Option<std::sync::Arc<ServiceRoots>>,
     service_secret: Option<String>,
+    native_probe_admission: Option<crate::ocr_native::NativeOcrProbeAdmission>,
 }
 
 #[derive(Debug, Serialize)]
@@ -155,8 +195,8 @@ impl OcrHostExecutor {
         config.runtime_profile.validate()?;
         crate::native_state_paths(config.codex_state_dir.as_deref())?;
         ensure!(
-            config.transport == OcrImageTransport::DynamicImages,
-            "ocr_native_viewer_hard_boundary_unavailable"
+            config.transport == config.runtime_profile.transport(),
+            "ocr_transport_profile_mismatch"
         );
         ensure!(!config.codex_bin.is_empty(), "ocr_codex_binary_missing");
         Ok(Self {
@@ -164,13 +204,37 @@ impl OcrHostExecutor {
             context,
             service_roots: None,
             service_secret: None,
+            native_probe_admission: None,
         })
     }
 
     /// Explicit qualification admission. This never promotes its result or profile.
     /// The caller must freeze probe inputs and reserve from the same OCR pool as production.
     pub async fn probe_page(&self, task: OcrTask) -> Result<OcrProbeReport> {
+        ensure!(
+            self.config.transport == OcrImageTransport::DynamicImages,
+            "ocr_native_probe_requires_explicit_parent_admission"
+        );
         self.execute_page(task, false).await
+    }
+    /// Separate native probe authority; this never accepts its output or changes a profile.
+    pub async fn probe_native_page(
+        &self,
+        task: OcrTask,
+        admission: crate::ocr_native::NativeOcrProbeAdmission,
+    ) -> Result<OcrProbeReport> {
+        ensure!(
+            self.config.transport == OcrImageTransport::NativeViewer,
+            "ocr_native_probe_transport"
+        );
+        admission.validate(
+            &task.task_sha256,
+            &self.config.runtime_profile.sha256()?,
+            self.context.snapshot()?.deadline_unix_ms,
+        )?;
+        let mut executor = self.clone();
+        executor.native_probe_admission = Some(admission);
+        executor.execute_page(task, false).await
     }
 
     #[cfg(test)]
@@ -228,11 +292,22 @@ impl OcrHostExecutor {
         task: OcrTask,
         cancel: OcrCancellation,
     ) -> Result<OcrPageResult> {
+        self.execute_cancellable_with_native_crops(task, Vec::new(), cancel)
+            .await
+    }
+    /// Opaque supplements enter before preparation/admission. This owns the same
+    /// original execution context, cancellation and child cleanup as execute.
+    pub async fn execute_cancellable_with_native_crops(
+        &self,
+        task: OcrTask,
+        crops: Vec<NativeOcrCrop>,
+        cancel: OcrCancellation,
+    ) -> Result<OcrPageResult> {
         let executor = self.clone();
         let worker_cancel = cancel.clone();
         let worker = tokio::spawn(async move {
             executor
-                .execute_native(task, true, Some(worker_cancel))
+                .execute_native_with_crops(task, crops, true, Some(worker_cancel))
                 .await
                 .map(|value| value.result)
         });
@@ -252,14 +327,25 @@ impl OcrHostExecutor {
         require_qualified: bool,
         cancel: Option<OcrCancellation>,
     ) -> Result<OcrProbeReport> {
+        self.execute_native_with_crops(task, Vec::new(), require_qualified, cancel)
+            .await
+    }
+    async fn execute_native_with_crops(
+        &self,
+        task: OcrTask,
+        crops: Vec<NativeOcrCrop>,
+        require_qualified: bool,
+        cancel: Option<OcrCancellation>,
+    ) -> Result<OcrProbeReport> {
         let runtime_digest = self.config.runtime_profile.sha256()?;
         let completed = self
-            .run_owned_page(
+            .run_owned_page_with_crops(
                 task,
                 require_qualified,
                 None,
                 runtime_digest.clone(),
                 cancel,
+                crops,
             )
             .await?;
         let outcome = completed.outcome;
@@ -293,8 +379,7 @@ impl OcrHostExecutor {
             image_qualification_accepted: self
                 .config
                 .runtime_profile
-                .accepted_image_qualification_sha256
-                .is_some(),
+                .image_qualification_accepted(),
             tool_calls: outcome.tool_calls,
             image_deliveries: outcome.page.image_deliveries,
             transport_bytes: outcome.transport_bytes,
@@ -309,22 +394,63 @@ impl OcrHostExecutor {
         runtime_digest: String,
         cancel: Option<OcrCancellation>,
     ) -> Result<CompletedOcrPage> {
+        self.run_owned_page_with_crops(
+            task,
+            require_qualified,
+            compatibility,
+            runtime_digest,
+            cancel,
+            Vec::new(),
+        )
+        .await
+    }
+    async fn run_owned_page_with_crops(
+        &self,
+        task: OcrTask,
+        require_qualified: bool,
+        compatibility: Option<gptgrep_parse::CompatibilityOcrTask>,
+        runtime_digest: String,
+        cancel: Option<OcrCancellation>,
+        crops: Vec<NativeOcrCrop>,
+    ) -> Result<CompletedOcrPage> {
+        ensure!(
+            crops.is_empty()
+                || (self.config.transport == OcrImageTransport::NativeViewer
+                    && compatibility.is_none()),
+            "ocr_native_crop_transport_required"
+        );
+        gptgrep_parse::validate_native_crop_set(&task, &crops)?;
         if require_qualified {
             ensure!(
-                self.config
-                    .runtime_profile
-                    .accepted_image_qualification_sha256
-                    .is_some(),
+                self.config.runtime_profile.image_qualification_accepted(),
                 "ocr_runtime_image_qualification_required"
             );
+        }
+        if self.config.transport == OcrImageTransport::NativeViewer {
+            ensure!(
+                compatibility.is_none(),
+                "ocr_native_compatibility_not_qualified"
+            );
+            crate::ocr_native::validate_task_budget(&task)?;
+            if !require_qualified {
+                self.native_probe_admission
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("ocr_native_probe_requires_explicit_parent_admission"))?
+                    .validate(
+                        &task.task_sha256,
+                        &runtime_digest,
+                        self.context.snapshot()?.deadline_unix_ms,
+                    )?;
+            }
         }
         let owner = self.clone();
         let (prepared, binary, home) = tokio::task::spawn_blocking(move || -> Result<_> {
             owner.context.remaining()?;
-            let prepared = match &owner.service_roots {
+            let mut prepared = match &owner.service_roots {
                 Some(roots) => PreparedPage::new_service(task, roots)?,
                 None => PreparedPage::new(task, &owner.config.prepared_root)?,
             };
+            prepared.native_crops = crops;
             let binary = resolve_binary(&owner.config.codex_bin)?;
             ensure!(
                 hash_file(&binary, 2 * 1024 * 1024 * 1024)?
@@ -360,21 +486,54 @@ impl OcrHostExecutor {
             .create_new(true)
             .write(true)
             .open(&descriptor_path)?;
-        descriptor.write_all(&serde_json::to_vec(&model_descriptor())?)?;
+        descriptor.write_all(&serde_json::to_vec(&if self.config.transport
+            == OcrImageTransport::NativeViewer
+        {
+            crate::ocr_native::model_descriptor()
+        } else {
+            model_descriptor()
+        })?)?;
         descriptor.sync_all()?;
         admission.check_deadline(deadline)?;
         if cancel.as_ref().is_some_and(OcrCancellation::is_cancelled) {
             return Err(anyhow!("ocr_cancelled_before_spawn"));
         }
-        let mut command = ocr_command(
-            &binary,
-            cwd.path(),
-            &home,
-            self.config.codex_state_dir.as_deref(),
-            &descriptor_path,
-        )?;
+        let native = if self.config.transport == OcrImageTransport::NativeViewer {
+            Some(crate::ocr_native::NativeOcrSession::prepare(
+                &prepared,
+                &self.config.raw_results_dir,
+                &runtime_digest,
+                deadline,
+                self.context.snapshot()?.deadline_unix_ms,
+            )?)
+        } else {
+            None
+        };
+        admission.check_deadline(deadline)?;
+        let mut command = match &native {
+            Some(native) => native.command(
+                &binary,
+                cwd.path(),
+                &home,
+                self.config.codex_state_dir.as_deref(),
+                &descriptor_path,
+            )?,
+            None => ocr_command(
+                &binary,
+                cwd.path(),
+                &home,
+                self.config.codex_state_dir.as_deref(),
+                &descriptor_path,
+            )?,
+        };
         if let Some(name) = &self.service_secret {
             strip_service_secret(&mut command, name)?;
+        }
+        // Frozen image verification/command preparation spends the same clock.
+        // Recheck immediately before the owned spawn; never renew admission.
+        admission.check_deadline(deadline)?;
+        if cancel.as_ref().is_some_and(OcrCancellation::is_cancelled) {
+            return Err(anyhow!("ocr_cancelled_before_spawn"));
         }
         let mut child = command
             .spawn()
@@ -392,9 +551,11 @@ impl OcrHostExecutor {
             .stderr
             .take()
             .ok_or_else(|| anyhow!("ocr_runtime_stderr_missing"))?;
-        let transport = ocr_protocol::TransportBudget::new(usize::try_from(
-            prepared.task.budget.transport_bytes,
-        )?);
+        let transport = ocr_protocol::TransportBudget::new(usize::try_from(if native.is_some() {
+            crate::ocr_native::RPC_BYTES
+        } else {
+            prepared.task.budget.transport_bytes
+        })?);
         let stderr_budget = transport.clone();
         let mut drain = tokio::spawn(async move {
             let mut stderr = ocr_protocol::BudgetedReader::new(stderr, stderr_budget);
@@ -424,6 +585,7 @@ impl OcrHostExecutor {
                     &mut admission,
                     ocr_protocol::OcrRunBudget { deadline, transport: transport.clone() },
                     compatibility,
+                    native,
                 ) => result,
             }
         })
@@ -447,7 +609,24 @@ impl OcrHostExecutor {
             admission.confirm_terminal()
         })();
         let mut outcome = finish_page_outcome(outcome, terminal_safeguards)?;
-        outcome.transport_bytes = transport.used();
+        if let Some(native) = outcome.native.as_ref() {
+            native.finish(
+                &mut outcome.page,
+                &outcome.mediated_calls,
+                &outcome.native_calls,
+                &outcome.turn_id,
+            )?;
+            outcome.transport_bytes = transport
+                .used()
+                .checked_add(native.image_wire_bytes(&outcome.page)?)
+                .ok_or_else(|| anyhow!("ocr_total_transport_overflow"))?;
+            ensure!(
+                outcome.transport_bytes as u64 <= outcome.page.task.budget.transport_bytes,
+                "ocr_total_transport_limit"
+            );
+        } else {
+            outcome.transport_bytes = transport.used();
+        }
         // The provider turn is terminal even when OCR completeness validation fails.
         let raw_sha256 = hash(outcome.answer.as_bytes());
         if let Some(roots) = &self.service_roots {
@@ -496,6 +675,18 @@ impl OcrExecutor for OcrHostExecutor {
         task: OcrTask,
     ) -> Pin<Box<dyn Future<Output = Result<OcrPageResult>> + Send + 'a>> {
         Box::pin(async move { Ok(self.execute_page(task, true).await?.result) })
+    }
+    fn execute_with_native_crops<'a>(
+        &'a self,
+        task: OcrTask,
+        crops: Vec<NativeOcrCrop>,
+    ) -> Pin<Box<dyn Future<Output = Result<OcrPageResult>> + Send + 'a>> {
+        Box::pin(async move {
+            Ok(self
+                .execute_native_with_crops(task, crops, true, None)
+                .await?
+                .result)
+        })
     }
 }
 
@@ -585,6 +776,7 @@ pub(crate) struct PreparedPage {
     source_namespace: Option<(std::sync::Arc<ServiceRoots>, PathBuf)>,
     pub image_deliveries: usize,
     pub delivery_events: Vec<OcrImageDelivery>,
+    pub(crate) native_crops: Vec<NativeOcrCrop>,
     delivered: BTreeSet<String>,
 }
 
@@ -625,6 +817,7 @@ impl PreparedPage {
             source_namespace: None,
             image_deliveries: 0,
             delivery_events: Vec::new(),
+            native_crops: Vec::new(),
             delivered: BTreeSet::new(),
         };
         page.fresh()?;
@@ -663,6 +856,7 @@ impl PreparedPage {
             source_namespace: Some((roots.clone(), source_relative)),
             image_deliveries: 0,
             delivery_events: Vec::new(),
+            native_crops: Vec::new(),
             delivered: BTreeSet::new(),
         };
         page.fresh()?;
@@ -694,7 +888,7 @@ impl PreparedPage {
         Ok(())
     }
 
-    fn image_bytes(&self, id: &str, digest: &str) -> Result<Vec<u8>> {
+    pub(crate) fn image_bytes(&self, id: &str, digest: &str) -> Result<Vec<u8>> {
         let image = self
             .task
             .images
@@ -852,6 +1046,7 @@ impl PreparedPage {
             width: image.width,
             height: image.height,
             tool_response_sha256: hash(&serde_json::to_vec(response)?),
+            native: None,
         });
         self.image_deliveries += 1;
         self.delivered.insert(image.artifact.id.clone());
@@ -897,6 +1092,23 @@ impl PreparedPage {
         } else {
             Err(anyhow!("ocr_unapproved_resource"))
         }
+    }
+    pub(crate) fn record_native_delivery(&mut self, delivery: OcrImageDelivery) -> Result<()> {
+        ensure!(
+            delivery.native.is_some()
+                && self.delivery_events.len() < self.task.budget.max_tool_calls as usize,
+            "ocr_native_delivery_limit"
+        );
+        if delivery
+            .native
+            .as_ref()
+            .is_some_and(|native| native.native_crop.is_none())
+        {
+            self.delivered.insert(delivery.artifact_id.clone());
+        }
+        self.delivery_events.push(delivery);
+        self.image_deliveries += 1;
+        Ok(())
     }
     pub fn verify_delivery(&self) -> Result<()> {
         ensure!(

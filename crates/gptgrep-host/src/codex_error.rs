@@ -143,6 +143,9 @@ pub struct OcrRuntimeError {
     /// Validated intermediate server notifications observed on this same turn.
     /// This is not a physical provider attempt or billed request count.
     pub server_retry_notifications: usize,
+    /// Closed classifications and bounded fingerprints; never provider text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<Value>,
 }
 
 impl OcrRuntimeError {
@@ -158,6 +161,7 @@ impl OcrRuntimeError {
             will_retry,
             usage: usage.and_then(observed_usage),
             server_retry_notifications: 0,
+            diagnostics: parsed.diagnostics,
         }
     }
 

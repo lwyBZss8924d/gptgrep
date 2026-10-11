@@ -1,7 +1,7 @@
 use super::*;
 use std::collections::BTreeSet;
 
-fn assert_only_prepared_and_valid_document_metadata(
+pub(crate) fn assert_only_prepared_and_valid_document_metadata(
     prepared: &PreparedDocument,
     budget: &ResourceBudget,
     physical_pages: u32,
@@ -25,6 +25,10 @@ fn assert_only_prepared_and_valid_document_metadata(
     );
     let length = std::fs::metadata(document_path).unwrap().len();
     assert!(length > 0 && length <= budget.document_metadata_bytes);
+    assert_eq!(
+        budget.staging_used(),
+        prepared.summary().prepared_bytes + length
+    );
     let bytes = std::fs::read(document_path).unwrap();
     let metadata: crate::NativeDocumentMetadata = serde_json::from_slice(&bytes).unwrap();
     crate::validate_native_document_metadata(&metadata, prepared.summary(), physical_pages, budget)
@@ -70,6 +74,7 @@ fn complete_result(task: &OcrTask, text: &str) -> OcrPageResult {
                     width: image.width,
                     height: image.height,
                     tool_response_sha256: "4".repeat(64),
+                    native: None,
                 })
                 .collect(),
             usage: None,
@@ -443,12 +448,14 @@ async fn char_and_raster_limits_reject_before_their_output_artifacts() {
     )
     .await
     .unwrap();
+    let error = extract_native(&prepared, &NativeOptions::default(), &budget)
+        .await
+        .unwrap_err();
     assert!(
-        extract_native(&prepared, &NativeOptions::default(), &budget)
-            .await
-            .unwrap_err()
+        error
             .to_string()
-            .contains("char count rejected before")
+            .contains("resource_limit: page character admission"),
+        "actual character-limit refusal: {error:#}"
     );
     // Document metadata is independently admitted before page materialization.
     // A page-count refusal may retain that snapshot, never a page/raster output.

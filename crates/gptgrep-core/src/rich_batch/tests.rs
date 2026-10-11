@@ -950,6 +950,7 @@ async fn native_and_offline_ocr_search_read_keep_distinct_evidence_receipts() ->
                     width: img.width,
                     height: img.height,
                     tool_response_sha256: "4".repeat(64),
+                    native: None,
                 })
                 .collect(),
             usage: None,

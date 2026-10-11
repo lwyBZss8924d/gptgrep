@@ -401,7 +401,17 @@ impl RichGenerationWriter {
         Ok(())
     }
 
-    pub fn publish(mut self) -> Result<GenerationPin> {
+    pub fn publish(self) -> Result<GenerationPin> {
+        self.publish_checked(|| Ok(()))
+    }
+
+    /// Host-only freshness/deadline veto. Failures retain the candidate and its
+    /// charges. The last check runs after build/verification immediately before
+    /// the atomic pointer write; it grants no global filesystem quiescence.
+    pub fn publish_checked(
+        mut self,
+        mut precommit: impl FnMut() -> Result<()>,
+    ) -> Result<GenerationPin> {
         ensure!(
             !self.poisoned,
             "candidate contains a failed import; CURRENT remains unchanged"
@@ -410,6 +420,7 @@ impl RichGenerationWriter {
             !self.manifest.documents.is_empty(),
             "no completed rich documents to publish"
         );
+        precommit()?;
         self.manifest
             .documents
             .sort_by(|a, b| a.document.path.cmp(&b.document.path));
@@ -418,6 +429,7 @@ impl RichGenerationWriter {
         self.budget.reserve_retained_staging(size)?;
         let bytes = serde_json::to_vec(&self.manifest)?;
         write_new(&self.dir.join("manifest.json"), &bytes)?;
+        precommit()?;
         gptgrep_index::build(
             &self.dir.join("artifact-text"),
             &self.dir.join("artifact-index"),
@@ -443,6 +455,7 @@ impl RichGenerationWriter {
         serde_json::to_writer(&mut temp, &pointer)?;
         temp.write_all(b"\n")?;
         temp.as_file().sync_all()?;
+        precommit()?;
         temp.persist(state.join("CURRENT.json"))?;
         File::open(state)?.sync_all()?;
         Ok(pin)
@@ -2779,3 +2792,90 @@ fn line_range(text: &str, number: usize) -> Result<(usize, usize)> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod checked_publication_tests {
+    // Synthetic parser/storage checks only. Future execution needs admitted
+    // external temporary storage; no model/runtime is launched by this test.
+    use super::*;
+    async fn candidate(
+        root: &Path,
+        staging: &Path,
+        budget: &ResourceBudget,
+    ) -> Result<(PathBuf, RichParsedDocument)> {
+        let prepared = gptgrep_parse::prepare_document(
+            &root.join("source.txt"),
+            staging,
+            &gptgrep_parse::PreparationOptions,
+            budget,
+        )
+        .await?;
+        let owned = prepared.staging_root().to_path_buf();
+        let native = gptgrep_parse::extract_native(
+            &prepared,
+            &gptgrep_parse::NativeOptions {
+                render_pages: false,
+                ..Default::default()
+            },
+            budget,
+        )
+        .await?;
+        Ok((
+            owned,
+            gptgrep_parse::finalize_document(native, vec![], gptgrep_parse::OcrMode::Off, budget)?,
+        ))
+    }
+    #[tokio::test]
+    async fn precommit_veto_after_index_build_retains_current_and_candidate_without_refunds()
+    -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let base = temporary.path().canonicalize()?;
+        let root = base.join("corpus");
+        fs::create_dir(&root)?;
+        fs::write(
+            root.join("source.txt"),
+            b"# Complete source\nall ordinary text\n",
+        )?;
+        let budget = ResourceBudget::default();
+        let (staging, parsed) = candidate(&root, &base.join("first-staging"), &budget).await?;
+        let mut writer = RichGenerationWriter::begin(&root, budget.clone())?;
+        writer.add_document("source.txt", &staging, parsed)?;
+        let previous = writer.publish()?;
+        let pointer = root.join(STATE).join("CURRENT.json");
+        let original = fs::read(&pointer)?;
+        for kind in ["deadline", "inventory"] {
+            let (staging, parsed) =
+                candidate(&root, &base.join(format!("{kind}-staging")), &budget).await?;
+            let mut writer = RichGenerationWriter::begin(&root, budget.clone())?;
+            writer.add_document("source.txt", &staging, parsed)?;
+            let directory = writer.candidate_dir().to_path_buf();
+            let before = budget.staging_used();
+            let mut vetoed_after_build = false;
+            let result = writer.publish_checked(|| {
+                // Initial/before-build checks pass. Only a post-build check can
+                // see this owned index; omitting the final hook would publish.
+                if directory.join("artifact-index").is_dir() {
+                    vetoed_after_build = true;
+                    if kind == "deadline" {
+                        anyhow::bail!("synthetic original deadline expired during index build");
+                    }
+                    fs::write(
+                        root.join("added.txt"),
+                        b"supported source added during index build",
+                    )?;
+                    crate::parse_agent::index_source_inventory(&root, 1)?;
+                    anyhow::bail!("synthetic changed inventory must never pass");
+                }
+                Ok(())
+            });
+            assert!(result.is_err());
+            assert!(vetoed_after_build);
+            assert_eq!(fs::read(&pointer)?, original);
+            assert!(directory.join("manifest.json").is_file());
+            assert!(directory.join("artifact-index").is_dir());
+            assert!(budget.staging_used() > before);
+            RichGenerationReader::open_pinned(&root, &previous)?.verify_all()?;
+        }
+        Ok(())
+    }
+}

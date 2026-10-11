@@ -2,7 +2,11 @@ use crate::ocr::{DEFAULT_OCR_MODEL, PreparedPage, hash};
 use crate::ocr_accounting::OcrAdmission;
 use anyhow::{Result, anyhow, ensure};
 use serde_json::{Value, json};
-use std::{collections::BTreeSet, io::Write, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::Write,
+    path::Path,
+};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 const TOOL: &str = "ocr_resource";
@@ -19,6 +23,10 @@ pub(crate) struct OcrOutcome {
     pub tool_calls: usize,
     pub transport_bytes: usize,
     pub retries: usize,
+    pub native: Option<crate::ocr_native::NativeOcrSession>,
+    pub mediated_calls: BTreeSet<String>,
+    pub native_calls: BTreeMap<String, String>,
+    pub turn_id: String,
 }
 
 pub(crate) struct OcrRunBudget {
@@ -45,6 +53,7 @@ pub(crate) async fn run<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         admission,
         budget,
         None,
+        None,
     )
     .await
 }
@@ -59,6 +68,7 @@ pub(crate) async fn run_mode<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     admission: &mut OcrAdmission,
     budget: OcrRunBudget,
     compatibility: Option<gptgrep_parse::CompatibilityOcrTask>,
+    mut native: Option<crate::ocr_native::NativeOcrSession>,
 ) -> Result<OcrOutcome> {
     let OcrRunBudget {
         deadline,
@@ -75,7 +85,11 @@ pub(crate) async fn run_mode<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         metadata: AutomaticMetadata::default(),
         working,
     };
-    rpc.request(1, "initialize", json!({"clientInfo":{"name":"gptgrep_ocr","title":"GPTgrep bounded OCR","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true,"explicitGatewayOauth":true}})).await?;
+    let initialized = rpc.request(1, "initialize", json!({"clientInfo":{"name":"gptgrep_ocr","title":"GPTgrep bounded OCR","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true,"explicitGatewayOauth":true}})).await?;
+    if let Some(native) = native.as_mut() {
+        native.initialize(&initialized)?;
+    }
+    drop(initialized);
     rpc.send(json!({"method":"initialized"})).await?;
     let config = rpc
         .request(2, "config/read", json!({"cwd":cwd,"includeLayers":false}))
@@ -105,15 +119,24 @@ pub(crate) async fn run_mode<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         );
     }
     drop(config);
-    let policy = crate::ocr::ocr_policy();
+    let policy = if native.is_some() {
+        crate::ocr_native::policy()
+    } else {
+        crate::ocr::ocr_policy()
+    };
     let task = &page.task;
     let prompt = json!({"task_id":task.id,"task_sha256":task.task_sha256,"source_sha256":task.source_sha256,"prepared_sha256":task.prepared_sha256,"page":task.page,"page_width_points":task.page_width_points,"page_height_points":task.page_height_points,"regions":task.regions,"images":task.images});
-    let instructions = if compatibility.is_some() {
+    let instructions = if native.is_some() {
+        crate::ocr_native::INSTRUCTIONS
+    } else if compatibility.is_some() {
         crate::ocr_compat::INSTRUCTIONS
     } else {
         OCR_BASE_INSTRUCTIONS
     };
     let mut prompt = prompt;
+    if let Some(native) = &native {
+        prompt["native_images"] = native.prompt_images();
+    }
     if let Some(compat) = &compatibility {
         prompt["compatibility"] = json!({"task_sha256":compat.task_sha256,"language":compat.language,
             "mode_policy_sha256":crate::ocr_compat::mode_policy_digest()?,"lineage":"submitted_image_only",
@@ -123,15 +146,27 @@ pub(crate) async fn run_mode<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         Some(compat) => {
             crate::ocr_compat::schema(compat, &crate::ocr_compat::mode_policy_digest()?)
         }
+        None if native.is_some() => native_output_schema(task),
         None => output_schema(task),
     };
-    let thread = rpc.request(3, "thread/start", json!({
+    let mut thread_params = json!({
         "model":DEFAULT_OCR_MODEL,"modelProvider":"openai","allowProviderModelFallback":false,
         "serviceTier":"fast","cwd":cwd,"approvalPolicy":"never","sandbox":"read-only",
         "ephemeral":true,"environments":[],"runtimeWorkspaceRoots":[],"selectedCapabilityRoots":[],
         "config":policy,"baseInstructions":instructions,
         "dynamicTools":tools()
-    })).await?;
+    });
+    if let Some(native) = &native {
+        thread_params
+            .as_object_mut()
+            .expect("thread params")
+            .remove("sandbox");
+        thread_params["permissions"] = json!(crate::ocr_native::PERMISSIONS_ID);
+        thread_params["serviceTier"] = json!("priority");
+        thread_params["dynamicTools"] = crate::ocr_native::tools();
+        thread_params["environments"] = native.environments();
+    }
+    let thread = rpc.request(3, "thread/start", thread_params).await?;
     let thread_id = identifier(&thread["thread"]["id"])?;
     ensure!(
         thread["model"] == DEFAULT_OCR_MODEL && thread["modelProvider"] == "openai",
@@ -139,8 +174,9 @@ pub(crate) async fn run_mode<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     );
     ensure!(
         thread["approvalPolicy"] == "never"
-            && thread["sandbox"]["type"] == "readOnly"
-            && thread["sandbox"]["networkAccess"] == false,
+            && (native.is_some()
+                || (thread["sandbox"]["type"] == "readOnly"
+                    && thread["sandbox"]["networkAccess"] == false)),
         "ocr_runtime_permissions_changed"
     );
     ensure!(
@@ -153,13 +189,26 @@ pub(crate) async fn run_mode<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         "ocr_runtime_tier_changed"
     );
     drop(thread);
-    let turn = json!({"id":4,"method":"turn/start","params":{
+    let mut turn = json!({"id":4,"method":"turn/start","params":{
         "threadId":thread_id,"model":DEFAULT_OCR_MODEL,"effort":"max","serviceTier":"fast",
         "approvalPolicy":"never","sandboxPolicy":{"type":"readOnly","networkAccess":false},
         "input":[{"type":"text","text":prompt.to_string(),"text_elements":[]}],"outputSchema":output
     }});
+    if native.is_some() {
+        turn["params"]
+            .as_object_mut()
+            .expect("turn params")
+            .remove("sandboxPolicy");
+        turn["params"]["permissions"] = json!(crate::ocr_native::PERMISSIONS_ID);
+        turn["params"]["serviceTier"] = json!("priority");
+    }
+    let descriptor = if native.is_some() {
+        crate::ocr_native::model_descriptor()
+    } else {
+        crate::ocr::model_descriptor()
+    };
     let request_sha256 = hash(&serde_json::to_vec(
-        &json!({"task_sha256":task.task_sha256,"runtime_profile_sha256":runtime_sha256,"model_descriptor":crate::ocr::model_descriptor(),"turn_request":turn}),
+        &json!({"task_sha256":task.task_sha256,"runtime_profile_sha256":runtime_sha256,"model_descriptor":descriptor,"turn_request":turn}),
     )?);
     page.fresh()?;
     // Synchronous hashing/decoding is not preempted by timeout_at. Recheck both original
@@ -171,6 +220,7 @@ pub(crate) async fn run_mode<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     rpc.send(turn).await?;
     let mut turn_id = None;
     let mut calls = BTreeSet::new();
+    let mut native_calls = BTreeMap::new();
     let mut event_calls = BTreeSet::new();
     let mut answer = None;
     let mut usage = None;
@@ -187,8 +237,13 @@ pub(crate) async fn run_mode<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             ensure!(params["threadId"] == thread_id, "ocr_tool_thread_mismatch");
             bind_turn(&mut turn_id, &params["turnId"])?;
             let call_id = identifier(&params["callId"])?;
-            ensure!(calls.insert(call_id), "ocr_duplicate_tool_call_id");
-            if calls.len() > page.task.budget.max_tool_calls as usize {
+            ensure!(
+                !native_calls.contains_key(&call_id) && calls.insert(call_id),
+                "ocr_duplicate_tool_call_id"
+            );
+            if calls.union(&event_calls).count() + native_calls.len()
+                > page.task.budget.max_tool_calls as usize
+            {
                 rpc.deny(id.clone()).await?;
                 return Err(anyhow!("ocr_tool_budget_exhausted"));
             }
@@ -200,6 +255,9 @@ pub(crate) async fn run_mode<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             crate::ocr_service::bounded_json(&params["arguments"], 4096)
                 .map_err(|_| anyhow!("ocr_tool_argument_limit"))?;
             let args = params["arguments"].clone();
+            if native.is_some() {
+                crate::ocr_native::context_only(&args)?;
+            }
             let id = id.clone();
             // Release the incoming tree/lease before page.call image decode.
             drop(message);
@@ -214,7 +272,9 @@ pub(crate) async fn run_mode<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             let result = page.call(args.clone())?;
             admission.check_deadline(deadline)?;
             rpc.send(json!({"id":id,"result":result})).await?;
-            page.record_delivery(&args, calls.len(), &result)?;
+            if native.is_none() {
+                page.record_delivery(&args, calls.len(), &result)?;
+            }
             continue;
         }
         if message.get("id").is_some() {
@@ -237,9 +297,12 @@ pub(crate) async fn run_mode<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 same_thread(&message, &thread_id)?;
                 bind_turn(&mut turn_id, &message["params"]["turnId"])?;
                 let item = &message["params"]["item"];
-                check_item(
+                check_item_mode(
                     item,
                     &mut event_calls,
+                    &mut native_calls,
+                    &calls,
+                    native.as_ref(),
                     page.task.budget.max_tool_calls as usize,
                 )?;
                 if message["method"] == "item/completed"
@@ -279,9 +342,12 @@ pub(crate) async fn run_mode<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 admission.observe_terminal();
                 if let Some(items) = turn["items"].as_array() {
                     for item in items {
-                        check_item(
+                        check_item_mode(
                             item,
                             &mut event_calls,
+                            &mut native_calls,
+                            &calls,
+                            native.as_ref(),
                             page.task.budget.max_tool_calls as usize,
                         )?;
                         if item["type"] == "agentMessage" && item["phase"] != "commentary" {
@@ -298,9 +364,13 @@ pub(crate) async fn run_mode<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     page,
                     request_sha256,
                     usage,
-                    tool_calls: calls.len(),
+                    tool_calls: calls.len() + native_calls.len(),
                     transport_bytes: rpc.transport.used(),
                     retries: server_retry_notifications,
+                    native,
+                    mediated_calls: calls,
+                    native_calls,
+                    turn_id: turn_id.ok_or_else(|| anyhow!("ocr_turn_identity_missing"))?,
                 });
             }
             Some("error") => {
@@ -337,6 +407,36 @@ pub(crate) async fn run_mode<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             _ => {}
         }
     }
+}
+
+pub(crate) fn check_item_mode(
+    item: &Value,
+    events: &mut BTreeSet<String>,
+    native_calls: &mut BTreeMap<String, String>,
+    mediated: &BTreeSet<String>,
+    native: Option<&crate::ocr_native::NativeOcrSession>,
+    max: usize,
+) -> Result<()> {
+    if item["type"] == "imageView" {
+        native
+            .ok_or_else(|| anyhow!("ocr_native_or_unapproved_item"))?
+            .check_item(item, native_calls)?;
+    } else {
+        check_item(item, events, max)?;
+    }
+    // Started/completed repeats are one call. Event arrival order grants no extra slots.
+    ensure!(
+        native_calls
+            .keys()
+            .all(|id| !mediated.contains(id) && !events.contains(id)),
+        "ocr_native_call_collision"
+    );
+    let dynamic_count = mediated.union(events).count();
+    ensure!(
+        dynamic_count + native_calls.len() <= max,
+        "ocr_tool_item_budget_exhausted"
+    );
+    Ok(())
 }
 
 fn check_item(item: &Value, calls: &mut BTreeSet<String>, max: usize) -> Result<()> {
@@ -413,6 +513,23 @@ fn output_schema(task: &gptgrep_parse::OcrTask) -> Value {
             "bbox":{"type":"object","additionalProperties":false,"properties":{"x":{"type":"number"},"y":{"type":"number"},"width":{"type":"number"},"height":{"type":"number"}},"required":["x","y","width","height"]}
         },"required":["id","text","reading_order","status","bbox"]}}
     },"required":["schema_version","task_id","task_sha256","source_sha256","prepared_sha256","page","status","regions"]})
+}
+
+/// Native Structured Outputs require explicit scalar types even for constants.
+/// Keep the legacy mediated schema unchanged; all identity checks remain exact.
+pub(crate) fn native_output_schema(task: &gptgrep_parse::OcrTask) -> Value {
+    let mut schema = output_schema(task);
+    for field in [
+        "schema_version",
+        "task_id",
+        "task_sha256",
+        "source_sha256",
+        "prepared_sha256",
+    ] {
+        schema["properties"][field]["type"] = json!("string");
+    }
+    schema["properties"]["page"]["type"] = json!("integer");
+    schema
 }
 
 pub(crate) use crate::transport::{BudgetedReader, TransportBudget};

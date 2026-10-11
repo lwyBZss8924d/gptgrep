@@ -645,7 +645,7 @@ pub async fn prepare_rich_ingest(
     Ok(prepared)
 }
 
-fn selected_sources(root: &Path, max_files: usize) -> Result<(Vec<String>, usize)> {
+pub(crate) fn selected_sources(root: &Path, max_files: usize) -> Result<(Vec<String>, usize)> {
     let walk_root = root.to_owned();
     let mut paths = Vec::new();
     let mut excluded = 0;

@@ -86,6 +86,7 @@ fn declared_offline_ocr(task: &gptgrep_parse::OcrTask) -> Result<gptgrep_parse::
                     width: image.width,
                     height: image.height,
                     tool_response_sha256: "4".repeat(64),
+                    native: None,
                 })
                 .collect(),
             usage: None,
@@ -794,6 +795,7 @@ async fn real_native_pdf_and_offline_ocr_preserve_raw_artifact_citations() -> Re
                     width: img.width,
                     height: img.height,
                     tool_response_sha256: "4".repeat(64),
+                    native: None,
                 })
                 .collect(),
             usage: None,

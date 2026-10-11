@@ -1,0 +1,10 @@
+**
+!Dockerfile
+!requirements.lock
+!probe.py
+!codex
+!bwrap
+!helper-record.json
+!COPYING.bubblewrap
+!LICENSE.codex
+!gptgrep

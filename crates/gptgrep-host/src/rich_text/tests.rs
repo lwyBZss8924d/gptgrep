@@ -1378,6 +1378,7 @@ async fn publish_saved_ocr(root: &Path) -> Result<GenerationPin> {
                 width: 2,
                 height: 4,
                 tool_response_sha256: "4".repeat(64),
+                native: None,
             }],
             usage: None,
             latency_ms: None,
@@ -1680,6 +1681,7 @@ fn native_metadata_offline_ocr(task: &OcrTask) -> Result<OcrPageResult> {
                     width: image.width,
                     height: image.height,
                     tool_response_sha256: "4".repeat(64),
+                    native: None,
                 })
                 .collect(),
             usage: None,

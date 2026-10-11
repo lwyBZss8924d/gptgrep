@@ -33,6 +33,12 @@ TARGETS = {
         "archive_sha256": "df8d1016fc36c2651b368ca13b992ae3bb6b6020d12f2d24443bf13cf76ea593",
         "payload_sha256": "e7ea012bbb01f137ff113f16502bea5aacb9d4bf97aa9031ce326e8d3182f02a",
     },
+    "aarch64-unknown-linux-gnu": {
+        "system": "Linux", "machine": "aarch64", "library": "libpdfium.so",
+        "asset": "pdfium-linux-arm64.tgz",
+        "archive_sha256": "4915b5351640c1eea59e26023e0edcad8433df96dc8f4cb3d645a4d64a178b7c",
+        "payload_sha256": "68b413b7935a014292c6f3d4e0999cd9be2a9131a14e26d22bb573451a01a6c2",
+    },
     "x86_64-unknown-linux-gnu": {
         "system": "Linux", "machine": "x86_64", "library": "libpdfium.so",
         "asset": "pdfium-linux-x64.tgz",
@@ -94,6 +100,8 @@ def verify_architecture(path: Path, target: str) -> None:
         head = stream.read(32)
     if target == "aarch64-apple-darwin":
         valid = head[:4] == b"\xcf\xfa\xed\xfe" and int.from_bytes(head[4:8], "little") == 0x100000C
+    elif target == "aarch64-unknown-linux-gnu":
+        valid = head[:6] == b"\x7fELF\x02\x01" and int.from_bytes(head[18:20], "little") == 183
     else:
         valid = head[:6] == b"\x7fELF\x02\x01" and int.from_bytes(head[18:20], "little") == 62
     if not valid:
@@ -317,6 +325,22 @@ def self_test() -> None:
                 self.assertEqual(sha256(first), sha256(second))
                 with tarfile.open(first) as archive:
                     self.assertEqual(stat.S_IMODE(archive.getmember("bundle/gptgrep").mode), 0o755)
+
+        def test_linux_arm64_and_amd64_architectures_are_distinct(self):
+            cases = (
+                ("aarch64-unknown-linux-gnu", 183, "x86_64-unknown-linux-gnu"),
+                ("x86_64-unknown-linux-gnu", 62, "aarch64-unknown-linux-gnu"),
+            )
+            for target, machine, other_target in cases:
+                with self.subTest(target=target), tempfile.NamedTemporaryFile() as file:
+                    head = bytearray(32)
+                    head[:6] = b"\x7fELF\x02\x01"
+                    head[18:20] = machine.to_bytes(2, "little")
+                    file.write(head)
+                    file.flush()
+                    verify_architecture(Path(file.name), target)
+                    with self.assertRaisesRegex(ValueError, "binary architecture does not match"):
+                        verify_architecture(Path(file.name), other_target)
 
         def test_wrong_architecture_rejected(self):
             with tempfile.NamedTemporaryFile() as file:
