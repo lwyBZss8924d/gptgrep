@@ -417,5 +417,43 @@ class MaterializationIsolationTests(unittest.TestCase):
             self.assertIn("environment_mode = \"separate\"", (destination / "task.toml").read_text())
 
 
+class NativeDirectToolPolicyTests(unittest.TestCase):
+    def test_reader_direct_functions_preserve_named_policy_and_profile(self):
+        import tomllib
+        from gptgrep_harbor.runtime import model_config
+        config = tomllib.loads(model_config(PROFILE, "reader").decode())
+        self.assertEqual(config["features"]["code_mode"],
+                         {"enabled": False, "direct_only_tool_namespaces": ["functions"]})
+        self.assertEqual(config["features"]["code_mode_host"],
+                         {"enabled": False, "disable_in_process_fallback": True})
+        self.assertTrue(config["features"]["shell_tool"])
+        self.assertTrue(config["features"]["view_image"])
+        self.assertEqual(config["default_permissions"], "full62_reader")
+        self.assertEqual(config["model"], PROFILE["model"])
+        self.assertEqual(config["model_reasoning_effort"], PROFILE["reasoning_effort"])
+        self.assertEqual(config["service_tier"], PROFILE["service_tier"])
+        policy = config["permissions"]["full62_reader"]
+        self.assertFalse(policy["network"]["enabled"])
+        self.assertEqual(policy["filesystem"]["/data/corpus"], "read")
+        self.assertEqual(policy["filesystem"]["/tmp/full62-work"], "write")
+        self.assertEqual(policy["filesystem"]["/opt/full62-home"], "deny")
+        self.assertEqual(policy["filesystem"]["/tests"], "deny")
+        self.assertEqual(policy["filesystem"]["/logs"], "deny")
+
+    def test_judge_keeps_empty_direct_namespace_and_native_tools_disabled(self):
+        import tomllib
+        from gptgrep_harbor.runtime import model_config
+        config = tomllib.loads(model_config(PROFILE, "judge").decode())
+        self.assertEqual(config["features"]["code_mode"],
+                         {"enabled": False, "direct_only_tool_namespaces": []})
+        self.assertFalse(config["features"]["shell_tool"])
+        self.assertFalse(config["features"]["view_image"])
+        self.assertEqual(config["default_permissions"], "full62_judge")
+        self.assertFalse(config["permissions"]["full62_judge"]["network"]["enabled"])
+        self.assertEqual(config["permissions"]["full62_judge"]["filesystem"]["/data"], "deny")
+        self.assertNotIn("/tmp/full62-work",
+                         config["permissions"]["full62_judge"]["filesystem"])
+
+
 if __name__ == "__main__":
     unittest.main()

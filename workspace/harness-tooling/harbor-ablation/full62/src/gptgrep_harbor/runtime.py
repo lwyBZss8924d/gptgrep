@@ -137,9 +137,10 @@ def model_config(profile, role):
     }
     lines = [key + " = " + json.dumps(value) for key, value in settings.items()]
     enabled = "true" if role == "reader" else "false"
+    direct_namespaces = ["functions"] if role == "reader" else []
     lines += ["", "[features]", "shell_tool = " + enabled, "view_image = " + enabled,
               "code_mode_only = false", "code_mode_prewarm = false",
-              "", "[features.code_mode]", "enabled = false", "direct_only_tool_namespaces = []",
+              "", "[features.code_mode]", "enabled = false", "direct_only_tool_namespaces = " + json.dumps(direct_namespaces),
               "", "[features.code_mode_host]", "enabled = false", "disable_in_process_fallback = true"]
     lines += ["", "[permissions." + name + ".filesystem]", '":minimal" = "read"']
     if role == "reader":

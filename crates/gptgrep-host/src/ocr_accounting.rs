@@ -455,6 +455,7 @@ impl OcrExecutionContext {
                         submitted: false,
                         finished: false,
                         observed_terminal: false,
+                        closeout_attempted: false,
                     });
                 }
                 Ok(None) => tokio::time::sleep(Duration::from_millis(5)).await,
@@ -580,9 +581,32 @@ pub(crate) struct OcrAdmission {
     submitted: bool,
     finished: bool,
     observed_terminal: bool,
+    closeout_attempted: bool,
 }
 
 impl OcrAdmission {
+    /// Explicit local closeout. This cannot synthesize provider completion.
+    /// A failed durable update stays visible and is not retried silently in Drop.
+    pub(crate) fn closeout(&mut self) -> Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        ensure!(
+            !self.closeout_attempted,
+            "ocr_journal_closeout_already_attempted"
+        );
+        self.closeout_attempted = true;
+        self.context.update(
+            self.id,
+            if self.submitted {
+                Status::CompletionUnknown
+            } else {
+                Status::Terminal
+            },
+        )?;
+        self.finished = true;
+        Ok(())
+    }
     pub fn observe_terminal(&mut self) {
         self.observed_terminal = true;
     }
@@ -613,7 +637,7 @@ impl OcrAdmission {
 }
 impl Drop for OcrAdmission {
     fn drop(&mut self) {
-        if !self.finished {
+        if !self.finished && !self.closeout_attempted {
             // A failed closeout leaves the existing reservation charged and occupied.
             let _ = self.context.update(
                 self.id,

@@ -1163,7 +1163,7 @@ async fn missing_image_or_forged_final_event_cannot_complete() {
 }
 
 #[cfg(unix)]
-fn mock_executor(
+pub(crate) fn mock_executor(
     fixture: &Fixture,
     mode: &str,
     accepted: bool,
@@ -1216,7 +1216,7 @@ for line in sys.stdin:
             send({'method': 'error', 'params': {'threadId': 'thread-1', 'turnId': 'turn-1', 'willRetry': False, 'error': {'message': 'private synthetic diagnostic', 'codexErrorInfo': {'responseStreamDisconnected': {'httpStatusCode': 503}}}}})
             cleanup_flood()
             sys.exit(0)
-        if MODE in ('hang', 'stderr_flood'):
+        if MODE in ('hang', 'hang_journal', 'stderr_flood'):
             child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
             pathlib.Path(__file__ + '.pid-writing').write_text(json.dumps([os.getpid(), child.pid]))
             os.replace(__file__ + '.pid-writing', __file__ + '.pid')
@@ -1246,6 +1246,13 @@ for line in sys.stdin:
         24,
     )
     .unwrap();
+    let context = if mode == "hang_journal" {
+        context
+            .with_ledger(fixture.dir.path().join("mock-ocr-ledger.json"))
+            .unwrap()
+    } else {
+        context
+    };
     let executor = crate::OcrHostExecutor::new(
         crate::OcrHostConfig {
             codex_bin: script.to_string_lossy().into_owned(),
@@ -1745,4 +1752,247 @@ fn ocr_explicit_state_keeps_auth_home_and_refuses_missing_state() {
     );
     std::fs::remove_dir(state.join("logs")).unwrap();
     assert!(ocr_command(binary, &root, &home, Some(&state), &descriptor).is_err());
+}
+
+#[cfg(unix)]
+pub(crate) async fn wait_for_submitted_mock(pid_file: &Path) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while !pid_file.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "mock did not submit"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn retained_document_ocr_cleanup_joins_after_submitted_tool_future_is_dropped() {
+    for timed_out in [false, true] {
+        let fixture = Fixture::new();
+        let (executor, context, pid_file) = mock_executor(&fixture, "hang", true);
+        let original = context.snapshot().unwrap();
+        let cleanup = crate::OcrCleanup::new(64).unwrap();
+        let executor = executor.with_cleanup(cleanup.clone());
+        let cancel = crate::OcrCancellation::default();
+        let mut operation =
+            Box::pin(executor.execute_cancellable(fixture.task.clone(), cancel.clone()));
+        tokio::select! {
+            result = &mut operation => panic!("mock ended before submission: {result:?}"),
+            () = wait_for_submitted_mock(&pid_file) => {}
+        }
+        let pids: Vec<u32> = serde_json::from_slice(&fs::read(&pid_file).unwrap()).unwrap();
+        assert!(!owned_pid_is_gone_or_zombie(pids[0]));
+        if timed_out {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(1), operation)
+                    .await
+                    .is_err()
+            );
+        } else {
+            cancel.cancel();
+            drop(operation);
+        }
+        assert!(cancel.is_cancelled());
+        cleanup
+            .cancel_and_drain(tokio::time::Instant::now() + Duration::from_secs(10))
+            .await
+            .unwrap();
+        // These assertions happen immediately at barrier return: no eventual
+        // polling window is allowed to conceal a detached worker.
+        for pid in &pids {
+            assert!(
+                owned_pid_is_gone_or_zombie(*pid),
+                "owned process outlived cleanup"
+            );
+        }
+        let leader = std::process::Command::new("/bin/ps")
+            .args(["-o", "stat=", "-p", &pids[0].to_string()])
+            .output()
+            .unwrap();
+        assert!(leader.stdout.is_empty(), "owned leader was not reaped");
+        let snapshot = context.snapshot().unwrap();
+        assert_eq!(snapshot.charged_admissions, 1);
+        assert_eq!(snapshot.active_or_quarantined_slots, 1);
+        assert_eq!(snapshot.quarantined_slots, 1);
+        assert_eq!(snapshot.terminal_admissions, 0);
+        assert_eq!(snapshot.deadline_unix_ms, original.deadline_unix_ms);
+        assert_eq!(snapshot.max_admissions, original.max_admissions);
+        let late = executor
+            .execute_cancellable(fixture.task.clone(), crate::OcrCancellation::default())
+            .await
+            .unwrap_err();
+        assert_eq!(late.to_string(), "ocr_cleanup_closed");
+        assert_eq!(context.snapshot().unwrap().charged_admissions, 1);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn retained_document_ocr_journal_failure_is_visible_and_never_synthesizes_terminal() {
+    let fixture = Fixture::new();
+    let (executor, _context, pid_file) = mock_executor(&fixture, "hang_journal", true);
+    let cleanup = crate::OcrCleanup::new(64).unwrap();
+    let executor = executor.with_cleanup(cleanup.clone());
+    let cancel = crate::OcrCancellation::default();
+    let mut operation =
+        Box::pin(executor.execute_cancellable(fixture.task.clone(), cancel.clone()));
+    tokio::select! {
+        result = &mut operation => panic!("mock ended before submission: {result:?}"),
+        () = wait_for_submitted_mock(&pid_file) => {}
+    }
+    let ledger = fixture.dir.path().join("mock-ocr-ledger.json");
+    let submitted = fs::read(&ledger).unwrap();
+    let rows: Value = serde_json::from_slice(&submitted).unwrap();
+    assert_eq!(rows["reservations"].as_array().unwrap().len(), 1);
+    assert_eq!(rows["reservations"][0]["status"], "submitted");
+    let retained = fixture.dir.path().join("mock-ocr-ledger-retained.json");
+    fs::rename(&ledger, &retained).unwrap();
+    fs::create_dir(&ledger).unwrap(); // Deterministic synthetic journal I/O failure.
+    cancel.cancel();
+    let error = operation.await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .starts_with("ocr_cancelled_completion_unknown")
+    );
+    assert!(error.to_string().contains("ocr_journal_closeout_unknown"));
+    let error = cleanup
+        .cancel_and_drain(tokio::time::Instant::now() + Duration::from_secs(10))
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "ocr_owned_execution_cleanup_unknown");
+    assert_eq!(fs::read(&retained).unwrap(), submitted);
+    assert!(ledger.is_dir());
+    let pids: Vec<u32> = serde_json::from_slice(&fs::read(pid_file).unwrap()).unwrap();
+    assert!(pids.iter().all(|pid| owned_pid_is_gone_or_zombie(*pid)));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn document_ocr_cleanup_record_limit_refuses_before_another_worker_or_admission() {
+    assert!(crate::OcrCleanup::new(0).is_err());
+    assert!(crate::OcrCleanup::new(65).is_err());
+    assert_eq!(crate::OcrCleanup::working_bytes(64).unwrap(), 65_536);
+    let fixture = Fixture::new();
+    let (executor, context, _) = mock_executor(&fixture, "complete", false);
+    let cleanup = crate::OcrCleanup::new(1).unwrap();
+    let executor = executor.with_cleanup(cleanup.clone());
+    let first = executor
+        .execute_cancellable(fixture.task.clone(), crate::OcrCancellation::default())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        first.to_string(),
+        "ocr_runtime_image_qualification_required"
+    );
+    let second = executor
+        .execute_cancellable(fixture.task.clone(), crate::OcrCancellation::default())
+        .await
+        .unwrap_err();
+    assert_eq!(second.to_string(), "ocr_cleanup_record_limit");
+    assert_eq!(context.snapshot().unwrap().charged_admissions, 0);
+    cleanup
+        .cancel_and_drain(tokio::time::Instant::now() + Duration::from_secs(10))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn observed_terminal_with_failed_owned_stop_keeps_charge_and_slot() {
+    for primary_timeout in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let ledger = directory.path().join("stop-failure-ledger.json");
+        let context = OcrExecutionContext::new(
+            "stop-failure",
+            HASH,
+            SystemTime::now() + Duration::from_secs(30),
+            2,
+        )
+        .unwrap()
+        .with_ledger(&ledger)
+        .unwrap();
+        let original_deadline = context.snapshot().unwrap().deadline_unix_ms;
+        let mut admission = context.reserve(HASH, HASH).await.unwrap();
+        admission.submitted().unwrap();
+        // Model the protocol's validated terminal observation before local cleanup.
+        admission.observe_terminal();
+        let primary: anyhow::Result<()> = if primary_timeout {
+            Err(anyhow::anyhow!("ocr_page_deadline_completion_unknown"))
+        } else {
+            Ok(())
+        };
+        let mut safeguards_called = false;
+        let error = crate::ocr::finish_owned_page_outcome(
+            primary,
+            Err(anyhow::anyhow!("injected_owned_stop_reap_failure")),
+            true,
+            || {
+                // Drain and transport succeed in the reported failure scenario.
+                safeguards_called = true;
+                admission.confirm_terminal()
+            },
+        )
+        .unwrap_err();
+        assert!(!safeguards_called);
+        assert!(
+            error
+                .to_string()
+                .contains("ocr_owned_execution_cleanup_unknown")
+        );
+        if primary_timeout {
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("ocr_page_deadline_completion_unknown")
+            );
+            assert!(
+                error
+                    .chain()
+                    .any(|cause| cause.to_string() == "ocr_page_deadline_completion_unknown")
+            );
+        }
+        let before_closeout: Value = serde_json::from_slice(&fs::read(&ledger).unwrap()).unwrap();
+        assert_eq!(before_closeout["reservations"][0]["status"], "submitted");
+        let snapshot = context.snapshot().unwrap();
+        assert_eq!(snapshot.charged_admissions, 1);
+        assert_eq!(snapshot.active_or_quarantined_slots, 1);
+        assert_eq!(snapshot.terminal_admissions, 0);
+
+        // The production registered-worker path performs this explicit closeout.
+        admission.closeout().unwrap();
+        drop(admission);
+        let snapshot = context.snapshot().unwrap();
+        assert_eq!(snapshot.charged_admissions, 1);
+        assert_eq!(snapshot.active_or_quarantined_slots, 1);
+        assert_eq!(snapshot.quarantined_slots, 1);
+        assert_eq!(snapshot.terminal_admissions, 0);
+        assert_eq!(snapshot.deadline_unix_ms, original_deadline);
+        assert_eq!(snapshot.max_admissions, 2);
+        let after_closeout: Value = serde_json::from_slice(&fs::read(&ledger).unwrap()).unwrap();
+        assert_eq!(
+            after_closeout["reservations"][0]["status"],
+            "completion_unknown"
+        );
+    }
+
+    // A successful owned stop/reap plus terminal safeguards can still release.
+    let context = OcrExecutionContext::new(
+        "stop-success",
+        HASH,
+        SystemTime::now() + Duration::from_secs(30),
+        2,
+    )
+    .unwrap();
+    let mut admission = context.reserve(HASH, HASH).await.unwrap();
+    admission.submitted().unwrap();
+    admission.observe_terminal();
+    crate::ocr::finish_owned_page_outcome(Ok(()), Ok(()), true, || admission.confirm_terminal())
+        .unwrap();
+    admission.closeout().unwrap();
+    let snapshot = context.snapshot().unwrap();
+    assert_eq!(snapshot.charged_admissions, 1);
+    assert_eq!(snapshot.active_or_quarantined_slots, 0);
+    assert_eq!(snapshot.terminal_admissions, 1);
 }

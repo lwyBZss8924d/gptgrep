@@ -19,12 +19,25 @@ struct ImageRow {
     rendition_sha256: String,
 }
 pub(super) fn contract_sha256() -> Result<String> {
+    contract_sha256_for(900)
+}
+pub(super) fn duration_millis(seconds: u64) -> Result<u64> {
+    ensure!(
+        (1..=3600).contains(&seconds),
+        "document_duration_out_of_range"
+    );
+    seconds
+        .checked_mul(1000)
+        .ok_or_else(|| anyhow!("document_duration_overflow"))
+}
+pub(super) fn contract_sha256_for(max_seconds: u64) -> Result<String> {
+    duration_millis(max_seconds)?;
     Ok(sha(&serde_json::to_vec(
         &json!({"schema_version":"gptgrep.native-document.guard-contract.v1",
         "admission":"gptgrep.native-document.admission.v1","ready":"gptgrep.native-document.ready.v1",
         "receipt":"gptgrep.native-document.receipt.v1","mode":"document","native_tool":"view_image",
         "dynamic_namespace":"gptgrep_parse","dynamic_function":"toolbox","max_tool_calls":64,"max_turns":1,
-        "max_seconds":900,"frame_bytes":FRAME,"rpc_bytes":RPC,"image_bytes":IMAGE,
+        "max_seconds":max_seconds,"frame_bytes":FRAME,"rpc_bytes":RPC,"image_bytes":IMAGE,
         "counter":"before_argument_parse_lookup_hooks_handler; failed and duplicate submissions charged",
         "normalized_request_profile_verified_before_send":true,
         "permissions_profile_id":PERMISSIONS,"filesystem":"root deny and private image directory read",
@@ -71,7 +84,8 @@ pub(super) fn validate_control(
         valid_hash(&native.owner_admission_sha256)
             && native.image_wire_bytes == IMAGE
             && control.limits.max_tool_calls == 64
-            && control.limits.timeout_ms == 900_000
+            && (1000..=3_600_000).contains(&control.limits.timeout_ms)
+            && control.limits.timeout_ms.is_multiple_of(1000)
             && control.limits.incoming_frame_bytes <= FRAME as usize
             && control.limits.outgoing_frame_bytes <= FRAME as usize
             && control.limits.total_rpc_bytes == RPC as usize,
@@ -131,6 +145,7 @@ pub(super) struct NativeSession {
     calls_lease: DocumentWorkingLease,
 }
 impl NativeSession {
+    #[cfg(test)]
     pub(super) fn prepare(
         config: &DocumentNativeControl,
         control: &DocumentAgentControl,
@@ -138,6 +153,21 @@ impl NativeSession {
         working: &DocumentWorking,
         deadline: Instant,
     ) -> Result<Self> {
+        Self::prepare_with_duration(config, control, backend, working, deadline, None)
+    }
+    pub(super) fn prepare_with_duration(
+        config: &DocumentNativeControl,
+        control: &DocumentAgentControl,
+        backend: &dyn DocumentBackend,
+        working: &DocumentWorking,
+        deadline: Instant,
+        max_seconds: Option<u64>,
+    ) -> Result<Self> {
+        let selected_seconds = max_seconds.unwrap_or(900);
+        ensure!(
+            duration_millis(selected_seconds)? == control.limits.timeout_ms,
+            "document_duration_caller_mismatch"
+        );
         let prepared = backend.prepared();
         ensure!(
             !backend.images().is_empty()
@@ -255,13 +285,16 @@ impl NativeSession {
         )
         .map_err(|_| anyhow!("document_native_clock"))?
         .min(control.deadline_unix_ms);
-        let manifest = json!({"schema_version":"gptgrep.native-document.admission.v1",
+        let mut manifest = json!({"schema_version":"gptgrep.native-document.admission.v1",
             "task_sha256":prepared.task_sha256,"source_sha256":prepared.source_sha256,"prepared_sha256":prepared.prepared_sha256,
             "runtime_profile_sha256":control.runtime_profile.sha256,"deadline_unix_ms":fixed_deadline,
             "max_tool_calls":64,"max_turns":1,"frame_bytes":FRAME,
             "image_transport_reserved_bytes":IMAGE,"image_root":config.image_root,"receipt_root":config.receipt_root,
             "permissions_profile_sha256":permission_sha256,"images":[],
             "image_catalog":{"path":catalog.path,"bytes":catalog.bytes,"sha256":catalog.sha256,"count":rows.len()}});
+        if let Some(seconds) = max_seconds {
+            manifest["max_seconds"] = json!(seconds);
+        }
         bounded_json(&manifest, 65_536)?;
         let bytes = serde_json::to_vec(&manifest)?;
         backend.reserve_retained(bytes.len() as u64)?;
@@ -272,7 +305,7 @@ impl NativeSession {
             "prepared_sha256":prepared.prepared_sha256,"runtime_profile_sha256":control.runtime_profile.sha256,
             "permissions_profile_id":PERMISSIONS,"permissions_profile_sha256":permission_sha256,
             "environment_ids":["local"],"environment_id_argument_admitted":false,
-            "max_tool_calls":64,"max_turns":1,"max_seconds":900,"deadline_unix_ms":fixed_deadline,
+            "max_tool_calls":64,"max_turns":1,"max_seconds":selected_seconds,"deadline_unix_ms":fixed_deadline,
             "frame_bytes":FRAME,"image_transport_reserved_bytes":IMAGE,
             "tool_counter_before_lookup_hooks_handler":true,"tool_counter_before_argument_parse":true,
             "normalized_request_profile_verified_before_send":true,"native_image_read_bounded":true,

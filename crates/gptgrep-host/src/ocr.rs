@@ -177,6 +177,8 @@ pub struct OcrHostExecutor {
     service_roots: Option<std::sync::Arc<ServiceRoots>>,
     service_secret: Option<String>,
     native_probe_admission: Option<crate::ocr_native::NativeOcrProbeAdmission>,
+    cleanup: Option<OcrCleanup>,
+    cleanup_proof: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -205,7 +207,15 @@ impl OcrHostExecutor {
             service_roots: None,
             service_secret: None,
             native_probe_admission: None,
+            cleanup: None,
+            cleanup_proof: None,
         })
+    }
+
+    /// The Document backend retains this registry outside its timed tool future.
+    pub fn with_cleanup(mut self, cleanup: OcrCleanup) -> Self {
+        self.cleanup = Some(cleanup);
+        self
     }
 
     /// Explicit qualification admission. This never promotes its result or profile.
@@ -303,6 +313,15 @@ impl OcrHostExecutor {
         crops: Vec<NativeOcrCrop>,
         cancel: OcrCancellation,
     ) -> Result<OcrPageResult> {
+        if let Some(cleanup) = &self.cleanup {
+            let guard = CancelWhenDropped(cancel.clone());
+            let result = cleanup
+                .start(self.clone(), task, crops, cancel)?
+                .await
+                .map_err(|_| anyhow!("ocr_owned_execution_cleanup_unknown"))?;
+            drop(guard);
+            return result;
+        }
         let executor = self.clone();
         let worker_cancel = cancel.clone();
         let worker = tokio::spawn(async move {
@@ -475,180 +494,209 @@ impl OcrHostExecutor {
             _ = cancellation_wait(cancel.as_ref()) => return Err(anyhow!("ocr_cancelled_before_admission")),
             admission = self.context.reserve(admitted_task, &runtime_digest) => admission?,
         };
-        let started = Instant::now();
-        let deadline = tokio::time::Instant::now()
-            + self.context.remaining()?.min(Duration::from_secs(u64::from(
-                prepared.task.budget.max_seconds,
-            )));
-        let cwd = tempfile::Builder::new().prefix("gptgrep-ocr-").tempdir()?;
-        let descriptor_path = cwd.path().join("model-catalog.json");
-        let mut descriptor = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&descriptor_path)?;
-        descriptor.write_all(&serde_json::to_vec(&if self.config.transport
-            == OcrImageTransport::NativeViewer
-        {
-            crate::ocr_native::model_descriptor()
-        } else {
-            model_descriptor()
-        })?)?;
-        descriptor.sync_all()?;
-        admission.check_deadline(deadline)?;
-        if cancel.as_ref().is_some_and(OcrCancellation::is_cancelled) {
-            return Err(anyhow!("ocr_cancelled_before_spawn"));
+        if let Some(proof) = &self.cleanup_proof {
+            proof.store(false, std::sync::atomic::Ordering::SeqCst);
         }
-        let native = if self.config.transport == OcrImageTransport::NativeViewer {
-            Some(crate::ocr_native::NativeOcrSession::prepare(
-                &prepared,
-                &self.config.raw_results_dir,
-                &runtime_digest,
-                deadline,
-                self.context.snapshot()?.deadline_unix_ms,
-            )?)
-        } else {
-            None
-        };
-        admission.check_deadline(deadline)?;
-        let mut command = match &native {
-            Some(native) => native.command(
-                &binary,
-                cwd.path(),
-                &home,
-                self.config.codex_state_dir.as_deref(),
-                &descriptor_path,
-            )?,
-            None => ocr_command(
-                &binary,
-                cwd.path(),
-                &home,
-                self.config.codex_state_dir.as_deref(),
-                &descriptor_path,
-            )?,
-        };
-        if let Some(name) = &self.service_secret {
-            strip_service_secret(&mut command, name)?;
-        }
-        // Frozen image verification/command preparation spends the same clock.
-        // Recheck immediately before the owned spawn; never renew admission.
-        admission.check_deadline(deadline)?;
-        if cancel.as_ref().is_some_and(OcrCancellation::is_cancelled) {
-            return Err(anyhow!("ocr_cancelled_before_spawn"));
-        }
-        let mut child = command
-            .spawn()
-            .map_err(|_| anyhow!("ocr_runtime_spawn_failed"))?;
-        let mut group = crate::process_group::OwnedGroup::new(&child)?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("ocr_runtime_stdin_missing"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow!("ocr_runtime_stdout_missing"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow!("ocr_runtime_stderr_missing"))?;
-        let transport = ocr_protocol::TransportBudget::new(usize::try_from(if native.is_some() {
-            crate::ocr_native::RPC_BYTES
-        } else {
-            prepared.task.budget.transport_bytes
-        })?);
-        let stderr_budget = transport.clone();
-        let mut drain = tokio::spawn(async move {
-            let mut stderr = ocr_protocol::BudgetedReader::new(stderr, stderr_budget);
-            let mut buffer = [0u8; 4096];
-            loop {
-                let count = stderr
-                    .read(&mut buffer)
-                    .await
-                    .map_err(|_| anyhow!("ocr_stderr_transport_failed"))?;
-                if count == 0 {
-                    break;
-                }
+        let mut child_cleaned = true;
+        let outcome = async {
+            let started = Instant::now();
+            let deadline = tokio::time::Instant::now()
+                + self.context.remaining()?.min(Duration::from_secs(u64::from(
+                    prepared.task.budget.max_seconds,
+                )));
+            let cwd = tempfile::Builder::new().prefix("gptgrep-ocr-").tempdir()?;
+            let descriptor_path = cwd.path().join("model-catalog.json");
+            let mut descriptor = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&descriptor_path)?;
+            descriptor.write_all(&serde_json::to_vec(&if self.config.transport
+                == OcrImageTransport::NativeViewer
+            {
+                crate::ocr_native::model_descriptor()
+            } else {
+                model_descriptor()
+            })?)?;
+            descriptor.sync_all()?;
+            admission.check_deadline(deadline)?;
+            if cancel.as_ref().is_some_and(OcrCancellation::is_cancelled) {
+                return Err(anyhow!("ocr_cancelled_before_spawn"));
             }
-            Ok::<(), anyhow::Error>(())
-        });
-        let outcome = tokio::time::timeout_at(deadline, async {
-            tokio::select! {
-                biased;
-                _ = cancellation_wait(cancel.as_ref()) => Err(anyhow!("ocr_cancelled_completion_unknown")),
-                _ = transport.exceeded() => Err(anyhow!("ocr_total_transport_limit")),
-                result = ocr_protocol::run_mode(
-                    stdout,
-                    stdin,
-                    cwd.path(),
-                    prepared,
+            let native = if self.config.transport == OcrImageTransport::NativeViewer {
+                Some(crate::ocr_native::NativeOcrSession::prepare(
+                    &prepared,
+                    &self.config.raw_results_dir,
                     &runtime_digest,
-                    &mut admission,
-                    ocr_protocol::OcrRunBudget { deadline, transport: transport.clone() },
-                    compatibility,
-                    native,
-                ) => result,
+                    deadline,
+                    self.context.snapshot()?.deadline_unix_ms,
+                )?)
+            } else {
+                None
+            };
+            admission.check_deadline(deadline)?;
+            let mut command = match &native {
+                Some(native) => native.command(
+                    &binary,
+                    cwd.path(),
+                    &home,
+                    self.config.codex_state_dir.as_deref(),
+                    &descriptor_path,
+                )?,
+                None => ocr_command(
+                    &binary,
+                    cwd.path(),
+                    &home,
+                    self.config.codex_state_dir.as_deref(),
+                    &descriptor_path,
+                )?,
+            };
+            if let Some(name) = &self.service_secret {
+                strip_service_secret(&mut command, name)?;
             }
-        })
+            // Frozen image verification/command preparation spends the same clock.
+            // Recheck immediately before the owned spawn; never renew admission.
+            admission.check_deadline(deadline)?;
+            if cancel.as_ref().is_some_and(OcrCancellation::is_cancelled) {
+                return Err(anyhow!("ocr_cancelled_before_spawn"));
+            }
+            let mut child = command
+                .spawn()
+                .map_err(|_| anyhow!("ocr_runtime_spawn_failed"))?;
+            child_cleaned = false;
+            let mut group = crate::process_group::OwnedGroup::new(&child)?;
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| anyhow!("ocr_runtime_stdin_missing"))?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| anyhow!("ocr_runtime_stdout_missing"))?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| anyhow!("ocr_runtime_stderr_missing"))?;
+            let transport = ocr_protocol::TransportBudget::new(usize::try_from(if native.is_some() {
+                crate::ocr_native::RPC_BYTES
+            } else {
+                prepared.task.budget.transport_bytes
+            })?);
+            let stderr_budget = transport.clone();
+            let mut drain = tokio::spawn(async move {
+                let mut stderr = ocr_protocol::BudgetedReader::new(stderr, stderr_budget);
+                let mut buffer = [0u8; 4096];
+                loop {
+                    let count = stderr
+                        .read(&mut buffer)
+                        .await
+                        .map_err(|_| anyhow!("ocr_stderr_transport_failed"))?;
+                    if count == 0 {
+                        break;
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
+            });
+            let outcome = tokio::time::timeout_at(deadline, async {
+                tokio::select! {
+                    biased;
+                    _ = cancellation_wait(cancel.as_ref()) => Err(anyhow!("ocr_cancelled_completion_unknown")),
+                    _ = transport.exceeded() => Err(anyhow!("ocr_total_transport_limit")),
+                    result = ocr_protocol::run_mode(
+                        stdout,
+                        stdin,
+                        cwd.path(),
+                        prepared,
+                        &runtime_digest,
+                        &mut admission,
+                        ocr_protocol::OcrRunBudget { deadline, transport: transport.clone() },
+                        compatibility,
+                        native,
+                    ) => result,
+                }
+            })
+            .await;
+            // Capture transport and typed timeout state before owned cleanup can change it.
+            // A later drain failure must not erase an already observed runtime diagnostic.
+            let outcome = capture_page_outcome(outcome, &transport);
+            // Every path owns, kills and reaps this invocation's process group only.
+            let cleanup = group.stop(&mut child).await;
+            let drained = tokio::time::timeout(Duration::from_secs(2), &mut drain).await;
+            if drained.is_err() {
+                drain.abort();
+            }
+            child_cleaned = cleanup.is_ok() && matches!(&drained, Ok(Ok(Ok(()))));
+            let mut outcome = finish_owned_page_outcome(
+                outcome,
+                cleanup,
+                self.cleanup_proof.is_some(),
+                || {
+                    transport.check()?;
+                    drained
+                        .map_err(|_| anyhow!("ocr_stderr_cleanup_completion_unknown"))?
+                        .map_err(|_| anyhow!("ocr_stderr_cleanup_completion_unknown"))??;
+                    admission.confirm_terminal()
+                },
+            )?;
+            if let Some(native) = outcome.native.as_ref() {
+                native.finish(
+                    &mut outcome.page,
+                    &outcome.mediated_calls,
+                    &outcome.native_calls,
+                    &outcome.turn_id,
+                )?;
+                outcome.transport_bytes = transport
+                    .used()
+                    .checked_add(native.image_wire_bytes(&outcome.page)?)
+                    .ok_or_else(|| anyhow!("ocr_total_transport_overflow"))?;
+                ensure!(
+                    outcome.transport_bytes as u64 <= outcome.page.task.budget.transport_bytes,
+                    "ocr_total_transport_limit"
+                );
+            } else {
+                outcome.transport_bytes = transport.used();
+            }
+            // The provider turn is terminal even when OCR completeness validation fails.
+            let raw_sha256 = hash(outcome.answer.as_bytes());
+            if let Some(roots) = &self.service_roots {
+                crate::ocr_service::retain_service_raw(
+                    &roots.raw_path,
+                    &roots.raw,
+                    &raw_sha256,
+                    outcome.answer.as_bytes(),
+                    &outcome.page.task.budget.resources,
+                )?;
+            } else {
+                retain_raw(
+                    &self.config.raw_results_dir,
+                    &raw_sha256,
+                    outcome.answer.as_bytes(),
+                )?;
+            }
+            outcome.page.verify_delivery()?;
+            Ok(CompletedOcrPage {
+                outcome,
+                elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            })
+        }
         .await;
-        // Capture transport and typed timeout state before owned cleanup can change it.
-        // A later drain failure must not erase an already observed runtime diagnostic.
-        let outcome = capture_page_outcome(outcome, &transport);
-        // Every path owns, kills and reaps this invocation's process group only.
-        let cleanup = group.stop(&mut child).await;
-        let drained = tokio::time::timeout(Duration::from_secs(2), &mut drain).await;
-        if drained.is_err() {
-            drain.abort();
-        }
-        // An unconfirmed owned stop retains its preexisting lifecycle-unknown priority.
-        cleanup?;
-        let terminal_safeguards = (|| {
-            transport.check()?;
-            drained
-                .map_err(|_| anyhow!("ocr_stderr_cleanup_completion_unknown"))?
-                .map_err(|_| anyhow!("ocr_stderr_cleanup_completion_unknown"))??;
-            admission.confirm_terminal()
-        })();
-        let mut outcome = finish_page_outcome(outcome, terminal_safeguards)?;
-        if let Some(native) = outcome.native.as_ref() {
-            native.finish(
-                &mut outcome.page,
-                &outcome.mediated_calls,
-                &outcome.native_calls,
-                &outcome.turn_id,
-            )?;
-            outcome.transport_bytes = transport
-                .used()
-                .checked_add(native.image_wire_bytes(&outcome.page)?)
-                .ok_or_else(|| anyhow!("ocr_total_transport_overflow"))?;
-            ensure!(
-                outcome.transport_bytes as u64 <= outcome.page.task.budget.transport_bytes,
-                "ocr_total_transport_limit"
+        if let Some(proof) = &self.cleanup_proof {
+            // This explicit attempt runs after the owned stop/drain. A submitted
+            // request without validated terminal evidence remains nonterminal.
+            let journal = admission.closeout();
+            let known = child_cleaned && journal.is_ok();
+            proof.store(known, std::sync::atomic::Ordering::SeqCst);
+            let outcome = finish_owned_cleanup(outcome, journal, "ocr_journal_closeout_unknown");
+            return finish_owned_cleanup(
+                outcome,
+                if child_cleaned {
+                    Ok(())
+                } else {
+                    Err(anyhow!("cleanup"))
+                },
+                "ocr_owned_execution_cleanup_unknown",
             );
-        } else {
-            outcome.transport_bytes = transport.used();
         }
-        // The provider turn is terminal even when OCR completeness validation fails.
-        let raw_sha256 = hash(outcome.answer.as_bytes());
-        if let Some(roots) = &self.service_roots {
-            crate::ocr_service::retain_service_raw(
-                &roots.raw_path,
-                &roots.raw,
-                &raw_sha256,
-                outcome.answer.as_bytes(),
-                &outcome.page.task.budget.resources,
-            )?;
-        } else {
-            retain_raw(
-                &self.config.raw_results_dir,
-                &raw_sha256,
-                outcome.answer.as_bytes(),
-            )?;
-        }
-        outcome.page.verify_delivery()?;
-        Ok(CompletedOcrPage {
-            outcome,
-            elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        })
+        outcome
     }
 }
 
@@ -658,6 +706,24 @@ pub(super) fn capture_page_outcome<T>(
 ) -> Result<T> {
     transport.check()?;
     outcome.map_err(|_| anyhow!("ocr_page_deadline_completion_unknown"))?
+}
+
+pub(super) fn finish_owned_page_outcome<T>(
+    outcome: Result<T>,
+    cleanup: Result<()>,
+    retain_primary: bool,
+    terminal_safeguards: impl FnOnce() -> Result<()>,
+) -> Result<T> {
+    if let Err(cleanup) = cleanup {
+        // Terminal accounting is forbidden until owned stop/reap is known.
+        // Keeping the primary error must not evaluate this release closure.
+        return if retain_primary {
+            finish_owned_cleanup(outcome, Err(cleanup), "ocr_owned_execution_cleanup_unknown")
+        } else {
+            Err(cleanup)
+        };
+    }
+    finish_page_outcome(outcome, terminal_safeguards())
 }
 
 pub(super) fn finish_page_outcome<T>(
@@ -687,6 +753,156 @@ impl OcrExecutor for OcrHostExecutor {
                 .await?
                 .result)
         })
+    }
+}
+
+/// Retains only one Document backend's cancellable OCR workers. The caller
+/// reserves the fixed record budget before construction. This is not Tokio RSS.
+#[derive(Clone)]
+pub struct OcrCleanup {
+    inner: std::sync::Arc<std::sync::Mutex<OcrCleanupState>>,
+}
+struct OcrCleanupState {
+    workers: Vec<OcrCleanupWorker>,
+    limit: usize,
+    closed: bool,
+}
+struct OcrCleanupWorker {
+    cancel: OcrCancellation,
+    handle: tokio::task::JoinHandle<bool>,
+}
+struct OcrCleanupDrain(Vec<OcrCleanupWorker>);
+impl Drop for OcrCleanupDrain {
+    fn drop(&mut self) {
+        for worker in &self.0 {
+            worker.cancel.cancel();
+            if !worker.handle.is_finished() {
+                worker.handle.abort();
+            }
+        }
+    }
+}
+impl Drop for OcrCleanupState {
+    fn drop(&mut self) {
+        // A caller that drops the entire Document future cannot await here.
+        // Signal owned workers; only cancel_and_drain establishes waited cleanup.
+        for worker in &self.workers {
+            worker.cancel.cancel();
+        }
+    }
+}
+impl OcrCleanup {
+    pub fn working_bytes(max_operations: usize) -> Result<u64> {
+        ensure!(
+            (1..=64).contains(&max_operations),
+            "ocr_cleanup_record_limit"
+        );
+        Ok(max_operations as u64 * 1024)
+    }
+    pub fn new(max_operations: usize) -> Result<Self> {
+        Self::working_bytes(max_operations)?;
+        let mut workers = Vec::new();
+        workers
+            .try_reserve_exact(max_operations)
+            .map_err(|_| anyhow!("ocr_cleanup_record_allocation"))?;
+        Ok(Self {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(OcrCleanupState {
+                workers,
+                limit: max_operations,
+                closed: false,
+            })),
+        })
+    }
+    fn start(
+        &self,
+        mut executor: OcrHostExecutor,
+        task: OcrTask,
+        crops: Vec<NativeOcrCrop>,
+        cancel: OcrCancellation,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<OcrPageResult>>> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow!("ocr_owned_execution_cleanup_unknown"))?;
+        ensure!(!state.closed, "ocr_cleanup_closed");
+        ensure!(
+            state.workers.len() < state.limit,
+            "ocr_cleanup_record_limit"
+        );
+        let proof = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        // Do not give the worker an Arc back to its own retaining registry.
+        executor.cleanup = None;
+        executor.cleanup_proof = Some(proof.clone());
+        let worker_cancel = cancel.clone();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let outcome = executor
+                .execute_native_with_crops(task, crops, true, Some(worker_cancel))
+                .await
+                .map(|value| value.result);
+            let complete = proof.load(std::sync::atomic::Ordering::SeqCst);
+            let _ = send.send(outcome);
+            complete
+        });
+        state.workers.push(OcrCleanupWorker { cancel, handle });
+        Ok(receive)
+    }
+    /// Close registration, cancel every owned worker, then join within the
+    /// caller's one local cleanup allowance. No execution clock is renewed.
+    pub async fn cancel_and_drain(&self, deadline: tokio::time::Instant) -> Result<()> {
+        let deadline = deadline.min(tokio::time::Instant::now() + Duration::from_secs(10));
+        let mut workers = OcrCleanupDrain({
+            let mut state = self
+                .inner
+                .lock()
+                .map_err(|_| anyhow!("ocr_owned_execution_cleanup_unknown"))?;
+            ensure!(!state.closed, "ocr_cleanup_already_closed");
+            state.closed = true;
+            std::mem::take(&mut state.workers)
+        });
+        for worker in &workers.0 {
+            worker.cancel.cancel();
+        }
+        let mut complete = true;
+        for worker in &mut workers.0 {
+            if !matches!(
+                tokio::time::timeout_at(deadline, &mut worker.handle).await,
+                Ok(Ok(true))
+            ) {
+                complete = false;
+            }
+        }
+        // A bounded wait that expires is unknown, never a successful reap or
+        // terminal provider observation. The drain guard aborts unfinished work.
+        ensure!(complete, "ocr_owned_execution_cleanup_unknown");
+        Ok(())
+    }
+}
+#[derive(Debug)]
+struct CleanupUnknown {
+    primary: anyhow::Error,
+    code: &'static str,
+}
+impl std::fmt::Display for CleanupUnknown {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}; {}", self.primary, self.code)
+    }
+}
+impl std::error::Error for CleanupUnknown {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.primary.as_ref())
+    }
+}
+pub(crate) fn finish_owned_cleanup<T>(
+    primary: Result<T>,
+    cleanup: Result<()>,
+    code: &'static str,
+) -> Result<T> {
+    match (primary, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(_), Err(_)) => Err(anyhow!(code)),
+        (Err(primary), Err(_)) => Err(CleanupUnknown { primary, code }.into()),
     }
 }
 

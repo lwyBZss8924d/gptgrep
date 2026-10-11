@@ -318,10 +318,12 @@ class NativePolicyTests(unittest.TestCase):
         self.assertFalse(config["permissions"]["full62_reader"]["network"]["enabled"])
         self.assertEqual(config["features"], {
             "shell_tool": True, "view_image": True, "code_mode_only": False, "code_mode_prewarm": False,
-            "code_mode": {"enabled": False, "direct_only_tool_namespaces": []},
+            "code_mode": {"enabled": False, "direct_only_tool_namespaces": ["functions"]},
             "code_mode_host": {"enabled": False, "disable_in_process_fallback": True}})
         judge = tomllib.loads(model_config(PROFILE, "judge").decode())
-        self.assertEqual(judge["features"], {**config["features"], "shell_tool": False, "view_image": False})
+        self.assertEqual(judge["features"], {
+            **config["features"], "shell_tool": False, "view_image": False,
+            "code_mode": {"enabled": False, "direct_only_tool_namespaces": []}})
 
     def test_product_credential_never_reaches_native_environment(self):
         source = {"PATH": "/usr/bin", "OPENROUTER_API_KEY": "synthetic-only", "HTTPS_PROXY": "http://synthetic-proxy",

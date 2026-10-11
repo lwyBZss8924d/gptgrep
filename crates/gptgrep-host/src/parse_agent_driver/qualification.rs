@@ -1,5 +1,6 @@
 //! Separate source-bound DOCUMENT qualification. Page OCR receipts never join.
 use super::*;
+use anyhow::Context;
 
 /// Pin to the small control envelope, whose two subjects are sealed separately.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -128,7 +129,9 @@ pub(super) fn expected(
         .native_document_guard
         .as_ref()
         .ok_or_else(|| anyhow!("document_native_guard_required"))?;
-    let generic = native::canonical(
+    let max_seconds = u32::try_from(profile.selected_max_seconds(control)?)
+        .context("document_duration_binding_overflow")?;
+    let mut generic = native::canonical(
         json!({"schema":"gptgrep.parse-agent.document-generic-runtime-profile.v1",
         "source_revision":profile.source_revision,"protocol_schema_sha256":profile.protocol_schema_sha256,
         "standalone_app_server":profile.standalone_app_server,"codex_binary_sha256":profile.codex_binary_sha256,
@@ -136,6 +139,10 @@ pub(super) fn expected(
         "tools_sha256":profile.tools_sha256,"instructions_sha256":profile.instructions_sha256,
         "native_document_guard":{"schema":guard.schema,"source_sha256":guard.source_sha256,"contract_sha256":guard.contract_sha256}}),
     );
+    if let Some(seconds) = profile.max_seconds {
+        generic["max_seconds"] = json!(seconds);
+        generic = native::canonical(generic);
+    }
     Ok(DocumentImageQualificationBindings {
         standalone_binary_sha256: control.codex_bin.sha256.clone(),
         guard_source_sha256: guard.source_sha256.clone(),
@@ -150,7 +157,7 @@ pub(super) fn expected(
         normalized_request_service_tier: "priority".into(),
         max_tool_calls: 64,
         max_turns: 1,
-        max_seconds: 900,
+        max_seconds,
         frame_bytes: 4_194_304,
         image_transport_reserved_bytes: 33_554_432,
         rpc_transport_reserved_bytes: 33_554_432,

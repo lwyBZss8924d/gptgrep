@@ -708,6 +708,8 @@ async fn native_image_test_backend() -> Result<(Fixture, Backend, Vec<u8>)> {
         tracking_limit: 8_388_608,
         tracking_used: 0,
         _tracking: working.reserve(0)?,
+        ocr_cleanup: OcrCleanup::new(64)?,
+        _ocr_cleanup_working: working.reserve(OcrCleanup::working_bytes(64)?)?,
         crop_working: working,
         pending_crops: BTreeMap::new(),
         public_cursors: BTreeSet::new(),
@@ -1198,6 +1200,8 @@ async fn ocr_plan_pagination_test_backend() -> Result<(Fixture, Backend)> {
         tracking_limit: 8_388_608,
         tracking_used: 0,
         _tracking: working.reserve(0)?,
+        ocr_cleanup: OcrCleanup::new(64)?,
+        _ocr_cleanup_working: working.reserve(OcrCleanup::working_bytes(64)?)?,
         crop_working: working,
         pending_crops: BTreeMap::new(),
     };
@@ -1269,5 +1273,22 @@ async fn ocr_plan_public_pagination_replay_wrong_kind_and_freshness_keep_core_au
     assert!(backend.images.is_empty());
     assert!(backend.pending_crops.is_empty());
     assert!(!backend.finalized);
+    Ok(())
+}
+
+#[tokio::test]
+async fn document_backend_cleanup_hook_closes_the_actual_registry() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let mut backend = fixture.backend().await?;
+    assert!(backend.session.ocr_cleanup.is_some());
+    backend
+        .cancel_and_drain_ocr(Instant::now() + Duration::from_secs(10))
+        .await?;
+    let error = backend
+        .ocr_cleanup
+        .cancel_and_drain(Instant::now() + Duration::from_secs(10))
+        .await
+        .expect_err("same registry was already closed by backend hook");
+    assert_eq!(error.to_string(), "ocr_cleanup_already_closed");
     Ok(())
 }

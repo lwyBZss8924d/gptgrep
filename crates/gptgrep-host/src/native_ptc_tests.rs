@@ -111,6 +111,14 @@ async fn exchange(
     (result, frames, accounting.model_attempts().remove(0))
 }
 
+#[test]
+fn default_config_keeps_native_ptc_disabled_for_retrieval_and_completion() {
+    let selected = HostConfig::default();
+    assert!(!selected.native_ptc);
+    assert!(!crate::native_ptc::enabled(&selected, false).unwrap());
+    assert!(!crate::native_ptc::enabled(&selected, true).unwrap());
+}
+
 #[tokio::test]
 async fn default_native_items_are_rejected_in_notifications_and_final_snapshots() {
     for item in [command("command", "completed"), image("image")] {
@@ -141,7 +149,7 @@ async fn default_native_items_are_rejected_in_notifications_and_final_snapshots(
 }
 
 #[tokio::test]
-async fn opt_in_changes_only_two_feature_flags_and_preserves_the_permission_envelope() {
+async fn opt_in_exposes_direct_tools_without_fallback_and_preserves_the_permission_envelope() {
     let (root, mut evidence) = fixture().await;
     let (_, restricted, _) = exchange(
         root.path(),
@@ -163,9 +171,20 @@ async fn opt_in_changes_only_two_feature_flags_and_preserves_the_permission_enve
     let mut expected_config = default_thread["config"].clone();
     expected_config["features.shell_tool"] = json!(true);
     expected_config["features.view_image"] = json!(true);
+    expected_config["features.code_mode.direct_only_tool_namespaces"] =
+        json!(["gptgrep", "functions"]);
+    expected_config["features.code_mode_host.disable_in_process_fallback"] = json!(true);
     assert_eq!(native_thread["config"], expected_config);
     assert_eq!(default_thread["config"]["features.shell_tool"], false);
     assert_eq!(default_thread["config"]["features.view_image"], false);
+    assert_eq!(
+        default_thread["config"]["features.code_mode.direct_only_tool_namespaces"],
+        json!(["gptgrep"])
+    );
+    assert_eq!(
+        default_thread["config"]["features.code_mode_host.disable_in_process_fallback"],
+        false
+    );
     assert_eq!(default_thread["sandbox"], "read-only");
     assert_eq!(
         native_thread["config"]["mcp_servers"]["inherited"],

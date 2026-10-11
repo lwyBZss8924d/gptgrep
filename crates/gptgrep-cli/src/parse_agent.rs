@@ -16,8 +16,8 @@ use gptgrep_core::parse_agent::{
     ToolboxOperation, ToolboxRequest,
 };
 use gptgrep_host::{
-    OcrCancellation, OcrExecutionContext, OcrExecutionLimits, OcrHostConfig, OcrHostExecutor,
-    OcrRuntimeProfile,
+    OcrCancellation, OcrCleanup, OcrExecutionContext, OcrExecutionLimits, OcrHostConfig,
+    OcrHostExecutor, OcrRuntimeProfile,
 };
 use gptgrep_jev::RunClockAnchor;
 use gptgrep_parse::{
@@ -461,6 +461,7 @@ struct Session {
     budget: ResourceBudget,
     toolbox: ParseToolbox,
     context: Option<OcrExecutionContext>,
+    ocr_cleanup: Option<OcrCleanup>,
     quota: Quota,
     deadline: Instant,
 }
@@ -554,6 +555,7 @@ impl Session {
             budget: original,
             toolbox,
             context,
+            ocr_cleanup: None,
             deadline,
         };
         session.check()?;
@@ -615,6 +617,10 @@ impl Session {
             ),
             "parse_agent_ocr_executor",
         )
+        .map(|host| match &self.ocr_cleanup {
+            Some(cleanup) => host.with_cleanup(cleanup.clone()),
+            None => host,
+        })
     }
     async fn operation(&mut self, input: &[u8], deadline: Instant) -> Result<Vec<u8>> {
         self.quota.request()?;

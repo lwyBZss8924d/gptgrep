@@ -1780,7 +1780,7 @@
  mod realtime_history;
 --- /dev/null
 +++ b/codex-rs/core/src/native_ocr.rs
-@@ -0,0 +1,1688 @@
+@@ -0,0 +1,1779 @@
 +//! Required, process-local admission for isolated GPTgrep OCR and document runtimes.
 +//!
 +//! This module is absent from the ordinary upstream runtime. A page child opts in
@@ -1888,6 +1888,8 @@
 +    runtime_profile_sha256: String,
 +    deadline_unix_ms: u64,
 +    max_tool_calls: u32,
++    #[serde(default, deserialize_with = "explicit_max_seconds")]
++    max_seconds: Option<u64>,
 +    max_turns: u32,
 +    frame_bytes: u64,
 +    image_transport_reserved_bytes: u64,
@@ -1899,6 +1901,32 @@
 +    image_catalog: Option<ImageCataloguePin>,
 +}
 +
++fn explicit_max_seconds<'de, D: serde::Deserializer<'de>>(
++    deserializer: D,
++) -> Result<Option<u64>, D::Error> {
++    u64::deserialize(deserializer).map(Some)
++}
++fn admitted_max_seconds(manifest: &AdmissionManifest, kind: GuardKind) -> AdmissionResult<u64> {
++    match (kind, manifest.max_seconds) {
++        (GuardKind::Page, None) => Ok(MAX_SECONDS),
++        (GuardKind::Page, Some(_)) => Err("native_page_duration_override"),
++        (GuardKind::Document, None) => Ok(DOCUMENT_MAX_SECONDS),
++        (GuardKind::Document, Some(seconds)) if (1..=3600).contains(&seconds) => Ok(seconds),
++        (GuardKind::Document, Some(_)) => Err("native_document_duration_out_of_range"),
++    }
++}
++fn check_admitted_remaining(
++    manifest: &AdmissionManifest,
++    kind: GuardKind,
++    remaining: u128,
++) -> AdmissionResult<()> {
++    let milliseconds = admitted_max_seconds(manifest, kind)?
++        .checked_mul(1000).ok_or("native_ocr_deadline_out_of_range")?;
++    if remaining == 0 || remaining > u128::from(milliseconds) {
++        return Err("native_ocr_deadline_out_of_range");
++    }
++    Ok(())
++}
 +#[derive(Debug)]
 +struct Guard {
 +    kind: GuardKind,
@@ -1992,9 +2020,7 @@
 +    let remaining = u128::from(manifest.deadline_unix_ms)
 +        .checked_sub(now_ms)
 +        .ok_or("native_ocr_deadline_expired")?;
-+    if remaining == 0 || remaining > u128::from(kind.max_seconds() * 1000) {
-+        return Err("native_ocr_deadline_out_of_range");
-+    }
++    check_admitted_remaining(&manifest, kind, remaining)?;
 +    let deadline = Instant::now()
 +        .checked_add(Duration::from_millis(remaining as u64))
 +        .ok_or("native_ocr_clock")?;
@@ -2022,6 +2048,7 @@
 +}
 +
 +fn validate_manifest(manifest: &AdmissionManifest, kind: GuardKind) -> AdmissionResult<()> {
++    admitted_max_seconds(manifest, kind)?;
 +    if manifest.schema_version != kind.manifest_schema()
 +        || manifest.max_tool_calls != kind.max_tools()
 +        || manifest.max_turns != 1
@@ -2157,7 +2184,8 @@
 +            "permissions_profile_sha256":self.manifest.permissions_profile_sha256,
 +            "environment_ids":[codex_exec_server::LOCAL_ENVIRONMENT_ID],
 +            "environment_id_argument_admitted":false,
-+            "max_tool_calls":self.kind.max_tools(),"max_turns":1,"max_seconds":self.kind.max_seconds(),
++            "max_tool_calls":self.kind.max_tools(),"max_turns":1,
++            "max_seconds":self.manifest.max_seconds.unwrap_or_else(|| self.kind.max_seconds()),
 +            "deadline_unix_ms":self.manifest.deadline_unix_ms,
 +            "frame_bytes":FRAME_LIMIT,
 +            "image_transport_reserved_bytes":self.kind.image_wire_reservation(),
@@ -2958,6 +2986,7 @@
 +            runtime_profile_sha256: "d".repeat(64),
 +            deadline_unix_ms: 1,
 +            max_tool_calls: MAX_TOOLS,
++            max_seconds: None,
 +            max_turns: 1,
 +            frame_bytes: FRAME_LIMIT,
 +            image_transport_reserved_bytes: IMAGE_WIRE_RESERVATION,
@@ -3468,6 +3497,68 @@
 +            Some("priority"), Some(&allowed_document_wire_tools()), false),
 +            Err("native_ocr_model_tool_not_admitted"));
 +    }
++    #[test]
++    fn document_duration_selects_only_explicit_bounded_admission_seconds() {
++        let mut document = document_fixture(1);
++        assert_eq!(admitted_max_seconds(&document.guard.manifest, GuardKind::Document), Ok(900));
++        assert_eq!(check_admitted_remaining(&document.guard.manifest, GuardKind::Document, 900_000), Ok(()));
++        assert_eq!(check_admitted_remaining(&document.guard.manifest, GuardKind::Document, 900_001),
++            Err("native_ocr_deadline_out_of_range"));
++        document.guard.manifest.max_seconds = Some(3600);
++        validate_manifest(&document.guard.manifest, GuardKind::Document).expect("explicit duration");
++        assert_eq!(document.guard.ready_value()["max_seconds"], 3600);
++        assert_eq!(document.guard.ready_value()["max_tool_calls"], 64);
++        assert_eq!(document.guard.ready_value()["max_turns"], 1);
++        assert_eq!(check_admitted_remaining(&document.guard.manifest, GuardKind::Document, 3_600_000), Ok(()));
++        assert_eq!(check_admitted_remaining(&document.guard.manifest, GuardKind::Document, 3_600_001),
++            Err("native_ocr_deadline_out_of_range"));
++        assert_eq!(check_admitted_remaining(&document.guard.manifest, GuardKind::Document, 0),
++            Err("native_ocr_deadline_out_of_range"));
++        for seconds in [0, 3601, u64::MAX] {
++            document.guard.manifest.max_seconds = Some(seconds);
++            assert_eq!(validate_manifest(&document.guard.manifest, GuardKind::Document),
++                Err("native_document_duration_out_of_range"));
++        }
++    }
++
++    #[test]
++    fn page_duration_override_is_refused_and_original_tuple_is_unchanged() {
++        let mut page = fixture();
++        let ready = page.guard.ready_value();
++        assert_eq!(ready["max_tool_calls"], 8);
++        assert_eq!(ready["max_turns"], 1);
++        assert_eq!(ready["max_seconds"], 180);
++        assert_eq!(admitted_max_seconds(&page.guard.manifest, GuardKind::Page), Ok(180));
++        assert_eq!(check_admitted_remaining(&page.guard.manifest, GuardKind::Page, 180_000), Ok(()));
++        assert_eq!(check_admitted_remaining(&page.guard.manifest, GuardKind::Page, 180_001),
++            Err("native_ocr_deadline_out_of_range"));
++        for seconds in [0, 180, 900, 3600, u64::MAX] {
++            page.guard.manifest.max_seconds = Some(seconds);
++            assert_eq!(validate_manifest(&page.guard.manifest, GuardKind::Page),
++                Err("native_page_duration_override"));
++        }
++    }
++
++    #[test]
++    fn duration_field_rejects_null_fractional_negative_and_string_values() {
++        let fixture = fixture();
++        let manifest = &fixture.guard.manifest;
++        let mut value = json!({
++            "schema_version":manifest.schema_version,"task_sha256":manifest.task_sha256,
++            "source_sha256":manifest.source_sha256,"prepared_sha256":manifest.prepared_sha256,
++            "runtime_profile_sha256":manifest.runtime_profile_sha256,"deadline_unix_ms":1,
++            "max_tool_calls":8,"max_turns":1,"frame_bytes":FRAME_LIMIT,
++            "image_transport_reserved_bytes":IMAGE_WIRE_RESERVATION,
++            "image_root":manifest.image_root,"receipt_root":manifest.receipt_root,
++            "permissions_profile_sha256":manifest.permissions_profile_sha256,"images":[]
++        });
++        assert!(serde_json::from_value::<AdmissionManifest>(value.clone()).is_ok());
++        for duration in [Value::Null, json!(-1), json!(1.5), json!("3600")] {
++            value["max_seconds"] = duration;
++            assert!(serde_json::from_value::<AdmissionManifest>(value.clone()).is_err());
++        }
++    }
++
 +}
 --- a/codex-rs/core/src/session/turn_context.rs
 +++ b/codex-rs/core/src/session/turn_context.rs

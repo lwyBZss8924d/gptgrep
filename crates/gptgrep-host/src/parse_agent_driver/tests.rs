@@ -1304,6 +1304,7 @@ fn native_document_qualification_rejects_page_scope_and_different_binary_binding
         tools_sha256: document_tool_policy_sha256()?,
         instructions_sha256: document_instructions_sha256(),
         standalone_app_server: true,
+        max_seconds: None,
         native_document_guard: Some(NativeDocumentGuardProfile {
             schema: "gptgrep.native-document.guard-profile.v1".into(),
             source_sha256: "3".repeat(64),
@@ -1579,5 +1580,380 @@ async fn emitted_document_qualification_requires_direct_native_view_without_broa
             json!({"type":"object","additionalProperties":false,"properties":{"status":{"type":"string","enum":["complete","blocked"]},"handle":{"type":"string","pattern":"^[a-f0-9]{64}$"}},"required":["status","handle"]})
         );
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn duration_profile_value(config: &DocumentAgentControl, duration: Option<Value>) -> Result<Value> {
+    let mut value = json!({
+        "schema":"gptgrep.parse-agent.document-runtime-profile.v1",
+        "source_revision":"1".repeat(40), "protocol_schema_sha256":"2".repeat(64),
+        "codex_binary_sha256":config.codex_bin.sha256,
+        "descriptor_sha256":config.model_descriptor.sha256,
+        "permissions_config_sha256":config.permissions_config.sha256,
+        "permissions_template_sha256":sha(&serde_json::to_vec(&native::canonical(document_permissions_template(true)))?),
+        "tools_sha256":document_tool_policy_sha256()?,
+        "instructions_sha256":document_instructions_sha256(),
+        "standalone_app_server":true,
+        "native_document_guard":{
+            "schema":"gptgrep.native-document.guard-profile.v1",
+            "source_sha256":"3".repeat(64),
+            "contract_sha256":document_guard_contract_sha256()?
+        }
+    });
+    if let Some(duration) = duration {
+        value["max_seconds"] = duration;
+    }
+    Ok(value)
+}
+#[cfg(unix)]
+fn duration_profile(
+    config: &DocumentAgentControl,
+    duration: Option<Value>,
+) -> Result<RuntimeProfile> {
+    Ok(serde_json::from_value(duration_profile_value(
+        config, duration,
+    )?)?)
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_document_duration_rejects_mismatch_non_native_and_nonfinite_inputs() -> Result<()> {
+    let (_temporary, mut config, native, _) = retained_native_fixture()?;
+    config.native_viewer = Some(native);
+    let legacy = duration_profile(&config, None)?;
+    assert_eq!(legacy.selected_max_seconds(&config)?, 900);
+    config.limits.timeout_ms = 3_600_000;
+    assert!(legacy.selected_max_seconds(&config).is_err());
+    let selected = duration_profile(&config, Some(json!(3600)))?;
+    assert_eq!(selected.selected_max_seconds(&config)?, 3600);
+    config.limits.timeout_ms = 3_600_001;
+    assert!(selected.selected_max_seconds(&config).is_err());
+    for seconds in [0, 3601, u64::MAX] {
+        let profile = duration_profile(&config, Some(json!(seconds)))?;
+        assert!(profile.selected_max_seconds(&config).is_err());
+        assert!(document_guard_contract_sha256_for(seconds).is_err());
+        assert!(native::duration_millis(seconds).is_err());
+    }
+    for value in [Value::Null, json!(-1), json!(1.5), json!("3600")] {
+        assert!(duration_profile(&config, Some(value)).is_err());
+    }
+    assert_eq!(native::duration_millis(1)?, 1000);
+    assert_eq!(native::duration_millis(3600)?, 3_600_000);
+    config.native_viewer = None;
+    config.limits.timeout_ms = 3_600_000;
+    assert!(selected.selected_max_seconds(&config).is_err());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn document_duration_binds_all_18_fields_and_preserves_absent_900_digest() -> Result<()> {
+    let (_temporary, mut config, native, _) = retained_native_fixture()?;
+    config.native_viewer = Some(native);
+    let mut profile = duration_profile(&config, None)?;
+    let legacy = qualification::expected(&config, &profile)?;
+    let guard = profile.native_document_guard.as_ref().expect("guard");
+    // Freeze the complete legacy generic descriptor: no max_seconds field.
+    let legacy_generic = native::canonical(json!({
+        "schema":"gptgrep.parse-agent.document-generic-runtime-profile.v1",
+        "source_revision":profile.source_revision,"protocol_schema_sha256":profile.protocol_schema_sha256,
+        "standalone_app_server":profile.standalone_app_server,"codex_binary_sha256":profile.codex_binary_sha256,
+        "descriptor_sha256":profile.descriptor_sha256,"permissions_template_sha256":profile.permissions_template_sha256,
+        "tools_sha256":profile.tools_sha256,"instructions_sha256":profile.instructions_sha256,
+        "native_document_guard":{"schema":guard.schema,"source_sha256":guard.source_sha256,"contract_sha256":guard.contract_sha256}
+    }));
+    assert!(legacy_generic.get("max_seconds").is_none());
+    assert_eq!(
+        legacy.generic_runtime_profile_sha256,
+        sha(&serde_json::to_vec(&legacy_generic)?)
+    );
+    assert_eq!(legacy.max_seconds, 900);
+    assert_eq!(
+        document_guard_contract_sha256()?,
+        document_guard_contract_sha256_for(900)?
+    );
+    assert_eq!(
+        serde_json::to_value(&legacy)?
+            .as_object()
+            .expect("18 bindings")
+            .len(),
+        18
+    );
+
+    profile.max_seconds = Some(3600);
+    config.limits.timeout_ms = 3_600_000;
+    profile
+        .native_document_guard
+        .as_mut()
+        .expect("guard")
+        .contract_sha256 = document_guard_contract_sha256_for(3600)?;
+    let selected = qualification::expected(&config, &profile)?;
+    assert_eq!(selected.max_seconds, 3600);
+    assert_ne!(selected.guard_contract_sha256, legacy.guard_contract_sha256);
+    assert_ne!(
+        selected.generic_runtime_profile_sha256,
+        legacy.generic_runtime_profile_sha256
+    );
+    let mut selected_fields = serde_json::to_value(&selected)?;
+    let mut legacy_fields = serde_json::to_value(&legacy)?;
+    for field in [
+        "max_seconds",
+        "guard_contract_sha256",
+        "generic_runtime_profile_sha256",
+    ] {
+        selected_fields.as_object_mut().unwrap().remove(field);
+        legacy_fields.as_object_mut().unwrap().remove(field);
+    }
+    assert_eq!(selected_fields, legacy_fields);
+    // The other source/binary fields above are held synthetic and identical only
+    // for this unit check. A real duration build must rebind its actual new pins.
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn selected_document_duration_is_emitted_in_admission_and_ready_only_when_explicit() -> Result<()> {
+    for duration in [None, Some(3600)] {
+        let (_temporary, mut config, native, backend) = retained_native_fixture()?;
+        let selected = duration.unwrap_or(900);
+        config.limits.timeout_ms = selected * 1000;
+        let mut session = native::NativeSession::prepare_with_duration(
+            &native,
+            &config,
+            &backend,
+            &DocumentWorking::new(67_108_864),
+            Instant::now() + Duration::from_secs(selected),
+            duration,
+        )?;
+        let bytes = fs::read(&native.admission_path)?;
+        let manifest: Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(
+            manifest.get("max_seconds"),
+            duration.map(|value| json!(value)).as_ref()
+        );
+        assert_eq!(
+            manifest.as_object().unwrap().len(),
+            if duration.is_some() { 16 } else { 15 }
+        );
+        let ready = json!({"schema_version":"gptgrep.native-document.ready.v1","required":true,
+            "admission_sha256":sha(&bytes),"task_sha256":backend.prepared().task_sha256,
+            "source_sha256":backend.prepared().source_sha256,"prepared_sha256":backend.prepared().prepared_sha256,
+            "runtime_profile_sha256":config.runtime_profile.sha256,"permissions_profile_id":"gptgrep_native_document",
+            "permissions_profile_sha256":manifest["permissions_profile_sha256"],"environment_ids":["local"],
+            "environment_id_argument_admitted":false,"max_tool_calls":64,"max_turns":1,"max_seconds":selected,
+            "deadline_unix_ms":manifest["deadline_unix_ms"],"frame_bytes":4_194_304,"image_transport_reserved_bytes":33_554_432,
+            "tool_counter_before_lookup_hooks_handler":true,"tool_counter_before_argument_parse":true,
+            "normalized_request_profile_verified_before_send":true,"native_image_read_bounded":true,
+            "assembled_image_receipts_required":true,"requested_model":"gpt-6-luna","requested_effort":"max",
+            "normalized_request_service_tier":"priority","actual_served_profile_verified":false,
+            "image_catalog_sha256":manifest["image_catalog"]["sha256"],"image_catalog_count":1});
+        let mut wrong = ready.clone();
+        wrong["max_seconds"] = json!(selected + 1);
+        assert!(
+            session
+                .initialize(&json!({"gptgrepNativeDocument":wrong}))
+                .is_err()
+        );
+        session.initialize(&json!({"gptgrepNativeDocument":ready}))?;
+    }
+    Ok(())
+}
+
+struct CleanupBackend {
+    inner: Backend,
+    calls: usize,
+    fail: bool,
+    completed: Arc<std::sync::atomic::AtomicBool>,
+    ocr: Option<crate::OcrCleanup>,
+}
+impl DocumentBackend for CleanupBackend {
+    fn prepared(&self) -> &DocumentPreparedState {
+        self.inner.prepared()
+    }
+    fn images(&self) -> &[DocumentImageGrant] {
+        self.inner.images()
+    }
+    fn reserve_retained(&self, bytes: u64) -> Result<()> {
+        self.inner.reserve_retained(bytes)
+    }
+    fn call<'a>(
+        &'a mut self,
+        operation: DocumentToolOperation,
+    ) -> Pin<Box<dyn Future<Output = Result<DocumentToolReply>> + Send + 'a>> {
+        self.inner.call(operation)
+    }
+    fn verify_complete(&self) -> Result<DocumentVerifiedProduct> {
+        self.inner.verify_complete()
+    }
+    fn cancel_and_drain_ocr<'a>(
+        &'a mut self,
+        deadline: Instant,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        self.calls += 1;
+        Box::pin(async move {
+            if let Some(ocr) = &self.ocr {
+                ocr.cancel_and_drain(deadline).await?;
+            }
+            tokio::task::yield_now().await;
+            self.completed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            ensure!(!self.fail, "synthetic_cleanup_failure");
+            Ok(())
+        })
+    }
+}
+#[tokio::test]
+async fn document_cleanup_is_awaited_and_primary_timeout_survives_cleanup_failure() -> Result<()> {
+    for fail in [false, true] {
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut backend = CleanupBackend {
+            inner: Backend::new(),
+            calls: 0,
+            fail,
+            completed: completed.clone(),
+            ocr: None,
+        };
+        let primary = backend_failure("execute_ocr", None, None);
+        let original = primary.to_string();
+        let error = finish_document_cleanup::<()>(&mut backend, Err(primary), Some(Instant::now()))
+            .await
+            .expect_err("primary timeout");
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(backend.calls, 1);
+        assert!(error.to_string().starts_with(&original));
+        assert_eq!(
+            error.to_string().contains("document_ocr_cleanup_unknown"),
+            fail
+        );
+        assert!(error.chain().any(|cause| cause.to_string() == original));
+    }
+    Ok(())
+}
+#[tokio::test]
+async fn document_validation_return_also_waits_for_backend_cleanup() -> Result<()> {
+    let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut backend = CleanupBackend {
+        inner: Backend::new(),
+        calls: 0,
+        fail: false,
+        completed: completed.clone(),
+        ocr: None,
+    };
+    let mut invalid = control()?;
+    invalid.schema = "invalid-before-any-runtime".into();
+    let error = drive_document_agent(
+        &invalid,
+        &mut backend,
+        DocumentWorking::new(67_108_864),
+        Instant::now(),
+    )
+    .await
+    .err()
+    .expect("validation refusal");
+    assert_eq!(error.to_string(), "document_control_schema");
+    assert_eq!(backend.calls, 1);
+    assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn document_profile_validation_requires_the_selected_duration_contract_and_exact_caller()
+-> Result<()> {
+    fn pin_json(root: &Path, name: &str, value: &Value) -> Result<DocumentFilePin> {
+        let bytes = serde_json::to_vec(value)?;
+        let path = root.join(name);
+        fs::write(&path, &bytes)?;
+        Ok(DocumentFilePin {
+            path,
+            bytes: bytes.len() as u64,
+            sha256: sha(&bytes),
+        })
+    }
+    let (temporary, mut config, native, _) = retained_native_fixture()?;
+    config.native_viewer = Some(native);
+    config.model_descriptor = pin_json(
+        temporary.path(),
+        "descriptor.json",
+        &document_model_descriptor(),
+    )?;
+    config.permissions_config = pin_json(
+        temporary.path(),
+        "permissions.json",
+        &document_permissions_config(config.native_viewer.as_ref()),
+    )?;
+    config.limits.timeout_ms = 3_600_000;
+    let mut selected = duration_profile_value(&config, Some(json!(3600)))?;
+    config.runtime_profile = pin_json(temporary.path(), "profile.json", &selected)?;
+    assert!(validate_profile(&config).is_err()); // Legacy 900 contract cannot authorize 3600.
+    selected["native_document_guard"]["contract_sha256"] =
+        json!(document_guard_contract_sha256_for(3600)?);
+    config.runtime_profile = pin_json(temporary.path(), "profile.json", &selected)?;
+    assert_eq!(
+        validate_profile(&config)?.selected_max_seconds(&config)?,
+        3600
+    );
+    config.limits.timeout_ms = 900_000;
+    assert!(validate_profile(&config).is_err());
+    let legacy = duration_profile_value(&config, None)?;
+    assert!(legacy.get("max_seconds").is_none());
+    config.runtime_profile = pin_json(temporary.path(), "profile.json", &legacy)?;
+    assert_eq!(
+        validate_profile(&config)?.selected_max_seconds(&config)?,
+        900
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn document_return_barrier_waits_for_real_owned_mock_after_submitted_timeout() -> Result<()> {
+    let fixture = crate::ocr_tests::Fixture::new();
+    let (executor, context, pid_file) = crate::ocr_tests::mock_executor(&fixture, "hang", true);
+    let cleanup = crate::OcrCleanup::new(64)?;
+    let executor = executor.with_cleanup(cleanup.clone());
+    let cancel = crate::OcrCancellation::default();
+    let mut operation = Box::pin(executor.execute_cancellable(fixture.task.clone(), cancel));
+    tokio::select! {
+        result = &mut operation => panic!("mock ended before submission: {result:?}"),
+        () = crate::ocr_tests::wait_for_submitted_mock(&pid_file) => {}
+    }
+    let pids: Vec<u32> = serde_json::from_slice(&fs::read(&pid_file)?)?;
+    assert!(
+        timeout_at(Instant::now() + Duration::from_millis(1), operation)
+            .await
+            .is_err()
+    );
+    let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut backend = CleanupBackend {
+        inner: Backend::new(),
+        calls: 0,
+        fail: false,
+        completed: completed.clone(),
+        ocr: Some(cleanup),
+    };
+    let original = backend_failure("execute_ocr", None, None).to_string();
+    let error = finish_document_cleanup::<()>(
+        &mut backend,
+        Err(backend_failure("execute_ocr", None, None)),
+        Some(Instant::now()),
+    )
+    .await
+    .expect_err("original timeout");
+    assert_eq!(error.to_string(), original);
+    assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(backend.calls, 1);
+    let leader = std::process::Command::new("/bin/ps")
+        .args(["-o", "stat=", "-p", &pids[0].to_string()])
+        .output()?;
+    assert!(
+        leader.stdout.is_empty(),
+        "Document returned before OCR leader reap"
+    );
+    let snapshot = context.snapshot()?;
+    assert_eq!(snapshot.charged_admissions, 1);
+    assert_eq!(snapshot.terminal_admissions, 0);
+    assert_eq!(snapshot.quarantined_slots, 1);
     Ok(())
 }

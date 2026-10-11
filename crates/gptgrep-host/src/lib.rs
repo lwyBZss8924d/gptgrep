@@ -30,8 +30,8 @@ pub use completion::{
     complete_json,
 };
 pub use ocr::{
-    DEFAULT_OCR_MODEL, OcrCancellation, OcrHostConfig, OcrHostExecutor, OcrImageTransport,
-    OcrProbeReport, OcrRuntimeProfile,
+    DEFAULT_OCR_MODEL, OcrCancellation, OcrCleanup, OcrHostConfig, OcrHostExecutor,
+    OcrImageTransport, OcrProbeReport, OcrRuntimeProfile,
 };
 pub use ocr_accounting::{
     MAX_OCR_ADMISSIONS, MAX_OCR_CONCURRENCY, OcrBudgetSnapshot, OcrExecutionContext,

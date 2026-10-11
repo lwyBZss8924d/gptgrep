@@ -177,6 +177,8 @@ struct Backend {
     _tracking: DocumentWorkingLease,
     crop_working: DocumentWorking,
     pending_crops: BTreeMap<String, Vec<PendingCrop>>,
+    ocr_cleanup: OcrCleanup,
+    _ocr_cleanup_working: DocumentWorkingLease,
 }
 impl Backend {
     fn charge(&mut self, bytes: u64) -> Result<()> {
@@ -195,6 +197,10 @@ impl Backend {
         control: &DocumentAgentControl,
         working: &DocumentWorking,
     ) -> Result<Self> {
+        let max_operations = control.limits.max_tool_calls.min(64);
+        let cleanup_working = working.reserve(OcrCleanup::working_bytes(max_operations)?)?;
+        let ocr_cleanup = OcrCleanup::new(max_operations)?;
+        session.ocr_cleanup = Some(ocr_cleanup.clone());
         let frame = session
             .core(
                 ToolboxOperation::Prepare {
@@ -261,6 +267,8 @@ impl Backend {
             crop_working: working.clone(),
             pending_crops: BTreeMap::new(),
             public_cursors: BTreeSet::new(),
+            ocr_cleanup,
+            _ocr_cleanup_working: cleanup_working,
         };
         let mut cursor = None;
         let mut seen = 0;
@@ -1088,6 +1096,12 @@ impl DocumentBackend for Backend {
         operation: DocumentToolOperation,
     ) -> Pin<Box<dyn Future<Output = Result<DocumentToolReply>> + Send + 'a>> {
         Box::pin(self.operation(operation))
+    }
+    fn cancel_and_drain_ocr<'a>(
+        &'a mut self,
+        deadline: Instant,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(self.ocr_cleanup.cancel_and_drain(deadline))
     }
     fn verify_complete(&self) -> Result<DocumentVerifiedProduct> {
         ensure!(

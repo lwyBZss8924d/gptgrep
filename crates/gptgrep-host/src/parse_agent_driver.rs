@@ -138,7 +138,31 @@ struct RuntimeProfile {
     tools_sha256: String,
     instructions_sha256: String,
     standalone_app_server: bool,
+    #[serde(default, deserialize_with = "explicit_max_seconds")]
+    max_seconds: Option<u64>,
     native_document_guard: Option<NativeDocumentGuardProfile>,
+}
+fn explicit_max_seconds<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<u64>, D::Error> {
+    u64::deserialize(deserializer).map(Some)
+}
+impl RuntimeProfile {
+    fn selected_max_seconds(&self, control: &DocumentAgentControl) -> Result<u64> {
+        ensure!(
+            self.max_seconds.is_none() || control.native_viewer.is_some(),
+            "document_duration_native_required"
+        );
+        let seconds = self.max_seconds.unwrap_or(900);
+        let milliseconds = native::duration_millis(seconds)?;
+        if control.native_viewer.is_some() {
+            ensure!(
+                control.limits.timeout_ms == milliseconds,
+                "document_duration_caller_mismatch"
+            );
+        }
+        Ok(seconds)
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -289,6 +313,14 @@ pub trait DocumentBackend: Send {
         operation: DocumentToolOperation,
     ) -> Pin<Box<dyn Future<Output = Result<DocumentToolReply>> + Send + 'a>>;
     fn verify_complete(&self) -> Result<DocumentVerifiedProduct>;
+    /// Implemented by the caller that owns OCR workers. Empty backends have none.
+    /// Called after the timed protocol future has been dropped on every return.
+    fn cancel_and_drain_ocr<'a>(
+        &'a mut self,
+        _deadline: Instant,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 pub struct DocumentToolReply {
     pub text: String,
@@ -450,6 +482,10 @@ pub fn document_model_descriptor() -> Value {
 }
 pub fn document_guard_contract_sha256() -> Result<String> {
     native::contract_sha256()
+}
+/// Explicit native DOCUMENT duration; the absent-field profile remains 900 seconds.
+pub fn document_guard_contract_sha256_for(max_seconds: u64) -> Result<String> {
+    native::contract_sha256_for(max_seconds)
 }
 pub fn document_permissions_config(native: Option<&DocumentNativeControl>) -> Value {
     permissions(native.map(|native| native.image_root.as_path()))
@@ -624,6 +660,7 @@ fn validate_profile(control: &DocumentAgentControl) -> Result<RuntimeProfile> {
         permissions == document_permissions_config(control.native_viewer.as_ref()),
         "document_permissions"
     );
+    let max_seconds = profile.selected_max_seconds(control)?;
     if control.native_viewer.is_some() {
         let guard = profile
             .native_document_guard
@@ -632,7 +669,7 @@ fn validate_profile(control: &DocumentAgentControl) -> Result<RuntimeProfile> {
         ensure!(
             guard.schema == "gptgrep.native-document.guard-profile.v1"
                 && valid_hash(&guard.source_sha256)
-                && guard.contract_sha256 == native::contract_sha256()?,
+                && guard.contract_sha256 == native::contract_sha256_for(max_seconds)?,
             "document_native_guard_required"
         );
     }
@@ -647,10 +684,27 @@ pub async fn drive_document_agent(
     working: DocumentWorking,
     started: Instant,
 ) -> Result<DocumentAgentOutcome> {
-    validate_control(control)?;
-    let profile = validate_profile(control)?;
-    let accepted = qualification::accepted(control, &profile)?;
-    drive(control, backend, working, started, accepted, None).await
+    let mut cleanup_started = None;
+    let outcome = async {
+        validate_control(control)?;
+        let profile = validate_profile(control)?;
+        let accepted = qualification::accepted(control, &profile)?;
+        drive(
+            control,
+            backend,
+            working,
+            started,
+            DocumentDriveSelection {
+                accepted,
+                qualification_request: None,
+                max_seconds: profile.max_seconds,
+            },
+            &mut cleanup_started,
+        )
+        .await
+    }
+    .await;
+    finish_document_cleanup(backend, outcome, cleanup_started).await
 }
 /// Explicit qualification purpose over the same complete source-bound backend.
 /// It can produce private evidence, never a product/publication qualification.
@@ -661,27 +715,60 @@ pub async fn drive_document_image_qualification(
     started: Instant,
     request: &DocumentImageQualificationRequest,
 ) -> Result<DocumentAgentOutcome> {
-    validate_control(control)?;
-    let profile = validate_profile(control)?;
-    qualification::validate_request(request, control, &profile, backend.prepared())?;
-    drive(
-        control,
-        backend,
-        working,
-        started,
-        None,
-        Some(request.sha256().into()),
-    )
-    .await
+    let mut cleanup_started = None;
+    let outcome = async {
+        validate_control(control)?;
+        let profile = validate_profile(control)?;
+        qualification::validate_request(request, control, &profile, backend.prepared())?;
+        drive(
+            control,
+            backend,
+            working,
+            started,
+            DocumentDriveSelection {
+                accepted: None,
+                qualification_request: Some(request.sha256().into()),
+                max_seconds: profile.max_seconds,
+            },
+            &mut cleanup_started,
+        )
+        .await
+    }
+    .await;
+    finish_document_cleanup(backend, outcome, cleanup_started).await
+}
+async fn finish_document_cleanup<T>(
+    backend: &mut dyn DocumentBackend,
+    outcome: Result<T>,
+    cleanup_started: Option<Instant>,
+) -> Result<T> {
+    // The allowance starts at protocol exit and includes the Document child's
+    // own stop/drain. Earlier validation failures still close an empty registry.
+    let deadline = cleanup_started.unwrap_or_else(Instant::now) + Duration::from_secs(10);
+    let cleanup = timeout_at(deadline, backend.cancel_and_drain_ocr(deadline))
+        .await
+        .map_err(|_| anyhow!("document_ocr_cleanup_unknown"))
+        .and_then(|result| result);
+    crate::ocr::finish_owned_cleanup(outcome, cleanup, "document_ocr_cleanup_unknown")
+}
+struct DocumentDriveSelection {
+    accepted: Option<DocumentAcceptedImageQualification>,
+    qualification_request: Option<String>,
+    max_seconds: Option<u64>,
 }
 async fn drive(
     control: &DocumentAgentControl,
     backend: &mut dyn DocumentBackend,
     working: DocumentWorking,
     started: Instant,
-    accepted: Option<DocumentAcceptedImageQualification>,
-    qualification_request: Option<String>,
+    selection: DocumentDriveSelection,
+    cleanup_started: &mut Option<Instant>,
 ) -> Result<DocumentAgentOutcome> {
+    let DocumentDriveSelection {
+        accepted,
+        qualification_request,
+        max_seconds,
+    } = selection;
     ensure!(
         working.limit() == control.limits.working_bytes,
         "document_agent_working_binding"
@@ -703,7 +790,16 @@ async fn drive(
     let mut native = control
         .native_viewer
         .as_ref()
-        .map(|config| native::NativeSession::prepare(config, control, backend, &working, deadline))
+        .map(|config| {
+            native::NativeSession::prepare_with_duration(
+                config,
+                control,
+                backend,
+                &working,
+                deadline,
+                max_seconds,
+            )
+        })
         .transpose()?;
     let mut command = command(control, native.as_ref())?;
     let transport = TransportBudget::new(control.limits.total_rpc_bytes);
@@ -759,22 +855,35 @@ async fn drive(
         _=transport.exceeded()=>Err(anyhow!("document_transport_limit")), result=run=>result}
     })
     .await;
+    // timeout_at owns and has now dropped run_protocol, including its tool future.
+    *cleanup_started = Some(Instant::now());
+    let captured = captured
+        .map_err(|_| anyhow!("document_deadline_completion_unknown"))
+        .and_then(|result| result);
     if group.stop(&mut child).await.is_err() {
         stderr_task.abort();
-        return Err(anyhow!("document_cleanup_unknown"));
+        return crate::ocr::finish_owned_cleanup(
+            captured,
+            Err(anyhow!("cleanup")),
+            "document_cleanup_unknown",
+        );
     }
     let stderr = tokio::time::timeout(Duration::from_secs(2), &mut stderr_task).await;
     let stderr = match stderr {
         Ok(Ok(Ok(n))) => n,
         _ => {
             stderr_task.abort();
-            return Err(anyhow!("document_stderr_cleanup_unknown"));
+            return crate::ocr::finish_owned_cleanup(
+                captured,
+                Err(anyhow!("cleanup")),
+                "document_stderr_cleanup_unknown",
+            );
         }
     };
+    let mut outcome = captured?;
     transport
         .check()
         .map_err(|_| anyhow!("document_transport_limit"))?;
-    let mut outcome = captured.map_err(|_| anyhow!("document_deadline_completion_unknown"))??;
     control
         .original_clock
         .remaining()

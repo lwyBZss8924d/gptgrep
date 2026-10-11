@@ -323,6 +323,9 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
     if native_ptc_enabled {
         thread_config["features.shell_tool"] = json!(true);
         thread_config["features.view_image"] = json!(true);
+        thread_config["features.code_mode.direct_only_tool_namespaces"] =
+            json!(["gptgrep", "functions"]);
+        thread_config["features.code_mode_host.disable_in_process_fallback"] = json!(true);
     }
     let mut disabled = serde_json::Map::new();
     if let Some(servers) = configuration.get("mcp_servers") {
