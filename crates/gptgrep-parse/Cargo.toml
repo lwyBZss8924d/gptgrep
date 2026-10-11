@@ -10,6 +10,7 @@ description = "Native plaintext and LiteParse document ingestion for GPTgrep"
 anyhow = "1"
 gptgrep-pageindex = { path = "../gptgrep-pageindex" }
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg"] }
+png = "=0.18.1"
 liteparse = { git = "https://github.com/run-llama/liteparse", rev = "ab8879623ee45a0b7a775d12b42a9a7ae9dab16b", default-features = false }
 serde = { version = "1", features = ["derive"] }
 # Retained f32 observations and composed f64 geometry require exact JSON

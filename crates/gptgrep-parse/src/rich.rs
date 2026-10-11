@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail, ensure};
 use gptgrep_pageindex::{Heading, PageInput, ParsedDocument, from_pages, locate_heading};
-use image::ImageEncoder;
 use liteparse::{
     stages,
     types::{Page, PdfInput, TextItem},
@@ -35,6 +34,88 @@ pub(crate) mod native_text_metadata;
 
 pub const RICH_PARSER: &str = "liteparse-2.15.1/rich-v1";
 static PREPARATION_ID: AtomicU64 = AtomicU64::new(0);
+
+const PNG_STREAM_CHUNK_BYTES: usize = 8192;
+// The selected png 0.18.1 / flate2 1.1.10 / miniz_oxide 0.9.1
+// backend uses fixed compressor arrays (under 320 KiB), including its
+// nested boxed buffers. Keep separate slack for those arrays and constructor
+// temporaries; the row and output buffers are charged explicitly below.
+const PNG_COMPRESSOR_WORKING_UPPER: u64 = 4_194_304;
+const PNG_DEFLATE_OUTPUT_BYTES: u64 = 32_768;
+
+fn png_streaming_working_upper(width: u32) -> Result<u64> {
+    // StreamWriter retains three RGBA rows. Charge four rows, its explicitly
+    // selected chunk buffer, and flate2's fixed output buffer before render.
+    u64::from(width)
+        .checked_mul(4)
+        .and_then(|row| row.checked_mul(4))
+        .and_then(|rows| rows.checked_add(PNG_STREAM_CHUNK_BYTES as u64))
+        .and_then(|bytes| bytes.checked_add(PNG_DEFLATE_OUTPUT_BYTES))
+        .and_then(|bytes| bytes.checked_add(PNG_COMPRESSOR_WORKING_UPPER))
+        .context("resource_limit: PNG encoder working admission overflow")
+}
+
+fn admit_raster_working(
+    held_upper: u64,
+    width: u32,
+    pixels: u64,
+    budget: &ResourceBudget,
+) -> Result<()> {
+    let scratch = png_streaming_working_upper(width)?;
+    let raster_owned = pixels
+        .checked_mul(8)
+        .and_then(|bytes| bytes.checked_add(budget.image_file_bytes))
+        .and_then(|bytes| bytes.checked_add(scratch))
+        .context("resource_limit: raster/PNG working admission overflow")?;
+    ensure!(
+        held_upper
+            .checked_add(raster_owned)
+            .is_some_and(|bytes| bytes <= budget.owned_working_bytes),
+        "resource_limit: raster+metadata+PNG working admission"
+    );
+    Ok(())
+}
+
+fn encode_raster_png(rgba: &[u8], width: u32, height: u32, limit: u64) -> Result<Vec<u8>> {
+    let expected = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .context("resource_limit: PNG input geometry overflow")?;
+    ensure!(
+        width > 0 && height > 0 && expected == rgba.len() as u64,
+        "invalid PNG input geometry"
+    );
+    let mut output = LimitedWriter {
+        inner: Vec::with_capacity(
+            usize::try_from(limit).context("image file limit is not addressable")?,
+        ),
+        limit,
+        written: 0,
+    };
+    let result = (|| -> Result<()> {
+        let mut encoder = png::Encoder::new(&mut output, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(png::Compression::High);
+        encoder.set_filter(png::Filter::Adaptive);
+        let mut writer = encoder.write_header()?;
+        {
+            let mut stream = writer.stream_writer_with_size(PNG_STREAM_CHUNK_BYTES)?;
+            stream.write_all(rgba)?;
+            stream.finish()?;
+        }
+        // Validate final chunks and propagate IEND byte-limit errors too.
+        writer.finish()?;
+        Ok(())
+    })();
+    result.with_context(|| {
+        format!(
+            "PNG rendition encoding failed: width={width}, height={height}, limit_bytes={limit}, emitted_prefix_bytes={}",
+            output.written
+        )
+    })?;
+    Ok(output.inner)
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1273,11 +1354,7 @@ pub(crate) fn extract_sync(
                 );
                 let (pixel_width, pixel_height) = (pixel_width as u32, pixel_height as u32);
                 let pixels = budget.admit_image(pixel_width, pixel_height, 0)?;
-                ensure!(
-                    admission.held_upper()? + pixels * 8 + budget.image_file_bytes
-                        <= budget.owned_working_bytes,
-                    "resource_limit: raster+metadata working admission"
-                );
+                admit_raster_working(admission.held_upper()?, pixel_width, pixels, &budget)?;
                 let bitmap = page_obj.render(options.dpi)?;
                 ensure!(
                     bitmap.width() == pixel_width as i32 && bitmap.height() == pixel_height as i32,
@@ -1297,22 +1374,11 @@ pub(crate) fn extract_sync(
                     0x01,
                 );
                 let rgba = bitmap.to_rgba();
-                let mut encoded = LimitedWriter {
-                    inner: Vec::with_capacity(
-                        usize::try_from(budget.image_file_bytes)
-                            .context("image file limit is not addressable")?,
-                    ),
-                    limit: budget.image_file_bytes,
-                    written: 0,
-                };
-                image::codecs::png::PngEncoder::new(&mut encoded).write_image(
-                    &rgba,
-                    pixel_width,
-                    pixel_height,
-                    image::ExtendedColorType::Rgba8,
-                )?;
-                budget.admit_image(pixel_width, pixel_height, encoded.written)?;
-                admit_staging(&mut staged, encoded.written, &budget)?;
+                let encoded =
+                    encode_raster_png(&rgba, pixel_width, pixel_height, budget.image_file_bytes)?;
+                let encoded_bytes = encoded.len() as u64;
+                budget.admit_image(pixel_width, pixel_height, encoded_bytes)?;
+                admit_staging(&mut staged, encoded_bytes, &budget)?;
                 let artifact = write_bytes(
                     &prepared.staging_root,
                     &format!("{}-p{number}.png", prepared.summary.source_sha256),
@@ -1322,7 +1388,7 @@ pub(crate) fn extract_sync(
                         kind: ArtifactKind::Rendition,
                         page: Some(number),
                     },
-                    &encoded.inner,
+                    &encoded,
                     "image/png",
                     budget.image_file_bytes,
                 )?;
@@ -2099,6 +2165,75 @@ pub fn finalize_document(
 #[cfg(test)]
 mod boundary_tests {
     use super::*;
+    use image::ImageEncoder;
+
+    #[test]
+    fn png_streaming_respects_lossless_wire_and_working_limits() -> Result<()> {
+        let (width, height) = (512u32, 1024u32);
+        let row_bytes = width as usize * 4;
+        let mut state = 0x1a2b_3c4d_5e6f_7081u64;
+        let mut next_pixel = |pixel: &mut [u8]| {
+            for channel in &mut pixel[..3] {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                *channel = (state >> 32) as u8;
+            }
+            pixel[3] = 255;
+        };
+        // Nonadjacent repeated rows are still within the compressor's 32 KiB
+        // dictionary. No document text, IDs or expected encoded size are used.
+        let mut cycle = vec![0; row_bytes * 8];
+        for pixel in cycle.chunks_exact_mut(4) {
+            next_pixel(pixel);
+        }
+        let mut rgba = Vec::with_capacity(row_bytes * height as usize);
+        for row in 0..height as usize {
+            let start = (row % 8) * row_bytes;
+            rgba.extend_from_slice(&cycle[start..start + row_bytes]);
+        }
+        let mut legacy = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut legacy).write_image(
+            &rgba,
+            width,
+            height,
+            image::ExtendedColorType::Rgba8,
+        )?;
+        let mut budget = ResourceBudget::default();
+        assert!(legacy.len() as u64 > budget.image_file_bytes);
+        drop(legacy);
+        let encoded = encode_raster_png(&rgba, width, height, budget.image_file_bytes)?;
+        assert!(encoded.len() as u64 <= budget.image_file_bytes);
+        let decoded =
+            image::load_from_memory_with_format(&encoded, image::ImageFormat::Png)?.into_rgba8();
+        assert_eq!(decoded.dimensions(), (width, height));
+        assert_eq!(decoded.as_raw(), &rgba);
+        let wire = encoded.len() as u64;
+        assert_eq!(encode_raster_png(&rgba, width, height, wire)?, encoded);
+        // The last IEND CRC must propagate through writer.finish(), rather
+        // than becoming an ignored Drop error after an otherwise valid stream.
+        let error = encode_raster_png(&rgba, width, height, wire - 1).unwrap_err();
+        assert!(format!("{error:#}").contains("bounded writer admission failed"));
+        assert!(format!("{error:#}").contains("emitted_prefix_bytes="));
+
+        let pixels = u64::from(width) * u64::from(height);
+        assert_eq!(png_streaming_working_upper(width)?, 4_243_456);
+        let held = 12_345;
+        budget.owned_working_bytes = 9_498_681;
+        admit_raster_working(held, width, pixels, &budget)?;
+        budget.owned_working_bytes -= 1;
+        assert!(admit_raster_working(held, width, pixels, &budget).is_err());
+        assert!(admit_raster_working(u64::MAX, width, pixels, &budget).is_err());
+
+        // Independent RGB pixels cannot use the repeated-row dictionary.
+        // The byte cap still refuses them; no partial Vec escapes the helper.
+        for pixel in rgba.chunks_exact_mut(4) {
+            next_pixel(pixel);
+        }
+        let error = encode_raster_png(&rgba, width, height, budget.image_file_bytes).unwrap_err();
+        assert!(format!("{error:#}").contains("bounded writer admission failed"));
+        Ok(())
+    }
 
     #[test]
     fn dense_projection_separates_actual_wire_bytes_from_working_admission() {
