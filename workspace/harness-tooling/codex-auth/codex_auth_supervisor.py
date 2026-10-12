@@ -55,7 +55,7 @@ import time
 import unicodedata
 import urllib.parse
 
-SUPERVISOR_VERSION = "1.3.0"
+SUPERVISOR_VERSION = "1.3.1"
 CONFIG_SCHEMA = "gptgrep.codex-auth.config.v1"
 RUN_SCHEMA = "gptgrep.codex-auth.run.v1"
 LEDGER_SCHEMA = "gptgrep.codex-auth.ledger.v1"
@@ -279,13 +279,39 @@ def write_new_private(path, data):
         handle.write(data if isinstance(data, bytes) else data.encode())
 
 
-def write_new_private_atomic(path, data):
-    """Create `path` with its whole content at once, or raise FileExistsError: the data
-    goes to a private temporary file next to it, which is then hard-linked into place
-    (link never replaces an existing file). A concurrent reader sees no file or all of it."""
+def _private_temp(path, data):
+    """Write `data` to a new private temporary file next to `path`; return its path.
+
+    The name carries this process id and thread id. No live writer can hold a file of
+    that name: the only process with this id is this one, and this thread is not writing
+    one. A file found there was left by a writer that died between creating and removing
+    it (and whose process id was reused), so it is removed by name and the file is created
+    again. A write that fails removes its own partial file."""
     path = Path(path)
     temp = path.with_name("." + path.name + ".tmp-" + str(os.getpid()) + "-" + str(threading.get_ident()))
-    write_new_private(temp, data)
+    for attempt in (0, 1):
+        try:
+            write_new_private(temp, data)
+            return temp
+        except FileExistsError:
+            if attempt:
+                raise
+            os.unlink(temp)
+        except BaseException:
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
+            raise
+    raise AssertionError("unreachable")
+
+
+def write_new_private_atomic(path, data):
+    """Create `path` with its whole content at once, or raise FileExistsError when `path`
+    exists: the data goes to a private temporary file next to it, which is then hard-linked
+    into place (link never replaces an existing file). A concurrent reader sees no file or
+    all of it."""
+    temp = _private_temp(path, data)
     try:
         os.link(temp, path)
     finally:
@@ -293,10 +319,15 @@ def write_new_private_atomic(path, data):
 
 
 def write_json_atomic(path, value):
-    path = Path(path)
-    temp = path.with_name("." + path.name + ".tmp-" + str(os.getpid()) + "-" + str(threading.get_ident()))
-    write_new_private(temp, json.dumps(value, indent=2, sort_keys=True, default=str) + "\n")
-    os.replace(temp, path)
+    temp = _private_temp(path, json.dumps(value, indent=2, sort_keys=True, default=str) + "\n")
+    try:
+        os.replace(temp, path)
+    except BaseException:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
 
 
 def append_jsonl(path, value):
@@ -763,28 +794,93 @@ def canonical_identities(*metas):
     return {(meta["dev"], meta["ino"]) for meta in metas if meta and meta.get("exists") and "ino" in meta}
 
 
-def _symlink_reaches_credential(cfg, dirpath, name, dirfd, identities):
-    """A symlink through which the credential can be read: it resolves (through any
-    chain of links) to the canonical file, or to a directory that contains it, which an
-    archive that follows symlinks would copy. stat/realpath only; nothing is opened."""
+# Symlinks followed while resolving one link target (the kernel allows 32 on macOS).
+_LINK_HOPS = 40
+# Directory levels walked up from a link target towards `/` before the scan gives up.
+_MAX_DIRECTORY_DEPTH = 8192
+# The scan lists directories of the run (read access) and only looks names up in every
+# other directory it passes through (see _search_dir_flags). It never opens a file.
+_LIST_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+_SEARCH_FLAGS = []
+
+
+def _search_dir_flags():
+    """Flags that open a directory only to look names up in it: O_SEARCH (macOS 13 and
+    later) or O_PATH (Linux) need search permission only, as the kernel's own path lookup
+    does. O_RDONLY, which also needs read permission, is the fallback."""
+    if not _SEARCH_FLAGS:
+        base = os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        chosen = os.O_RDONLY | base
+        for name in ("O_SEARCH", "O_PATH"):
+            flag = getattr(os, name, 0)
+            if not flag:
+                continue
+            try:
+                os.close(os.open("/", flag | base))
+            except OSError:
+                continue
+            chosen = flag | base
+            break
+        _SEARCH_FLAGS.append(chosen)
+    return _SEARCH_FLAGS[0]
+
+
+def _identity(info):
+    return info.st_dev, info.st_ino
+
+
+def _path_identity(path, follow=True):
     try:
-        target = os.stat(name, dir_fd=dirfd)
-        if (target.st_dev, target.st_ino) in identities:
-            return True
+        return _identity(os.stat(path, follow_symlinks=follow))
     except OSError:
-        pass
-    resolved = os.path.realpath(os.path.join(dirpath, name))
-    return is_within(_path_key(cfg.canonical_auth_file), _path_key(resolved))
+        return None
+
+
+def _auth_home_and_ancestors(cfg):
+    """(st_dev, st_ino) of the canonical auth home and of every directory that contains
+    it: each prefix of its path, its physical parents (`..` up to `/`), and on macOS the
+    data-volume directories through which the same home is reachable as well
+    (/System/Volumes/Data/...). A symlink to any of them gives access to the credential."""
+    home = str(cfg.canonical_auth_home)
+    found = set()
+    parts = Path(home).parts
+    for count in range(1, len(parts) + 1):
+        found.add(_path_identity(os.path.join(*parts[:count])))
+    path = home
+    for _level in range(256):
+        here, parent = _path_identity(path), _path_identity(path + "/..")
+        found.add(here)
+        if here is None or parent is None or parent == here:
+            break
+        path += "/.."
+    home_identity = _path_identity(home)
+    if home_identity is not None and _path_identity("/System/Volumes/Data" + home) == home_identity:
+        for extra in ("/System", "/System/Volumes", "/System/Volumes/Data"):
+            found.add(_path_identity(extra))
+    found.discard(None)
+    return found
+
+
+def _canonical_home_is_physical(cfg):
+    try:
+        info = os.lstat(cfg.canonical_auth_home)
+    except OSError:
+        return False
+    return stat.S_ISDIR(info.st_mode) and os.path.realpath(cfg.canonical_auth_home) == str(cfg.canonical_auth_home)
 
 
 def _remove_credential_link(cfg, dirfd, name, info, kind):
     """Remove one extra link, never the credential. The entry is unlinked by name in its
     own directory descriptor, so no symlink in its path can redirect the removal. A hard
-    link is removed only while the canonical path still names the same file and so keeps
-    another link: a consumer that moved or replaced the canonical file may have left the
-    only copy of the original here, which stays for review."""
+    link is removed only while the canonical path, through a physical auth home, still
+    names the same file and so keeps another link: a consumer that moved or replaced the
+    canonical file (or the auth home) may have left the only copy of the original here,
+    which stays for review."""
     item = {"kind": kind, "removed": False}
     if kind == "hardlink":
+        if not _canonical_home_is_physical(cfg):
+            item["kept"] = "canonical_home_not_physical"
+            return item
         try:
             canonical = os.lstat(cfg.canonical_auth_file)
         except OSError:
@@ -806,43 +902,270 @@ def _remove_credential_link(cfg, dirfd, name, info, kind):
     return item
 
 
-def credential_links(cfg, layout, identities):
-    """Find and remove hard links and symlinks to the canonical credential below the run
-    directory, other than the run's own auth link (`codex-home/auth.json`, which
-    `link_state` judges). A consumer can create them through its link, and an archive of
-    `results/` would then carry the credential. Metadata only (lstat, stat, readlink via
-    realpath): nothing is opened. The walk never follows a symlink (`os.fwalk` re-checks
-    each directory it enters). Returns a non-secret summary with run-relative paths."""
-    top = str(layout.run_dir)
-    links, errors = [], []
-    try:
-        for dirpath, dirnames, filenames, dirfd in os.fwalk(top, follow_symlinks=False,
-                                                            onerror=lambda exc: errors.append(errno_name(exc))):
-            rel = os.path.relpath(dirpath, top)
-            for name in dirnames + filenames:
-                if rel == "codex-home" and name == "auth.json":
+class _ScanFrame:
+    __slots__ = ("identity", "rel", "subdirs")
+
+    def __init__(self, identity, rel):
+        self.identity = identity
+        self.rel = rel
+        self.subdirs = []
+
+
+class _CredentialLinkScan:
+    """One scan of a run directory for links through which the credential can be read.
+
+    The walk holds one open directory at a time: it lists a directory, judges every
+    entry, then enters each subdirectory by name (O_NOFOLLOW, checked against the entry's
+    lstat) and comes back through `..` (checked against the recorded identity). No path
+    string is ever built, so neither the depth of the tree nor PATH_MAX nor the
+    open-file limit stops it. Symlink targets are resolved one component at a time
+    relative to directory descriptors (`_resolve`), never by a path string. Every
+    directory that cannot be read and every target that cannot be resolved is recorded:
+    the scan is then incomplete, and the caller fails closed."""
+
+    def __init__(self, cfg, identities):
+        self.cfg = cfg
+        self.identities = set(identities)
+        self.search = _search_dir_flags()
+        self.home = _path_identity(cfg.canonical_auth_home)
+        self.home_and_ancestors = _auth_home_and_ancestors(cfg)
+        self.runs_root = _path_identity(cfg.runs_root, follow=False)
+        self.links = []
+        self.errors = []
+        self._chains = {}
+
+    def _error(self, rel, error):
+        code = error if isinstance(error, str) else errno_name(error)
+        self.errors.append({"path": "/".join(rel) or ".", "error": code})
+
+    def walk(self, top):
+        try:
+            cur = os.open(top, _LIST_DIR_FLAGS)
+        except OSError as exc:
+            self._error((), exc)
+            return
+        rel = ()
+        try:
+            frames = [self._enter(cur, rel)]
+            on_path = {frames[0].identity}
+            while frames:
+                frame = frames[-1]
+                if frame.subdirs:
+                    name, identity = frame.subdirs.pop()
+                    rel = frame.rel + (name,)
+                    if identity in on_path:
+                        self._error(rel, "DIRECTORY_CYCLE")
+                        continue
+                    try:
+                        child = os.open(name, _LIST_DIR_FLAGS, dir_fd=cur)
+                    except OSError as exc:
+                        self._error(rel, exc)
+                        continue
+                    try:
+                        same = _identity(os.fstat(child)) == identity
+                    except OSError:
+                        same = False
+                    if not same:
+                        os.close(child)
+                        self._error(rel, "ENTRY_CHANGED")
+                        continue
+                    os.close(cur)
+                    cur = child
+                    frames.append(self._enter(cur, rel))
+                    on_path.add(identity)
+                    continue
+                frames.pop()
+                on_path.discard(frame.identity)
+                if not frames:
+                    break
+                rel = frames[-1].rel
+                parent = os.open("..", self.search, dir_fd=cur)
+                try:
+                    back = _identity(os.fstat(parent)) == frames[-1].identity
+                except OSError:
+                    back = False
+                if not back:
+                    os.close(parent)
+                    # The tree moved under the scan: what is left cannot be reached reliably.
+                    self._error(rel, "DIRECTORY_MOVED")
+                    break
+                os.close(cur)
+                cur = parent
+        except Exception as exc:  # noqa: BLE001 - an aborted scan is incomplete, never clean
+            self._error(rel, exc if isinstance(exc, OSError) else type(exc).__name__)
+        finally:
+            os.close(cur)
+
+    def _enter(self, fd, rel):
+        frame = _ScanFrame(_identity(os.fstat(fd)), rel)
+        try:
+            names = sorted(os.listdir(fd))
+        except OSError as exc:
+            self._error(rel, exc)
+            return frame
+        for name in names:
+            if rel == ("codex-home",) and name == "auth.json":
+                continue  # the run's own link: link_state judges it
+            entry = rel + (name,)
+            try:
+                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            except OSError as exc:
+                self._error(entry, exc)
+                continue
+            if stat.S_ISDIR(info.st_mode):
+                frame.subdirs.append((name, _identity(info)))
+            elif stat.S_ISREG(info.st_mode):
+                if _identity(info) in self.identities:
+                    self._remove(fd, name, info, entry, "hardlink", None)
+            elif stat.S_ISLNK(info.st_mode):
+                try:
+                    reaches = self._symlink_reaches(fd, name)
+                except OSError as exc:
+                    self._error(entry, exc)
+                    continue
+                if reaches:
+                    self._remove(fd, name, info, entry, "symlink", reaches)
+        frame.subdirs.reverse()
+        return frame
+
+    def _remove(self, dirfd, name, info, entry, kind, reaches):
+        item = _remove_credential_link(self.cfg, dirfd, name, info, kind)
+        if reaches:
+            item["reaches"] = reaches
+        item["path"] = "/".join(entry)
+        self.links.append(item)
+
+    def _symlink_reaches(self, dirfd, name):
+        """What the symlink `name` in the directory `dirfd` gives access to, or None:
+        * "credential": it resolves to the canonical file;
+        * "auth_home": to the auth home or a directory above it (both contain the
+          credential), or to anything inside the auth home;
+        * "codex_home": to a run's codex-home or anything inside one (a live run keeps its
+          link to the credential there; a finished run's link path is under it too);
+        * "run_directory": to the runs root, a role directory or a run directory, which
+          contain codex-homes.
+        The target is compared by (st_dev, st_ino), so its spelling does not matter.
+        Raises OSError when the link cannot be resolved."""
+        target, chain, in_codex_home = self._resolve(dirfd, name)
+        identity = _identity(target) if target is not None else None
+        directory = target is not None and stat.S_ISDIR(target.st_mode)
+        if identity is not None and identity in self.identities:
+            return "credential"
+        if (directory and identity in self.home_and_ancestors) or self.home in chain:
+            return "auth_home"
+        if in_codex_home:
+            return "codex_home"
+        if directory and self.runs_root is not None and self.runs_root in chain[:3]:
+            return "run_directory"
+        return None
+
+    def _step(self, fd, name):
+        new = os.open(name, self.search, dir_fd=fd)
+        os.close(fd)
+        return new
+
+    def _resolve(self, dirfd, name):
+        """(target, chain, in_codex_home) for the symlink `name` in `dirfd`, resolved as the
+        kernel follows it, one component and one link at a time, relative to directory
+        descriptors. `target` is the lstat of what the link finally names (None when that
+        does not exist: a dangling link). `chain` and `in_codex_home` come from
+        `_ancestry` of the target itself when it is a directory, else of the deepest
+        existing directory on the way to it."""
+        fd = os.dup(dirfd)
+        try:
+            parts, hops = [name], 0
+            while parts:
+                part = parts.pop(0)
+                if part in ("", "."):
+                    continue
+                if part == "..":
+                    fd = self._step(fd, "..")
                     continue
                 try:
-                    info = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
-                except OSError as exc:
-                    errors.append(errno_name(exc))
+                    info = os.stat(part, dir_fd=fd, follow_symlinks=False)
+                except (FileNotFoundError, NotADirectoryError):
+                    return (None,) + self._ancestry(fd)
+                if stat.S_ISLNK(info.st_mode):
+                    hops += 1
+                    if hops > _LINK_HOPS:
+                        raise OSError(errno.ELOOP, "too many levels of symbolic links")
+                    text = os.readlink(part, dir_fd=fd)
+                    if not text:
+                        return (None,) + self._ancestry(fd)
+                    if text.startswith("/"):
+                        fd = self._step(fd, "/")
+                    parts[:0] = text.split("/")
                     continue
-                if stat.S_ISREG(info.st_mode) and (info.st_dev, info.st_ino) in identities:
-                    kind = "hardlink"
-                elif stat.S_ISLNK(info.st_mode) and _symlink_reaches_credential(cfg, dirpath, name, dirfd,
-                                                                                identities):
-                    kind = "symlink"
-                else:
+                if stat.S_ISDIR(info.st_mode):
+                    fd = self._step(fd, part)
                     continue
-                item = _remove_credential_link(cfg, dirfd, name, info, kind)
-                item["path"] = os.path.normpath(os.path.join(rel, name))
-                links.append(item)
-                if name in dirnames:
-                    dirnames.remove(name)  # a symlink is never entered; do not revisit a removed one
-    except OSError as exc:
-        errors.append(errno_name(exc))
-    return {"found": len(links), "removed": sum(1 for item in links if item["removed"]),
-            "links": links[:CREDENTIAL_LINK_REPORT_LIMIT], "scan_errors": len(errors),
+                if parts:  # a file followed by more components: nothing to reach (ENOTDIR)
+                    return (None,) + self._ancestry(fd)
+                return (info,) + self._ancestry(fd)
+            return (os.fstat(fd),) + self._ancestry(fd)
+        finally:
+            os.close(fd)
+
+    def _ancestry(self, fd):
+        """(chain, in_codex_home) of the directory `fd`: the identities of `fd` and of every
+        directory above it up to `/`, and whether `fd` is a run's codex-home or lies inside
+        one (RUNS_ROOT/<role>/<run-id>/codex-home). Walks `..` holding at most five
+        descriptors. Raises OSError when a parent cannot be opened."""
+        start = _identity(os.fstat(fd))
+        cached = self._chains.get(start)
+        if cached is not None:
+            return cached
+        chain, in_codex_home, recent = [], False, []
+        cur = os.dup(fd)
+        try:
+            for _level in range(_MAX_DIRECTORY_DEPTH):
+                identity = _identity(os.fstat(cur))
+                if identity == self.runs_root and len(chain) >= 3 and not in_codex_home:
+                    # chain[-3] lies directly in the run directory chain[-2] (descriptor
+                    # recent[-2]); it is that run's codex-home when the run names it so.
+                    try:
+                        named = _identity(os.stat("codex-home", dir_fd=recent[-2], follow_symlinks=False))
+                    except FileNotFoundError:
+                        named = None
+                    in_codex_home = named == chain[-3]
+                chain.append(identity)
+                parent = os.open("..", self.search, dir_fd=cur)
+                try:
+                    parent_identity = _identity(os.fstat(parent))
+                except OSError:
+                    os.close(parent)
+                    raise
+                if parent_identity == identity:  # `/` is its own parent
+                    os.close(parent)
+                    result = (tuple(chain), in_codex_home)
+                    self._chains[start] = result
+                    return result
+                recent.append(cur)
+                if len(recent) > 3:
+                    os.close(recent.pop(0))
+                cur = parent
+            raise OSError(errno.ELOOP, "directory nesting too deep")
+        finally:
+            os.close(cur)
+            for item in recent:
+                os.close(item)
+
+
+def credential_links(cfg, layout, identities):
+    """Find and remove links below the run directory through which the credential can be
+    read, other than the run's own auth link (`codex-home/auth.json`, which `link_state`
+    judges): hard links to the canonical file, and symlinks to it, to the auth home or a
+    directory above it, into the auth home, into a run's codex-home, or to a run-state
+    directory (`_CredentialLinkScan._symlink_reaches`). A consumer can create them through
+    its link, and an archive of `results/` would then carry the credential. Nothing is
+    read: directories are listed or opened for lookups only, files are never opened, and
+    the walk never enters a symlink. Returns a non-secret summary with run-relative paths;
+    `scan_errors` > 0 means the scan was incomplete."""
+    scan = _CredentialLinkScan(cfg, identities)
+    scan.walk(str(layout.run_dir))
+    return {"found": len(scan.links), "removed": sum(1 for item in scan.links if item["removed"]),
+            "links": scan.links[:CREDENTIAL_LINK_REPORT_LIMIT], "scan_errors": len(scan.errors),
+            "scan_error_items": scan.errors[:CREDENTIAL_LINK_REPORT_LIMIT], "complete": not scan.errors,
             "canonical_nlink_after": canonical_metadata(cfg).get("nlink")}
 
 
@@ -1047,11 +1370,22 @@ def bind_or_verify(cfg, lease_fd, binding):
     if binding is None:
         canonical_home_check(cfg)
         record = _binding_record(cfg, lease_fd)
-        try:
-            write_new_private_atomic(cfg.binding_path, json.dumps(record, indent=2, sort_keys=True) + "\n")
-            binding, created = record, True
-        except FileExistsError:
-            binding = read_binding(cfg)
+        text = json.dumps(record, indent=2, sort_keys=True) + "\n"
+        for _attempt in range(3):
+            try:
+                write_new_private_atomic(cfg.binding_path, text)
+                binding, created = record, True
+                break
+            except FileExistsError:
+                # Another first command created the marker after it was read here.
+                binding = read_binding(cfg)
+                if binding is not None:
+                    break
+                # It is gone again (removed right after it was created): bind again.
+            except OSError as exc:
+                raise SupervisorError("lease_binding_unwritable", detail=errno_name(exc)) from None
+        if binding is None:
+            raise SupervisorError("lease_binding_unreadable", detail="marker_vanished_while_binding")
     verify_binding_identity(cfg, binding)
     if (binding["lease_dev"], binding["lease_ino"]) != (info.st_dev, info.st_ino):
         raise SupervisorError("lease_file_replaced", detail="the bound lease file was replaced; see rebind-lease")
@@ -1532,11 +1866,24 @@ def _codex_root_path(base, value, home):
     return os.path.normpath(os.path.join(str(base), value))
 
 
+def _exact_key(path):
+    """Comparison form of a path for the own-directory exemption: lexically normalized
+    with one leading slash, but with letter case and Unicode normalization kept. Folding
+    them would widen an allowance: on a case-sensitive runs root, `RV-ABC` and `rv-abc`
+    are two runs, and run ids may differ only in case."""
+    text = os.path.normpath(str(path))
+    if text.startswith("//"):
+        text = "/" + text.lstrip("/")
+    return text
+
+
 def _inside_own_dirs(path, own_keys):
     """True when a root is one of this run's own directories or lies inside one, both
     as written (lexically normalized, as Codex resolves `-C`/`--add-dir`) and with
-    symlinks resolved (as Codex's sandbox canonicalizes each writable root)."""
-    return all(any(is_within(_path_key(form), key) for key in own_keys)
+    symlinks resolved (as Codex's sandbox canonicalizes each writable root), in the exact
+    spelling (`_exact_key`). Another spelling is not exempt; it is then checked like any
+    other root, which can only refuse more."""
+    return all(any(is_within(_exact_key(form), key) for key in own_keys)
                for form in (path, os.path.realpath(path)))
 
 
@@ -1561,7 +1908,7 @@ def codex_project_root_violation(argv, layout, denied, runs_root):
     options = _codex_options(argv)
     cwd, home = layout.work_dir, layout.home
     own = [str(path) for path in (layout.work_dir, layout.results, layout.tmp, layout.home)]
-    own_keys = [_path_key(path) for path in dict.fromkeys(own + [os.path.realpath(path) for path in own])]
+    own_keys = [_exact_key(path) for path in dict.fromkeys(own + [os.path.realpath(path) for path in own])]
     bases = [str(cwd)] + [_codex_root_path(cwd, value, home)
                           for name, value in options if name in ("-C", "--cd") and value]
     for name, value in options:
@@ -2108,14 +2455,23 @@ def guardian_keep(cfg, layout, kind, mode, baseline, docker_label, sidecar):
         ledger(cfg, {"run_id": layout.run_id, "decision": "OWNER_INTERRUPTED", "canonical_changed": changed,
                      "canonical_before": baseline, "canonical_after": after})
     # Survivors may have linked the credential into the run directory after the
-    # supervisor's own scan.
+    # supervisor's own scan. link_state first restores the mode of a CODEX_HOME that a
+    # consumer made unreadable, as it does after the run, so the scan can read it.
+    layout.link_state(cfg)
     links = credential_links(cfg, layout, canonical_identities(baseline, after))
     outcome["credential_links"] = links
-    if links["found"] or (links["canonical_nlink_after"] or 1) > 1:
-        outcome["credential_link_quarantine"] = write_quarantine(
-            cfg, "CREDENTIAL_LINK_IN_RUN_DIR" if links["found"] else "CANONICAL_HARDLINKED", layout.run_id, {
-                "operation": kind, "guardian_mode": mode, "found": links["found"], "removed": links["removed"],
-                "canonical_nlink": links["canonical_nlink_after"]})
+    if links["found"]:
+        reason = "CREDENTIAL_LINK_IN_RUN_DIR"
+    elif (links["canonical_nlink_after"] or 1) > 1:
+        reason = "CANONICAL_HARDLINKED"
+    elif links["scan_errors"]:
+        reason = "CREDENTIAL_LINK_SCAN_INCOMPLETE"  # fail closed, as after the supervisor's own scan
+    else:
+        reason = None
+    if reason:
+        outcome["credential_link_quarantine"] = write_quarantine(cfg, reason, layout.run_id, {
+            "operation": kind, "guardian_mode": mode, "found": links["found"], "removed": links["removed"],
+            "scan_errors": links["scan_errors"], "canonical_nlink": links["canonical_nlink_after"]})
     link = layout.release_auth_link(cfg)
     outcome["auth_link_final"] = link
     if link.get("present") and not link.get("released"):
@@ -2946,9 +3302,13 @@ def _supervise(cfg, args, spec, layout, receipt, proc, tracker, guardian, docker
         # An extra hard link remains somewhere outside this run directory.
         reasons.append("CANONICAL_HARDLINKED")
     if links["scan_errors"]:
-        receipt["anomalies"].append({"code": "CREDENTIAL_LINK_SCAN_INCOMPLETE", "errors": links["scan_errors"]})
+        # Fail closed: a directory the scan could not read, or a link it could not resolve,
+        # may still give access to the credential.
+        reasons.append("CREDENTIAL_LINK_SCAN_INCOMPLETE")
     for reason in reasons:
-        if reason != "BLOCKER_LISTENER_APPEARED":
+        if reason == "CREDENTIAL_LINK_SCAN_INCOMPLETE":
+            receipt["anomalies"].append({"code": reason, "errors": links["scan_errors"]})
+        elif reason != "BLOCKER_LISTENER_APPEARED":
             receipt["anomalies"].append({"code": reason})
     if reasons:
         receipt["quarantine"] = write_quarantine(cfg, reasons[0], args.run_id, {

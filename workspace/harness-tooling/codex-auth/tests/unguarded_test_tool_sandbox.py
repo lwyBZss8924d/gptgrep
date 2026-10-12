@@ -63,6 +63,12 @@ class ToolSandboxTests(unittest.TestCase):
             support.assert_fake_path(path)
         self.backend = support.FakeBackend()
         self.proxy = support.ProxyTrap()
+        # N4: the declared proxy-trap mode is accepted only with this test's own live trap.
+        refusal = support.real_binary_refusal(self.proxy)
+        if refusal:
+            self.backend.stop()
+            self.proxy.stop()
+            raise RuntimeError(refusal)
         roles = dict(self.env.values["roles"])
         roles["tools"] = {"tool_permissions": {"extends": ":workspace", "network_enabled": False},
                           "passthrough_env": PROXY_NAMES}
@@ -369,6 +375,24 @@ class GuardClaimTests(unittest.TestCase):
         self.assertIn("Ran 0 tests", proc.stderr)
         self.assertFalse(ran.exists(), "no Codex binary was started")
         support.observe("declared_guard_verified", exit_code=proc.returncode, binary_started=False)
+
+    def test_a_declared_proxy_trap_needs_the_tests_own_live_trap(self):
+        """N4: GPTGREP_AUTH_TEST_SANDBOX=proxy-trap alone does not let the seatbelt-only integration
+        module run a real binary: it routes Codex through no trap, so setUpClass fails and no Codex
+        binary is started. A live trap passes the check; a stopped one does not."""
+        proc, ran = support.run_integration_module_child("proxy-trap")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("routes Codex through no proxy trap", proc.stderr)
+        self.assertIn("Ran 0 tests", proc.stderr)
+        self.assertFalse(ran.exists(), "no Codex binary was started")
+        trap = support.ProxyTrap()
+        try:
+            self.assertIsNone(support.real_binary_refusal(trap))
+            self.assertEqual((trap.count, trap.destinations, trap.self_checks), (0, [], 1))
+        finally:
+            trap.stop()
+        self.assertIn("did not record its self-check", support.real_binary_refusal(trap))
+        support.observe("declared_proxy_trap_verified", exit_code=proc.returncode, binary_started=False)
 
 
 if __name__ == "__main__":

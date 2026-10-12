@@ -81,17 +81,26 @@ def seatbelt_active():
             sock.close()
 
 
-def real_binary_refusal():
+def real_binary_refusal(proxy_trap=None):
     """None when a test may run a real Codex binary in this process, else why it must refuse
     (README, Qualification). Allowed under run_qualification.py's seatbelt guard, verified by
     a denied loopback connect, or in its explicit unguarded pass (--unguarded-tool-sandbox,
-    which sets GPTGREP_AUTH_TEST_SANDBOX=proxy-trap and routes every proxy to a trap)."""
+    which sets GPTGREP_AUTH_TEST_SANDBOX=proxy-trap). There the test must hand over the
+    ProxyTrap it routes every Codex proxy variable to, and the trap must record a self-check
+    connection: the declared mode alone proves nothing, and a module written for the seatbelt
+    guard, which passes no trap, refuses."""
     if SANDBOX == "seatbelt":
         if seatbelt_active():
             return None
         return ("refusing to run a real Codex binary: GPTGREP_AUTH_TEST_SANDBOX=seatbelt, but outbound "
                 "connections are not denied, so no guard is active")
     if SANDBOX == "proxy-trap":
+        if proxy_trap is None:
+            return ("refusing to run a real Codex binary: GPTGREP_AUTH_TEST_SANDBOX=proxy-trap, but this test "
+                    "routes Codex through no proxy trap (only the unguarded_test_* modules do)")
+        if not proxy_trap.verify_live():
+            return ("refusing to run a real Codex binary: GPTGREP_AUTH_TEST_SANDBOX=proxy-trap, but the proxy "
+                    "trap did not record its self-check connection, so no trap is active")
         return None
     return ("refusing to run a real Codex binary without the qualification guard: use run_qualification.py "
             "(seatbelt) or its explicit --unguarded-tool-sandbox pass")
@@ -463,11 +472,27 @@ class ProxyTrap(Trap):
     it ended (`eof`: the peer closed; `silent`: nothing arrived for 2 s; `data`) and,
     when a request line arrived, its method and destination host:port (`CONNECT
     host:443`, or the authority of an absolute URL). The line is read one byte at a
-    time up to its end; no path, query, header or body is kept."""
+    time up to its end; no path, query, header or body is kept.
+
+    `verify_live()` proves the trap is listening and recording: its own self-check
+    line (with a per-trap nonce) is counted in `self_checks`, never as a connection."""
 
     def __init__(self):
         self.destinations = []
+        self.self_checks = 0
+        self._probe_line = ("GPTGREP-PROXY-TRAP-SELF-CHECK %s\r\n" % secrets.token_hex(8)).encode()
         super().__init__()
+
+    def verify_live(self, timeout=5):
+        """True when a loopback connection to the trap is accepted and recorded as this trap's
+        own self-check."""
+        before = self.self_checks
+        try:
+            with socket.create_connection(("127.0.0.1", self.port), timeout=timeout) as conn:
+                conn.sendall(self._probe_line)
+        except OSError:
+            return False
+        return wait_for(lambda: self.self_checks > before, timeout)
 
     def _loop(self):
         while self.running:
@@ -494,8 +519,12 @@ class ProxyTrap(Trap):
             host = target.split("://", 1)[1].split("/", 1)[0] if "://" in target else target.split("/", 1)[0]
             host = host.rsplit("@", 1)[-1]  # never keep userinfo
             with self.lock:
-                self.destinations.append({"bytes": len(line), "outcome": "data" if line else outcome,
-                                          "method": (parts[0] if parts else "")[:16], "host": host[:128]})
+                if line == self._probe_line:
+                    self.count -= 1
+                    self.self_checks += 1
+                else:
+                    self.destinations.append({"bytes": len(line), "outcome": "data" if line else outcome,
+                                              "method": (parts[0] if parts else "")[:16], "host": host[:128]})
             try:
                 conn.shutdown(socket.SHUT_RDWR)
             except OSError:

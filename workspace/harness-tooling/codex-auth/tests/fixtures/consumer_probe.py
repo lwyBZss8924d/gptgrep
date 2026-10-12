@@ -22,6 +22,18 @@ Modes (argv[1]):
   move-canonical-keep NAME       hard-link the credential into results as NAME, then replace
                                  the canonical path with another file (NAME is then the only
                                  link to the original credential)
+  deep-link LEVELS SEGMENT KIND=NAME...
+                                 below results/deep, create LEVELS nested directories named
+                                 SEGMENT (relative steps, so the path may exceed PATH_MAX) and
+                                 in the deepest one a symlink NAME per KIND: canonical (to the
+                                 canonical file), home (to the auth home) or root (to /);
+                                 write the deepest directory's path length to
+                                 results/deep-path-length.txt
+  hidden-link NAME               symlink results/hide/NAME to the credential, then chmod
+                                 results/hide 000 (a directory the scan cannot read)
+  move-home NAME                 move the canonical auth home into results as NAME, leave a
+                                 symlink to it at the auth home's path and add a second hard
+                                 link NAME/auth2.json to the credential
   symlink TARGET LINK            create the symlink LINK -> TARGET
   ignore-term SECONDS READY      ignore SIGTERM and sleep
   survivor SECONDS keep|close    fork a grandchild that outlives this process;
@@ -33,6 +45,7 @@ Modes (argv[1]):
                                    canonical-append      append to $CODEX_HOME/auth.json
                                    docker-add STATE ID   add a fake container id, sleep 1
                                    hard-link NAME        hard-link the credential into results
+                                   hidden-link NAME      as the hidden-link mode
   chmod-home PIDFILE SECONDS     an escaped grandchild as above, then chmod $CODEX_HOME 000
   write-canonical                append to $CODEX_HOME/auth.json through the run's link
                                  (a misbehaving consumer rewriting the fake credential)
@@ -92,6 +105,36 @@ def write_record(text):
     os.close(fd)
 
 
+def hidden_link(canonical, results, name):
+    """A symlink to the credential in a directory the post-run scan cannot read."""
+    hide = os.path.join(results, "hide")
+    os.mkdir(hide, 0o700)
+    os.symlink(canonical, os.path.join(hide, name))
+    os.chmod(hide, 0)
+
+
+def deep_link(levels, segment, specs):
+    """Nested directories built with relative steps (no path string is ever this long),
+    then one symlink per KIND=NAME in the deepest one."""
+    canonical = canonical_path()
+    targets = {"canonical": canonical, "home": os.path.dirname(canonical), "root": "/"}
+    start = os.getcwd()
+    base = os.path.join(results_dir(), "deep")
+    os.mkdir(base)
+    os.chdir(base)
+    length = len(base)
+    for _ in range(levels):
+        os.mkdir(segment)
+        os.chdir(segment)
+        length += 1 + len(segment)
+    for spec in specs:
+        kind, _sep, name = spec.partition("=")
+        os.symlink(targets[kind], name)
+    os.chdir(start)
+    with open(os.path.join(results_dir(), "deep-path-length.txt"), "w") as handle:
+        handle.write(str(length))
+
+
 def escape(pidfile, seconds, action=None, args=()):
     """Fork a daemon-like grandchild that the supervisor must still find."""
     home = os.environ.get("CODEX_HOME")
@@ -118,6 +161,9 @@ def escape(pidfile, seconds, action=None, args=()):
             elif action == "hard-link":
                 os.link(os.readlink(os.path.join(home, "auth.json")),
                         os.path.join(os.path.dirname(home), "results", args[0]))
+            elif action == "hidden-link":
+                hidden_link(os.readlink(os.path.join(home, "auth.json")),
+                            os.path.join(os.path.dirname(home), "results"), args[0])
         finally:
             os._exit(0)
     deadline = time.time() + 10
@@ -199,6 +245,19 @@ def main(argv):
         return 0
     if mode == "symlink":
         os.symlink(argv[2], argv[3])
+        return 0
+    if mode == "deep-link":
+        deep_link(int(argv[2]), argv[3], argv[4:])
+        return 0
+    if mode == "hidden-link":
+        hidden_link(canonical_path(), results_dir(), argv[2])
+        return 0
+    if mode == "move-home":
+        home = os.path.dirname(canonical_path())
+        moved = os.path.join(results_dir(), argv[2])
+        os.rename(home, moved)
+        os.symlink(moved, home)
+        os.link(os.path.join(moved, "auth.json"), os.path.join(moved, "auth2.json"))
         return 0
     if mode == "ignore-term":
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
