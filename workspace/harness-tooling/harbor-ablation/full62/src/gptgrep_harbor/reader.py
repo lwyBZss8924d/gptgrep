@@ -11,6 +11,7 @@ from .common import MAX_ANSWER, MAX_READER_QUESTION_BYTES, PROFILE, canonical, c
 from .native import codex_accounting, codex_argv, codex_result, prompt_bytes
 from .process import run
 from .runtime import CODEX_VERSION, DECISIONS_BUDGET, DECISIONS_LEDGER_DIR, check_config, native_environment
+from .decisions import TRIAL_BUDGET, acquire_writer, prepare as prepare_decisions
 
 
 def reader_argv(config, binding, question):
@@ -21,7 +22,13 @@ def reader_argv(config, binding, question):
                 "shared_native_reader_required")
         require(config["reader_mode"] in ("rich_multimodal", "legacy_text"), "explicit_reader_mode")
         mode_flags = ["--multimodal"] if config["reader_mode"] == "rich_multimodal" else []
-        return [config["gptgrep_binary"], "--decisions-budget", DECISIONS_BUDGET,
+        preparing = config.get("decisions_preparation") is not None
+        if preparing:
+            require(config["reader_mode"] == "rich_multimodal"
+                    and config["decisions_preparation"]["max_concurrent_batches"] == 1,
+                    "decisions_preparation_mode")
+            mode_flags += ["--max-concurrent-batches", "1"]
+        return [config["gptgrep_binary"], "--decisions-budget", TRIAL_BUDGET if preparing else DECISIONS_BUDGET,
                 "ask", "--native-ptc", *mode_flags, "--document=" + config["source_relative_path"],
                 "--jev-model", config["jev_model"], "--codex-bin", "/opt/full62/codex-native",
                 "--codex-home", config["codex_home"], "--codex-permissions", config["codex_permissions"],
@@ -159,6 +166,7 @@ def main():
             "reader_outputs_already_exist")
     put("/logs/agent/attempt-start.json", {"binding": binding, "profile": PROFILE})
     started = time.monotonic()
+    deadline_unix_ms = time.time_ns() // 1000000 + config["deadline_seconds"] * 1000
     outcome = {"schema": "gptgrep.harbor.answer.v1", "binding": binding,
                "status": "operational_failure", "answer": None}
     operation = {"schema": "gptgrep.harbor.operation.v1", "binding": binding,
@@ -174,6 +182,7 @@ def main():
                  "budget_scope": config["budget_scope"],
                  "outer_retry_count": 0, "provider_internal_retry_count": None,
                  "index_excluded": True, "grounding": "unassessed"}
+    writer = None
     try:
         env = native_environment(os.environ, product=binding["arm"] == "gptgrep")
         version = run([config["codex_binary"], "--version"], cwd="/data/corpus",
@@ -181,11 +190,16 @@ def main():
         require(version["return_code"] == 0 and version["failure"] is None and
                 version["stdout"].strip() == ("codex-cli " + CODEX_VERSION).encode(), "native_version_mismatch")
         operation["observed_native_version"] = version["stdout"].decode().strip()
-        if binding["arm"] == "gptgrep":
+        argv = reader_argv(config, binding, question)
+        if binding["arm"] == "gptgrep" and config.get("decisions_preparation") is not None:
+            writer = acquire_writer()
+            env, operation["decisions_preparation"] = prepare_decisions(
+                config, binding, question, argv, started=started,
+                deadline_unix_ms=deadline_unix_ms, environ=os.environ)
+        elif binding["arm"] == "gptgrep":
             budget = parse(pinned(config["decisions_budget"], 16384))
             require(Path(budget["ledger_path"]).parent == Path(DECISIONS_LEDGER_DIR),
                     "decisions_ledger_mount_contract")
-        argv = reader_argv(config, binding, question)
         native_input = raw_prompt(config, question) if binding["arm"] == "raw_only" else None
         remaining = config["deadline_seconds"] - (time.monotonic() - started)
         require(remaining > 0, "reader_deadline")
@@ -223,6 +237,9 @@ def main():
     except Exception:
         # Redacted code only: exception text may contain task/provider/private data.
         operation["failure"] = "reader_failed"
+    finally:
+        if writer is not None:
+            os.close(writer)
     operation["cumulative_query_wall_ms"] = round((time.monotonic() - started) * 1000)
     operation["status"] = outcome["status"]
     operation["answer_sha256"] = sha(canonical(outcome))

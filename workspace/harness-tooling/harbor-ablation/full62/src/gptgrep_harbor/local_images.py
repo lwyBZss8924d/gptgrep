@@ -14,6 +14,7 @@ import uuid
 from .common import canonical, copy_asset, digest, integer, parse, pinned, put, read, relative, require, sha
 from .process import run
 from .runtime import PASS_ENV
+from .trial_order import check_job_order
 
 
 def config_id(value):
@@ -227,6 +228,7 @@ def build_dataset(export_path, export_sha256, dataset, output, docker, timeout,
     require(output.resolve() == output and not output.exists() and not output.is_relative_to(dataset),
             "fresh_local_build_output")
     runtime = parse(pinned(export["runtime"]))
+    check_job_order(export, runtime, dataset)
     images = runtime["images"]
     for role in ("gptgrep", "raw_only", "judge"):
         config_id(images[role])

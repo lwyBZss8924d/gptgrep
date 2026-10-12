@@ -9,6 +9,9 @@ from .common import ARMS, MAX_READER_QUESTION_BYTES, PROFILE, canonical, copy_as
 from .runtime import (API_ENV, BASE_CAPABILITIES, BASE_TOOLS_PATH, CODEX_HOME, DECISIONS_BUDGET, DECISIONS_LEDGER_DIR, PASS_ENV, WORK_DIR, auth_compose, auth_paths,
                       base_tools_identity, model_config, native_identity, validate_asset_path)
 from .product_bundle import PRODUCT_ENTRYPOINT, PRODUCT_PROVENANCE, bundle_identity
+from .decisions import (CONTROL_ROOT, FAMILY_ROOT, TRIAL_ROOT, WRITER_LOCK,
+                        control as decisions_control)
+from .trial_order import paired_order
 
 
 def validate_cohort(cohort):
@@ -81,16 +84,23 @@ class Full62Adapter:
         if runtime["reader_mode"] == "rich_multimodal":
             require(runtime["jev_model"] in ("openai/gpt-6-luna-decisions", "openai/gpt-6-luna-decisions-20261006"),
                     "rich_decisions_model")
-        budget = runtime["decisions_budget"]
-        require(type(budget) is dict and set(budget) == {"path", "bytes", "sha256"}
-                and Path(budget["path"]).is_absolute(), "decisions_budget_pin")
-        integer(budget["bytes"], 1, 16384)
-        digest(budget["sha256"])
-        validate_asset_path(budget["path"])
-        ledger_dir = runtime["decisions_ledger_dir"]
-        require(isinstance(ledger_dir, str) and ledger_dir.startswith("/") and ledger_dir != "/" and
-                Path(ledger_dir).as_posix() == ledger_dir and ".." not in Path(ledger_dir).parts and
-                not any(c in ledger_dir for c in ("$", "\n", "\r", "\x00")), "ledger_directory_reference")
+        if runtime.get("decisions_preparation") is not None:
+            decisions_control(runtime["decisions_preparation"])
+            require("decisions_budget" not in runtime and "decisions_ledger_dir" not in runtime
+                    and runtime["reader_mode"] == "rich_multimodal"
+                    and runtime["jev_model"] == "openai/gpt-6-luna-decisions",
+                    "decisions_preparation_mode_conflict")
+        else:
+            budget = runtime["decisions_budget"]
+            require(type(budget) is dict and set(budget) == {"path", "bytes", "sha256"}
+                    and Path(budget["path"]).is_absolute(), "decisions_budget_pin")
+            integer(budget["bytes"], 1, 16384)
+            digest(budget["sha256"])
+            validate_asset_path(budget["path"])
+            ledger_dir = runtime["decisions_ledger_dir"]
+            require(isinstance(ledger_dir, str) and ledger_dir.startswith("/") and ledger_dir != "/" and
+                    Path(ledger_dir).as_posix() == ledger_dir and ".." not in Path(ledger_dir).parts and
+                    not any(c in ledger_dir for c in ("$", "\n", "\r", "\x00")), "ledger_directory_reference")
         require(runtime["account_scope"] == "Dev/Test/Eval" and runtime["admitted"] is True,
                 "isolated_runtime_admission")
         # This receipt is independently selected by root. Source preparation does
@@ -152,6 +162,7 @@ class Full62Adapter:
         require("OPENROUTER_API_KEY" not in runtime["judge_env"], "product_credential_in_judge")
         require(runtime["primary_metric"] == "answer_equivalence_delta", "selected_primary_metric")
         integer(runtime["bootstrap_seed"])
+        integer(runtime["trial_order_seed"])
         require(re.fullmatch(r"[a-z0-9][a-z0-9-]{0,79}", runtime["run_id"]), "run_id")
         require(Path(runtime["jobs_dir"]).is_absolute(), "explicit_jobs_directory")
         integer(runtime["max_asset_bytes"], 1, 2**40)
@@ -211,6 +222,11 @@ class Full62Adapter:
             copy_asset(asset["pin"], self.runtime["max_asset_bytes"])
         require(not (root.parent / (root.name + ".export.json")).exists() and
                 not (root.parent / (root.name + ".job.json")).exists(), "fresh_companion_outputs")
+        preparation = self.runtime.get("decisions_preparation")
+        if preparation is not None:
+            for key in ("controls_directory", "financial_family_directory", "trial_state_directory"):
+                require(not Path(preparation[key]).is_relative_to(root), "decisions_inside_task_output")
+            put(Path(preparation["trial_state_directory"]) / "sole-writer.lock", b"")
         root.mkdir(mode=0o700, parents=False)
         package = Path(__file__).parent
         exported = []
@@ -236,15 +252,22 @@ class Full62Adapter:
                  "runtime": self.manifest["runtime"], "judge_contract": self.manifest["judge_contract"],
                  "source_cohort_sha256": self.cohort["source_cohort_sha256"], "tasks": exported,
                  "expected_pairs": 62, "expected_documents": 34, "runtime_started": False}
-        # Kept adjacent, not beneath the dataset; Harbor sees only task directories.
-        put(root.parent / (root.name + ".export.json"), index)
+        order = paired_order(exported, self.runtime["trial_order_seed"])
         job = {"job_name": self.runtime["run_id"], "jobs_dir": self.runtime["jobs_dir"],
                "n_attempts": 1, "n_concurrent_trials": 1, "retry": {"max_retries": 0},
-               "datasets": [{"path": str(root)}], "environment": {"type": "docker", "delete": True},
+               "datasets": [], "tasks": [{"path": str(root / name), "source": root.name}
+                                          for name in order["task_names"]],
+               "environment": {"type": "docker", "delete": True},
                "agents": [{"import_path": "gptgrep_harbor.agent:PairedNativeAgent",
                            "model_name": PROFILE["model"], "env": self.runtime["reader_env"]}],
                "verifier": {"env": self.runtime["judge_env"]}}
-        put(root.parent / (root.name + ".job.json"), job)
+        job_path = root.parent / (root.name + ".job.json")
+        job_bytes = canonical(job) + b"\n"
+        put(job_path, job_bytes)
+        index.update(trial_order=order, job={"path": str(job_path), "bytes": len(job_bytes), "sha256": sha(job_bytes)})
+        # Keep controls outside dataset discovery and freeze the concrete order
+        # before any result. Harbor otherwise sorts dataset task directories.
+        put(root.parent / (root.name + ".export.json"), index)
         return index
 
     def _task(self, task, package, row, document, binding):
@@ -259,7 +282,6 @@ class Full62Adapter:
                       "provenance": {**runtime["base_tool_environment"]["provenance"], "path": BASE_TOOLS_PATH}},
                   "native_cli": runtime["native_cli"],
                   "native_config_sha256": sha(model_config(PROFILE, "reader")),
-                  "decisions_budget": {**runtime["decisions_budget"], "path": DECISIONS_BUDGET},
                   "reader_base_binary": runtime["reader_base_binary"],
                   "gptgrep_binary_pin": runtime["gptgrep_binary_pin"],
                   "gptgrep_bundle": {"provenance": {**runtime["gptgrep_bundle"]["provenance"],
@@ -276,6 +298,18 @@ class Full62Adapter:
                      "deadline_seconds", "max_tool_calls", "max_input_bytes")},
                   "source_relative_path": document["relative_path"],
                   "raw_document": "/data/corpus/" + document["relative_path"]}
+        preparation = runtime.get("decisions_preparation")
+        trial_state = None
+        if preparation is None:
+            reader["decisions_budget"] = {**runtime["decisions_budget"], "path": DECISIONS_BUDGET}
+        elif arm == "gptgrep":
+            trial_id = sha(canonical(binding))[:32]
+            trial_state = Path(preparation["trial_state_directory"]) / trial_id
+            trial_state.mkdir(mode=0o700)
+            reader["decisions_preparation"] = {
+                "seed": {**preparation["seed"], "path": CONTROL_ROOT + "/seed.json"},
+                # The unchanged financial guard caps each identifier at 96 bytes.
+                "run_id": runtime["run_id"][:63] + "-" + trial_id, "max_concurrent_batches": 1}
         put(task / "environment/reader.json", reader)
         judge = {"binding": binding, "question": row["question"], "reference": row["reference"],
                  "base_tool_environment": reader["base_tool_environment"],
@@ -288,7 +322,7 @@ class Full62Adapter:
                  "judge_deadline_seconds": runtime["judge_deadline_seconds"]}
         put(task / "tests/judge.json", judge)
         for target in (task / "environment/gptgrep_harbor", task / "tests/gptgrep_harbor"):
-            for name in ("__init__.py", "common.py", "process.py", "native.py", "runtime.py", "product_bundle.py", "reader.py", "verifier.py"):
+            for name in ("__init__.py", "common.py", "process.py", "native.py", "runtime.py", "product_bundle.py", "decisions.py", "reader.py", "verifier.py"):
                 put(target / name, (package / name).read_bytes())
         for asset in runtime["documents"] + (runtime["index_files"] if arm == "gptgrep" else []):
             destination = task / "environment/corpus" / asset["relative_path"]
@@ -321,12 +355,17 @@ class Full62Adapter:
             put(task / directory / "config.toml", model_config(profile, role))
             compose = auth_compose(runtime["auth"][auth_key], runtime["platform"])
             if role == "reader" and arm == "gptgrep":
-                compose["services"]["main"]["volumes"].append({"type": "bind",
-                    "source": runtime["decisions_budget"]["path"], "target": DECISIONS_BUDGET,
-                    "read_only": True, "bind": {"create_host_path": False}})
-                compose["services"]["main"]["volumes"].append({"type": "bind",
-                    "source": runtime["decisions_ledger_dir"], "target": DECISIONS_LEDGER_DIR,
-                    "read_only": False, "bind": {"create_host_path": False}})
+                mounts = ([(preparation["controls_directory"], CONTROL_ROOT, True),
+                           (preparation["financial_family_directory"], FAMILY_ROOT, False),
+                           (str(trial_state), TRIAL_ROOT, False),
+                           (str(Path(preparation["trial_state_directory"]) / "sole-writer.lock"), WRITER_LOCK, False)]
+                          if preparation is not None else
+                          [(runtime["decisions_budget"]["path"], DECISIONS_BUDGET, True),
+                           (runtime["decisions_ledger_dir"], DECISIONS_LEDGER_DIR, False)])
+                for source, target, read_only in mounts:
+                    compose["services"]["main"]["volumes"].append({"type": "bind",
+                        "source": source, "target": target, "read_only": read_only,
+                        "bind": {"create_host_path": False}})
             put(task / directory / "docker-compose.yaml", compose)
             # Credentials and arbitrary sibling files cannot enter either image.
             allowed = ["gptgrep_harbor", "config.toml"] + (

@@ -50,22 +50,37 @@ historical verdicts. This compact projection records their aggregate outcomes.
 | 2026-10-11 | PNG diagnostic observed 16 required OCR tasks and zero completed OCR; no generation published | Retain the failure; prepare and validate native image/parse controls |
 | 2026-10-11, earlier source round | Integrated source checks passed: 977 Rust tests, 4 ignored; formatting, Clippy, 11 offline cases and 71 wrapper tests | Source delivery recorded; broader live acceptance remains separate |
 | 2026-10-11, native components | Page image qualification and Document image contrast checks received scoped acceptance | Full document parse/OCR/index still required |
-| 2026-10-11, full34 attempt | OCR response contained eight unplanned region IDs for one planned region; terminal failure after about 131 seconds | No accepted generation; bind the output schema to the planned region and bounding box |
-| 2026-10-12, this source round | Integrated source checks passed: 986 Rust tests, 4 ignored; formatting, Clippy, 11 offline cases, 71 full62 wrapper tests and 25 Node wrapper tests, with 1 skipped. CLI release build completed | OCR and Decisions source changes received scoped independent review; complete native document integration remains active |
+| 2026-10-11, historical full34 attempt | OCR response contained eight unplanned region IDs for one planned region; terminal failure after about 131 seconds | Original failure retained; later region-binding acceptance does not qualify a complete generation |
+| 2026-10-12, earlier integrated source round | Integrated source checks passed: 986 Rust tests, 4 ignored; formatting, Clippy, 11 offline cases, 71 full62 wrapper tests and 25 Node wrapper tests, with 1 skipped. CLI release build completed | OCR and Decisions source changes received scoped independent review; complete native document integration remains active |
 | 2026-10-12, native Page OCR | Fresh live run passed 2/2 synthetic image cases in about 81 seconds; original region IDs and bounding boxes matched exactly | Independent review accepted image delivery, region binding and paired image influence only; full34/full62 acceptance remains pending |
+| 2026-10-12, latest full34 attempt | Terminal failure after 750.688 seconds: ten complete OCR pages, one partial required region and eleven terminal OCR reservations; no generation published | Required content remains incomplete; a new 200-DPI single-page experiment tests a generic 100-DPI legibility hypothesis, not an accepted fix |
+| 2026-10-12, current Python wrapper round | All 80 full62 wrapper tests passed; the wrapper generates and verifies all 124 tasks using the selected seed, randomized pair order and within-pair arm order | Source evidence only; the actual full62 export, SEARCH and Judge remain pending, and G5 remains HOLD |
+| 2026-10-12, private Decisions integration | Per-trial preparation and request-ID isolation repair received scoped source acceptance; the actual private Linux build and 13 tests passed | Package qualification and actual Ask remain pending; source acceptance does not establish live integration or full62 acceptance |
 
-The next Opt step is to validate the repaired native document pipeline, publish
-the complete frozen index, then execute all 124 SEARCH trials and their separate
-Judge stage.
+The next Opt step is to test the image-legibility hypothesis and validate the
+complete native document pipeline, publish the complete frozen index, then
+execute all 124 SEARCH trials and their separate Judge stage.
 
 ## Recent checks and retained failures
 
-The current integrated source round passed **986 Rust tests**, with **0 failed**
+The earlier integrated source round passed **986 Rust tests**, with **0 failed**
 and **4 ignored**, plus formatting and Clippy with warnings denied. Its frozen CLI
-release build passed **11 offline evaluation cases**. The full62 wrapper suite passed **71 tests**, and the
-Node wrapper passed **25**, with **1 skipped** because the optional real-native
-metadata fixture was absent. An earlier integrated round passed **977 Rust
-tests** and **11 offline evaluation cases**; its receipts remain historical.
+release build passed **11 offline evaluation cases**. That round's full62 Python
+wrapper suite passed **71 tests**, and its Node wrapper passed **25**, with
+**1 skipped** because the optional real-native metadata fixture was absent.
+An older integrated round passed **977 Rust tests** and **11 offline evaluation
+cases**; its receipts remain historical.
+
+The current Python wrapper round passed **all 80 tests**. Its paired-order
+implementation retains all **124 tasks**, randomizing the 62 pair blocks and
+each pair's arm order using a seed selected before outcomes, with one concurrent
+trial and no retries. The actual full62 export and concrete task sequence still
+need to be generated and verified before launch. The private
+per-trial Decisions preparation and request-ID isolation repair received
+independent acceptance within its source scope. Its actual private Linux build
+and **13 tests** passed; package qualification and an actual Ask remain pending.
+These results are separate from the earlier Rust, offline and Node checks and do
+not establish complete SEARCH/Judge or live retrieval acceptance.
 
 The first full-workspace run encountered a busy OCR ledger lock. A direct
 filesystem experiment showed that an inherited descriptor could retain the
@@ -74,7 +89,7 @@ ledger on scope exit; independent source review, a focused inherited-descriptor
 regression and the subsequent full suite passed. Inheritance as the cause of the
 original failure remains an inference. The initial failure is retained.
 
-The most recent retained full34 attempt failed during `execute_ocr` after about
+The historical full34 region-ID attempt failed during `execute_ocr` after about
 **131 seconds**. The task planned **one region**, but the native response supplied
 **eight unplanned region IDs**. A completed model response therefore did not
 produce accepted OCR or an index generation. The repair binds the planned region
@@ -86,6 +101,14 @@ accepted original-region binding, native image delivery and paired image
 influence for those cases. Each case planned one region; live multi-region
 behavior remains unverified. This does not qualify the complete 34-document
 index or the paired SEARCH experiment.
+
+The latest full34 attempt failed after **750.688 seconds**. It completed OCR for
+**ten pages**, left **one required region partial**, and recorded **eleven terminal
+OCR reservations**. It published **no generation**. A new single-page experiment
+at **200 DPI** is testing the generic hypothesis that **100-DPI** input limits
+image legibility. This hypothesis is not an accepted fix, and the original
+131-second region-ID failure remains in the retained history. The complete
+full62 SEARCH/Judge comparison remains pending; **G5 remains HOLD**.
 
 Earlier image, OCR timeout, parsing, source-review and build failures remain in
 the private experiment history. This document publishes aggregate outcomes only;

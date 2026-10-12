@@ -69,7 +69,7 @@ class HarborMaterializationTests(unittest.TestCase):
             "reader_env": {"OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}"}, "judge_env": {},
             "jev_model": "openai/gpt-6-luna-decisions", "reader_mode": "rich_multimodal",
             "native_ptc": True, "codex_permissions": "full62_reader",
-            "primary_metric": "answer_equivalence_delta", "bootstrap_seed": 17,
+            "primary_metric": "answer_equivalence_delta", "bootstrap_seed": 17, "trial_order_seed": 23,
             "max_asset_bytes": 1048576, "max_assets_total_bytes": 1048576,
             "deadline_seconds": 20, "judge_deadline_seconds": 20, "max_tool_calls": 8, "max_input_bytes": 8192,
             "documents": documents, "index_files": [{"relative_path": ".gptgrep/index.bin",
@@ -126,7 +126,10 @@ class HarborMaterializationTests(unittest.TestCase):
         self.assertEqual(len({row["binding"]["document_id"] for row in result["tasks"]}), 34)
         job = JobConfig.model_validate_json((self.root / "dataset.job.json").read_text())
         self.assertEqual((job.n_attempts, job.n_concurrent_trials, job.retry.max_retries), (1, 1, 0))
-        self.assertEqual(job.datasets[0].path, output)
+        self.assertEqual(job.datasets, [])
+        self.assertEqual([task.path for task in job.tasks],
+                         [output / name for name in result["trial_order"]["task_names"]])
+        self.assertTrue(all(task.source == output.name for task in job.tasks))
         self.assertEqual(job.agents[0].import_path, "gptgrep_harbor.agent:PairedNativeAgent")
         reader_policies = set()
         for record in result["tasks"]:
@@ -327,10 +330,14 @@ class NativePolicyTests(unittest.TestCase):
 
     def test_product_credential_never_reaches_native_environment(self):
         source = {"PATH": "/usr/bin", "OPENROUTER_API_KEY": "synthetic-only", "HTTPS_PROXY": "http://synthetic-proxy",
-                  "BASH_ENV": "/unsafe/startup", "CODEX_HOME": "/wrong-home"}
+                  "BASH_ENV": "/unsafe/startup", "CODEX_HOME": "/wrong-home",
+                  "GPTGREP_DECISIONS_ATTACH_PLAN": "/private/plan.json",
+                  "GPTGREP_DECISIONS_ATTACH_PLAN_SHA256": "synthetic-pin"}
         native = native_environment(source)
         self.assertNotIn("OPENROUTER_API_KEY", native)
         self.assertNotIn("BASH_ENV", native)
+        self.assertNotIn("GPTGREP_DECISIONS_ATTACH_PLAN", native)
+        self.assertNotIn("GPTGREP_DECISIONS_ATTACH_PLAN_SHA256", native)
         self.assertEqual(native["CODEX_HOME"], CODEX_HOME)
         self.assertEqual(native["HTTPS_PROXY"], source["HTTPS_PROXY"])
         self.assertEqual(native_environment(source, product=True)["OPENROUTER_API_KEY"], "synthetic-only")
@@ -343,7 +350,9 @@ class NativePolicyTests(unittest.TestCase):
         with patch("gptgrep_harbor.runtime.read", return_value=canonical(config)), \
              patch("gptgrep_harbor.runtime.check_config"), \
              patch("gptgrep_harbor.common.copy_asset"), \
-             patch.dict(os.environ, {"OPENROUTER_API_KEY": "synthetic-only"}, clear=True), \
+             patch.dict(os.environ, {"OPENROUTER_API_KEY": "synthetic-only",
+                                    "GPTGREP_DECISIONS_ATTACH_PLAN": "/private/plan.json",
+                                    "GPTGREP_DECISIONS_ATTACH_PLAN_SHA256": "synthetic-pin"}, clear=True), \
              patch("sys.argv", ["codex-native", "app-server"]), \
              patch("os.execve") as execute:
             native_wrapper()
@@ -351,6 +360,8 @@ class NativePolicyTests(unittest.TestCase):
             self.assertEqual(binary, "/opt/codex")
             self.assertEqual(argv[-1], "app-server")
             self.assertNotIn("OPENROUTER_API_KEY", env)
+            self.assertNotIn("GPTGREP_DECISIONS_ATTACH_PLAN", env)
+            self.assertNotIn("GPTGREP_DECISIONS_ATTACH_PLAN_SHA256", env)
             execute.reset_mock()
             with patch("sys.argv", ["codex-native", "exec", "--sandbox", "read-only"]):
                 with self.assertRaisesRegex(ValueError, "legacy_sandbox_override_forbidden"):
