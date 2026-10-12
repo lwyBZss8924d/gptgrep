@@ -54,6 +54,92 @@ impl Fixture {
             config,
         })
     }
+    fn with_ocr(transport: gptgrep_host::OcrImageTransport, qualified: bool) -> Result<Self> {
+        use gptgrep_host::{NativeAgentRuntimeProfile, NativeOcrQualification, OcrImageTransport};
+        let mut fixture = Self::new()?;
+        let source = fixture.root.join("synthetic-scan.png");
+        image::RgbImage::from_pixel(64, 32, image::Rgb([240, 240, 240])).save(&source)?;
+        let bytes = fs::read(&source)?;
+        fixture.config.sources[0] = Source {
+            alias: "approved".into(),
+            path: source,
+            bytes: bytes.len() as u64,
+            sha256: digest(&bytes),
+        };
+        fixture.config.native.render_pages = true;
+        let binary = fixture.root.join("synthetic-codex-never-executed");
+        fs::write(&binary, b"synthetic configuration fixture; not executable")?;
+        let binary_sha = digest(&fs::read(&binary)?);
+        for name in ["empty-auth", "state", "results", "scratch"] {
+            fs::create_dir(fixture.root.join(name))?;
+        }
+        fs::create_dir(fixture.root.join("state/logs"))?;
+        let mut profile = match transport {
+            OcrImageTransport::NativeAgent => OcrRuntimeProfile::with_native_agent(
+                "a".repeat(40),
+                "b".repeat(64),
+                binary_sha,
+                NativeAgentRuntimeProfile {
+                    permission_profile: "synthetic-native-ocr".into(),
+                    scratch_root: fixture.root.join("scratch"),
+                    capabilities: BTreeMap::new(),
+                    native_skills: Vec::new(),
+                    native_runtime_package: None,
+                    max_tool_calls: 16,
+                    timeout_secs: 60,
+                },
+            )?,
+            OcrImageTransport::NativeViewer => OcrRuntimeProfile::unqualified_native(
+                "a".repeat(40),
+                "b".repeat(64),
+                binary_sha,
+                "c".repeat(64),
+            )?,
+            OcrImageTransport::DynamicImages => {
+                OcrRuntimeProfile::unqualified("a".repeat(40), "b".repeat(64), binary_sha)?
+            }
+        };
+        if qualified {
+            if transport == OcrImageTransport::NativeViewer {
+                let runtime_profile_sha256 = profile.sha256()?;
+                profile
+                    .native_viewer
+                    .as_mut()
+                    .unwrap()
+                    .accepted_qualification = Some(NativeOcrQualification {
+                    schema_version: "gptgrep.ocr.native-qualification.v1".into(),
+                    runtime_profile_sha256,
+                    qualification_sha256: "d".repeat(64),
+                    native_delivery_accepted: true,
+                    paired_semantic_influence_accepted: true,
+                    actual_served_profile_verified: false,
+                });
+            } else {
+                profile.accepted_image_qualification_sha256 = Some("d".repeat(64));
+            }
+        }
+        profile.validate()?;
+        let clock =
+            RunClockAnchor::capture(std::time::SystemTime::now() + Duration::from_secs(60))?;
+        let ledger = fixture.root.join("synthetic-ledger.json");
+        OcrExecutionContext::with_clock_anchor("synthetic", &"e".repeat(64), clock.clone(), 1)?
+            .join_original_ledger(&ledger, &clock)?;
+        fixture.config.ocr = Some(OcrControl {
+            codex_bin: binary,
+            auth_home: fixture.root.join("empty-auth"),
+            state_dir: fixture.root.join("state"),
+            results_root: fixture.root.join("results"),
+            runtime_profile: profile,
+            run_id: "synthetic".into(),
+            plan_sha256: "e".repeat(64),
+            deadline_unix_ms: clock.deadline_unix_ms(),
+            original_clock: clock,
+            max_pages: 1,
+            phase_limits: None,
+            ledger,
+        });
+        Ok(fixture)
+    }
     async fn backend(&self) -> Result<Backend> {
         let limits = driver::DocumentAgentLimits {
             timeout_ms: 900000,
@@ -107,6 +193,87 @@ impl Fixture {
         Backend::prepare(session, "approved", &document, &working).await
     }
 }
+#[tokio::test]
+async fn backend_prepares_required_ocr_for_native_agent_and_qualified_native_viewer() -> Result<()>
+{
+    use gptgrep_host::OcrImageTransport;
+    for (transport, qualified) in [
+        (OcrImageTransport::NativeAgent, false),
+        (OcrImageTransport::NativeViewer, true),
+    ] {
+        let fixture = Fixture::with_ocr(transport, qualified)?;
+        let backend = fixture.backend().await?;
+        assert_eq!(backend.prepared.original_pages, 1);
+        assert_eq!(backend.prepared.required_ocr_tasks, 1);
+        assert_eq!(backend.tasks.len(), 1);
+        assert!(
+            backend
+                .tasks
+                .values()
+                .all(|task| !task.submitted && !task.complete)
+        );
+        backend.session.host(&backend.prepared.handle)?;
+        let snapshot = backend.session.context.as_ref().unwrap().snapshot()?;
+        assert_eq!(snapshot.charged_admissions, 0);
+        assert_eq!(snapshot.terminal_admissions, 0);
+        assert!(!backend.finalized);
+        assert_eq!(fs::read_dir(fixture.root.join("results"))?.count(), 0);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn backend_rejects_dynamic_images_and_unqualified_native_viewer_for_required_ocr()
+-> Result<()> {
+    use gptgrep_host::OcrImageTransport;
+    for (transport, qualified, expected) in [
+        (
+            OcrImageTransport::DynamicImages,
+            true,
+            "document_native_ocr_qualification_required",
+        ),
+        (
+            OcrImageTransport::DynamicImages,
+            false,
+            "parse_agent_ocr_qualification_required",
+        ),
+        (
+            OcrImageTransport::NativeViewer,
+            false,
+            "parse_agent_ocr_qualification_required",
+        ),
+    ] {
+        let fixture = Fixture::with_ocr(transport, qualified)?;
+        let error = fixture
+            .backend()
+            .await
+            .err()
+            .expect("ineligible OCR configuration");
+        assert_eq!(error.to_string(), expected, "{transport:?}");
+        assert_eq!(fs::read_dir(fixture.root.join("results"))?.count(), 0);
+    }
+    let mut fixture = Fixture::with_ocr(OcrImageTransport::NativeAgent, false)?;
+    fixture
+        .config
+        .ocr
+        .as_mut()
+        .unwrap()
+        .runtime_profile
+        .native_agent
+        .as_mut()
+        .unwrap()
+        .permission_profile
+        .clear();
+    let error = fixture
+        .backend()
+        .await
+        .err()
+        .expect("invalid native profile");
+    assert_eq!(error.to_string(), "parse_agent_ocr_profile");
+    assert_eq!(fs::read_dir(fixture.root.join("results"))?.count(), 0);
+    Ok(())
+}
+
 #[tokio::test]
 async fn complete_parser_product_does_not_require_model_reading_every_metadata_byte() -> Result<()>
 {

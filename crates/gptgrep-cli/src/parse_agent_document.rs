@@ -408,8 +408,11 @@ impl Backend {
                 .as_ref()
                 .ok_or_else(|| anyhow!("document_native_ocr_configuration_required"))?;
             ensure!(
-                ocr.runtime_profile.transport() == gptgrep_host::OcrImageTransport::NativeViewer
-                    && ocr.runtime_profile.image_qualification_accepted(),
+                matches!(
+                    ocr.runtime_profile.transport(),
+                    gptgrep_host::OcrImageTransport::NativeViewer
+                        | gptgrep_host::OcrImageTransport::NativeAgent
+                ) && ocr.runtime_profile.execution_ready(),
                 "document_native_ocr_qualification_required"
             );
             let snapshot = code(

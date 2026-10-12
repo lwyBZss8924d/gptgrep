@@ -32,6 +32,9 @@ struct Control {
     run_id: String,
     plan_sha256: String,
     timeout_seconds: u64,
+    /// A resumed source-repair phase keeps its original same-boot deadline.
+    #[serde(default)]
+    original_clock: Option<RunClockAnchor>,
     max_admissions: usize,
     #[serde(default)]
     phase_limits: Option<OcrExecutionLimits>,
@@ -121,6 +124,13 @@ fn main() -> Result<()> {
         "prepare_ocr_phase_input_sha256"
     );
     let control: Control = serde_json::from_slice(&bytes)?;
+    let mut prepared = prepare(&control)?;
+    prepared["input"] = json!({"path":input_path,"bytes":bytes.len(),"sha256":expected_sha});
+    println!("{prepared}");
+    Ok(())
+}
+
+fn prepare(control: &Control) -> Result<Value> {
     ensure!(
         control.schema == "gptgrep.ocr-phase.prepare-input.v1",
         "prepare_ocr_phase_input_schema"
@@ -173,11 +183,21 @@ fn main() -> Result<()> {
     absent(&control.ledger_path)?;
     absent(&lock_path)?;
 
-    // Exactly one clock capture for this fresh phase; all later use adopts it.
-    let deadline = SystemTime::now()
-        .checked_add(Duration::from_secs(control.timeout_seconds))
-        .context("prepare_ocr_phase_deadline")?;
-    let original_clock = RunClockAnchor::capture(deadline)?;
+    let timeout = Duration::from_secs(control.timeout_seconds);
+    let original_clock = match &control.original_clock {
+        Some(clock) => clock.clone(),
+        None => RunClockAnchor::capture(
+            SystemTime::now()
+                .checked_add(timeout)
+                .context("prepare_ocr_phase_deadline")?,
+        )?,
+    };
+    // Validate expiry and same-boot identity before either ledger file exists.
+    // Imported anchors are never recaptured or shortened to a new deadline.
+    ensure!(
+        original_clock.remaining()? <= timeout,
+        "prepare_ocr_phase_clock_exceeds_timeout"
+    );
     let context = match &control.phase_limits {
         Some(limits) => OcrExecutionContext::with_phase_limits(
             &control.run_id,
@@ -205,18 +225,91 @@ fn main() -> Result<()> {
         .phase_limits
         .as_ref()
         .map_or(128 * 1024, |limits| limits.ledger_bytes);
-    println!(
-        "{}",
-        json!({
-            "schema":"gptgrep.ocr-phase.prepared.v1",
-            "input":{"path":input_path,"bytes":bytes.len(),"sha256":expected_sha},
-            "run_id":control.run_id,"plan_sha256":control.plan_sha256,
-            "original_clock":original_clock,"deadline_unix_ms":snapshot.deadline_unix_ms,
-            "phase_limits":control.phase_limits,"context_snapshot":snapshot,
-            "ledger":file_pin(&control.ledger_path,ledger_limit)?,
-            "ledger_lock":file_pin(&lock_path,ledger_limit)?,
-            "models_started":false
-        })
-    );
-    Ok(())
+    Ok(json!({
+        "schema":"gptgrep.ocr-phase.prepared.v1",
+        "run_id":control.run_id,"plan_sha256":control.plan_sha256,
+        "original_clock":original_clock,"deadline_unix_ms":snapshot.deadline_unix_ms,
+        "phase_limits":control.phase_limits,"context_snapshot":snapshot,
+        "ledger":file_pin(&control.ledger_path,ledger_limit)?,
+        "ledger_lock":file_pin(&lock_path,ledger_limit)?,
+        "models_started":false
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn control(root: &Path, original_clock: Option<RunClockAnchor>) -> Control {
+        Control {
+            schema: "gptgrep.ocr-phase.prepare-input.v1".into(),
+            run_id: "synthetic-helper-fixture".into(),
+            plan_sha256: "a".repeat(64),
+            timeout_seconds: 60,
+            original_clock,
+            max_admissions: 1,
+            phase_limits: None,
+            ledger_path: root.join("synthetic-ledger.json"),
+        }
+    }
+
+    #[test]
+    fn carried_clock_is_retained_in_output_and_fresh_ledger() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().canonicalize()?;
+        let clock = RunClockAnchor::capture(SystemTime::now() + Duration::from_secs(30))?;
+        let selected = control(&root, Some(clock.clone()));
+        let output = prepare(&selected)?;
+        assert_eq!(output["original_clock"], serde_json::to_value(&clock)?);
+        assert_eq!(output["deadline_unix_ms"], clock.deadline_unix_ms());
+        let joined = OcrExecutionContext::with_clock_anchor(
+            &selected.run_id,
+            &selected.plan_sha256,
+            clock.clone(),
+            selected.max_admissions,
+        )?
+        .join_existing_original_ledger(&selected.ledger_path, &clock)?;
+        assert!(joined.ledger_clock_anchor()?.as_ref() == Some(&clock));
+        assert_eq!(joined.snapshot()?.charged_admissions, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn expired_foreign_or_overlong_clocks_fail_before_ledger_creation() -> Result<()> {
+        let clock = RunClockAnchor::capture(SystemTime::now() + Duration::from_secs(60))?;
+        for case in ["expired", "foreign", "timeout"] {
+            let temporary = tempfile::tempdir()?;
+            let root = temporary.path().canonicalize()?;
+            let mut value = serde_json::to_value(&clock)?;
+            if case == "expired" {
+                value["deadline_unix_ms"] = json!(1);
+            } else if case == "foreign" {
+                value["boot_identity"] = json!("synthetic-foreign-boot");
+            }
+            let mut selected = control(&root, Some(serde_json::from_value(value)?));
+            if case == "timeout" {
+                selected.timeout_seconds = 1;
+            }
+            assert!(prepare(&selected).is_err(), "{case}");
+            assert!(!selected.ledger_path.exists(), "{case}");
+            assert!(!root.join("synthetic-ledger.json.lock").exists(), "{case}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn omitted_clock_keeps_fresh_capture_and_existing_pair_refusal() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().canonicalize()?;
+        let selected = control(&root, None);
+        let started = SystemTime::now();
+        let output = prepare(&selected)?;
+        let clock: RunClockAnchor = serde_json::from_value(output["original_clock"].clone())?;
+        assert!(clock.remaining()? <= Duration::from_secs(selected.timeout_seconds));
+        assert!(SystemTime::UNIX_EPOCH + Duration::from_millis(clock.deadline_unix_ms()) > started);
+        let ledger = fs::read(&selected.ledger_path)?;
+        assert!(prepare(&selected).is_err());
+        assert_eq!(fs::read(&selected.ledger_path)?, ledger);
+        Ok(())
+    }
 }
