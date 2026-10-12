@@ -1,0 +1,262 @@
+# Development and evaluation setup
+
+This guide covers the experimental source in
+[`lwyBZss8924d/gptgrep`](https://github.com/lwyBZss8924d/gptgrep), including the
+native parse/OCR path and the full62 Harbor adapter. Read the
+[current status](experimental-status.md) for measured outcomes and open gaps.
+[SPEC](../SPEC.md) owns acceptance; these instructions do not change its gates.
+
+## Checkout and storage
+
+```sh
+git clone --branch codex/gptgrep-experimental-20261012 \
+  https://github.com/lwyBZss8924d/gptgrep.git
+cd gptgrep
+git rev-parse HEAD
+```
+
+Record that revision for every build and result. Keep private controls and results
+under an ignored directory or an explicitly owned external directory. The
+maintained workspace follows [development storage](../workspace/harness-config/development-storage.md).
+Another workstation must provide its own storage admission and physical paths;
+the private registry is not part of this source distribution.
+
+The following variables describe output locations, not storage authorization.
+Set `GPTGREP_DEV_ROOT` to a real, owned, adequately sized build volume before
+running download/build/test commands. Create the selected directories there.
+
+```sh
+export GPTGREP_DEV_ROOT=/absolute/owned/external/gptgrep-dev
+export CARGO_HOME="$GPTGREP_DEV_ROOT/cargo-home"
+export CARGO_TARGET_DIR="$GPTGREP_DEV_ROOT/cargo-target"
+export UV_CACHE_DIR="$GPTGREP_DEV_ROOT/uv-cache"
+export UV_PYTHON_INSTALL_DIR="$GPTGREP_DEV_ROOT/uv-python"
+export TMPDIR="$GPTGREP_DEV_ROOT/tmp"
+mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR" "$UV_CACHE_DIR" \
+  "$UV_PYTHON_INSTALL_DIR" "$TMPDIR" "$GPTGREP_DEV_ROOT/results"
+```
+
+Container images, layer storage and job outputs need their own external capacity;
+`TMPDIR` does not relocate Docker's data root. Preserve normal proxy/CA and OS
+gateway policy. Local IPC and provider egress are separate readiness checks.
+
+## Dependencies and local build
+
+| Component | Selected requirement |
+| --- | --- |
+| GPTgrep | Rust/Cargo with edition 2024; CI selects Rust 1.96.0, rustfmt and Clippy; use `Cargo.lock` |
+| Native parsing | Pinned LiteParse Rust source and PDFium `chromium/8058`; an existing LibreOffice installation for Office conversion |
+| Codex login and ordinary reader | Caller-selected official Codex CLI; the Harbor common base pins 0.162.1 |
+| Native Page/Document image path | Separately built pinned standalone app-server derivative described below |
+| Python tools | uv-managed Python 3.12+; the common evaluation image uses Python 3.13 |
+| Raw-document evaluation tools | Python, Pillow 12.3.0, Poppler `pdftotext`/`pdftoppm`, shell, and the same native reader in both arms |
+| Harbor | Exact `harbor==0.24.0` from the adapter's `uv.lock`, plus an independently managed Docker/Buildx environment |
+| Optional wrapper | Node 24 and pnpm 11.24.0, using `packages/cli/pnpm-lock.yaml` |
+
+```sh
+cargo build --release --locked -p gptgrep-cli
+export GPTGREP_BIN="$CARGO_TARGET_DIR/release/gptgrep"
+"$GPTGREP_BIN" doctor --json
+"$GPTGREP_BIN" --schema
+"$GPTGREP_BIN" --llms
+"$GPTGREP_BIN" index ./evals/fixtures/corpus --json
+"$GPTGREP_BIN" search 'retention|expiry' ./evals/fixtures/corpus --mode regex --json
+```
+
+Plaintext works without loading PDFium. The first native build may download the
+pinned PDFium payload into the selected build/cache area. An explicitly provided
+`PDFIUM_LIB_PATH` selects its library directory; `PDFIUM_INCLUDE_PATH` selects
+headers for the build helper. For distribution, use the complete launcher,
+library and license bundle from [release packaging](release.md), not a copied
+standalone `gptgrep.bin`. Python/Pillow/Poppler and Codex remain separate agent
+runtime dependencies rather than dependencies of a local regex command.
+
+## Independent ChatGPT authentication
+
+Use an independent existing account home for this project's Dev/Test/Eval roles.
+Authenticate with the official CLI; the standalone app-server derivative is not
+a replacement login command. Set a caller-owned path and let Codex manage its
+credential store:
+
+```sh
+export GPTGREP_CODEX_HOME=/absolute/private/gptgrep-codex-home
+mkdir -p "$GPTGREP_CODEX_HOME"
+chmod 700 "$GPTGREP_CODEX_HOME"
+CODEX_HOME="$GPTGREP_CODEX_HOME" codex \
+  -c 'cli_auth_credentials_store="file"' login --device-auth
+CODEX_HOME="$GPTGREP_CODEX_HOME" codex \
+  -c 'cli_auth_credentials_store="file"' login status
+```
+
+Complete the one-time code in the browser when prompted. Device login must be
+enabled for that ChatGPT account/workspace. `login status` checks authentication
+without printing credentials; model availability and an actual permitted turn
+remain separate checks. See [official Codex authentication](https://learn.chatgpt.com/docs/auth).
+Never put the credential cache in a build context or source commit. Harbor mounts
+the selected cached file at runtime and refreshes it outside consumed trials.
+
+GPTgrep's native roles request `gpt-6-luna`, reasoning effort `max`, service tier
+`fast`. The guarded protocol normalizes Fast to `priority`; that request does not
+prove the served tier. Use the explicit `--codex-home`/`--ocr-codex-home` options
+or corresponding control fields, and separate state/log/temp directories where
+supported. Named permission profiles must be configured and actually qualified
+for the selected runtime; do not infer filesystem isolation from a profile name.
+
+## OpenRouter Decisions
+
+Provide `OPENROUTER_API_KEY` only to the invoking GPTgrep process through your
+secret manager. Do not place its value in a command example, JSON control or
+checked-in environment file. The default model is
+`openai/gpt-6-luna-decisions`; `typesafe/jev-1.13` is an explicit text-only legacy
+choice. Codex authentication and the Decisions credential are independent.
+
+```sh
+"$GPTGREP_BIN" search 'How are snapshots retained?' ./evals/fixtures/corpus \
+  --mode hybrid --json
+"$GPTGREP_BIN" ask 'How are snapshots retained?' ./evals/fixtures/corpus \
+  --codex-home "$GPTGREP_CODEX_HOME" \
+  --model gpt-6-luna --reasoning-effort max --service-tier fast --json
+```
+
+These are live, model-assisted commands. Failures remain explicit, and unknown
+usage/cost remains null. `--decisions-budget FILE` joins a separately initialized,
+matching owner ledger; it does not create a campaign or renew consumed allowance.
+Without it, the product uses a finite single-invocation context. A public checkout
+does not inherit another operator's budget or existing campaign controls.
+
+## Native parsing, OCR and complete index publication
+
+The default legacy `index` remains local. Explicit `--rich` / `--ocr off` publishes
+the rich path only when all required content is available; required but disabled
+OCR is a failure. A zero-model preparation is available as:
+
+```sh
+"$GPTGREP_BIN" index /absolute/owned/documents --rich --plan-only --json
+```
+
+For agentic parsing, build the derivative at
+[patches/codex-native-viewer](../patches/codex-native-viewer/README.md). Its upstream
+pin is Codex `rust-v0.162.1`, commit
+`092d3acd6bec3e3a14bdc7e7a2810ab628ab759d`; the derived version is
+`0.162.1-gptgrep.1`. Keep the source patch, build identity and licenses together.
+Page and Document image qualifications bind the actual binary and profile;
+another build cannot reuse the owner's private acceptance by copying a digest.
+
+The advanced workflow requires operator-created inputs:
+
+| Input | Contract and purpose |
+| --- | --- |
+| Parse control | `gptgrep.parse-agent.control.v1`: exact source aliases/pins, staging, resource/toolbox bounds, and optional original OCR context; see the [CLI control types](../crates/gptgrep-cli/src/parse_agent.rs) |
+| Document control | One source-bound `DocumentAgentControl`: selected standalone binary, account/state, permissions, runtime profile, native image qualification and limits; see [driver types](../crates/gptgrep-host/src/parse_agent_driver.rs) |
+| Index registry | `gptgrep.parse-agent.index-controls.v1`: exact parse-control pin and one document-control pin per selected supported source |
+| OCR qualification/phase | Accepted Page runtime profile and existing original-clock OCR phase/ledger; required OCR shares that context across the document invocation |
+
+The source provides the schemas and qualification frontdoors. It does **not**
+provide a one-command generator for a newly accepted native profile, publish the
+owner's private controls, or certify a new workstation. Build and qualify those
+inputs first. The following commands show the actual interface after that work;
+the variables refer to your own existing controls and their SHA-256 values.
+
+```sh
+"$GPTGREP_BIN" parse-agent serve \
+  --config "$PARSE_CONTROL" --expected-control-sha256 "$PARSE_SHA"
+
+"$GPTGREP_BIN" parse-agent run \
+  --config "$PARSE_CONTROL" --expected-control-sha256 "$PARSE_SHA" \
+  --source "$SOURCE_ALIAS" --mode off --output "$NEW_PRODUCT"
+
+"$GPTGREP_BIN" parse-agent agent \
+  --config "$PARSE_CONTROL" --expected-control-sha256 "$PARSE_SHA" \
+  --document-agent-control "$DOCUMENT_CONTROL" \
+  --expected-document-agent-control-sha256 "$DOCUMENT_SHA" \
+  --source "$SOURCE_ALIAS" --output "$NEW_AGENT_PRODUCT"
+
+"$GPTGREP_BIN" index "$DOCUMENT_ROOT" \
+  --parse-agent-config "$PARSE_CONTROL" \
+  --expected-parse-agent-config-sha256 "$PARSE_SHA" \
+  --document-agent-controls "$INDEX_REGISTRY" \
+  --expected-document-agent-controls-sha256 "$REGISTRY_SHA" --json
+```
+
+`serve` is foreground NDJSON for an external PTC caller; it waits for requests.
+`run` executes deterministic stages and optionally qualified OCR when `--mode auto`
+is explicitly selected. `agent` runs one native Document turn over the toolbox.
+Those three produce no generation themselves; the last command imports complete,
+verified owned products and atomically publishes the generation. `parse-agent
+qualify` records private image evidence, not an automatically accepted profile.
+
+Processing windows bound intermediate work without a whole-document page-count
+cap. Every source page, metadata inventory and required OCR result must be covered
+before publication. Logical buffer/staging reservations are not process RSS or
+physical disk measurements. Page OCR retains eight tools, one turn and 180 seconds;
+Document defaults to 64 tools, one turn and 900 seconds, with an explicitly bound
+duration up to 3,600 seconds. The effective deadline is the smallest applicable
+document, frontend/session and original phase deadline.
+
+After a successful rich generation, `search --multimodal`, `ask --multimodal`
+and `batch --rich` consume its source-bound text/images. Ordinary queries do not
+start OCR. See [rich batch](rich-batch.md), [native metadata](native-metadata.md),
+[rerank](rerank.md) and the separate [foreground OCR service](ocr-serve.md).
+
+## Development checks
+
+Use the selected external environment and retain failures as well as final passes:
+
+```sh
+cargo fmt --all -- --check
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+uv venv --python 3.13 "$GPTGREP_DEV_ROOT/eval-venv"
+uv pip sync --python "$GPTGREP_DEV_ROOT/eval-venv/bin/python" evals/requirements.lock
+"$GPTGREP_DEV_ROOT/eval-venv/bin/python" -B -m unittest discover -s evals -p 'test_*.py'
+"$GPTGREP_DEV_ROOT/eval-venv/bin/python" -B scripts/eval.py \
+  --binary "$GPTGREP_BIN" --output "$GPTGREP_DEV_ROOT/results/offline-eval.json"
+pnpm --dir packages/cli install --frozen-lockfile --ignore-scripts
+pnpm --dir packages/cli test
+```
+
+Set pnpm's store to the selected external location using the local project/runtime
+configuration before installation. The offline suite does not establish native
+model behavior. A code change needs its relevant regression and the complete
+release checks before release; a native/profile change also needs matching actual
+runtime evidence. Do not count ignored or unrun tests as passes.
+
+## Full62 paired SEARCH through Harbor
+
+The current adapter is
+[workspace/harness-tooling/harbor-ablation/full62](../workspace/harness-tooling/harbor-ablation/full62/README.md).
+The parent Harbor directory also retains earlier adapter work; use `full62` for
+the approved main comparison.
+
+```sh
+export GPTGREP_FULL62_SOURCE="$PWD/workspace/harness-tooling/harbor-ablation/full62"
+export UV_PROJECT_ENVIRONMENT="$GPTGREP_DEV_ROOT/full62-venv"
+uv sync --project "$GPTGREP_FULL62_SOURCE" --frozen
+uv run --project "$GPTGREP_FULL62_SOURCE" --frozen gptgrep-harbor-full62 --help
+uv run --project "$GPTGREP_FULL62_SOURCE" --frozen python -B -m unittest discover \
+  -s "$GPTGREP_FULL62_SOURCE/tests" -v
+```
+
+For a real run, follow the adapter's sequence: build and verify the common
+Python/Pillow/Poppler/native-Codex foundation; add the complete Linux GPTgrep plus
+PDFium bundle to the treatment derivative; qualify matching reader permissions
+and account mounts; supply the frozen private cohort and Judge contract; prepare
+all 124 tasks; build exact role images; run the generated Harbor job; aggregate
+all paired outcomes. Its `prepare`, `build-local-images` and `aggregate` commands
+require pinned manifests. `harbor run -c GENERATED_JOB_JSON` uses the same installed
+adapter environment and a fresh admitted output namespace, with one attempt and
+no automatic retry.
+
+Raw Codex receives only original documents and may extract/render during SEARCH.
+GPTgrep receives the same bytes plus a frozen index built before question access.
+Both readers use the same selected native binary and generic raw-document tools.
+The Judge runs in a separate environment with the complete answer and frozen
+reference, not the reader's history. Task failures stay in the denominator;
+unavailable judging stays unknown. INDEX and Judge costs are separate from
+question-dependent SEARCH. See the [evaluation protocol](design/agentic-search-evaluation.md)
+for the unchanged primary metric and missing-result rules.
+
+The private 62-task cohort, accepted image/account controls, budget state and
+prebuilt index are not distributed. Synthetic adapter checks can run from source;
+they do not make a real paired run ready or prove an advantage. Full34 native
+indexing and full62 paired acceptance remain the next live development gates.

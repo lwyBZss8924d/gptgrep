@@ -1,7 +1,7 @@
 {
   "binary": {
-    "bytes": 307803104,
-    "sha256": "f55f8413c4f7a95175dd0a4d1cd6375c3ba5707f03d376802b317e126cc7fd8e"
+    "bytes": 307804160,
+    "sha256": "23c599a6a6ddbdbd165c16c6ac73994ffc4bea9dcfdaa0840ec3444c48dc1d6c"
   },
   "effective_derived_build_version": "0.162.1-gptgrep.1",
   "files": [
@@ -183,8 +183,8 @@
     },
     {
       "postimage": {
-        "bytes": 82243,
-        "sha256": "d80c4a12775e4543af952600cdddc2e01964c9e492ab7bd7c233a2412cb5d90d"
+        "bytes": 87076,
+        "sha256": "fcb58626a1c3e355bddc459498a9f990aa3021e495c56a9f0bb8ccf86a8ee959"
       },
       "preimage": null,
       "relative_path": "codex-rs/core/src/native_ocr.rs"
@@ -356,8 +356,8 @@
     }
   ],
   "guard_source": {
-    "bytes": 82243,
-    "sha256": "d80c4a12775e4543af952600cdddc2e01964c9e492ab7bd7c233a2412cb5d90d"
+    "bytes": 87076,
+    "sha256": "fcb58626a1c3e355bddc459498a9f990aa3021e495c56a9f0bb8ccf86a8ee959"
   },
   "license_notice": [
     {
@@ -374,14 +374,16 @@
     }
   ],
   "models_manager_whole_client_version": "0.162.1",
+  "observed_build_profile": "dev-small",
+  "observed_build_target": "aarch64-apple-darwin",
   "patch": {
-    "bytes": 139174,
+    "bytes": 144098,
     "relative_path": "codex-native-guard-v0.162.1.patch",
-    "sha256": "d88ba2cc5bffc42124d2e2b7b77372fdae7ee24831ebad4ba059a8884c72a6b1"
+    "sha256": "d6d82e783da12ead5edc4bf97974b23ebf0f9023799d1086ee0b4ee95ca97e31"
   },
-  "postimages_match_actual_latest_release_build": true,
+  "postimages_match_observed_build": true,
   "protocol_schema_sha256": "5b2d2cfaf332595f8c53f6c62c3909749e36b0a955f1dd4f6b0627976668cf49",
-  "scope": "Strict native Page/Document guard and unchanged ready ABI; release-native accounting hook; typed initialize compiler repair; truthful derived Cargo version plus exact workspace lock refresh. No clientInfo spoof, guard relaxation, machine paths, runtime identities or corpus literals.",
+  "scope": "Strict native Page/Document guard and unchanged ready ABI; explicit Document duration 1..3600 seconds with Page fixed at 180; native accounting hook; typed initialize compiler repair; truthful derived Cargo version plus exact workspace lock refresh. No clientInfo spoof, guard relaxation, machine paths, runtime identities or corpus literals.",
   "upstream_release": "rust-v0.162.1",
   "upstream_repository": "https://github.com/openai/codex.git",
   "upstream_revision": "092d3acd6bec3e3a14bdc7e7a2810ab628ab759d",

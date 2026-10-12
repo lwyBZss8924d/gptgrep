@@ -23,6 +23,12 @@ Use the smallest useful team; independent review is required before release.
 The first experimental release additionally requires the accepted live PageIndex
 comparison gate in SPEC.md; source delivery and CI alone do not authorize its tag.
 Read docs/architecture.md for module boundaries and SPEC.md for acceptance.
+Use docs/development.md for portable Dev/Test/Eval setup, docs/experimental-status.md
+for the dated public progress summary, and workspace/harness-tooling/harbor-ablation/full62/README.md
+for the current paired SEARCH adapter. The parent Harbor directory retains older
+adapter work; select the full62 entry for the approved main comparison.
+Update applicable root and docs/ entrypoints when interfaces or measured status change.
+Keep public progress aggregate and dated; exact local evidence stays private.
 Never modify the upstream reference checkouts. Pin reused source and retain licenses.
 Never hardcode benchmark questions, answers, document IDs, evidence pages or
 task-specific routing rules in product code or adapters. Load evaluation tasks at
@@ -41,9 +47,19 @@ Keep workspace/exec-plans/ and workspace/issues/ local-only, ignored and untrack
 Every completed code round requires a commit and verified refs/notes/commits PoUW.
 Back up Git history and notes to a verified bundle on registered external owner
 storage; keep only a small ignored locator under .local/backups/ and retain prior bundles.
-Push source and tags to the authorized origin when release checks pass. Do not push
-private PoUW notes or runtime evidence. No global configuration, toolchain or service
+Deliver the fully integrated source revision to an explicitly authorized experimental
+branch after its matching checks and independent review. Source sharing does not
+qualify the first release tag: retain G5 and all tag checks separately. Push source
+and tags only within their corresponding authorization. Do not push private PoUW
+notes or runtime evidence. No global configuration, toolchain or service
 changes are implied by project ownership.
+
+The main Opt loop uses actual current-source parse/OCR/index and retrieval runs,
+then the complete same-Codex full62 paired SEARCH comparison and independent Judge.
+INDEX preparation is excluded from primary SEARCH reward/cost and reported separately.
+Preserve failed and unknown outcomes; test/mock success alone cannot accept a live
+pipeline or advantage. Use the requested gpt-6-luna/max/fast native profile and the
+independent OpenRouter Decisions model; credentials and accepted controls are caller-owned.
 
 Run cargo fmt --all -- --check, cargo test --workspace, cargo clippy --workspace
 --all-targets -- -D warnings, the offline eval harness, and the applicable wrapper

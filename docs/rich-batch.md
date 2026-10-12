@@ -1,5 +1,9 @@
 # Rich batch composition
 
+For source build, rich generation creation, native runtime setup and provider
+credentials, start with [development setup](development.md). A batch consumes an
+existing pinned generation; it does not start ingestion or OCR.
+
 `gptgrep batch --rich --root DOCUMENTS --input operations.json --json` accepts
 `gptgrep.batch.rich.request.v1`. Local operations keep their existing behavior
 and cursors. `inspect_native_metadata` adds bounded page-object, path, image,

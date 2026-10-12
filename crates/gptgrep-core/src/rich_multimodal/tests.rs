@@ -583,6 +583,56 @@ async fn keywordless_chart_uses_normal_images_two_stages_and_retained_context() 
     Ok(())
 }
 
+#[test]
+fn source_selection_scope_retains_lexical_text_and_visuals_beyond_four_documents() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    publish_charts(&root, 6, "needle observation in this ordinary source")?;
+    let execution = context(20)?;
+    let prepared = prepare_rich_multimodal_search(
+        RichGenerationReader::open(&root)?,
+        client("http://127.0.0.1:1/unused", execution.clone())?,
+        "What does needle indicate?",
+        &RichMultimodalSearchOptions {
+            max_visual_candidates: 6,
+            max_concurrent_batches: 1,
+            ..Default::default()
+        },
+    )?;
+    let route_documents: BTreeSet<_> = prepared
+        .routing_selection_scope()
+        .map(|(_, document)| document)
+        .collect();
+    assert_eq!(route_documents.len(), 6);
+    let selection: BTreeMap<_, _> = prepared
+        .rerank_selection_scope()
+        .map(|(id, document, retained)| (id, (document, retained)))
+        .collect();
+    assert_eq!(selection.len(), prepared.candidate_scope().count());
+    let mut lexical_nonliteral = false;
+    let mut visual = 0;
+    for (id, content) in prepared.candidate_scope() {
+        let (document, retained) = selection[id];
+        assert!(route_documents.contains(&document));
+        match content {
+            RichMultimodalContent::Text { literal_anchor, .. } => {
+                if retained && !literal_anchor {
+                    lexical_nonliteral = true;
+                }
+            }
+            RichMultimodalContent::Visual { .. } => {
+                assert!(retained);
+                visual += 1;
+            }
+        }
+    }
+    assert!(lexical_nonliteral);
+    assert_eq!(visual, 6);
+    assert_eq!(execution.snapshot()?.logical_reservations, 0);
+    assert_eq!(execution.snapshot()?.submission_observations, 0);
+    Ok(())
+}
+
 #[tokio::test]
 async fn same_text_different_rasters_union_keeps_exact_source_refs_and_image_order() -> Result<()> {
     let dir = tempfile::tempdir()?;

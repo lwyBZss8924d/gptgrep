@@ -12,9 +12,11 @@ license inventory and PDFium's full native notices, not only this summary.
 | [PageIndex](https://github.com/VectifyAI/PageIndex/tree/9c4c3ff2ddd2cbd70501997635578064f2b7c7c3) | `9c4c3ff2ddd2cbd70501997635578064f2b7c7c3` | Studied structural semantics; custom Rust implementation, partial algorithm coverage | MIT |
 | [incur](https://github.com/wevm/incur) | published `0.5.1` | Optional gptgrep-ai wrapper | MIT |
 | [PDFium native binaries](https://github.com/run-llama/pdfium-binaries/releases/tag/chromium%2F8058) | `chromium/8058` | Runtime PDFium library | Per-component licenses bundled in release |
-| [Codex](https://github.com/openai/codex) | Runtime selected by caller | Optional local stdio app-server, not redistributed | Apache-2.0 source; hosted service terms separate |
+| [Codex](https://github.com/openai/codex) | Reader runtime selected by caller; native viewer derivative pins `rust-v0.162.1` / `092d3acd6bec3e3a14bdc7e7a2810ab628ab759d` | Local stdio app-server; derivative source patch and notices under `patches/codex-native-viewer`, no Codex binary bundled | Apache-2.0 source; hosted service terms separate |
 
 The PageIndex and parser crate notices document their source mapping and limitations.
+The [native viewer derivative](patches/codex-native-viewer/README.md) records its
+upstream pin, source patch, notices and build/qualification boundaries.
 JevGrep, TypeSafe SDK/skills and the example projects were studied for interface and
 workflow patterns; GPTgrep implements its own Rust Decisions client. No Jev weights
 are distributed. TypeSafe/OpenRouter are hosted providers selected explicitly by

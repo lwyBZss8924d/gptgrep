@@ -66,6 +66,50 @@ fn native_structured_output_declares_scalar_types_and_preserves_exact_identities
         properties.len()
     );
 }
+
+#[test]
+fn native_output_rejects_invented_regions_and_crossed_source_geometry() {
+    let fixture = Fixture::new();
+    let mut task = fixture.task.clone();
+    let mut second = task.regions[0].clone();
+    second.id = "second-source-region".into();
+    second.bbox.x += 0.25;
+    task.regions.push(second);
+    let schema = crate::ocr_protocol::native_output_schema(&task);
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let mut value = json!({
+        "schema_version":"gptgrep.ocr.result.v1", "task_id":task.id,
+        "task_sha256":task.task_sha256,"source_sha256":task.source_sha256,
+        "prepared_sha256":task.prepared_sha256,"page":task.page,"status":"complete",
+        "regions":task.regions.iter().enumerate().map(|(order,region)| json!({
+            "id":region.id,"bbox":region.bbox,"text":"synthetic transcription",
+            "reading_order":order,"status":"complete"
+        })).collect::<Vec<_>>()
+    });
+    assert!(validator.is_valid(&value));
+    let correct = value.clone();
+    value["regions"][0]["id"] = json!("model-invented-subdivision");
+    assert!(!validator.is_valid(&value));
+    value = correct.clone();
+    value["regions"][0]["bbox"] = correct["regions"][1]["bbox"].clone();
+    assert!(!validator.is_valid(&value));
+    value = correct.clone();
+    value["regions"]
+        .as_array_mut()
+        .unwrap()
+        .push(correct["regions"][0].clone());
+    assert!(!validator.is_valid(&value));
+
+    // A single source region uses the same exact constraint without anyOf.
+    let single =
+        jsonschema::validator_for(&crate::ocr_protocol::native_output_schema(&fixture.task))
+            .unwrap();
+    value = correct;
+    value["regions"].as_array_mut().unwrap().truncate(1);
+    assert!(single.is_valid(&value));
+    value["regions"][0]["bbox"]["width"] = json!(0.5);
+    assert!(!single.is_valid(&value));
+}
 fn session(fixture: &Fixture) -> NativeOcrSession {
     NativeOcrSession::prepare(
         &fixture.page(),

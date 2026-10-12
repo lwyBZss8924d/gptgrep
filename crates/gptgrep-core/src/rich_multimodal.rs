@@ -988,6 +988,26 @@ impl PreparedRichMultimodalSearch {
     pub fn candidate_scope(&self) -> impl Iterator<Item = (&str, &RichMultimodalContent)> {
         self.pool.iter().map(|p| (p.id.as_str(), &p.content))
     }
+    /// Source-derived route identity and its document ordinal in this preparation.
+    /// Ordinals are local to this exact generation, not public document identifiers.
+    pub fn routing_selection_scope(&self) -> impl Iterator<Item = (&str, usize)> {
+        self.routes
+            .iter()
+            .map(|r| (r.id.as_str(), r.document_index))
+    }
+    /// Candidate identity, document ordinal and whether routing cannot remove it.
+    /// Visual and lexical candidates survive independently; structural-only text
+    /// survives when its document is in the top four validated routing scores.
+    /// This metadata grants no submission, exposure or citation authority.
+    pub fn rerank_selection_scope(&self) -> impl Iterator<Item = (&str, usize, bool)> {
+        self.pool.iter().map(|p| {
+            (
+                p.id.as_str(),
+                p.document_index,
+                p.image.is_some() || p.lexical,
+            )
+        })
+    }
     pub fn routing_requests(&self) -> impl Iterator<Item = &PreparedDecision> {
         self.route_batches
             .iter()

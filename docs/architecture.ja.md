@@ -11,9 +11,11 @@ GPTgrep は、推論を行うエージェントがローカル文書へ高速に
 ```mermaid
 flowchart TD
   A[明示的な文書ルート] --> B[プレーンテキストまたは LiteParse Rust パーサー]
-  B --> C[正規化テキスト、物理ページ、レイアウト、ブックマーク]
+  B --> C[全ページの native text、metadata、画像]
+  C --> P[明示的な native Document agent と必須 Page OCR]
+  P --> D
   C --> D[GPTgrep PageIndex Rust ツリーと任意のマージ最適化]
-  D --> E[変更不可の世代: マニフェスト、テキスト、tgrep インデックス]
+  D --> E[変更不可の世代: text、OCR、画像成果物、tgrep インデックス]
   Q[クエリ] --> F[ネイティブの正規表現／語句検索]
   E --> F
   Q --> G[Jev の型付き文書ルーティングと根拠の再ランキング]
@@ -29,16 +31,20 @@ flowchart TD
   I --> K[検証済みの引用と任意の要約]
 ```
 
+現在の実装と未完了の live gate は[実験状況](experimental-status.md)、移植可能な
+ビルド・独立 Codex ログイン・native runtime・full62 の準備は[開発ガイド](development.md)を参照してください。
+34 文書全体のパイプラインと 62 組の SEARCH は未受理です。INDEX は別計測で、PageIndex G5 の初回タグ条件も別です。
+
 ## モジュールの責務
 
 | クレート／インターフェース | 責務 | 実行時の外部依存 |
 | --- | --- | --- |
 | `gptgrep-pageindex` | 純粋な Rust によるページ／セクション座標、見出し階層、ブックマーク統合、構造の最適化 | なし |
-| `gptgrep-parse` | UTF-8 ソースの保持と、ソースリビジョンを固定した LiteParse 出力の変換 | ネイティブ文書には PDFium、Office 変換には LibreOffice |
+| `gptgrep-parse` | 文書全体のバッチ処理、UTF-8／native metadata、画像準備、OCR 統合、成果物の来歴 | ネイティブ文書には PDFium、Office 変換には LibreOffice |
 | `gptgrep-index` | tgrep-core の組み込み、安全側に候補を残すトライグラム検索、Rust 正規表現による厳密な検証 | なし。デーモン不要 |
 | `gptgrep-jev` | Choice/Noul/Score Decisions の通信、スキーマ検証、上限付きの推論 | 明示的な OpenRouter リクエスト |
-| `gptgrep-core` | スナップショットの公開、ソースの鮮度、検索の組み合わせ、根拠の契約 | デフォルトの hybrid と semantic 検索では Jev が必須 |
-| `gptgrep-host` | 上限付きのローカル Codex stdio app-server ワークフロー、ツールの振り分け、最終的な引用検証 | 呼び出し側が選択した Codex インストールとアカウント |
+| `gptgrep-core` | 準備済み文書の toolbox、完全な rich generation 公開、ソースの鮮度、検索と根拠の契約 | デフォルトの hybrid と semantic 検索では Jev が必須 |
+| `gptgrep-host` | native Page OCR と Document driver、Codex reader、ツール振り分け、最終引用検証 | 呼び出し側が選択した Codex インストールとアカウント |
 | `gptgrep-cli` | ネイティブの argv、JSON、スキーマ、grep 形式の表示 | ローカルコマンドには不要 |
 | `packages/cli` | 任意の incur 表示・検出ラッパー | Node と公開済みの incur 0.5.1 |
 
@@ -54,6 +60,18 @@ Decisions のデフォルトは `openai/gpt-6-luna-decisions` です。上限付
 エージェントのモデルは変更しません。実行時の `CODEX_HOME` により、既存のアカウント環境を選択
 します。プログラムが認証ファイルを読み取ったりコピーしたり、グローバルプロファイルを変更したり、
 対話的なログインを実行したりすることはありません。
+
+## ネイティブ解析と OCR
+
+`parse-agent serve` は foreground NDJSON toolbox、`run` は完全な決定的解析と任意の検証済み OCR、
+`agent` は一回の native Document turn です。明示的な index registry が完全な検証済み成果物を writer に渡します。
+Document は標準で 64 tools／1 turn／900 秒、一致する profile では最大 3600 秒を明示できます。
+実際の期限は frontend、session、元の phase の各期限の最小値です。Page OCR は独立して 8 tools／1 turn／180 秒です。
+原文全ページの解析・metadata coverage と、モデルが実際に確認した範囲を分けて記録します。
+ページウィンドウはバッチ上限であり、文書全体のページ数制限ではありません。論理 buffer／staging 予約は
+プロセス全体の RSS や物理ディスク使用量の実測ではありません。native `view_image` は
+[固定された source derivative](../patches/codex-native-viewer/README.md)を使い、実際の binary／profile を
+Page と Document で別々に検証します。ビルド成功だけでは live 受理になりません。
 
 ## 取り込みとスナップショットの整合性
 
@@ -89,8 +107,8 @@ OCR が無効な状態でのテキストのないスキャン文書はエラー�
 **デフォルトは Hybrid です。** 通常のワークフローでは Jev のルーティングと再ランキングを必須とし、
 認証情報の不足や推論エラーを拒否します。明示的な regex と lexical は、制御されたアブレーションも
 含めたローカルの基本操作です。Jev が失敗した後の代替経路ではありません。
-解析とスナップショットの公開は決定的なローカル処理であり、このリリースではモデルを使った
-インデックス作成は実装済みとはしていません。
+標準の legacy 解析はローカルです。明示的な OCR と Document-agent 索引は native model を呼び、
+完全でソースに結び付いた成果物だけを公開します。enrich は独立したモデル補助ナビゲーション層です。
 
 正確な文書パスを指定すると、すべての候補上限より前に、トライグラム候補と Jev のルーティングを
 絞り込みます。報告は `document_scope` を保持し、`indexed_files` は文書集合全体を、
@@ -188,7 +206,8 @@ MCP サーバーは使用しません。モデルには、上限付きの GPTgre
 
 ## 任意の推論索引拡張
 
-`index` はモデルを呼ばず、決定的な LiteParse／文書ツリー／tgrep 索引を公開します。
+標準の legacy `index` はモデルを呼ばず、決定的な LiteParse／文書ツリー／tgrep 索引を公開します。
+明示的な OCR／Document-agent 索引は実装済みの別経路で、native model の利用を宣言します。
 明示的な `enrich` は、ソースに結び付いた UTF-8 バイトカーソルで各対象文書を最後まで
 走査します。モデルを使わない計画で全ウィンドウと最悪時の呼び出し上限を固定し、live Codex
 （builder の標準モデルは `gpt-6-luna`）が閉じた schema の短いヒントを提案します。

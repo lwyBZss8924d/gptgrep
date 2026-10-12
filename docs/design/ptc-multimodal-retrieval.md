@@ -1,6 +1,8 @@
 # GPTgrep：PTC 批量检索、多模态 Decisions 与 Agentic OCR
 
-状态：技术设计，待实现与运行验收。核查日期：2026-10-07。
+状态：保留的技术设计合同；原始核查日期为 2026-10-07。实现与运行验收持续推进。
+截至 2026-10-12，原生 parse/OCR、rich 索引和检索已有实现，完整 full34／full62 验收仍未完成；
+当前状态见[实验摘要](../experimental-status.md)，可执行准备步骤见[开发说明](../development.md)。
 设计基线：`cc43c2aa2130bb3721f8613e6dbbad1accd33389`。
 本文描述目标行为；当前可执行接口仍以 [SPEC](../../SPEC.md)、[架构](../architecture.md) 和原生 `--schema` 为准。
 研究记录、Exec Build Plan、运行凭据与审查记录分别保存在忽略的 `docs/research/`、`workspace/exec-plans/`、`workspace/handoff/`。

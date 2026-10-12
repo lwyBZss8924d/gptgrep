@@ -10,6 +10,11 @@ GPTgrep 返回可核查的源文档证据。默认 `search` 使用 `hybrid`，�
 `semantic` 和 `judge` 同样使用远程 Jev 推理。显式的 `regex` 与 `lexical` 命令是本地检索原语。
 推理智能体可以组合搜索、查看文档树，并在回答前分次读取有大小限制的节点内容。
 
+协作者请先阅读[开发与评估环境](docs/development.md)和[当前实验状态](docs/experimental-status.md)。
+原生 parse-agent／OCR、rich 索引和 full62 Harbor adapter 已有实现；完整 34 文档流水线
+和 62 对 SEARCH 消融尚未验收。主比较使用相同 Codex reader，INDEX 不计入 SEARCH reward，
+与 PageIndex G5 首发门槛分别判定。构建前按 setup 设置 `CARGO_TARGET_DIR` 等外置输出目录。
+
 这是开发中的源码。第一个实验版发布前，必须在 PageIndex-OSS-Benchmark 的真实运行中，
 证明相对 PageIndex Flash 加 GPT-5.6 的最小优势。请参阅[架构说明](docs/architecture.zh-CN.md)和明确列出的
 [Flash 阶段覆盖情况](crates/gptgrep-pageindex/FLASH_STAGE_COVERAGE.md)。
@@ -28,15 +33,16 @@ GPTgrep 返回可核查的源文档证据。默认 `search` 使用 `hybrid`，�
 
 ```sh
 cargo build --release --locked
-./target/release/gptgrep doctor --json
-./target/release/gptgrep index ./documents --json
-./target/release/gptgrep search 'retention|expiry' ./documents --mode regex --json
-./target/release/gptgrep search 'signed snapshot recovery' ./documents --mode lexical --json
+"$CARGO_TARGET_DIR/release/gptgrep" doctor --json
+"$CARGO_TARGET_DIR/release/gptgrep" index ./documents --json
+"$CARGO_TARGET_DIR/release/gptgrep" search 'retention|expiry' ./documents --mode regex --json
+"$CARGO_TARGET_DIR/release/gptgrep" search 'signed snapshot recovery' ./documents --mode lexical --json
 ```
 
 首次构建时，如果尚未提供所需文件，原生解析器依赖会下载固定版本的 PDFium 二进制文件。
 原生发行压缩包包含 PDFium 运行库及其许可证声明；请使用其中的 `gptgrep` 启动脚本来选择随包提供的库。
-Office 格式转换还需要 LibreOffice。初始构建关闭了 OCR：没有文本层的扫描文档会明确报错。
+Office 格式转换还需要 LibreOffice。默认 legacy index 关闭 OCR；显式 rich ingestion 和
+文档 parse-agent 支持经过资格验证的原生 OCR。必需 OCR 缺失或无效时，拒绝发布不完整索引。
 纯文本和 Markdown 操作无需加载 PDFium。
 [发行打包说明](docs/release.md)记录了已验证的平台和迁移到新目录后的运行检查。
 
@@ -71,7 +77,9 @@ gptgrep --llms
 ## Jev 核心检索
 
 Jev 是 GPTgrep 搜索系统的必需组成部分。默认搜索执行文档路由和证据重排；
-不会自动降级到纯本地检索。解析和索引发布是确定性的本地准备步骤。
+不会自动降级到纯本地检索。默认模型为 `openai/gpt-6-luna-decisions`。
+默认解析路径在本地执行；显式 OCR、document-agent 与 enrich 会在 INDEX 阶段调用模型，
+发布仍要求完整且已验证的产物。
 使用 `--document manual.pdf` 可在候选预算生效之前，将检索限制到一个精确的已索引路径。
 结果会报告 `document_scope` 和 `coverage`。
 
@@ -104,7 +112,7 @@ Jev 使用 OpenRouter 的强类型 **Decisions API**，而非 chat completions�
 [config/codex-host.toml](config/codex-host.toml) 中专用辅助模型的默认配置如下：
 
 ```toml
-model = "gpt-5.6-luna"
+model = "gpt-6-luna"
 model_reasoning_effort = "max"
 service_tier = "fast"
 approval_policy = "never"
@@ -121,7 +129,7 @@ gptgrep ask 'What is the recovery procedure, and how long are snapshots kept?' \
   ./documents --json
 
 gptgrep summarize DOCUMENT_ID:NODE_ID --root ./documents \
-  --model gpt-5.6-luna --reasoning-effort max --service-tier fast --json
+  --model gpt-6-luna --reasoning-effort max --service-tier fast --json
 ```
 
 默认模式在启动回答 worker 之前，宿主会执行必需的 Jev 混合检索，并将有大小限制的证据交给推理模型。
@@ -208,10 +216,12 @@ Python 验证需要 3.12 或更新版本；下面的命令会在本地隔离环�
 cargo fmt --all -- --check
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
-python3 -m venv .local/eval-venv
-.local/eval-venv/bin/python -m pip install --only-binary=:all: -r evals/requirements.lock
-.local/eval-venv/bin/python -B -m unittest discover -s evals -p 'test_*.py'
-.local/eval-venv/bin/python -B scripts/eval.py --binary target/release/gptgrep --output /tmp/gptgrep-eval.json
+uv venv --python 3.13 "$GPTGREP_DEV_ROOT/eval-venv"
+uv pip sync --python "$GPTGREP_DEV_ROOT/eval-venv/bin/python" evals/requirements.lock
+"$GPTGREP_DEV_ROOT/eval-venv/bin/python" -B -m unittest discover -s evals -p 'test_*.py'
+"$GPTGREP_DEV_ROOT/eval-venv/bin/python" -B scripts/eval.py \
+  --binary "$CARGO_TARGET_DIR/release/gptgrep" \
+  --output "$GPTGREP_DEV_ROOT/results/offline-eval.json"
 ```
 
 测试样例覆盖正则匹配正确性、词法检索、Unicode、精确的源文件摘要值与字节区间、
@@ -229,7 +239,7 @@ python3 -m venv .local/eval-venv
 
 - 布局前端由 LiteParse 提供。Rust 的结构与合并阶段不声明与完整 Flash 的字符／字体修复、
   多语言标题分类和生成式扩展算法等价。
-- 不声明具备 OCR 能力，也不声明支持所有 Office 或图像文件。缺少所需提取能力时会明确失败。
+- 原生 OCR 已实现，图像组件已有限定范围的 live 验证；完整文档集合 OCR／索引和所有 Office／图像格式的验收仍未完成。缺失或无效的必需结果会明确失败。
 - 语义候选预算可能使相关文档或节点未被选中。Jev 无法补回上游已排除的证据；其分数也不保证内容真实。
 - 文档集合的新鲜度以快照为准。新增文件需要重新索引；搜索仅重新检查与本次检索相关的源文件，
   而 `status` 会检查现有索引中的全部文档。

@@ -154,7 +154,7 @@ pub struct DecisionRequestObservation<'a> {
 }
 
 /// Optional synchronous admission/accounting callbacks for a trusted caller.
-/// `send_started` runs after SDK admission and immediately before HTTP send.
+/// `send_started_with_body` runs after SDK admission and immediately before HTTP send.
 /// It records a conservative send attempt, not proof of provider receipt.
 /// `validated_response` receives the complete typed response before callers
 /// consume or project its usage. Returning an error stops the operation.
@@ -162,6 +162,16 @@ pub struct DecisionRequestObservation<'a> {
 /// retain unresolved liabilities when their owned request permits are dropped.
 pub trait DecisionObserver: Send + Sync {
     fn send_started(&self, request: &DecisionRequestObservation<'_>) -> Result<()>;
+    /// Borrow the exact source-bearing wire bytes for trusted in-process admission.
+    /// The default preserves existing metadata-only observers. Do not log or
+    /// retain document text or images from this borrow in generic receipts.
+    fn send_started_with_body(
+        &self,
+        request: &DecisionRequestObservation<'_>,
+        _canonical_body: &[u8],
+    ) -> Result<()> {
+        self.send_started(request)
+    }
     fn validated_response(
         &self,
         request: &DecisionRequestObservation<'_>,
@@ -408,7 +418,7 @@ impl JevClient {
             );
             if let Some(observer) = &self.observer {
                 observer_started = true;
-                observer.send_started(&observation)?;
+                observer.send_started_with_body(&observation, &body)?;
                 ensure!(
                     tokio::time::Instant::now() < deadline,
                     "Jev request deadline expired during send admission; reservation remains charged"

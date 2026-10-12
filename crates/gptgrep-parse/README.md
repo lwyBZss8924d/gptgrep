@@ -37,8 +37,12 @@ canonical document still holds all extracted text in memory. PDFium is
 process-serialized upstream; spawning async tasks does not imply parallel native
 PDF extraction.
 
-OCR is **disabled**. Textless scanned/image/vector-only documents fail with an
-actionable message instead of becoming empty successful indexes. Native image
+OCR is disabled in the compatibility `parse_path` / `layout-v1` API. Textless
+scanned/image/vector-only documents fail there instead of becoming empty successful
+indexes. The implemented rich pipeline below prepares required OCR tasks and
+finalizes source-bound results from a qualified native executor. The native
+Document toolbox and CLI are described in [development setup](../../docs/development.md);
+full-corpus acceptance is tracked in [experimental status](../../docs/experimental-status.md). Native image
 conversion uses Rust image/resvg; Office conversion requires an existing
 LibreOffice installation. No tools or services are installed or started by the
 adapter. PDFs with a usable text layer require no LLM or network inference.

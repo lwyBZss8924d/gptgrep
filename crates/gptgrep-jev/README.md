@@ -31,6 +31,14 @@ assert_eq!(result.rankings[0].id, "handbook:page-8:block-3");
 
 `prepare_decision(state, questions)` validates and serializes the complete request without network I/O or charging a submission. Its opaque `PreparedDecision` exposes the encoded byte count, SHA-256, question count and requested model. Both it and `PreparedRerank` offer an explicit `canonical_body()` borrow for trusted request-budget inspection. These bytes include document content, exclude authorization headers, and must not be written to public telemetry. Borrowing bytes does not clone the submission capability. `submit_prepared(prepared)` admits and sends those exact bytes once. A prepared request is bound to its originating client, model and endpoint; neither API silently splits or retries an oversized request.
 
+An optional `DecisionObserver::send_started_with_body` callback borrows those exact
+wire bytes after SDK admission and immediately before HTTP send. Trusted callers
+can inspect internally prepared requests using the same admission boundary. The
+default delegates to the existing metadata callback. A callback failure prevents
+the HTTP send while preserving the charged reservation; a send-start observation
+does not prove provider receipt. Keep source-bearing bytes out of generic logs
+and retain unresolved liabilities if a request future is cancelled.
+
 Submission has a 20-second admission/request timeout, a 64-question cap, a 64 KiB serialized input cap and a 1 MiB response cap. Client clones share four slots and a maximum of 200 charged submissions. These are local application bounds, not token counts or a billing guarantee. The client makes no application retries, follows no redirects and explicitly disables provider fallback. Callers own shortlisting, further batches, result-output reservation and any explicit local fallback.
 
 For an experiment, create `ExecutionContext::new(run_id, plan_digest, absolute_deadline, max_submissions)` and attach it with `JevClient::with_execution_context`. The cap must be 1–200. All clones share the context; time limits use the earlier of the 20-second request limit, the wall deadline and a monotonic deadline captured at context creation. Legacy constructors retain their per-request deadline behavior. Without an explicit ledger the accounting scope is `single_invocation`; separate processes have independent contexts.

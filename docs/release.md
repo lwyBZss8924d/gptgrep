@@ -1,20 +1,20 @@
 # Native binary releases
 
-The release package contains the native Rust CLI and the exact PDFium library needed for local PDF parsing. It does not require Node, Bun, Python, a vector database, or an MCP service at runtime. The optional `gptgrep-ai` incur wrapper is a separate source package. Office conversion still needs an existing LibreOffice installation; OCR is disabled in this build.
+The release package contains the native Rust CLI and the exact PDFium library needed for local PDF parsing. Local regex/lexical retrieval needs no Node, Bun, Python, vector database or MCP service. The optional `gptgrep-ai` incur wrapper is a separate source package. Office conversion needs an existing LibreOffice installation. Agentic parsing/OCR and reasoning additionally require their selected Codex runtime, independent authentication, qualified controls and generic tools; see [development setup](development.md). The package does not bundle those private runtime inputs.
 
-The initial package targets are `aarch64-apple-darwin` and `x86_64-unknown-linux-gnu`. macOS ARM64 is the local development host. A configured Linux job is not evidence of a successful Linux run; platform validation is established by that target's completed native CI and archive smoke receipt. macOS binaries are unsigned and not notarized. Linux compatibility is with the runner/build environment used for that release, not a promise of arbitrary older glibc support. Windows, macOS Intel, Linux ARM64 and musl artifacts are outside this release set.
+The initial package targets are `aarch64-apple-darwin` and `x86_64-unknown-linux-gnu`. macOS ARM64 is the local development host. A configured Linux job is not evidence of a successful Linux run; platform validation is established by that target's completed native CI and archive smoke receipt. macOS binaries are unsigned and not notarized. Linux compatibility is with the runner/build environment used for that release, not a promise of arbitrary older glibc support. The packaging source additionally supports `aarch64-unknown-linux-gnu` for the experimental Harbor workflow. Its current-source Linux build, complete license bundle and relocation/native smoke must be verified separately; support in the script is not an accepted release artifact. Windows, macOS Intel and musl remain outside this release set.
 
 ## Package an existing native build
 
-Python 3.12 or later, Cargo and a native build environment are packaging tools. Pass every binary input explicitly. The script does not search a developer home directory or download native dependencies.
+Use the owned output paths and uv-managed Python from [development setup](development.md). Python 3.12 or later, Cargo and a native build environment are packaging tools. Pass every binary input explicitly. The script does not search a developer home directory or download native dependencies.
 
 ```sh
 cargo build --release --locked -p gptgrep-cli
 python3 scripts/package_release.py \
-  --binary target/release/gptgrep \
+  --binary "$CARGO_TARGET_DIR/release/gptgrep" \
   --pdfium-dir /path/to/unmodified/extracted/pdfium \
   --target aarch64-apple-darwin \
-  --output dist/release --require-clean --smoke-test
+  --output "$GPTGREP_DEV_ROOT/release" --require-clean --smoke-test
 ```
 
 Use the corresponding native Linux target on Linux. `--require-clean` requires an actual committed source revision and a clean tree. Omit it only for local preparation; the metadata then records the actual dirty/uncommitted status and cannot pass publication checks. The script checks the native binary's version and architecture, rejects existing output filenames, and publishes its local files only after the requested checks pass.
@@ -25,6 +25,7 @@ PDFium is pinned to [`chromium/8058`](https://github.com/run-llama/pdfium-binari
 |---|---|---|
 | macOS ARM64 | `pdfium-mac-arm64.tgz` | `df8d1016fc36c2651b368ca13b992ae3bb6b6020d12f2d24443bf13cf76ea593` |
 | Linux x86_64 | `pdfium-linux-x64.tgz` | `2dd418a8974dbb373ad281f99b6f95ed02e01b1a2bb2e05e772c80b7587577b5` |
+| Linux ARM64 experimental | `pdfium-linux-arm64.tgz` | `4915b5351640c1eea59e26023e0edcad8433df96dc8f4cb3d645a4d64a178b7c` |
 
 The `.tar.gz` has one top-level directory:
 
@@ -52,12 +53,16 @@ Each archive also has `.tar.gz.sha256`, `.release.json`, and, when requested, `.
 
 ```sh
 python3 scripts/collect_licenses.py --target aarch64-apple-darwin \
-  --output .local/license-audit --require-complete
+  --output "$GPTGREP_DEV_ROOT/license-audit" --require-complete
 ```
 
 Some published crates omit their upstream license files. The version-bound files under `licenses/rust-supplements/` retain exact source text, SHA-256, Git blob identity, the package's `.cargo_vcs_info.json` revision and primary source URL. They are admitted only for the matching installed package revision. For `simd_helpers` 0.1.0, the original package commit omitted `LICENSE`; the author's next commit only adds that file, and the compiled source blob is unchanged. Both revisions and the one-file comparison are recorded explicitly. Zune's full Zlib text is retained alongside its upstream alternative-license notice; the notice is not presented as the full MIT or Apache text.
 
 No local dependency-cache paths, private session identities or credentials are written into release metadata or license inventories.
+
+An authorized experimental source branch is a collaborator handoff, not a binary
+release or a successful benchmark. Its current development limits are recorded in
+[experimental status](experimental-status.md).
 
 ## CI and publication
 

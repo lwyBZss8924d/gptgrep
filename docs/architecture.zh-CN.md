@@ -9,7 +9,9 @@ GPTgrep 为推理智能体提供快速、可核查的本地文档访问能力。
 ```mermaid
 flowchart TD
   A[显式指定的文档根目录] --> B[纯文本或 LiteParse Rust 解析器]
-  B --> C[规范化文本、物理页、布局与书签]
+  B --> C[完整原生文本、元数据与页图像]
+  C --> P[显式 Document agent 与必需 Page OCR]
+  P --> D
   C --> D[GPTgrep PageIndex Rust 文档树与可选合并优化器]
   D --> E[不可变索引版本：清单、文本、tgrep 索引]
   Q[查询] --> F[原生正则或词法检索]
@@ -26,6 +28,10 @@ flowchart TD
   J --> I
   I --> K[经过验证的引用与可选摘要]
 ```
+
+当前实现与未完成的 live gate 见[实验状态](experimental-status.md)，可移植构建、独立
+Codex 登录、原生 runtime 和 full62 环境见[开发说明](development.md)。完整 34 文档
+原生流水线与 62 对 SEARCH 尚未验收；INDEX 成本单列，PageIndex G5 首发门槛独立保留。
 
 ## 模块职责
 
@@ -49,6 +55,17 @@ PNG/JPEG 输入，并严格校验返回的模型标识。`typesafe/jev-1.13` 保
 `model_reasoning_effort = "max"`，以及 `service_tier = "fast"`。这些设置仅用于本地辅助模型，不会改变开发智能体的模型。
 运行时的 `CODEX_HOME` 用于选择已有的账户隔离环境。
 程序不读取或复制认证文件、不修改全局配置，也不执行交互式登录。
+
+## 原生解析与 OCR
+
+`parse-agent serve` 提供前台 NDJSON toolbox，`run` 执行完整确定性解析和可选已资格验证的 OCR，
+`agent` 执行一个原生 Document turn；显式 index registry 才将已验证的完整产物移交给 generation writer。
+Document 默认 64 tools／1 turn／900 秒，可在一致绑定的 profile 中显式选择不超过 3600 秒；
+实际期限取 frontend／session／原始 phase 等限制的最小值。Page OCR 保留独立的 8 tools／1 turn／180 秒。
+完整原生提取和元数据覆盖每个原始页，模型观察覆盖另行记录。页窗口不是整份文档页数上限。
+payload、metadata 和 staging 的逻辑预留不能当作整个进程 RSS 或物理磁盘实测。
+原生 `view_image` 使用[固定源码 derivative](../patches/codex-native-viewer/README.md)，Page 与 Document
+资格分别绑定实际 binary／profile，不能从编译成功推断 live 验收。
 
 ## 文档摄取与快照一致性
 
@@ -77,7 +94,8 @@ PNG/JPEG 输入，并严格校验返回的模型标识。`typesafe/jev-1.13` 保
 
 **Hybrid 是默认模式。** 默认工作流必须执行 Jev 路由和重排，缺少凭据或推理失败会明确报错。
 显式的 regex 和 lexical 模式是本地检索原语，也可用于受控消融实验；它们不会成为 Jev 失败后的回退路径。
-解析和快照发布是确定性的本地阶段；本版本不声称已经实现模型辅助索引。
+默认 legacy 解析在本地执行；显式 OCR 和 Document-agent 索引会调用原生模型。
+发布只接受完整、来源绑定的产物；enrich 是另外的模型辅助导航层流程。
 
 可以用一个精确的文档路径，在任何候选上限生效前同时约束 trigram 候选与 Jev 路由。
 报告绑定 `document_scope`；`indexed_files` 统计整个文档集合，`scoped_files` 统计本次指定的检索范围。
@@ -164,7 +182,8 @@ Rust 的树与合并阶段具有明确的源代码映射和测试；仅仅生成
 
 ## 可选的推理索引增强
 
-`index` 不调用模型，先发布确定性的 LiteParse／文档树／tgrep 索引。显式 `enrich` 随后
+默认 legacy `index` 不调用模型，先发布确定性的 LiteParse／文档树／tgrep 索引。
+显式 OCR／Document-agent 索引是另一个已实现、需声明原生调用的流程。显式 `enrich` 随后
 沿来源绑定的 UTF-8 字节游标遍历每份已收录文档。零模型计划固定所有窗口和最坏调用预算；
 live Codex（builder 默认 `gpt-6-luna`）提出小型封闭 schema 提示，Jev 对准确的原文
 锚点进行支持判别。构建器和 Jev 使用独立持久账本；安全的预算暂停后可复用已验证的完整窗口。

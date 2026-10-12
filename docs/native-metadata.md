@@ -1,5 +1,9 @@
 # Native page metadata
 
+Create a complete rich generation through the explicit ingestion or native
+parse-agent path in [development setup](development.md) before using this API.
+Metadata inventory coverage is distinct from model inspection and citation authority.
+
 `inspect_native_metadata` reads structured metadata for one physical page from a
 published rich generation. It runs locally through the ordinary rich batch
 interface and the CLI wrapper. It does not call a model or grant citation rights.

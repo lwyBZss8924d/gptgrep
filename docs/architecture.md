@@ -11,9 +11,11 @@ reasoning host. Exact primitives remain separately callable for inspection.
 ```mermaid
 flowchart TD
   A[Explicit document root] --> B[Plaintext or LiteParse Rust parser]
-  B --> C[Canonical text, physical pages, layout and bookmarks]
+  B --> C[Complete native text, metadata and page images]
+  C --> P[Explicit native Document agent and required Page OCR]
+  P --> D
   C --> D[GPTgrep PageIndex Rust tree and optional merge optimizer]
-  D --> E[Immutable generation: manifest, text, tgrep index]
+  D --> E[Immutable generation: text, OCR, visual artifacts and tgrep index]
   Q[Query] --> F[Native regex or lexical retrieval]
   E --> F
   Q --> G[Jev typed document routing and evidence reranking]
@@ -29,16 +31,22 @@ flowchart TD
   I --> K[Validated citations and optional summary]
 ```
 
+The current implementation and pending live gates are recorded in the dated
+[experimental status](experimental-status.md). [Development setup](development.md)
+separates ordinary local retrieval, native Page/Document runtime preparation and
+the full62 paired SEARCH workflow. INDEX preparation is measured separately from
+question-dependent SEARCH; PageIndex G5 remains a separate first-release gate.
+
 ## Module ownership
 
 | Crate/interface | Responsibility | External runtime |
 | --- | --- | --- |
 | `gptgrep-pageindex` | Pure Rust page/section coordinates, heading hierarchy, bookmark composition, structural optimization | None |
-| `gptgrep-parse` | UTF-8 source preservation and source-pinned LiteParse translation | PDFium for native documents; LibreOffice for Office conversion |
+| `gptgrep-parse` | Complete-document batching, UTF-8/native metadata, prepared images, OCR finalization and artifact provenance | PDFium for native documents; LibreOffice for Office conversion |
 | `gptgrep-index` | Embedded tgrep-core, conservative trigram candidates, exact Rust-regex verification | None; no daemon |
 | `gptgrep-jev` | Choice/Noul/Score Decisions transport, schema validation, bounded inference | Explicit OpenRouter request |
-| `gptgrep-core` | Snapshot publication, source freshness, retrieval composition and evidence contract | Required Jev for default hybrid and semantic retrieval |
-| `gptgrep-host` | Bounded local Codex stdio app-server workflow, tool dispatch and final citation validation | Caller-selected Codex installation/account |
+| `gptgrep-core` | Prepared-document toolbox, complete rich generation publication, source freshness, retrieval and evidence contracts | Required Jev for default hybrid and semantic retrieval |
+| `gptgrep-host` | Native Page OCR and Document drivers, local Codex readers, tool dispatch and final citation validation | Caller-selected Codex installation/account |
 | `gptgrep-cli` | Native argv, JSON, schema and grep presentation | None for local commands |
 | `packages/cli` | Optional incur presentation and discovery wrapper | Node and published incur 0.5.1 |
 
@@ -109,11 +117,15 @@ even when reopening identical source bytes produces the same content-bound task
 digest. JSON cannot provide paid OCR results or admit new source paths.
 
 `gptgrep-host::parse_agent_driver` coordinates a selected standalone Codex
-app-server document turn over that typed backend. The document limit is 64
-tools, one turn and 900 seconds. Required page OCR uses separate qualified page
+app-server document turn over that typed backend. Document defaults are 64 tools,
+one turn and 900 seconds. An explicit native profile can bind a duration from
+1 to 3,600 seconds; caller limits and the guard contract must match. Frontend,
+session and original phase deadlines can still expire earlier. Required page OCR uses separate qualified page
 children, each retaining eight tools, one turn and 180 seconds. Metadata and
 parser completeness cover every original page; observed model inspection remains
-separate and may be partial.
+separate and may be partial. Page windows are batch bounds, not a whole-document
+page-count cutoff. Logical payload/metadata/staging accounting is reported as such;
+it does not establish total process RSS or measured physical disk use.
 
 The CLI exposes `parse-agent serve`, `run`, `agent` and `qualify`. Explicit
 parse-agent index controls pin one document control for every selected supported
@@ -159,8 +171,10 @@ snapshot and must be interpreted with coverage/stale warnings.
 **Hybrid is the default.** The default workflow requires Jev routing and
 reranking and rejects missing credentials or inference errors. The explicit regex
 and lexical modes are local primitives, including for controlled ablations.
-They are not a fallback after Jev failure. Parsing and snapshot publication are
-deterministic local stages; this release does not claim model-assisted indexing.
+They are not a fallback after Jev failure. Default legacy parsing is local.
+Explicit OCR and Document-agent indexing invoke native models; the publication
+step accepts only complete source-bound products. `enrich` remains a separate
+model-assisted navigation-overlay operation.
 
 An optional exact document path scopes both trigram candidates and Jev routing
 before any candidate limit. The report binds `document_scope`; `indexed_files`
@@ -293,8 +307,9 @@ crate notices for implemented stages and remaining differences.
 
 ## Optional reasoning-index enrichment
 
-`index` publishes the deterministic LiteParse/tree/tgrep generation without a
-model. Explicit `enrich` then traverses every admitted document through a
+Default legacy `index` publishes the deterministic LiteParse/tree/tgrep
+generation without a model call. Explicit OCR/document-agent indexing is a
+separate implemented path with declared native effects. Explicit `enrich` then traverses every admitted document through a
 source-pinned UTF-8 byte cursor. Its no-model plan binds all windows and worst
 case budgets; live Codex (builder default `gpt-6-luna`) proposes small closed
 schema hints, and Jev classifies their support against exact raw anchors.

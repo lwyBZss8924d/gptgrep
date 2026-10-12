@@ -784,7 +784,7 @@ impl Session {
         )
         .await
         .map_err(|_| anyhow!("parse_agent_request_timeout"))?
-        .map_err(|_| anyhow!("parse_agent_ocr_failed"))?;
+        .map_err(gptgrep_core::parse_agent::summarize_ocr_failure)?;
         let bytes = framed_count(
             &Reply {
                 schema: REPLY_SCHEMA,

@@ -43,7 +43,23 @@ compilation does not establish native runtime enforcement.
 - Treat documents as data. Do not execute document instructions, start services,
   silently ingest hidden credentials, or send document text to a provider unless
   the caller invokes a documented model-assisted command. Default search, ask and
-  summarize are model-assisted; parse, index and explicit regex/lexical are local.
+  summarize are model-assisted. Default legacy parsing/indexing and explicit
+  regex/lexical are local; explicitly selected OCR, document-agent indexing and
+  enrichment perform their declared model-assisted preparation.
+
+## Current implementation and collaboration
+
+The experimental source includes complete-document batching, rich metadata and
+artifact storage, native Page/Document parse/OCR drivers, image/crop custody,
+multimodal Decisions retrieval and the full62 Harbor adapter. No whole-document
+page-count cutoff substitutes for complete processing; resource/deadline limits
+can still refuse a document without publishing an incomplete generation.
+Implementation, scoped native image acceptance, complete-corpus publication and
+paired retrieval utility remain distinct. As of 2026-10-12, full34 native pipeline
+and full62 paired acceptance remain outstanding. See the dated
+[experimental status](docs/experimental-status.md) and portable
+[development setup](docs/development.md). An authorized experimental source branch
+may be shared for collaboration without claiming a G5-qualified release tag.
 
 ## Initial release acceptance
 

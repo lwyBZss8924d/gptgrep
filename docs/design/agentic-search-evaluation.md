@@ -5,6 +5,12 @@ configuration, remaining implementation and actual comparative evidence are
 separate deliverables; adopting this protocol does not establish their completion.
 The retained PageIndex first-release gate remains separate.
 
+The current executable adapter is [full62 Harbor](../../workspace/harness-tooling/harbor-ablation/full62/README.md).
+Use [development setup](../development.md) for its environment and
+[experimental status](../experimental-status.md) for observed progress. As of
+2026-10-12, its complete paired run and Judge remain pending; source and synthetic
+interface validation do not satisfy this protocol.
+
 ## Main question and two arms
 
 Does the same Codex agent answer document questions better with GPTgrep than with

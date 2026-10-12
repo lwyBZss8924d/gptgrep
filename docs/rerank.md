@@ -1,5 +1,8 @@
 # Source-bound rerank
 
+This requires an existing complete rich generation and the independently supplied
+Decisions credential; [development setup](development.md) covers both prerequisites.
+
 `gptgrep rerank --root ROOT --input FILE_OR_DASH --json` scores only explicitly
 supplied evidence from one published rich generation. It is a paid Decisions
 operation, using the supported Luna profile and the same relevance rubric as

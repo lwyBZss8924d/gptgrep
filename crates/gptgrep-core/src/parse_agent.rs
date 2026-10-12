@@ -32,6 +32,90 @@ const MAX_CURSORS: usize = 1024;
 const MAX_SOURCES: usize = 64;
 static NEXT_INVOCATION: AtomicU64 = AtomicU64::new(0);
 
+/// Bounded failure evidence. Arbitrary executor/provider text is never retained.
+#[derive(Clone, Debug)]
+pub struct OcrFailureDiagnostic {
+    cause: &'static str,
+    hashed_bytes: usize,
+    sha256: String,
+    truncated: bool,
+}
+impl std::fmt::Display for OcrFailureDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ocr_failure cause={} error_bytes_hashed={} error_sha256={} error_truncated={}",
+            self.cause, self.hashed_bytes, self.sha256, self.truncated
+        )
+    }
+}
+impl std::error::Error for OcrFailureDiagnostic {}
+
+pub fn summarize_ocr_failure(error: anyhow::Error) -> anyhow::Error {
+    if let Some(prior) = error.downcast_ref::<OcrFailureDiagnostic>() {
+        return anyhow::Error::new(prior.clone());
+    }
+    struct Bounded {
+        bytes: [u8; 4096],
+        used: usize,
+    }
+    impl std::fmt::Write for Bounded {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            let count = text.len().min(self.bytes.len() - self.used);
+            self.bytes[self.used..self.used + count].copy_from_slice(&text.as_bytes()[..count]);
+            self.used += count;
+            if count < text.len() {
+                Err(std::fmt::Error)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let mut buffer = Bounded {
+        bytes: [0; 4096],
+        used: 0,
+    };
+    let truncated = std::fmt::write(&mut buffer, format_args!("{error:#}")).is_err();
+    let hashed_bytes = buffer.used;
+    let sha256 = format!("{:x}", Sha256::digest(&buffer.bytes[..buffer.used]));
+    let mut cause = "unknown";
+    for entry in error.chain().take(16) {
+        buffer.used = 0;
+        if std::fmt::write(&mut buffer, format_args!("{entry}")).is_err() {
+            continue;
+        }
+        cause = match &buffer.bytes[..buffer.used] {
+            b"OCR result lineage mismatch" => "result_lineage",
+            b"OCR result model/profile mismatch" => "result_profile",
+            b"OCR region coordinates mismatch" => "region_coordinates",
+            b"unplanned OCR region" => "unplanned_region",
+            b"duplicate OCR region/order" => "duplicate_region_order",
+            b"required OCR region not complete" => "required_region_incomplete",
+            b"required OCR page incomplete" => "required_page_incomplete",
+            b"OCR required image delivery incomplete" => "image_delivery_incomplete",
+            b"OCR delivered image metadata mismatch" => "image_metadata",
+            b"ocr_invalid_result_json" => "result_json",
+            b"ocr_total_transport_limit" => "transport_limit",
+            b"ocr_page_deadline_completion_unknown" => "page_deadline",
+            b"ocr_cancelled_completion_unknown" => "cancelled",
+            b"ocr_owned_execution_cleanup_unknown" => "cleanup_unknown",
+            b"parse_toolbox_ocr_result_working_limit" => "result_working_limit",
+            b"resource_limit: OCR result regions" => "region_count_limit",
+            b"resource_limit: OCR region text" => "region_text_limit",
+            _ => "unknown",
+        };
+        if cause != "unknown" {
+            break;
+        }
+    }
+    anyhow::Error::new(OcrFailureDiagnostic {
+        cause,
+        hashed_bytes,
+        sha256,
+        truncated,
+    })
+}
+
 /// The same complete supported-source selection used by rich ingestion. It
 /// grants neither source registration nor parser/provider execution authority.
 #[derive(Clone, Debug, Serialize)]
@@ -770,7 +854,7 @@ impl ParseToolbox {
         let result = executor
             .execute_with_native_crops(task.clone(), crops)
             .await
-            .map_err(|_| anyhow::anyhow!("parse_toolbox_ocr_executor_failed"))?;
+            .map_err(summarize_ocr_failure)?;
         self.verify_task(self.doc(handle)?, &task)?;
         let working = result_working(&result, task.budget.resources.ocr_result_bytes)?;
         ensure!(

@@ -1,4 +1,9 @@
-# Experimental Decisions image preparation
+# Decisions image preparation and qualification
+
+The normal Luna Decisions path accepts typed text/image input for multimodal
+search and rerank; see [development setup](development.md) for provider setup and
+[rich batch composition](rich-batch.md) for the product entrypoints. This page
+describes the separate preparation/qualification interface and its exact limits.
 
 `JevClient::prepare_image_qualification` prepares the flat `state` representation
 documented in OpenRouter's [Multimodal Decisions guide](https://openrouter.ai/docs/guides/community/multimodal-decisions).

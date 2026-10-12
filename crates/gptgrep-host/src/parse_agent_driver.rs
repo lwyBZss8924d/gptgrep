@@ -1663,14 +1663,18 @@ fn backend_failure(
     let shape = read_shape.map_or_else(String::new, |(max_bytes, cursor_present)| {
         format!(" max_bytes={max_bytes} cursor_present={cursor_present}")
     });
+    let ocr = error
+        .and_then(|error| error.downcast_ref::<gptgrep_core::parse_agent::OcrFailureDiagnostic>())
+        .map_or_else(String::new, |diagnostic| format!(" {diagnostic}"));
     anyhow!(
-        "document_backend_refused_or_timeout kind={} operation={} error_bytes_hashed={} error_sha256={} error_truncated={}{}",
+        "document_backend_refused_or_timeout kind={} operation={} error_bytes_hashed={} error_sha256={} error_truncated={}{}{}",
         kind,
         operation,
         bounded.used,
         sha(&bounded.bytes[..bounded.used]),
         truncated,
-        shape
+        shape,
+        ocr
     )
 }
 

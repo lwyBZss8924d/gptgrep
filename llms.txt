@@ -6,12 +6,15 @@
 - Local research gaps: `workspace/issues/research-gaps.json` (ignored and untracked).
 - Local execution plans: `workspace/exec-plans/` (ignored and untracked).
 - [Architecture](docs/architecture.md): parsing, trees, trigram filtering, Jev and the local Codex host.
-- [PTC multimodal design](docs/design/ptc-multimodal-retrieval.md): proposed batch retrieval, Luna Decisions, rich parsing and Agentic OCR; implementation and release gates remain pending.
+- [PTC multimodal design](docs/design/ptc-multimodal-retrieval.md): implemented batch retrieval, Luna Decisions, rich parsing and Agentic OCR contracts; complete live integration and release gates remain pending.
+- [Development setup](docs/development.md): external build storage, native runtime, authentication, parse/OCR controls and evaluation environment.
+- [Experimental status](docs/experimental-status.md): D1–D7 progress, aggregate checkpoints, retained failures and the next live experiment.
 - Local research entry: `docs/research/README.md` (ignored and untracked).
 - [Flash stage coverage](crates/gptgrep-pageindex/FLASH_STAGE_COVERAGE.md): verified port stages, LiteParse alternatives and pending parity.
 - Local paired plan: `docs/research/paired-baseline-plan.md` (ignored and untracked).
 - [Baseline runner](scripts/pageindex_baseline/README.md): reproducible controls, execution and accounting.
-- [Local host defaults](config/codex-host.toml): gpt-5.6-luna / max; account selected at runtime.
+- [Local host defaults](config/codex-host.toml): gpt-6-luna / max; account selected at runtime.
+- [Full paired evaluation](workspace/harness-tooling/harbor-ablation/full62/README.md): 62 tasks, 34 raw documents, 124 SEARCH trials, separate Judge and INDEX accounting.
 - [Release workflow](docs/release.md): source binding, native dependency notices and relocation.
 
 Private continuation evidence lives under `.local/runs/`; exact source revision,

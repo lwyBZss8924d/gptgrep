@@ -184,6 +184,7 @@ fn contract_sha256() -> Result<String> {
         "tool_counter_before_argument_parse":true,
         "normalized_request_profile_verified_before_send":true,
         "output_schema_identity_types":"explicit_scalar_types_v1",
+        "output_schema_region_identity":"source_planned_id_and_bbox_v1",
         "context_tool":"gptgrep_ocr.ocr_resource","native_item":"imageView:id,path",
         "environments":["local"],"native_environment_id_argument":false,
         "receipt_join":["tool_admitted","native_source_buffer","native_prepared_image","native_image_assembled"],

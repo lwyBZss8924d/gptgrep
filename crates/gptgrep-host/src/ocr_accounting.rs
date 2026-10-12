@@ -324,8 +324,7 @@ impl OcrExecutionContext {
             // A racing initializer may have created this pair after the absent
             // precheck. Once observed, it must never be recreated by this join.
             observe_existing_pair(&mut inner, original);
-            let mut lock = open_no_follow(&existing_lock, false)?;
-            lock.try_lock_exclusive()?;
+            let mut lock = LedgerLock::acquire(open_no_follow(&existing_lock, false)?)?;
             let stored: Header = serde_json::from_slice(&read_bounded(
                 &mut lock,
                 inner
@@ -491,7 +490,7 @@ impl OcrExecutionContext {
         };
         let lock_path = lock_path(path);
         ensure!(!lock_path.is_symlink(), "ocr_ledger_lock_symlink");
-        let (mut lock, created) = if self.0.require_existing {
+        let (lock, created) = if self.0.require_existing {
             (open_no_follow(&lock_path, false)?, false)
         } else {
             match open_no_follow(&lock_path, true) {
@@ -502,13 +501,7 @@ impl OcrExecutionContext {
                 Err(error) => return Err(error.into()),
             }
         };
-        lock.try_lock_exclusive().map_err(|error| {
-            if error.kind() == std::io::ErrorKind::WouldBlock {
-                anyhow!(LedgerBusy)
-            } else {
-                error.into()
-            }
-        })?;
+        let mut lock = LedgerLock::acquire(lock)?;
         if created {
             // Existing journal without its stable lock identity is never silently adopted.
             ensure!(!path.exists(), "ocr_ledger_lock_missing");
@@ -656,6 +649,40 @@ fn lock_path(path: &Path) -> PathBuf {
     name.push(".lock");
     PathBuf::from(name)
 }
+
+/// Unlock before closing: a concurrent process spawn can temporarily inherit
+/// the open file description even though its descriptor is close-on-exec.
+/// Closing only our descriptor would leave the shared flock held until exec.
+struct LedgerLock(File);
+impl LedgerLock {
+    fn acquire(file: File) -> Result<Self> {
+        file.try_lock_exclusive().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                anyhow!(LedgerBusy)
+            } else {
+                error.into()
+            }
+        })?;
+        Ok(Self(file))
+    }
+}
+impl std::ops::Deref for LedgerLock {
+    type Target = File;
+    fn deref(&self) -> &File {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for LedgerLock {
+    fn deref_mut(&mut self) -> &mut File {
+        &mut self.0
+    }
+}
+impl Drop for LedgerLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.0);
+    }
+}
+
 fn open_no_follow(path: &Path, create: bool) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true).write(true);
@@ -705,6 +732,26 @@ fn is_busy(error: &anyhow::Error) -> bool {
 mod tests {
     use super::*;
     const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn ledger_lock_release_does_not_wait_for_an_inherited_descriptor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("inherited.lock");
+        let guard = LedgerLock::acquire(open_no_follow(&path, true).unwrap()).unwrap();
+        // A duplicate shares the same open file description as a descriptor
+        // inherited between fork and exec, without forking the test process.
+        let inherited = guard.try_clone().unwrap();
+        let contender = open_no_follow(&path, false).unwrap();
+        assert_eq!(
+            contender.try_lock_exclusive().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(guard);
+        contender.try_lock_exclusive().unwrap();
+        assert!(inherited.metadata().unwrap().is_file());
+        FileExt::unlock(&contender).unwrap();
+        drop(inherited);
+    }
     fn context(deadline: SystemTime) -> OcrExecutionContext {
         OcrExecutionContext::new("test", HASH, deadline, 3).unwrap()
     }

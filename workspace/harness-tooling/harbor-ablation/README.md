@@ -1,5 +1,11 @@
 # GPTgrep Harbor ablation exporter candidate
 
+For the current approved 62-pair SEARCH experiment, start with
+[full62/README.md](full62/README.md) and the repository
+[development guide](../../../docs/development.md). This directory also retains
+earlier exporter, bridge and qualification work; their historical results and
+limits below are not the current full62 runtime acceptance.
+
 The offline exporter creates nonexecuting Harbor 0.24.0 tasks through separate
 synthetic and source-custodied native-v2 interfaces.
 The source owner is `workspace/harness-tooling/harbor-ablation/`. Its export and

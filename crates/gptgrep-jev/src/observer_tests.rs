@@ -215,3 +215,137 @@ async fn attaching_observer_invalidates_an_already_prepared_client_identity() {
     );
     assert!(observer.0.lock().unwrap().sent.is_empty());
 }
+
+struct BodyObserver {
+    metadata: Arc<Observer>,
+    expected: Vec<u8>,
+    reject: bool,
+    delay: Duration,
+}
+
+impl DecisionObserver for BodyObserver {
+    fn send_started(&self, _: &DecisionRequestObservation<'_>) -> Result<()> {
+        anyhow::bail!("body_callback_required")
+    }
+
+    fn send_started_with_body(
+        &self,
+        request: &DecisionRequestObservation<'_>,
+        canonical_body: &[u8],
+    ) -> Result<()> {
+        ensure!(canonical_body == self.expected, "body_mismatch");
+        ensure!(canonical_body.len() == request.body_bytes);
+        ensure!(format!("{:x}", Sha256::digest(canonical_body)) == request.body_sha256);
+        self.metadata.send_started(request)?;
+        if !self.delay.is_zero() {
+            std::thread::sleep(self.delay);
+        }
+        ensure!(!self.reject, "body_admission_rejected");
+        Ok(())
+    }
+
+    fn validated_response(
+        &self,
+        request: &DecisionRequestObservation<'_>,
+        response: &DecisionResponse,
+    ) -> Result<()> {
+        self.metadata.validated_response(request, response)
+    }
+
+    fn failed(&self, request: &DecisionRequestObservation<'_>) -> Result<()> {
+        self.metadata.failed(request)
+    }
+}
+
+#[tokio::test]
+async fn borrowed_body_observer_receives_exact_wire_once_before_http() {
+    let metadata = Arc::new(Observer::default());
+    let (endpoint, server) = server(response().to_string(), 1, Arc::clone(&metadata)).await;
+    let client = JevClient::with_endpoint("synthetic-test-key", None, &endpoint).unwrap();
+    let expected = client
+        .prepare_decision(json!({"source":"ceramic"}), questions())
+        .unwrap()
+        .canonical_body()
+        .to_vec();
+    let client = client.with_decision_observer(Arc::new(BodyObserver {
+        metadata: Arc::clone(&metadata),
+        expected: expected.clone(),
+        reject: false,
+        delay: Duration::ZERO,
+    }));
+    client
+        .decide(json!({"source":"ceramic"}), questions())
+        .await
+        .unwrap();
+    assert_eq!(server.await.unwrap(), vec![expected]);
+    let observed = metadata.0.lock().unwrap();
+    assert_eq!(observed.sent.len(), 1);
+    assert_eq!(observed.validated.len(), 1);
+    assert!(observed.failed.is_empty());
+}
+
+#[tokio::test]
+async fn borrowed_body_rejection_or_elapsed_admission_prevents_http_and_keeps_attempt() {
+    for elapsed in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/decisions", listener.local_addr().unwrap());
+        let metadata = Arc::new(Observer::default());
+        let context = ExecutionContext::new(
+            "borrowed-body-admission-test",
+            &"a".repeat(64),
+            std::time::SystemTime::now() + Duration::from_secs(10),
+            1,
+        )
+        .unwrap();
+        let client = JevClient::with_endpoint("synthetic-test-key", None, &endpoint)
+            .unwrap()
+            .with_execution_context(context.clone());
+        let expected = client
+            .prepare_decision(json!({"source":"ceramic"}), questions())
+            .unwrap()
+            .canonical_body()
+            .to_vec();
+        let client = client.with_decision_observer(Arc::new(BodyObserver {
+            metadata: Arc::clone(&metadata),
+            expected,
+            reject: !elapsed,
+            delay: if elapsed {
+                Duration::from_millis(100)
+            } else {
+                Duration::ZERO
+            },
+        }));
+        let client = if elapsed {
+            client.with_execution_context(
+                context
+                    .with_deadline(std::time::Instant::now() + Duration::from_millis(50))
+                    .unwrap(),
+            )
+        } else {
+            client
+        };
+        let error = client
+            .decide(json!({"source":"ceramic"}), questions())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(if elapsed {
+            "expired during send admission"
+        } else {
+            "body_admission_rejected"
+        }));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+        let observed = metadata.0.lock().unwrap();
+        assert_eq!(observed.sent.len(), 1);
+        assert_eq!(observed.failed.len(), 1);
+        assert!(observed.validated.is_empty());
+        let snapshot = context.snapshot().unwrap();
+        assert_eq!(snapshot.logical_reservations, 1);
+        assert_eq!(snapshot.submission_observations, 1);
+        assert_eq!(snapshot.send_start_observations, 1);
+        assert_eq!(snapshot.quarantined_slots, 1);
+    }
+}

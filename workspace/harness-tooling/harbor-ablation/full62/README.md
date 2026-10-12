@@ -2,6 +2,13 @@
 
 Portable adapter for the private paired SEARCH comparison. This package contains the adapter, agent, reader, verifier, aggregation source, a uv lockfile and synthetic regressions. It includes no private tasks, corpus, credentials or experimental results. Synthetic tests run against the installed Harbor 0.24.0 interfaces; the actual 124-trial comparison remains unrun.
 
+For a fresh checkout, [development setup](../../../../docs/development.md) covers
+Rust/PDFium, independent device login, the standalone INDEX helper, Decisions
+credentials and the uv environment. [Experimental status](../../../../docs/experimental-status.md)
+separates implemented source from current live outcomes. The official native
+SEARCH reader in the common base and the guarded standalone INDEX helper are
+different roles; the two SEARCH arms must still share their exact selected reader.
+
 ## Overview
 
 The complete frozen historical development cohort supplies 62 tasks over 34 documents at runtime. Each task produces a GPTgrep arm and a raw-document native Codex arm: 124 Harbor trials, 62 paired outcomes. No task is selected by its content, answer, filename pattern or evidence location. This is a compatibility comparison and is not an unseen holdout.
@@ -201,7 +208,7 @@ The adapter summary is a bounded SEARCH projection, not an implementation claim 
 
 ## Installation / Prerequisites
 
-Install with `uv sync --frozen` in the selected external environment, with `UV_PROJECT_ENVIRONMENT`, `UV_CACHE_DIR`, `UV_PYTHON_INSTALL_DIR`, `HOME`, `TMPDIR` and XDG state/cache/data roots explicitly set there. Python ≥3.12 and Harbor 0.24.0 are pinned by the project and `uv.lock`. Docker remains an independently managed prerequisite.
+Install with `uv sync --frozen` in the selected external environment, with `UV_PROJECT_ENVIRONMENT`, `UV_CACHE_DIR`, `UV_PYTHON_INSTALL_DIR`, `TMPDIR` and tool-specific state/cache/data roots explicitly selected there. Keep the caller's `HOME` unchanged; account selection uses the explicit Codex home. Python ≥3.12 and Harbor 0.24.0 are pinned by the project and `uv.lock`. Docker remains an independently managed prerequisite.
 
 Reader images need Linux Python 3.12+, the exact native Codex reader, the protocol's ordinary raw-document tools, and a clean isolated runtime/account. GPTgrep's image additionally needs the independently accepted Linux GPTgrep binary and its runtime dependencies. The judge base image needs Python and the selected native CLI, but no corpus/index. No credentials may be baked into images or task build contexts.
 

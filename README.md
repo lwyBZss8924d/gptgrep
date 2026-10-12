@@ -2,8 +2,9 @@
 
 English | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
 
-Local document retrieval for agents: **Rust parsing and document trees, embedded
-trigram grep, core Jev routing/reranking, and a local Codex reasoning host**.
+Local document retrieval for agents: **complete-document Rust parsing, native
+Codex parse/OCR agents, document trees, embedded tgrep 1.1.0, multimodal Decisions
+routing/reranking, and a local Codex reasoning host**.
 No vector database, no search daemon, and no MCP server.
 
 GPTgrep returns inspectable source evidence. Default `search` uses `hybrid` and
@@ -12,6 +13,13 @@ the final Codex reader; missing credentials or provider failures are explicit
 errors. `semantic` and `judge` also use remote Jev inference. Explicit `regex` and
 `lexical` commands are local retrieval primitives. The reasoning agent can compose
 searches, inspect trees and read bounded nodes before answering.
+
+Experimental collaborators: start with [development and evaluation setup](docs/development.md)
+and the dated [implementation and live-run status](docs/experimental-status.md).
+The source includes the native pipeline and full62 Harbor adapter; complete
+34-document native indexing and the 62-pair SEARCH comparison remain unaccepted.
+The main comparison uses the same Codex reader with and without GPTgrep and
+excludes INDEX from SEARCH reward. Its Goal is separate from the G5 tag gate.
 
 This is development source. The first experimental release requires a verified
 minimum live advantage over PageIndex Flash plus GPT-5.6 on PageIndex-OSS-Benchmark.
@@ -36,20 +44,24 @@ still require live measurement.
 
 ## Build and use
 
+Set `CARGO_TARGET_DIR` and the other owned output locations using
+[development setup](docs/development.md) first.
+
 ```sh
 cargo build --release --locked
-./target/release/gptgrep doctor --json
-./target/release/gptgrep index ./documents --json
-./target/release/gptgrep search 'retention|expiry' ./documents --mode regex --json
-./target/release/gptgrep search 'signed snapshot recovery' ./documents --mode lexical --json
+"$CARGO_TARGET_DIR/release/gptgrep" doctor --json
+"$CARGO_TARGET_DIR/release/gptgrep" index ./documents --json
+"$CARGO_TARGET_DIR/release/gptgrep" search 'retention|expiry' ./documents --mode regex --json
+"$CARGO_TARGET_DIR/release/gptgrep" search 'signed snapshot recovery' ./documents --mode lexical --json
 ```
 
 The native parser dependency downloads its pinned PDFium binary during the first
 build if it is not already provided. Native release archives include a PDFium
 runtime and notices; use their `gptgrep` launcher to select the bundled library.
-Office conversion additionally needs LibreOffice. OCR is disabled in the initial
-build: textless scans fail explicitly. Plaintext/Markdown work without loading
-PDFium. [Release packaging](docs/release.md) describes the verified platforms and
+Office conversion additionally needs LibreOffice. The default legacy index keeps
+OCR off; explicit rich ingestion and the prepared-document agent support qualified
+native OCR. Missing required OCR fails instead of publishing a partial generation.
+Plaintext/Markdown work without loading PDFium. [Release packaging](docs/release.md) describes the verified platforms and
 relocation checks.
 
 The index lives under `documents/.gptgrep/`. Hidden and ignored descendants,
@@ -107,7 +119,10 @@ and call reservations with local operations and `search_multimodal`. Explicit
 rerank omits document routing; ordinary search retains mandatory routing. Neither
 rerank interface grants reader delivery or citation authority. See
 [source-bound rerank](docs/rerank.md) for the strict input and result contracts.
-The ordinary `index` command currently publishes the original generation format.
+Default `index` publishes the original format. Explicit `--rich` / `--ocr` controls
+select rich ingestion; `--parse-agent-config` with a complete document-control
+registry selects native agentic parsing and owned-product import. These are
+distinct interfaces with explicit runtime requirements; see [setup](docs/development.md).
 
 The Rust core provides `DerivedVisualCache` for PNG crops obtained from a
 `VisualGenerationReader` rendition. Each derivative binds its generation, source,
@@ -123,7 +138,9 @@ owned cache payloads and crop admission, not total process memory.
 The required Decisions stage defaults to `openai/gpt-6-luna-decisions`.
 Explicit `--model typesafe/jev-1.13` selects legacy text-only Jev. Default search performs
 document routing and evidence reranking; there is no automatic local-only
-fallback. Parsing and index publication are deterministic local preparation.
+fallback. The default parser path is local; explicit OCR, document-agent and
+enrichment workflows invoke models during INDEX. Publication still requires
+complete validated products.
 Use `--document manual.pdf` to constrain retrieval to one exact indexed path
 before candidate budgets apply. Results expose `document_scope` and `coverage`.
 
@@ -170,6 +187,10 @@ sandbox_mode = "read-only"
 ```
 
 An existing Codex installation and authenticated local account are required.
+The advanced native Page/Document path also requires the pinned standalone
+[app-server derivative](patches/codex-native-viewer/README.md) and independently
+qualified controls; the ordinary CLI is used for device login and selected reader
+workflows. [Setup](docs/development.md) separates these roles.
 Select the account home explicitly for isolated development. Authentication is
 handled by Codex; GPTgrep does not read or copy its auth cache or install a global
 profile. [Codex authentication](https://learn.chatgpt.com/docs/auth?surface=cli)
@@ -276,16 +297,20 @@ published registry version during this investigation.
 
 ## Verification and evidence
 
-Python checks use Python 3.12 or newer and a local environment with locked dependencies.
+Configure the explicit external output paths and uv environment in
+[development setup](docs/development.md) before running these checks. Python
+checks use Python 3.12 or newer and the repository lockfiles.
 
 ```sh
 cargo fmt --all -- --check
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
-python3 -m venv .local/eval-venv
-.local/eval-venv/bin/python -m pip install --only-binary=:all: -r evals/requirements.lock
-.local/eval-venv/bin/python -B -m unittest discover -s evals -p 'test_*.py'
-.local/eval-venv/bin/python -B scripts/eval.py --binary target/release/gptgrep --output /tmp/gptgrep-eval.json
+uv venv --python 3.13 "$GPTGREP_DEV_ROOT/eval-venv"
+uv pip sync --python "$GPTGREP_DEV_ROOT/eval-venv/bin/python" evals/requirements.lock
+"$GPTGREP_DEV_ROOT/eval-venv/bin/python" -B -m unittest discover -s evals -p 'test_*.py'
+"$GPTGREP_DEV_ROOT/eval-venv/bin/python" -B scripts/eval.py \
+  --binary "$CARGO_TARGET_DIR/release/gptgrep" \
+  --output "$GPTGREP_DEV_ROOT/results/offline-eval.json"
 ```
 
 The fixture suite covers regex correctness, lexical retrieval, Unicode, exact
@@ -307,8 +332,9 @@ and experimental interpretation remain under the ignored `docs/research/` path.
 - LiteParse supplies the layout front end. Full Flash character/font repair,
   multilingual heading classification and generative expansion parity are not
   claimed by the Rust structural/merge stages.
-- OCR and universal Office/image acceptance are not claimed. Missing extraction
-  capability is an explicit failure.
+- Native OCR is implemented and image components have scoped live evidence.
+  Complete-corpus OCR/indexing and universal Office/image acceptance remain open;
+  missing or invalid required extraction is an explicit failure.
 - Semantic candidate budgets can miss relevant documents/nodes. Jev cannot rescue
   evidence excluded upstream; its scores are not a truth guarantee.
 - Corpus freshness is a snapshot contract. Rerun indexing for new files; a search
@@ -369,6 +395,6 @@ Bounds are configurable with `--window-bytes` (4–2048), `--max-visual-candidat
 
 `--multimodal-timeout` admits 1–900 seconds, default 180 for search; ask uses the smaller of this value and its existing `--timeout`. `--decisions-budget FILE` joins the same existing original-clock shared context for routing, reranking and host Decisions tools, without initializing or resetting its ledger. Without that file, the command creates one finite invocation context whose plan identity binds the retained generation manifest; it is not a portable campaign claim.
 
-A v1 generation, regex/lexical/semantic mode selection, legacy grep/window/candidate options, or ask's experimental planning/navigation/continuation options are rejected for this workflow. There is no text or regex fallback. Omitting `--multimodal` preserves the legacy paths and output. The rich ingestion frontdoor supports lossless UTF-8 text/Markdown, PDF, PNG and restricted strict baseline JPEG. Plaintext preserves original bytes and line spans without physical-page or OCR claims. Office inputs use one bounded LibreOffice conversion retained for parsing, rendering and OCR; a working converter is required and real Office runtime qualification remains pending. The wider JPEG family remains unsupported. CLI composition and offline mock checks establish implementation behavior. Actual provider image influence, native runtime availability and the live comparison/release gates remain pending.
+A v1 generation, regex/lexical/semantic mode selection, legacy grep/window/candidate options, or ask's experimental planning/navigation/continuation options are rejected for this workflow. There is no text or regex fallback. Omitting `--multimodal` preserves the legacy paths and output. The rich ingestion frontdoor supports lossless UTF-8 text/Markdown, PDF, PNG and restricted strict baseline JPEG. Plaintext preserves original bytes and line spans without physical-page or OCR claims. Office inputs use one bounded LibreOffice conversion retained for parsing, rendering and OCR; a working converter is required. Existing scoped Office evidence does not establish support for every Office format or document. The wider JPEG family remains unsupported. CLI composition and offline mock checks establish implementation behavior. Scoped native image qualification is separate from complete-corpus native indexing, current-source provider outcomes and the still-pending paired comparison/release gates.
 
 Foreground OCR is available through the native-only `gptgrep ocr serve --config CONTROL_JSON --token-env GPTGREP_OCR_SERVE_TOKEN` frontdoor. It uses authenticated loopback, explicit server-held source/task custody and a finite original-anchor phase. Full-task and PNG LiteParse compatibility have separate qualification and lineage; compatibility confidence is model-reported and uncalibrated. See [foreground OCR](docs/ocr-serve.md) for control schemas, create-only ledger behavior, limits and pending runtime qualification. Ordinary queries do not start OCR.

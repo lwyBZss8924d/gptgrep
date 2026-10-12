@@ -4,6 +4,42 @@ use super::*;
 use serde_json::{Value, json};
 use std::fs;
 
+#[test]
+fn ocr_failure_diagnostic_preserves_exact_cause_without_private_context() {
+    let original = anyhow::anyhow!("OCR region coordinates mismatch")
+        .context("private source path /private/canary");
+    let diagnostic = summarize_ocr_failure(original);
+    assert!(diagnostic.to_string().contains("cause=region_coordinates"));
+    assert!(!format!("{diagnostic:#?}").contains("canary"));
+    assert_eq!(diagnostic.chain().count(), 1);
+    let once = diagnostic.to_string();
+    let twice = summarize_ocr_failure(diagnostic.context("another private context"));
+    assert_eq!(once, twice.to_string());
+}
+
+#[test]
+fn ocr_failure_diagnostic_does_not_classify_substrings() {
+    let error = summarize_ocr_failure(anyhow::anyhow!(
+        "private payload: OCR region coordinates mismatch"
+    ));
+    assert!(error.to_string().contains("cause=unknown"));
+    assert!(!error.to_string().contains("private payload"));
+}
+
+#[test]
+fn ocr_failure_diagnostic_caps_unknown_unicode_error() {
+    let raw = "中".repeat(5000);
+    let error = summarize_ocr_failure(anyhow::anyhow!(raw.clone()));
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "ocr_failure cause=unknown error_bytes_hashed=4096 error_sha256={:x} error_truncated=true",
+            Sha256::digest(&raw.as_bytes()[..4096])
+        )
+    );
+    assert!(!format!("{error:#?}").contains('中'));
+}
+
 struct Fixture {
     _temporary: tempfile::TempDir,
     root: PathBuf,

@@ -664,6 +664,21 @@ async fn backend_refusal_reports_only_opcode_and_bounded_error_fingerprint() -> 
     Ok(())
 }
 
+#[test]
+fn backend_ocr_failure_preserves_sanitized_cause() {
+    let error = gptgrep_core::parse_agent::summarize_ocr_failure(
+        anyhow!("OCR region coordinates mismatch").context("private source canary"),
+    );
+    let failure = backend_failure("execute_ocr", Some(&error), None);
+    assert!(
+        failure
+            .to_string()
+            .contains("ocr_failure cause=region_coordinates")
+    );
+    assert!(!format!("{failure:#?}").contains("canary"));
+    assert_eq!(failure.chain().count(), 1);
+}
+
 #[tokio::test]
 async fn read_backend_refusal_reports_numeric_shape_without_artifact_or_cursor_identity()
 -> Result<()> {

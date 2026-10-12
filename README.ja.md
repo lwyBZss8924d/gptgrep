@@ -13,6 +13,12 @@ Jev によるルーティングと再ランキングを必須とします。`ask
 ローカル検索の基本操作です。推論を行うエージェントは、検索を組み合わせ、ツリーを確認し、
 上限付きでノードを読み取ってから回答できます。
 
+協力開発の入口は[開発・評価環境](docs/development.md)と[実験の現状](docs/experimental-status.md)です。
+ネイティブ parse-agent／OCR、rich 索引、full62 Harbor adapter は実装されていますが、
+34 文書全体のパイプラインと 62 組の SEARCH 比較は未受理です。同じ Codex reader を比較し、
+INDEX は SEARCH reward に含めません。PageIndex G5 の初回タグ条件は別に維持します。
+ビルド前に setup に従って `CARGO_TARGET_DIR` などの外部出力先を設定してください。
+
 これは開発中のソースです。最初の実験版を公開するには、PageIndex-OSS-Benchmark の実測で、
 PageIndex Flash と GPT-5.6 の組み合わせに対する最小限の優位性を確認する必要があります。
 元のローカル PageIndex OSS `results.json` は Luna/high で 60/62、別途検証した SDK/Codex の
@@ -34,17 +40,18 @@ live 対照は Luna/max で 60/62 です。モデル、バックエンド、証�
 
 ```sh
 cargo build --release --locked
-./target/release/gptgrep doctor --json
-./target/release/gptgrep index ./documents --json
-./target/release/gptgrep search 'retention|expiry' ./documents --mode regex --json
-./target/release/gptgrep search 'signed snapshot recovery' ./documents --mode lexical --json
+"$CARGO_TARGET_DIR/release/gptgrep" doctor --json
+"$CARGO_TARGET_DIR/release/gptgrep" index ./documents --json
+"$CARGO_TARGET_DIR/release/gptgrep" search 'retention|expiry' ./documents --mode regex --json
+"$CARGO_TARGET_DIR/release/gptgrep" search 'signed snapshot recovery' ./documents --mode lexical --json
 ```
 
 ネイティブパーサーの依存ライブラリは、PDFium バイナリがまだ用意されていない場合、初回の
 ビルド時に固定されたバージョンをダウンロードします。ネイティブ版のリリースアーカイブには
 PDFium ランタイムとライセンス等の通知文書が含まれます。同梱ライブラリを使うには、アーカイブ内の
 `gptgrep` ランチャーを使用してください。Office 形式の変換には、別途 LibreOffice が必要です。
-初期ビルドでは OCR は無効で、テキストのないスキャン文書は明示的なエラーになります。
+標準の legacy index では OCR は無効です。明示的な rich ingestion と document parse-agent は
+検証済みランタイムによるネイティブ OCR を利用します。必須 OCR が不足・不正なら、不完全な世代を公開せず失敗します。
 プレーンテキストと Markdown は PDFium を読み込まずに処理できます。
 検証済みのプラットフォームと再配置の検証については、[リリースのパッケージ化](docs/release.md)を
 参照してください。
@@ -83,7 +90,8 @@ gptgrep --llms
 
 Jev は GPTgrep 検索システムの必須要素です。デフォルトの検索では文書ルーティングと根拠の
 再ランキングを実行し、ローカルのみの検索へ自動的に切り替えることはありません。
-解析とインデックスの公開は、決定的なローカルの準備処理です。
+既定モデルは `openai/gpt-6-luna-decisions` です。標準解析はローカルですが、
+明示的な OCR、document-agent、enrich は INDEX 中にモデルを呼びます。公開には完全で検証済みの成果物が必要です。
 `--document manual.pdf` を指定すると、候補の上限を適用する前に、インデックス内の正確な
 パス 1 件へ検索を絞ります。結果は `document_scope` と `coverage` を示します。
 
@@ -122,7 +130,7 @@ Jev はチャット補完ではなく、OpenRouter の型付き **Decisions API*
 次のように定義されています。
 
 ```toml
-model = "gpt-5.6-luna"
+model = "gpt-6-luna"
 model_reasoning_effort = "max"
 service_tier = "fast"
 approval_policy = "never"
@@ -140,7 +148,7 @@ gptgrep ask 'What is the recovery procedure, and how long are snapshots kept?' \
   ./documents --json
 
 gptgrep summarize DOCUMENT_ID:NODE_ID --root ./documents \
-  --model gpt-5.6-luna --reasoning-effort max --service-tier fast --json
+  --model gpt-6-luna --reasoning-effort max --service-tier fast --json
 ```
 
 デフォルトでは回答 worker の起動前に、ホストは必須の Jev ハイブリッド検索を実行し、上限付きの根拠を
@@ -238,10 +246,12 @@ Python の検証には 3.12 以上を使い、下記のローカル仮想環境�
 cargo fmt --all -- --check
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
-python3 -m venv .local/eval-venv
-.local/eval-venv/bin/python -m pip install --only-binary=:all: -r evals/requirements.lock
-.local/eval-venv/bin/python -B -m unittest discover -s evals -p 'test_*.py'
-.local/eval-venv/bin/python -B scripts/eval.py --binary target/release/gptgrep --output /tmp/gptgrep-eval.json
+uv venv --python 3.13 "$GPTGREP_DEV_ROOT/eval-venv"
+uv pip sync --python "$GPTGREP_DEV_ROOT/eval-venv/bin/python" evals/requirements.lock
+"$GPTGREP_DEV_ROOT/eval-venv/bin/python" -B -m unittest discover -s evals -p 'test_*.py'
+"$GPTGREP_DEV_ROOT/eval-venv/bin/python" -B scripts/eval.py \
+  --binary "$CARGO_TARGET_DIR/release/gptgrep" \
+  --output "$GPTGREP_DEV_ROOT/results/offline-eval.json"
 ```
 
 フィクスチャによるテストは、正規表現の正しさ、語句検索、Unicode、ソースの正確なダイジェストと
@@ -261,7 +271,7 @@ python3 -m venv .local/eval-venv
 
 - レイアウト解析のフロントエンドには LiteParse を使用します。Rust の構造化／マージ段階について、
   Flash の完全な文字・フォント修復、多言語の見出し分類、生成モデルによる拡張との同等性は主張しません。
-- OCR や、あらゆる Office／画像形式への対応は主張しません。抽出に必要な機能がなければ、明示的に失敗します。
+- ネイティブ OCR と画像コンポーネントの限定的な live 検証は実装済みです。文書集合全体の OCR／索引と、すべての Office／画像形式の受理は未完了です。必要な結果の不足や不正は失敗として扱います。
 - 意味検索の候補数には上限があり、関連する文書やノードを取りこぼす可能性があります。Jev は前段で
   除外された根拠を取り戻せず、そのスコアも真実性の保証にはなりません。
 - 文書集合の鮮度はスナップショットの契約に基づきます。新しいファイルを追加したら、インデックスを

@@ -515,8 +515,8 @@ fn output_schema(task: &gptgrep_parse::OcrTask) -> Value {
     },"required":["schema_version","task_id","task_sha256","source_sha256","prepared_sha256","page","status","regions"]})
 }
 
-/// Native Structured Outputs require explicit scalar types even for constants.
-/// Keep the legacy mediated schema unchanged; all identity checks remain exact.
+/// Bind native output identities and region geometry to the actual prepared task.
+/// The model supplies transcription/status; it cannot invent a new region layout.
 pub(crate) fn native_output_schema(task: &gptgrep_parse::OcrTask) -> Value {
     let mut schema = output_schema(task);
     for field in [
@@ -529,6 +529,33 @@ pub(crate) fn native_output_schema(task: &gptgrep_parse::OcrTask) -> Value {
         schema["properties"][field]["type"] = json!("string");
     }
     schema["properties"]["page"]["type"] = json!("integer");
+    let template = schema["properties"]["regions"]["items"].clone();
+    let regions: Vec<_> = task
+        .regions
+        .iter()
+        .map(|region| {
+            let mut item = template.clone();
+            item["properties"]["id"] = json!({"type":"string","const":region.id});
+            for (name, value) in [
+                ("x", region.bbox.x),
+                ("y", region.bbox.y),
+                ("width", region.bbox.width),
+                ("height", region.bbox.height),
+            ] {
+                item["properties"]["bbox"]["properties"][name] =
+                    json!({"type":"number","const":value});
+            }
+            item
+        })
+        .collect();
+    schema["properties"]["regions"]["maxItems"] = json!(regions.len());
+    // Empty/partial results remain expressible and are rejected by the unchanged
+    // completion validator. Schema conformance alone grants no OCR acceptance.
+    if regions.len() == 1 {
+        schema["properties"]["regions"]["items"] = regions.into_iter().next().unwrap();
+    } else if !regions.is_empty() {
+        schema["properties"]["regions"]["items"] = json!({"anyOf":regions});
+    }
     schema
 }
 
