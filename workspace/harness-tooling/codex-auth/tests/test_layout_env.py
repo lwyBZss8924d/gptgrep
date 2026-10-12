@@ -853,6 +853,27 @@ class ToolPathsAndArgvGuardTests(unittest.TestCase):
                                                             "--add-dir", ".", "x"], layout, denied, cfg.runs_root))
         support.observe("argv_guard_other_dirs_below_ancestor_deny", refused=len(cases) + 1)
 
+    def test_the_own_directory_exemption_needs_the_exact_spelling(self):
+        """N5: run ids may differ only in letter case, and on a case-sensitive runs root `JX-CASE` and
+        `jx-case` are two runs. Only the exact spelling of this run's own directories is exempt; any
+        other spelling is checked like every other root (on a case-insensitive volume it names the
+        same directory, so this can only refuse more)."""
+        fake, schema = self.judge_world()
+        reopen = "consumer_argv_reopens_denied_path"
+        upper = self.env.run_dir("judge", "JX-CASE")
+        for run_id, root_args, detail in (("jx-case", ("-C", str(upper / "work")), "-C " + str(upper / "work")),
+                                          ("jx-case", ("--add-dir", str(upper / "results")),
+                                           "--add-dir " + str(upper / "results"))):
+            with self.subTest(detail=detail[-24:]):
+                code, result, _ = self.env.supervisor("run", "--role", "judge", "--run-id", run_id, "--dry-run",
+                                                      "--", str(fake), *judge_args(schema, root_args))
+                self.assertEqual((code, result.get("state"), result.get("refusal")),
+                                 (sup.EXIT_USAGE, "CONFIG_ERROR", {"reason": reopen, "detail": detail}))
+        code, plan, _ = self.env.supervisor("run", "--role", "judge", "--run-id", "jx-case", "--dry-run", "--",
+                                            str(fake), *judge_args(schema, ("-C", "{work_dir}")))
+        self.assertEqual((code, plan["tool_credential_access"]["consumer_argv_guard"]), (0, "checked"))
+        support.observe("argv_guard_own_dirs_exact_spelling", other_case_refused=2, exact_allowed=1)
+
     def test_consumer_argv_guard_resolves_the_executable_like_the_launch(self):
         """A bare name is looked up in the role's PATH and a name is matched in any case; an executable
         that cannot be resolved is inspected as Codex."""

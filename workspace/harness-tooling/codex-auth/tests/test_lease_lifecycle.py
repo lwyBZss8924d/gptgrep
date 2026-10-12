@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import signal
 import socket
+import subprocess
+import threading
 import time
 import unittest
 
@@ -244,6 +246,33 @@ class BindingTests(unittest.TestCase):
         self.assertNotIn("child_started_at", receipt["timings"])
         support.observe("binding_marker_being_written", awaited=True, empty_refused=True)
 
+    def test_a_stale_temp_file_never_breaks_binding_or_records(self):
+        """N8: a temporary file that a writer killed between creating and removing it left behind
+        (its process id since reused) was taken for an existing binding marker: TypeError and
+        INTERNAL_ERROR. No live writer can own that name, so it is removed and the file written again,
+        for the marker and for every record written the same way."""
+        cfg = self.env.cfg()
+        lease = sup.Lease(cfg).open()
+        try:
+            suffix = ".tmp-%d-%d" % (os.getpid(), threading.get_ident())
+            stale = cfg.binding_path.with_name("." + cfg.binding_path.name + suffix)
+            stale.write_text("{}")  # fake drill: what such a writer leaves
+            binding = sup.bind_or_verify(cfg, lease.fd, None)
+            self.assertEqual((binding["created"], binding["lease_path"]), (True, str(self.env.lease_path)))
+            self.assertFalse(stale.exists())
+            self.assertEqual(json.loads(self.env.binding().read_text())["lease_ino"], os.fstat(lease.fd).st_ino)
+            record = self.env.root / "record.json"
+            stale = record.with_name("." + record.name + suffix)
+            stale.write_text("partial")
+            sup.write_json_atomic(record, {"ok": True})
+            self.assertEqual((json.loads(record.read_text()), stale.exists()), ({"ok": True}, False))
+        finally:
+            lease.close()
+        code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "after-stale", *probe("exit", 0))
+        self.assertEqual((code, receipt["lease"]["binding"]["created"]), (0, False))
+        self.assertEqual([p.name for p in self.env.credential.home.iterdir() if ".tmp-" in p.name], [])
+        support.observe("stale_binding_temp_reaped", created=True)
+
     def test_deleted_lease_file_cannot_split_the_lock(self):
         ready = self.env.root / "ready-split"
         holder = self.env.popen("run", "--role", "dev", "--run-id", "split-hold",
@@ -399,8 +428,10 @@ class LifecycleTests(unittest.TestCase):
         """L2: a hard link or a symlink (to the file, to the run's link or to the auth home) that a
         consumer leaves in results/ would put the credential into an archive of results/."""
         before = self.env.credential.meta()
-        cases = [("ln-hard", "hard", "hardlink"), ("ln-sym", "sym-canonical", "symlink"),
-                 ("ln-runlink", "sym-run-link", "symlink"), ("ln-home", "sym-home", "symlink")]
+        cases = [("ln-hard", "hard", {"kind": "hardlink"}),
+                 ("ln-sym", "sym-canonical", {"kind": "symlink", "reaches": "credential"}),
+                 ("ln-runlink", "sym-run-link", {"kind": "symlink", "reaches": "credential"}),
+                 ("ln-home", "sym-home", {"kind": "symlink", "reaches": "auth_home"})]
         for run_id, kind, found in cases:
             with self.subTest(kind=kind):
                 code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", run_id,
@@ -411,7 +442,7 @@ class LifecycleTests(unittest.TestCase):
                 self.assertNotIn("CANONICAL_HARDLINKED", [a["code"] for a in receipt["anomalies"]])
                 links = receipt["credential_links"]
                 self.assertEqual((links["found"], links["removed"], links["canonical_nlink_after"]), (1, 1, 1))
-                self.assertEqual(links["links"], [{"kind": found, "removed": True, "path": "results/copy.json"}])
+                self.assertEqual(links["links"], [dict(found, removed=True, path="results/copy.json")])
                 self.assertFalse(os.path.lexists(self.env.run_dir("dev", run_id) / "results" / "copy.json"))
                 self.assertEqual(json.loads(self.env.quarantine_marker().read_text())["reason"],
                                  "CREDENTIAL_LINK_IN_RUN_DIR")
@@ -485,6 +516,191 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(os.lstat(self.env.credential.path).st_nlink, 1)
         self.assertEqual(json.loads(self.env.quarantine_marker().read_text())["reason"], "CREDENTIAL_LINK_IN_RUN_DIR")
         support.observe("guardian_credential_link_rescan", removed=1)
+
+    # -- verification findings of 1.3.0: N1 (incomplete scans), N2 (deep and unresolvable
+    # -- targets), N3 (codex-homes and run directories), N10 (symlinked auth home) -----------
+
+    def marker_reason(self):
+        return json.loads(self.env.quarantine_marker().read_text())["reason"]
+
+    def test_an_incomplete_link_scan_quarantines(self):
+        """N1: a directory the post-run scan cannot read may hold a link to the credential. The run
+        is QUARANTINED (fail closed), never PASS; the lease is released as for any quarantine, and the
+        marker refuses the next consumer."""
+        code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "inc1",
+                                               *probe("hidden-link", "sl"))
+        hide = self.env.run_dir("dev", "inc1") / "results" / "hide"
+        try:
+            self.assertEqual((code, receipt["state"], receipt["child_exit_code"]),
+                             (sup.EXIT_QUARANTINED, "QUARANTINED", 0))
+            self.assertIn({"code": "CREDENTIAL_LINK_SCAN_INCOMPLETE", "errors": 1}, receipt["anomalies"])
+            links = receipt["credential_links"]
+            self.assertEqual((links["found"], links.get("complete"), links.get("scan_error_items")),
+                             (0, False, [{"path": "results/hide", "error": "EACCES"}]))
+            marker = json.loads(self.env.quarantine_marker().read_text())
+            self.assertEqual((marker["reason"], marker["details"]["reasons"]),
+                             ("CREDENTIAL_LINK_SCAN_INCOMPLETE", ["CREDENTIAL_LINK_SCAN_INCOMPLETE"]))
+            self.assertTrue(receipt["auth_link_final"]["released"])
+            self.assertEqual(self.env.lease_probe(), "free")
+            code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "inc1-next", *probe("exit", 0))
+            self.assertEqual((code, receipt["state"]), (sup.EXIT_QUARANTINED, "QUARANTINED"))
+        finally:
+            os.chmod(hide, 0o700)
+        self.assertTrue(os.path.islink(hide / "sl"), "an unscanned link is left for review")
+        (hide / "sl").unlink()  # the test removes its own fake drill link after checking
+        support.observe("credential_link_scan_incomplete", state="QUARANTINED", next_run="QUARANTINED")
+
+    def test_a_deep_link_tree_is_scanned_whole_under_a_low_open_file_limit(self):
+        """N1: with 256 open files (the stock macOS soft limit), a 300-level directory chain exhausted
+        the 1.3.0 scan's descriptors (EMFILE) and the run ended PASS with the link left in place. The
+        scan now holds one directory open at a time: the link is found and removed."""
+        argv = self.env.supervisor_argv("run", "--role", "dev", "--run-id", "fd256",
+                                        *probe("deep-link", 300, "a", "canonical=sl"))
+        proc = subprocess.run(["/bin/sh", "-c", 'ulimit -S -n 256 && exec "$@"', "sh", *argv],
+                              capture_output=True, text=True, env=self.env.parent_env(), cwd=str(self.env.root),
+                              timeout=300)
+        receipt = support.last_json(proc.stdout)
+        self.assertEqual((proc.returncode, receipt["state"]), (sup.EXIT_QUARANTINED, "QUARANTINED"),
+                         proc.stderr[-800:])
+        links = receipt["credential_links"]
+        self.assertEqual((links["found"], links["removed"], links["scan_errors"]), (1, 1, 0))
+        self.assertEqual(links["links"], [{"kind": "symlink", "removed": True, "reaches": "credential",
+                                           "path": "results/deep/" + "a/" * 300 + "sl"}])
+        self.assertEqual(self.marker_reason(), "CREDENTIAL_LINK_IN_RUN_DIR")
+        self.assertEqual(os.lstat(self.env.credential.path).st_nlink, 1)
+        support.observe("credential_link_scan_deep_tree_low_fd_limit", levels=300, soft_nofile=256, removed=1)
+
+    def test_deep_symlinks_beyond_path_max_are_found(self):
+        """N2: below a path longer than PATH_MAX, realpath failed silently, and symlinks to the auth home
+        and to / survived a PASS run. Link targets are now resolved relative to directory descriptors
+        and compared by device and inode with the auth home and every directory above it."""
+        segment = "d" * 100
+        code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "deep1",
+                                               *probe("deep-link", 12, segment, "home=to-home", "root=to-root"))
+        run = self.env.run_dir("dev", "deep1")
+        length = int((run / "results" / "deep-path-length.txt").read_text())
+        self.assertGreater(length, 1024, "the links sit below a path longer than PATH_MAX")
+        self.assertEqual((code, receipt["state"]), (sup.EXIT_QUARANTINED, "QUARANTINED"))
+        links = receipt["credential_links"]
+        self.assertEqual((links["found"], links["removed"], links["scan_errors"]), (2, 2, 0))
+        prefix = "results/deep/" + (segment + "/") * 12
+        self.assertEqual(links["links"], [
+            {"kind": "symlink", "removed": True, "reaches": "auth_home", "path": prefix + "to-home"},
+            {"kind": "symlink", "removed": True, "reaches": "auth_home", "path": prefix + "to-root"}])
+        self.assertEqual(os.lstat(self.env.credential.path).st_nlink, 1)
+        support.observe("credential_links_beyond_path_max", path_length=length, removed=2)
+
+    def test_an_unresolvable_symlink_target_makes_the_scan_incomplete(self):
+        """N2: a symlink that cannot be resolved (a directory without search permission on the way to
+        its target, or a loop) cannot be judged: the scan is incomplete, the run QUARANTINED, and the
+        link left for review."""
+        locked = self.env.root / "locked"
+        (locked / "inner").mkdir(parents=True, mode=0o700)
+        os.chmod(locked, 0)
+        try:
+            for run_id, target, name, error in (("unres-locked", str(locked / "inner"), "x", "EACCES"),
+                                                ("unres-loop", "loop", "loop", "ELOOP")):
+                with self.subTest(error=error):
+                    code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", run_id,
+                                                           *probe("symlink", target, "{results}/" + name))
+                    self.assertEqual((code, receipt["state"]), (sup.EXIT_QUARANTINED, "QUARANTINED"))
+                    links = receipt["credential_links"]
+                    self.assertEqual((links["found"], links.get("scan_error_items")),
+                                     (0, [{"path": "results/" + name, "error": error}]))
+                    self.assertIn({"code": "CREDENTIAL_LINK_SCAN_INCOMPLETE", "errors": 1}, receipt["anomalies"])
+                    self.assertTrue(os.path.islink(self.env.run_dir("dev", run_id) / "results" / name))
+                    self.clear(run_id + "-clear")
+        finally:
+            os.chmod(locked, 0o700)
+        support.observe("credential_link_unresolvable_target", cases=2, state="QUARANTINED")
+
+    def test_symlinks_into_codex_homes_and_run_directories_are_removed(self):
+        """N3: a symlink to this run's codex-home or into another run's (also one left dangling after
+        that run ended), or to a directory that holds codex-homes (this run's directory, the runs
+        root): an archive that follows symlinks would reach a live run's link to the credential."""
+        code, _, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "cx-done", *probe("exit", 0))
+        self.assertEqual(code, 0)
+        done = self.env.run_dir("dev", "cx-done") / "codex-home"
+        self.assertFalse(os.path.lexists(done / "auth.json"))
+        cases = [("cx-own", "../codex-home", "codex_home"),
+                 ("cx-done-link", str(done / "auth.json"), "codex_home"),
+                 ("cx-done-file", str(done / "config.toml"), "codex_home"),
+                 ("cx-run", "..", "run_directory"),
+                 ("cx-runs-root", str(self.env.runs_root), "run_directory")]
+        for run_id, target, reaches in cases:
+            with self.subTest(run_id=run_id):
+                code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", run_id,
+                                                       *probe("symlink", target, "{results}/x"))
+                self.assertEqual((code, receipt["state"]), (sup.EXIT_QUARANTINED, "QUARANTINED"))
+                self.assertEqual(receipt["credential_links"]["links"],
+                                 [{"kind": "symlink", "removed": True, "reaches": reaches, "path": "results/x"}])
+                self.assertFalse(os.path.lexists(self.env.run_dir("dev", run_id) / "results" / "x"))
+                self.assertEqual(self.marker_reason(), "CREDENTIAL_LINK_IN_RUN_DIR")
+                self.clear(run_id + "-clear")
+        # Other links inside the run's own tree are not credential links.
+        code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "cx-work",
+                                               *probe("symlink", "../work", "{results}/x"))
+        self.assertEqual((code, receipt["state"], receipt["credential_links"]["found"]), (0, "PASS", 0))
+        support.observe("credential_links_codex_home_and_run_dirs", removed=len(cases), allowed=1)
+
+    def test_a_symlink_to_another_live_runs_codex_home_is_removed(self):
+        """N3: while another run is live, its codex-home holds its link to the credential."""
+        self.env.reconfigure(allow_shared_consumers=True)
+        ready = self.env.root / "ready-cx-live"
+        holder = self.env.popen("run", "--role", "dev", "--run-id", "cx-live", "--lease", "shared",
+                                *probe("hold", 12, ready, self.env.lease_path))
+        try:
+            self.assertTrue(support.wait_for(ready.exists, 60), "holder did not start")
+            other = self.env.run_dir("dev", "cx-live") / "codex-home"
+            self.assertTrue(os.path.islink(other / "auth.json"))
+            code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "cx-linker", "--lease",
+                                                   "shared", *probe("symlink", str(other), "{results}/other-ch"))
+            self.assertEqual((code, receipt["state"]), (sup.EXIT_QUARANTINED, "QUARANTINED"))
+            self.assertEqual(receipt["credential_links"]["links"], [
+                {"kind": "symlink", "removed": True, "reaches": "codex_home", "path": "results/other-ch"}])
+            self.assertTrue(os.path.islink(other / "auth.json"), "the live run's own link is untouched")
+        finally:
+            out, _ = holder.communicate(timeout=120)
+        self.assertEqual(support.last_json(out)["state"], "PASS")
+        support.observe("credential_link_other_live_codex_home", removed=1)
+
+    def test_hard_links_are_kept_when_the_auth_home_was_replaced_by_a_symlink(self):
+        """N10: the hard-link check looked the canonical file up through the auth home's path, which a
+        consumer can replace with a symlink to a moved copy of the home. Every link to the original is
+        then kept for review; nothing is removed."""
+        original = self.env.credential.meta()
+        code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "mh1",
+                                               *probe("move-home", "moved-home"))
+        self.assertEqual((code, receipt["state"]), (sup.EXIT_QUARANTINED, "QUARANTINED"))
+        links = receipt["credential_links"]
+        self.assertEqual((links["found"], links["removed"]), (2, 0))
+        self.assertEqual([(item["kind"], item.get("kept")) for item in links["links"]],
+                         [("hardlink", "canonical_home_not_physical")] * 2)
+        moved = self.env.run_dir("dev", "mh1") / "results" / "moved-home"
+        self.assertEqual([os.lstat(moved / name).st_ino for name in ("auth.json", "auth2.json")],
+                         [original["ino"]] * 2)
+        support.observe("credential_links_kept_symlinked_auth_home", kept=2)
+
+    def test_guardian_quarantines_when_its_rescan_is_incomplete(self):
+        """N1 (guardian): a survivor hides a link in a directory the guardian's rescan cannot read; the
+        guardian quarantines before it releases the lease (fail closed)."""
+        pidfile = self.env.root / "late-hider.pid"
+        code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "gl2",
+                                               *probe("escaped", pidfile, 8, "hidden-link", "late"))
+        self.assertEqual((code, receipt["state"]), (sup.EXIT_UNKNOWN, "UNKNOWN"))
+        self.assertEqual(receipt["credential_links"]["scan_errors"], 0)
+        self.assertTrue(support.wait_for(lambda: self.env.lease_probe() == "free", 60, 0.2))
+        run = self.env.run_dir("dev", "gl2")
+        result = json.loads((run / "state" / "lease-guardian-result.json").read_text())
+        self.assertEqual((result["credential_links"]["found"], result["credential_links"].get("scan_error_items")),
+                         (0, [{"path": "results/hide", "error": "EACCES"}]))
+        self.assertEqual((result.get("credential_link_quarantine") or {}).get("reason"),
+                         "CREDENTIAL_LINK_SCAN_INCOMPLETE")
+        self.assertEqual(self.marker_reason(), "CREDENTIAL_LINK_SCAN_INCOMPLETE")
+        hide = run / "results" / "hide"
+        os.chmod(hide, 0o700)
+        (hide / "late").unlink()  # the test removes its own fake drill link after checking
+        support.observe("guardian_incomplete_rescan_quarantined", reason="CREDENTIAL_LINK_SCAN_INCOMPLETE")
 
     def test_replaced_link_is_quarantined_and_left_for_review(self):
         code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "rl1", *probe("replace-link"))

@@ -246,7 +246,12 @@ def inner(args):
                          "post-run and guardian scans)", "account-probe protected outputs",
                          "exit 77 counts only with the auth-failure record",
                          "real-binary tests refuse without a verified guard",
-                         "concurrent first commands bind the auth source once"],
+                         "concurrent first commands bind the auth source once",
+                         "credential-link scan fails closed when incomplete, walks deep trees with bounded "
+                         "descriptors, resolves link targets by descriptor and flags links into codex-homes and "
+                         "run directories (1.3.1)",
+                         "stale temporary files never break binding or record writes",
+                         "a declared proxy-trap mode needs the test's own live trap"],
                "limitations": ["Fake credentials and loopback fakes only: no real token authority, ChatGPT backend "
                                "or model was contacted; live behaviour remains unqualified.",
                                "Process-tree tracking cannot see a daemon that escapes between samples, closes "
