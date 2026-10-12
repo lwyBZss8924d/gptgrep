@@ -136,6 +136,54 @@ and its upstream license are under [patches/codex-native-viewer](../patches/code
 Its native Page and Document qualifications remain independent of the existing
 mediated DynamicImages transport and of compilation.
 
+Encoded page-image capacity is configured in the existing parse-agent control's
+`resources` object. The CLI consumes that control through `--config` and
+`--expected-control-sha256`; `index` uses the pinned `--parse-agent-config`
+control. Defaults are 1,048,576 image-file bytes, 1,398,104 base64 bytes and
+4,194,304 image-file bytes per page. To admit a 4 MiB page image, set these three
+fields in the complete control, retain its other selected resource fields, and
+recompute its control digest:
+
+```json
+{
+  "image_file_bytes": 4194304,
+  "image_base64_bytes": 5592408,
+  "image_file_bytes_per_page": 4194304
+}
+```
+
+These are configurable capacities. The base64 capacity must cover the selected
+file capacity, which must fit the per-page capacity. Checked pixel, decode,
+working-memory and document/run staging admission still applies to actual work;
+setting a larger encoded capacity cannot raise the original invocation's server
+limits or replace its shared staging counter. Pixel/decode limits retain their
+existing defaults and ceilings. Text-only work may select a smaller memory or
+staging envelope without reserving unused image capacity.
+
+Native Page profiles derive `image_limits` from those resources, with separate
+`image_file_bytes`, `image_base64_bytes`, `image_wire_bytes` and
+`image_transport_bytes`. The 4 MiB example derives 5,657,944 bytes per image on
+the wire and 5,854,568 cumulative image bytes; the latter is also the profile's
+`image_transport_reserved_bytes`. The wire allowance includes bounded JSON
+framing separately from base64. Native Document controls and their guard profiles
+carry the same typed per-image limits; the control's `image_wire_bytes` selects
+the cumulative document allowance (32 MiB by default). The library helper
+`document_native_image_limits` binds it to the parser resource budget. Both modes
+copy the exact limits into admission and readiness evidence, and validate source
+and prepared-image receipts against them. RPC frames retain their separate 4 MiB
+limit. Image bytes are not admitted as RPC frames.
+
+For the retained fixed Page/Document modes, changing a native binary, profile or
+image-limit tuple requires fresh qualification for that tuple.
+`OcrRuntimeProfile::unqualified_native_with_resources` derives a Page profile,
+and the existing `native_page_probe` example accepts an optional `resources`
+control object for its two-image qualification; omission retains the defaults.
+These fixed-mode qualifications are scoped component evidence. The current D3
+work is full native PTC parsing/OCR with the agent's native tools and Skills;
+new fixed Page/Document qualifications are not prerequisites for that mainline.
+Decisions retains its independent 1 MiB per-image contract, and the HTTP `/ocr`
+compatibility endpoint retains its independent 1 MiB body-image cap.
+
 ## Ingestion and snapshot consistency
 
 The corpus root is explicit. Normal ignore rules apply even outside a Git repo;

@@ -1,4 +1,4 @@
-//! Frozen parser admission limits. Tighter caller limits are allowed.
+//! Parser admission limits with configurable encoded-image capacity.
 
 use std::io::{self, Write};
 use std::sync::{
@@ -119,12 +119,67 @@ impl ResourceBudget {
         let frozen = serde_json::to_value(Self::default())?;
         for (field, value) in selected.as_object().expect("budget object") {
             let value = value.as_u64().expect("unsigned budget");
+            let configurable = matches!(
+                field.as_str(),
+                "image_file_bytes" | "image_base64_bytes" | "image_file_bytes_per_page"
+            );
             ensure!(
-                value > 0 && value <= frozen[field].as_u64().expect("frozen budget"),
-                "resource_limit: {field} must be positive and at most its frozen M0 maximum"
+                value > 0
+                    && (configurable || value <= frozen[field].as_u64().expect("frozen budget")),
+                "resource_limit: {field} must be positive and within its admission"
             );
         }
+        ensure!(
+            self.image_base64_bytes >= base64_bytes(self.image_file_bytes)?,
+            "resource_limit: base64 budget does not cover the image file budget"
+        );
+        ensure!(
+            self.image_file_bytes <= self.image_file_bytes_per_page,
+            "resource_limit: image and page byte budgets disagree"
+        );
+        base64_bytes(self.image_file_bytes_per_page)?;
+        let encoded_working = self
+            .image_file_bytes
+            .checked_add(self.image_base64_bytes)
+            .ok_or_else(|| anyhow::anyhow!("resource_limit: encoded image working overflow"))?;
+        usize::try_from(encoded_working)?;
+        // Capacities need not all fit at once: text-only work can select a
+        // smaller working/staging envelope. Actual render, decode, encoding and
+        // retention paths reserve their checked byte totals before allocation.
         Ok(())
+    }
+
+    /// The JSON wrapper is bounded separately from the base64 image. Native
+    /// call IDs are at most 256 bytes; 64 KiB also covers the finite MIME/detail
+    /// fields. This is framing allowance, not an encoded-image ceiling.
+    pub fn native_image_limits(&self) -> Result<NativeImageLimits> {
+        self.validate()?;
+        let framing = 65_536u64;
+        let images = u64::try_from(self.images_per_page)?;
+        let image_wire_bytes = self
+            .image_base64_bytes
+            .checked_add(framing)
+            .ok_or_else(|| anyhow::anyhow!("resource_limit: native image wire overflow"))?;
+        // Each separately encoded image may contribute one extra base64 group.
+        let image_transport_bytes = base64_bytes(self.image_file_bytes_per_page)?
+            .checked_add(
+                images.checked_mul(framing + 4).ok_or_else(|| {
+                    anyhow::anyhow!("resource_limit: native image framing overflow")
+                })?,
+            )
+            .ok_or_else(|| anyhow::anyhow!("resource_limit: native image transport overflow"))?;
+        let limits = NativeImageLimits {
+            image_file_bytes: self.image_file_bytes,
+            image_base64_bytes: self.image_base64_bytes,
+            image_wire_bytes,
+            image_transport_bytes,
+        };
+        limits.validate()?;
+        ensure!(
+            limits.transport_bytes()? <= self.owned_working_bytes,
+            "resource_limit: native image transport exceeds owned working budget"
+        );
+        Ok(limits)
     }
 
     /// Check geometry before allocating a pixel buffer or decoding an image.
@@ -139,21 +194,64 @@ impl ResourceBudget {
         let rgba = pixels.checked_mul(4).ok_or_else(|| {
             anyhow::anyhow!("resource_limit: decoded image multiplication overflow")
         })?;
-        let base64 = encoded_bytes
-            .checked_add(2)
-            .and_then(|bytes| bytes.checked_div(3))
-            .and_then(|bytes| bytes.checked_mul(4))
-            .ok_or_else(|| anyhow::anyhow!("resource_limit: base64 length overflow"))?;
+        let base64 = base64_bytes(encoded_bytes)?;
         ensure!(
             pixels <= self.image_pixels
                 && rgba <= self.image_pixel_buffer_bytes
                 && encoded_bytes <= self.image_file_bytes
                 && base64 <= self.image_base64_bytes,
-            "resource_limit: image exceeds frozen pixel/file/base64/decode budget"
+            "resource_limit: image exceeds admitted pixel/file/base64/decode budget"
         );
         Ok(pixels)
     }
 }
+
+/// Limits bound into the native runtime profile, manifest, and ready receipt.
+/// RPC frames have a separate unchanged admission.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeImageLimits {
+    pub image_file_bytes: u64,
+    pub image_base64_bytes: u64,
+    pub image_wire_bytes: u64,
+    pub image_transport_bytes: u64,
+}
+impl NativeImageLimits {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.image_file_bytes > 0
+                && self.image_base64_bytes >= base64_bytes(self.image_file_bytes)?
+                && self.image_wire_bytes > self.image_base64_bytes
+                && self.image_transport_bytes >= self.image_wire_bytes,
+            "resource_limit: native image limits disagree"
+        );
+        usize::try_from(self.image_wire_bytes)?;
+        usize::try_from(
+            self.image_file_bytes
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("resource_limit: native image read overflow"))?,
+        )?;
+        self.transport_bytes()?;
+        Ok(())
+    }
+    pub fn transport_bytes(&self) -> Result<u64> {
+        self.image_transport_bytes
+            .checked_add(8 * 1024 * 1024)
+            .ok_or_else(|| anyhow::anyhow!("resource_limit: native transport overflow"))
+    }
+}
+
+fn base64_bytes(bytes: u64) -> Result<u64> {
+    bytes
+        .checked_add(2)
+        .and_then(|n| n.checked_div(3))
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| anyhow::anyhow!("resource_limit: base64 length overflow"))
+}
+
+#[cfg(test)]
+#[path = "resource_tests.rs"]
+mod tests;
 
 pub(crate) struct LimitedWriter<W> {
     pub(crate) inner: W,

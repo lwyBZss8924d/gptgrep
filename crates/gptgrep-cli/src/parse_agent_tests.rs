@@ -79,6 +79,24 @@ fn bounds() -> FrontendBounds {
         output_file_bytes: 1024,
     }
 }
+
+#[test]
+fn parse_control_roundtrips_configured_image_budget_without_default_clamping() -> Result<()> {
+    let mut fixture = Fixture::new("ordinary source\n")?;
+    fixture.config.resources.image_file_bytes = 4_194_304;
+    fixture.config.resources.image_base64_bytes = 5_592_408;
+    fixture.config.resources.image_file_bytes_per_page = 4_194_304;
+    fixture.save()?;
+    let selected: Control = serde_json::from_slice(&fs::read(&fixture.control_path)?)?;
+    validate(&selected)?;
+    let session = Session::new(selected, Instant::now())?;
+    assert_eq!(session.budget.image_file_bytes, 4_194_304);
+    assert_eq!(session.budget.image_base64_bytes, 5_592_408);
+    assert_eq!(session.budget.image_file_bytes_per_page, 4_194_304);
+    fixture.config.resources.image_base64_bytes -= 1;
+    assert!(validate(&fixture.config).is_err());
+    Ok(())
+}
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(30)
 }

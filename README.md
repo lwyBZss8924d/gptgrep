@@ -16,10 +16,12 @@ searches, inspect trees and read bounded nodes before answering.
 
 Experimental collaborators: start with [development and evaluation setup](docs/development.md)
 and the dated [implementation and live-run status](docs/experimental-status.md).
-The source includes the native pipeline and full62 Harbor adapter; complete
-34-document native indexing and the 62-pair SEARCH comparison remain unaccepted.
-The main comparison uses the same Codex reader with and without GPTgrep and
-excludes INDEX from SEARCH reward. Its Goal is separate from the G5 tag gate.
+The core optimization goal is the actual **GPTgrep harness versus bare Codex
+ablation study**: the same reader on 62 paired tasks, with INDEX reported
+separately from SEARCH reward and cost. The source includes the native pipeline
+and full62 Harbor adapter; complete 34-document indexing and the 124 SEARCH
+trials remain unaccepted. Component qualifications support that comparison;
+they do not replace it. Its Goal is separate from the G5 tag gate.
 
 This is development source. The first experimental release requires a verified
 minimum live advantage over PageIndex Flash plus GPT-5.6 on PageIndex-OSS-Benchmark.
@@ -123,6 +125,9 @@ Default `index` publishes the original format. Explicit `--rich` / `--ocr` contr
 select rich ingestion; `--parse-agent-config` with a complete document-control
 registry selects native agentic parsing and owned-product import. These are
 distinct interfaces with explicit runtime requirements; see [setup](docs/development.md).
+Parse-agent image-file, base64 and per-page byte capacities are configured in the
+control's `resources` object. See the [4 MiB image example](docs/architecture.md#prepared-document-agent)
+for the coupled limits, native profile binding and qualification requirements.
 
 The Rust core provides `DerivedVisualCache` for PNG crops obtained from a
 `VisualGenerationReader` rendition. Each derivative binds its generation, source,
@@ -333,6 +338,9 @@ and experimental interpretation remain under the ignored `docs/research/` path.
   multilingual heading classification and generative expansion parity are not
   claimed by the Rust structural/merge stages.
 - Native OCR is implemented and image components have scoped live evidence.
+  Full native PTC coding for parsing/OCR, including native built-ins and shell,
+  image and CV work through the available CLIs/APIs, remains active work. Fixed
+  Page/Document guard qualifications cover individual components only.
   Complete-corpus OCR/indexing and universal Office/image acceptance remain open;
   missing or invalid required extraction is an explicit failure.
 - Semantic candidate budgets can miss relevant documents/nodes. Jev cannot rescue

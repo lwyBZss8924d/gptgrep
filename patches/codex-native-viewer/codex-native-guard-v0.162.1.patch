@@ -1780,7 +1780,7 @@
  mod realtime_history;
 --- /dev/null
 +++ b/codex-rs/core/src/native_ocr.rs
-@@ -0,0 +1,1779 @@
+@@ -0,0 +1,1912 @@
 +//! Required, process-local admission for isolated GPTgrep OCR and document runtimes.
 +//!
 +//! This module is absent from the ordinary upstream runtime. A page child opts in
@@ -1791,7 +1791,7 @@
 +use codex_protocol::openai_models::ReasoningEffort;
 +use codex_protocol::protocol::AskForApproval;
 +use codex_tools::ToolName;
-+use serde::Deserialize;
++use serde::{Deserialize, Serialize};
 +use serde_json::{Value, json};
 +use sha2::{Digest, Sha256};
 +use std::collections::{BTreeMap, BTreeSet};
@@ -1866,6 +1866,34 @@
 +
 +type AdmissionResult<T> = Result<T, &'static str>;
 +
++#[derive(Clone, Debug, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct NativeImageLimits {
++    image_file_bytes: u64,
++    image_base64_bytes: u64,
++    image_wire_bytes: u64,
++    image_transport_bytes: u64,
++}
++impl NativeImageLimits {
++    fn validate(&self) -> AdmissionResult<()> {
++        let encoded = base64_length(self.image_file_bytes)?;
++        if self.image_file_bytes == 0 || self.image_base64_bytes < encoded
++            || self.image_wire_bytes <= self.image_base64_bytes
++            || self.image_transport_bytes < self.image_wire_bytes
++        { return Err("native_ocr_image_limits"); }
++        usize::try_from(self.image_file_bytes.checked_add(1)
++            .ok_or("native_ocr_transport_overflow")?).map_err(|_| "native_ocr_transport_overflow")?;
++        usize::try_from(self.image_wire_bytes).map_err(|_| "native_ocr_transport_overflow")?;
++        self.image_transport_bytes.checked_add(8 * 1024 * 1024)
++            .ok_or("native_ocr_transport_overflow")?;
++        Ok(())
++    }
++}
++fn base64_length(bytes: u64) -> AdmissionResult<u64> {
++    bytes.checked_add(2).and_then(|n| n.checked_div(3))
++        .and_then(|n| n.checked_mul(4)).ok_or("native_ocr_transport_overflow")
++}
++
 +#[derive(Clone, Debug, Deserialize)]
 +#[serde(deny_unknown_fields)]
 +pub struct ImageGrant {
@@ -1893,12 +1921,28 @@
 +    max_turns: u32,
 +    frame_bytes: u64,
 +    image_transport_reserved_bytes: u64,
++    #[serde(default, deserialize_with = "explicit_image_limits")]
++    image_limits: Option<NativeImageLimits>,
 +    image_root: PathBuf,
 +    receipt_root: PathBuf,
 +    permissions_profile_sha256: String,
 +    images: Vec<ImageGrant>,
 +    #[serde(default)]
 +    image_catalog: Option<ImageCataloguePin>,
++}
++
++fn explicit_image_limits<'de, D: serde::Deserializer<'de>>(
++    deserializer: D,
++) -> Result<Option<NativeImageLimits>, D::Error> {
++    NativeImageLimits::deserialize(deserializer).map(Some)
++}
++impl AdmissionManifest {
++    fn image_file_limit(&self) -> u64 {
++        self.image_limits.as_ref().map_or(FRAME_LIMIT, |limits| limits.image_file_bytes)
++    }
++    fn image_wire_limit(&self) -> u64 {
++        self.image_limits.as_ref().map_or(FRAME_LIMIT, |limits| limits.image_wire_bytes)
++    }
 +}
 +
 +fn explicit_max_seconds<'de, D: serde::Deserializer<'de>>(
@@ -2032,7 +2076,7 @@
 +    }
 +    let image_directory = open_directory(&manifest.image_root)?;
 +    let receipt_directory = open_directory(&manifest.receipt_root)?;
-+    let catalogue = manifest.image_catalog.as_ref().map(open_catalogue).transpose()?.map(Mutex::new);
++    let catalogue = manifest.image_catalog.as_ref().map(|pin| open_catalogue(pin, manifest.image_file_limit())).transpose()?.map(Mutex::new);
 +    let guard = Guard {
 +        kind, catalogue,
 +        manifest,
@@ -2049,11 +2093,15 @@
 +
 +fn validate_manifest(manifest: &AdmissionManifest, kind: GuardKind) -> AdmissionResult<()> {
 +    admitted_max_seconds(manifest, kind)?;
++    let image_reservation = if let Some(limits) = &manifest.image_limits {
++        limits.validate()?;
++        limits.image_transport_bytes
++    } else { kind.image_wire_reservation() };
 +    if manifest.schema_version != kind.manifest_schema()
 +        || manifest.max_tool_calls != kind.max_tools()
 +        || manifest.max_turns != 1
 +        || manifest.frame_bytes != FRAME_LIMIT
-+        || manifest.image_transport_reserved_bytes != kind.image_wire_reservation()
++        || manifest.image_transport_reserved_bytes != image_reservation
 +        || (kind == GuardKind::Page && (manifest.images.is_empty()
 +            || manifest.images.len() > MAX_TOOLS as usize || manifest.image_catalog.is_some()))
 +        || (kind == GuardKind::Document && (!manifest.images.is_empty() || manifest.image_catalog.is_none()))
@@ -2089,7 +2137,7 @@
 +    let mut paths = BTreeSet::new();
 +    let mut ids = BTreeSet::new();
 +    for grant in &manifest.images {
-+        validate_grant(grant)?;
++        validate_grant(grant, manifest.image_file_limit())?;
 +        if !paths.insert(grant.relative_path.clone()) || !ids.insert(grant.artifact_id.clone()) {
 +            return Err("native_ocr_image_grant");
 +        }
@@ -2097,12 +2145,12 @@
 +    Ok(())
 +}
 +
-+fn validate_grant(grant: &ImageGrant) -> AdmissionResult<()> {
++fn validate_grant(grant: &ImageGrant, image_file_limit: u64) -> AdmissionResult<()> {
 +    let mut parts = grant.relative_path.components();
 +    if !matches!(parts.next(), Some(Component::Normal(_))) || parts.next().is_some()
 +        || grant.artifact_id.is_empty() || grant.artifact_id.len() > 256
 +        || !valid_digest(&grant.sha256) || !valid_digest(&grant.rendition_sha256)
-+        || grant.bytes == 0 || grant.bytes > FRAME_LIMIT
++        || grant.bytes == 0 || grant.bytes > image_file_limit
 +        || grant.width == 0 || grant.height == 0
 +        || u64::from(grant.width) * u64::from(grant.height) > PIXEL_WORKING_LIMIT / 4
 +    { return Err("native_ocr_image_grant"); }
@@ -2188,7 +2236,7 @@
 +            "max_seconds":self.manifest.max_seconds.unwrap_or_else(|| self.kind.max_seconds()),
 +            "deadline_unix_ms":self.manifest.deadline_unix_ms,
 +            "frame_bytes":FRAME_LIMIT,
-+            "image_transport_reserved_bytes":self.kind.image_wire_reservation(),
++            "image_transport_reserved_bytes":self.manifest.image_transport_reserved_bytes,
 +            "tool_counter_before_lookup_hooks_handler":true,
 +            "tool_counter_before_argument_parse":true,
 +            "normalized_request_profile_verified_before_send":true,
@@ -2198,6 +2246,9 @@
 +            "normalized_request_service_tier":"priority",
 +            "actual_served_profile_verified":false
 +        });
++        if let Some(limits) = &self.manifest.image_limits {
++            value["image_limits"] = json!(limits);
++        }
 +        if let Some(pin) = &self.manifest.image_catalog {
 +            value["image_catalog_sha256"] = json!(pin.sha256);
 +            value["image_catalog_count"] = json!(pin.count);
@@ -2434,7 +2485,7 @@
 +}
 +
 +/// Called after native resize/encoding, before attachment upload/outgoing image assembly.
-+/// The 8 MiB reservation is disjoint from the host's 8 MiB RPC allowance.
++/// The selected image reservation is disjoint from the host's RPC allowance.
 +pub(crate) fn prepared_image(
 +    call_id: Option<&str>, bytes: &[u8], mime: &str, width: u32, height: u32,
 +    detail: Option<codex_protocol::models::ImageDetail>,
@@ -2460,8 +2511,7 @@
 +        return Err("native_ocr_prepared_mime");
 +    }
 +    let length = u64::try_from(payload_bytes).map_err(|_| "native_ocr_transport_overflow")?;
-+    let encoded = length.checked_add(2).and_then(|value| value.checked_div(3))
-+        .and_then(|value| value.checked_mul(4)).ok_or("native_ocr_transport_overflow")?;
++    let encoded = base64_length(length)?;
 +    let framing = image_wire_bytes(call_id,
 +        codex_protocol::models::ImageReference::Inline {
 +            image_url: format!("data:{mime};base64,"),
@@ -2580,19 +2630,19 @@
 +}
 +
 +#[cfg(unix)]
-+fn open_catalogue(pin: &ImageCataloguePin) -> AdmissionResult<File> {
++fn open_catalogue(pin: &ImageCataloguePin, image_file_limit: u64) -> AdmissionResult<File> {
 +    use std::os::unix::fs::OpenOptionsExt;
 +    validate_absolute(&pin.path)?;
 +    let mut file = OpenOptions::new().read(true)
 +        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
 +        .open(&pin.path).map_err(|_| "native_document_catalogue_open")?;
 +    same_regular_file(&pin.path, &file)?;
-+    scan_catalogue(&mut file, pin, None)?;
++    scan_catalogue(&mut file, pin, None, image_file_limit)?;
 +    Ok(file)
 +}
 +
 +#[cfg(unix)]
-+fn scan_catalogue(file: &mut File, pin: &ImageCataloguePin, selected: Option<&Path>)
++fn scan_catalogue(file: &mut File, pin: &ImageCataloguePin, selected: Option<&Path>, image_file_limit: u64)
 +    -> AdmissionResult<Option<ImageGrant>>
 +{
 +    use std::os::unix::fs::MetadataExt;
@@ -2633,7 +2683,7 @@
 +        hasher.update(&row);
 +        let grant: ImageGrant = serde_json::from_slice(&row)
 +            .map_err(|_| "native_document_catalogue_row_schema")?;
-+        validate_grant(&grant)?;
++        validate_grant(&grant, image_file_limit)?;
 +        if previous.as_ref().is_some_and(|prior| prior >= &grant.relative_path)
 +            || !ids.insert(grant.artifact_id.clone())
 +        { return Err("native_document_catalogue_order_or_identity"); }
@@ -2658,9 +2708,9 @@
 +#[cfg(not(unix))]
 +fn same_regular_file(_: &Path, _: &File) -> AdmissionResult<()> { Err("native_document_platform_not_admitted") }
 +#[cfg(not(unix))]
-+fn open_catalogue(_: &ImageCataloguePin) -> AdmissionResult<File> { Err("native_document_platform_not_admitted") }
++fn open_catalogue(_: &ImageCataloguePin, _: u64) -> AdmissionResult<File> { Err("native_document_platform_not_admitted") }
 +#[cfg(not(unix))]
-+fn scan_catalogue(_: &mut File, _: &ImageCataloguePin, _: Option<&Path>)
++fn scan_catalogue(_: &mut File, _: &ImageCataloguePin, _: Option<&Path>, _: u64)
 +    -> AdmissionResult<Option<ImageGrant>> { Err("native_document_platform_not_admitted") }
 +
 +#[cfg(not(unix))]
@@ -2780,7 +2830,7 @@
 +            .ok_or("native_document_catalogue_missing")?;
 +        let mut file = guard.catalogue.as_ref().ok_or("native_document_catalogue_missing")?
 +            .lock().map_err(|_| "native_document_catalogue_poisoned")?;
-+        match scan_catalogue(&mut file, pin, Some(relative)) {
++        match scan_catalogue(&mut file, pin, Some(relative), guard.manifest.image_file_limit()) {
 +            Ok(value) => value,
 +            Err(error) => return guard.fail(&mut state, error),
 +        }
@@ -2860,7 +2910,12 @@
 +    // Base64 characters need no JSON escaping; mime and call identity framing do.
 +    let wire_bytes = planned_image_wire_bytes(call_id, bytes.len(), mime, detail)?;
 +    let next = state.image_wire_bytes.checked_add(wire_bytes).ok_or("native_ocr_transport_overflow")?;
-+    if wire_bytes > FRAME_LIMIT || next > guard.kind.image_wire_reservation() {
++    let payload = u64::try_from(bytes.len()).map_err(|_| "native_ocr_transport_overflow")?;
++    let encoded = base64_length(payload)?;
++    if payload == 0 || payload > guard.manifest.image_file_limit()
++        || guard.manifest.image_limits.as_ref().is_some_and(|limits| encoded > limits.image_base64_bytes)
++        || wire_bytes > guard.manifest.image_wire_limit()
++        || next > guard.manifest.image_transport_reserved_bytes {
 +        return guard.fail(&mut state, "native_ocr_image_wire_budget_exhausted");
 +    }
 +    let image_url = format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes));
@@ -2907,7 +2962,7 @@
 +        codex_protocol::models::ImageReference::Inline { image_url } => {
 +            let (prefix, payload) = image_url.split_once(',').ok_or("native_ocr_assembled_image_format")?;
 +            if !prefix.starts_with("data:") || !prefix.ends_with(";base64")
-+                || image_url.len() as u64 > FRAME_LIMIT
++                || image_url.len() as u64 > guard.manifest.image_wire_limit()
 +            { return guard.fail(&mut state, "native_ocr_assembled_image_format"); }
 +            let bytes = base64::engine::general_purpose::STANDARD.decode(payload)
 +                .map_err(|_| "native_ocr_assembled_image_format")?;
@@ -2990,6 +3045,7 @@
 +            max_turns: 1,
 +            frame_bytes: FRAME_LIMIT,
 +            image_transport_reserved_bytes: IMAGE_WIRE_RESERVATION,
++            image_limits: None,
 +            image_root: images,
 +            receipt_root: receipts,
 +            permissions_profile_sha256: "e".repeat(64),
@@ -3041,6 +3097,56 @@
 +            None, &permissions,
 +        ).expect("exact granted leaf").is_some());
 +        fixture.guard.source_buffer("image-call", &fixture.png).expect("actual source buffer");
++    }
++
++    fn configured_image_limits() -> NativeImageLimits {
++        NativeImageLimits { image_file_bytes: 4_194_304, image_base64_bytes: 5_592_408,
++            image_wire_bytes: 5_657_944, image_transport_bytes: 5_854_568 }
++    }
++
++    #[test]
++    fn configured_image_wire_exceeds_rpc_frame_and_remains_bound() {
++        let mut fixture = fixture();
++        let limits = configured_image_limits();
++        fixture.guard.manifest.image_transport_reserved_bytes = limits.image_transport_bytes;
++        fixture.guard.manifest.image_limits = Some(limits);
++        validate_manifest(&fixture.guard.manifest, GuardKind::Page).expect("configured page admission");
++        assert_eq!(fixture.guard.ready_value()["image_limits"]["image_file_bytes"], 4_194_304);
++        admit_image(&fixture);
++        // The source remains a valid pinned PNG; this synthetic native output
++        // isolates the actual preparation/assembly wire boundary without a model.
++        let payload = vec![7u8; 3_200_000];
++        let forecast = planned_image_wire_bytes("image-call", payload.len(), "image/png", None).unwrap();
++        assert!(forecast > FRAME_LIMIT);
++        fixture.guard.prepared_image(Some("image-call"), &payload, "image/png", 1000, 800, None)
++            .expect("configured output larger than the RPC frame");
++        fixture.guard.assembled_image(Some("image-call"), &ImageReference::Inline {
++            image_url: format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(&payload)),
++        }).expect("exact larger inline payload");
++        fixture.guard.before_model_request("gpt-6-luna", Some(&ReasoningEffort::Max), Some("priority"))
++            .expect("configured assembly complete");
++    }
++
++    #[test]
++    fn configured_image_limits_reject_overflow_incoherence_and_excess_payload() {
++        let mut limits = configured_image_limits();
++        limits.image_file_bytes = u64::MAX;
++        assert!(limits.validate().is_err());
++        limits = configured_image_limits();
++        limits.image_base64_bytes -= 1;
++        assert!(limits.validate().is_err());
++        let mut fixture = fixture();
++        let limits = configured_image_limits();
++        fixture.guard.manifest.image_transport_reserved_bytes = limits.image_transport_bytes;
++        fixture.guard.manifest.image_limits = Some(limits);
++        admit_image(&fixture);
++        assert_eq!(fixture.guard.prepared_image(Some("image-call"), &vec![0; 4_194_305],
++            "image/png", 2, 2, None), Err("native_ocr_image_wire_budget_exhausted"));
++        assert!(!fixture.guard.manifest.receipt_root.join("prepared-1.json").exists());
++        assert!(fixture.guard.before_model_request("gpt-6-luna", Some(&ReasoningEffort::Max), Some("priority")).is_err());
++        let worst_call_id = "\\u{1}".repeat(256);
++        let framed = planned_image_wire_bytes(&worst_call_id, 4_194_304, "image/jpeg", Some(ImageDetail::Original)).unwrap();
++        assert!(framed <= configured_image_limits().image_wire_bytes);
 +    }
 +
 +    #[test]
@@ -3357,7 +3463,7 @@
 +        manifest.image_transport_reserved_bytes = DOCUMENT_IMAGE_WIRE_RESERVATION;
 +        manifest.images.clear();
 +        manifest.image_catalog = Some(pin.clone());
-+        fixture.guard.catalogue = Some(Mutex::new(open_catalogue(&pin).expect("catalogue fully checked")));
++        fixture.guard.catalogue = Some(Mutex::new(open_catalogue(&pin, FRAME_LIMIT).expect("catalogue fully checked")));
 +        fixture.guard.expected_permissions = permission_value(manifest, GuardKind::Document);
 +        manifest.permissions_profile_sha256 = digest(&serde_json::to_vec(
 +            &fixture.guard.expected_permissions,
@@ -3413,6 +3519,33 @@
 +    }
 +
 +    #[test]
++    fn document_configured_limits_accept_larger_source_and_wire() {
++        let mut fixture = document_fixture(1);
++        let mut limits = configured_image_limits();
++        limits.image_file_bytes = 8_388_608;
++        limits.image_base64_bytes = 11_184_812;
++        limits.image_wire_bytes = 11_250_348;
++        limits.image_transport_bytes = DOCUMENT_IMAGE_WIRE_RESERVATION;
++        fixture.guard.manifest.image_limits = Some(limits);
++        validate_manifest(&fixture.guard.manifest, GuardKind::Document).expect("configured document admission");
++        let mut grant: ImageGrant = serde_json::from_slice(&fs::read(&fixture.guard.manifest.image_catalog.as_ref().unwrap().path).unwrap()).unwrap();
++        grant.bytes = FRAME_LIMIT + 1;
++        validate_grant(&grant, fixture.guard.manifest.image_file_limit()).expect("configured source cap");
++        assert!(validate_grant(&grant, FRAME_LIMIT).is_err());
++        fixture.guard.admit_tool("fixture-turn", &ToolName::plain("view_image"), "configured", Some(1)).unwrap();
++        fixture.guard.verify_dispatched_tool("fixture-turn", &ToolName::plain("view_image"), "configured", Some(1)).unwrap();
++        let permissions = serde_json::from_value(fixture.guard.expected_permissions.clone()).unwrap();
++        fixture.guard.image_grant("configured", &fixture.guard.manifest.image_root.join("page-0000.png"), None, &permissions).unwrap();
++        fixture.guard.source_buffer("configured", &fixture.png).unwrap();
++        let payload = vec![9u8; 4_194_305];
++        fixture.guard.prepared_image(Some("configured"), &payload, "image/png", 2000, 1000, None).unwrap();
++        fixture.guard.assembled_image(Some("configured"), &ImageReference::Inline {
++            image_url: format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(&payload)),
++        }).unwrap();
++        assert_eq!(fixture.guard.ready_value()["image_limits"]["image_file_bytes"], 8_388_608);
++    }
++
++    #[test]
 +    fn document_sixty_fifth_tool_is_fatal_without_changing_page_child_counter() {
 +        let fixture = document_fixture(0);
 +        for ordinal in 1..=DOCUMENT_MAX_TOOLS {
@@ -3442,7 +3575,7 @@
 +        bytes[at] = b'e';
 +        fs::write(&pin.path, bytes).expect("same-size changed catalogue");
 +        let mut file = changed.guard.catalogue.as_ref().expect("catalogue").lock().expect("lock");
-+        assert_eq!(scan_catalogue(&mut file, pin, Some(Path::new("page-0001.png")))
++        assert_eq!(scan_catalogue(&mut file, pin, Some(Path::new("page-0001.png")), FRAME_LIMIT)
 +            .expect_err("same-size source change"), "native_document_catalogue_changed");
 +        drop(file);
 +        let unregistered = document_fixture(1);
@@ -3468,7 +3601,7 @@
 +        fs::set_permissions(&pin.path, fs::Permissions::from_mode(0o600)).expect("fixture permissions");
 +        fs::write(&pin.path, &replacement).expect("duplicate fixture");
 +        let changed_pin = ImageCataloguePin { sha256:digest(&replacement), ..pin.clone() };
-+        assert_eq!(open_catalogue(&changed_pin).expect_err("duplicate catalogue ID"),
++        assert_eq!(open_catalogue(&changed_pin, FRAME_LIMIT).expect_err("duplicate catalogue ID"),
 +            "native_document_catalogue_order_or_identity");
 +        let large = document_fixture(0);
 +        let pin = large.guard.manifest.image_catalog.as_ref().expect("pin");
@@ -3478,7 +3611,7 @@
 +        fs::write(&pin.path, &row).expect("oversized row");
 +        let changed_pin = ImageCataloguePin { bytes:row.len() as u64, sha256:digest(&row),
 +            count:1, ..pin.clone() };
-+        assert_eq!(open_catalogue(&changed_pin).expect_err("bounded row"),
++        assert_eq!(open_catalogue(&changed_pin, FRAME_LIMIT).expect_err("bounded row"),
 +            "native_document_catalogue_row_limit");
 +    }
 +

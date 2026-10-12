@@ -137,7 +137,8 @@ pub(super) fn expected(
         "standalone_app_server":profile.standalone_app_server,"codex_binary_sha256":profile.codex_binary_sha256,
         "descriptor_sha256":profile.descriptor_sha256,"permissions_template_sha256":profile.permissions_template_sha256,
         "tools_sha256":profile.tools_sha256,"instructions_sha256":profile.instructions_sha256,
-        "native_document_guard":{"schema":guard.schema,"source_sha256":guard.source_sha256,"contract_sha256":guard.contract_sha256}}),
+        "native_document_guard":{"schema":guard.schema,"source_sha256":guard.source_sha256,"contract_sha256":guard.contract_sha256,
+            "image_limits":guard.image_limits}}),
     );
     if let Some(seconds) = profile.max_seconds {
         generic["max_seconds"] = json!(seconds);
@@ -159,7 +160,12 @@ pub(super) fn expected(
         max_turns: 1,
         max_seconds,
         frame_bytes: 4_194_304,
-        image_transport_reserved_bytes: 33_554_432,
+        image_transport_reserved_bytes: control
+            .native_viewer
+            .as_ref()
+            .expect("validated native control")
+            .image_limits
+            .image_transport_bytes,
         rpc_transport_reserved_bytes: 33_554_432,
         receipt_schema: "gptgrep.native-document.receipt.v1".into(),
     })

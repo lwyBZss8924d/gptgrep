@@ -316,7 +316,11 @@ pub fn validate_ocr_task_metadata(task: &OcrTask) -> Result<()> {
             && task.budget.frame_bytes > 0
             && task.budget.frame_bytes <= 4_194_304
             && task.budget.transport_bytes > 0
-            && task.budget.transport_bytes <= 16_777_216,
+            && task.budget.transport_bytes
+                <= budget
+                    .native_image_limits()?
+                    .transport_bytes()?
+                    .max(16_777_216),
         "OCR host budget exceeds frozen M0 limits"
     );
     ensure!(
@@ -396,12 +400,18 @@ fn validate_native_delivery(
     delivery: &OcrImageDelivery,
     native: &OcrNativeImageDelivery,
 ) -> Result<()> {
+    let limits = task.budget.resources.native_image_limits()?;
     ensure!(
         task.budget.max_tool_calls == 8
             && task.budget.max_turns == 1
             && task.budget.max_seconds == 180
             && task.budget.frame_bytes == 4 * 1024 * 1024
-            && task.budget.transport_bytes == 16 * 1024 * 1024,
+            && task.budget.transport_bytes
+                >= task
+                    .budget
+                    .resources
+                    .native_image_limits()?
+                    .transport_bytes()?,
         "OCR native task budget changed"
     );
     let image = task
@@ -443,13 +453,13 @@ fn validate_native_delivery(
     }
     ensure!(
         native.prepared_image_bytes > 0
-            && native.prepared_image_bytes <= 4 * 1024 * 1024
+            && native.prepared_image_bytes <= limits.image_file_bytes
             && native.prepared_width > 0
             && native.prepared_height > 0
             && u64::from(native.prepared_width) * u64::from(native.prepared_height)
                 <= 16 * 1024 * 1024
             && native.image_content_wire_charge > native.prepared_image_bytes
-            && native.image_content_wire_charge <= 4 * 1024 * 1024,
+            && native.image_content_wire_charge <= limits.image_wire_bytes,
         "OCR native prepared image bounds"
     );
     match &native.reference {
@@ -578,7 +588,12 @@ pub fn validate_ocr_result_metadata(task: &OcrTask, result: &OcrPageResult) -> R
                 .checked_add(native.image_content_wire_charge)
                 .ok_or_else(|| anyhow::anyhow!("OCR native transport overflow"))?;
             ensure!(
-                native_wire <= 8 * 1024 * 1024,
+                native_wire
+                    <= task
+                        .budget
+                        .resources
+                        .native_image_limits()?
+                        .image_transport_bytes,
                 "OCR native image transport limit"
             );
             if let Some(crop) = &native.native_crop {

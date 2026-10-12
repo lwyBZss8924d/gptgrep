@@ -1449,6 +1449,10 @@ pub(crate) fn extract_sync(
                     layout_context: String::new(),
                     profile: OcrProfile::default(),
                     budget: OcrTaskBudget {
+                        transport_bytes: budget
+                            .native_image_limits()?
+                            .transport_bytes()?
+                            .max(OcrTaskBudget::default().transport_bytes),
                         resources: budget.clone(),
                         ..Default::default()
                     },

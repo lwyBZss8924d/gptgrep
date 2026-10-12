@@ -259,6 +259,7 @@ impl MultimodalArgs {
             || !(1..=4).contains(&options.max_concurrent_batches)
             || !(1..=1048576).contains(&options.max_output_bytes)
             || !(1..=524288).contains(&options.max_metadata_bytes)
+            || options.resources.image_file_bytes > gptgrep_jev::MAX_IMAGE_BYTES as u64
             || !min_score.is_finite()
             || !(0.0..=1.0).contains(&min_score)
             || options

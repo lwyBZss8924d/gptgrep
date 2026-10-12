@@ -1132,7 +1132,10 @@ mod tests {
             match kind {
                 0 => budget.images_per_page = 1,
                 1 => budget.image_pixels_per_page = 1,
-                _ => budget.image_file_bytes_per_page = one_image_bytes,
+                _ => {
+                    budget.image_file_bytes = one_image_bytes;
+                    budget.image_file_bytes_per_page = one_image_bytes;
+                }
             }
             let before = f.reader.meter.snapshot().unwrap();
             let error = f

@@ -7,7 +7,8 @@ use crate::ocr::{
 use crate::ocr_accounting::valid_digest;
 use anyhow::{Result, anyhow, ensure};
 use gptgrep_parse::{
-    NativeOcrCropProof, OcrImageDelivery, OcrNativeImageDelivery, OcrNativeImageReference, OcrTask,
+    NativeImageLimits, NativeOcrCropProof, OcrImageDelivery, OcrNativeImageDelivery,
+    OcrNativeImageReference, OcrTask, ResourceBudget,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -29,7 +30,6 @@ mod tests;
 pub(crate) const PROFILE_SCHEMA: &str = "gptgrep.ocr.runtime-profile.native.v1";
 pub(crate) const PERMISSIONS_ID: &str = "gptgrep_native_ocr";
 pub(crate) const RPC_BYTES: u64 = 8 * 1024 * 1024;
-const IMAGE_BYTES: u64 = 8 * 1024 * 1024;
 const FRAME_BYTES: u64 = 4 * 1024 * 1024;
 const RECEIPT_BYTES: u64 = 16 * 1024;
 const RECEIPT_SCHEMA: &str = "gptgrep.native-ocr.receipt.v1";
@@ -45,6 +45,7 @@ pub struct NativeViewerRuntimeProfile {
     pub permissions_policy_sha256: String,
     pub rpc_transport_bytes: u64,
     pub image_transport_reserved_bytes: u64,
+    pub image_limits: NativeImageLimits,
     pub accepted_qualification: Option<NativeOcrQualification>,
 }
 
@@ -91,6 +92,23 @@ impl OcrRuntimeProfile {
         codex_binary_sha256: String,
         guard_source_sha256: String,
     ) -> Result<Self> {
+        Self::unqualified_native_with_resources(
+            source_revision,
+            protocol_schema_sha256,
+            codex_binary_sha256,
+            guard_source_sha256,
+            &ResourceBudget::default(),
+        )
+    }
+
+    pub fn unqualified_native_with_resources(
+        source_revision: String,
+        protocol_schema_sha256: String,
+        codex_binary_sha256: String,
+        guard_source_sha256: String,
+        resources: &ResourceBudget,
+    ) -> Result<Self> {
+        let image_limits = resources.native_image_limits()?;
         let profile = Self {
             schema_version: PROFILE_SCHEMA.into(),
             source_revision,
@@ -105,7 +123,8 @@ impl OcrRuntimeProfile {
                 guard_contract_sha256: contract_sha256()?,
                 permissions_policy_sha256: permission_policy_sha256()?,
                 rpc_transport_bytes: RPC_BYTES,
-                image_transport_reserved_bytes: IMAGE_BYTES,
+                image_transport_reserved_bytes: image_limits.image_transport_bytes,
+                image_limits,
                 accepted_qualification: None,
             }),
         };
@@ -129,9 +148,10 @@ pub(crate) fn validate_profile(profile: &OcrRuntimeProfile) -> Result<()> {
             && native.guard_contract_sha256 == contract_sha256()?
             && native.permissions_policy_sha256 == permission_policy_sha256()?
             && native.rpc_transport_bytes == RPC_BYTES
-            && native.image_transport_reserved_bytes == IMAGE_BYTES,
+            && native.image_transport_reserved_bytes == native.image_limits.image_transport_bytes,
         "ocr_native_profile_contract"
     );
+    native.image_limits.validate()?;
     if let Some(accepted) = &native.accepted_qualification {
         // Avoid recursive profile.validate -> profile.sha256 -> profile.validate.
         let mut binding = profile.clone();
@@ -159,7 +179,13 @@ pub(crate) fn validate_task_budget(task: &OcrTask) -> Result<()> {
             && task.budget.max_turns == 1
             && task.budget.max_seconds == 180
             && task.budget.frame_bytes == FRAME_BYTES
-            && task.budget.transport_bytes == RPC_BYTES + IMAGE_BYTES,
+            && task.budget.transport_bytes
+                == task
+                    .budget
+                    .resources
+                    .native_image_limits()?
+                    .transport_bytes()?
+                    .max(16_777_216),
         "ocr_native_task_budget_changed"
     );
     ensure!(
@@ -174,12 +200,23 @@ pub(crate) fn validate_task_budget(task: &OcrTask) -> Result<()> {
     );
     Ok(())
 }
+pub(crate) fn validate_resource_profile(task: &OcrTask, profile: &OcrRuntimeProfile) -> Result<()> {
+    let limits = task.budget.resources.native_image_limits()?;
+    ensure!(
+        profile
+            .native_viewer
+            .as_ref()
+            .is_some_and(|native| native.image_limits == limits),
+        "ocr_native_resource_profile_limits_changed"
+    );
+    Ok(())
+}
 fn contract_sha256() -> Result<String> {
     Ok(hash(&serde_json::to_vec(&json!({
         "schema_version":"gptgrep.ocr.native-host-contract.v1",
         "manifest":MANIFEST_SCHEMA,"ready":"gptgrep.native-ocr.ready.v1","receipt":RECEIPT_SCHEMA,
         "max_tool_calls":8,"max_turns":1,"max_seconds":180,"frame_bytes":FRAME_BYTES,
-        "rpc_bytes":RPC_BYTES,"image_bytes":IMAGE_BYTES,
+        "rpc_bytes":RPC_BYTES,"image_limits":"resource_budget_derived_v1",
         "counter":"before_lookup_hooks_handler","native_tool":"view_image",
         "tool_counter_before_argument_parse":true,
         "normalized_request_profile_verified_before_send":true,
@@ -294,6 +331,7 @@ impl NativeOcrSession {
         original_deadline: u64,
     ) -> Result<Self> {
         validate_task_budget(&page.task)?;
+        let image_limits = page.task.budget.resources.native_image_limits()?;
         gptgrep_parse::validate_native_crop_set(&page.task, &page.native_crops)?;
         ensure!(valid_digest(runtime), "ocr_native_runtime_binding");
         let working = page.service_working();
@@ -303,16 +341,29 @@ impl NativeOcrSession {
             .transpose()?;
         // Include all retained crop capacities and host proof copies before
         // allocating/copying. This remains a logical envelope, not process RSS.
-        let crop_held = (page.native_crops.len() as u64)
-            .checked_mul(page.task.budget.resources.image_file_bytes + 65_536)
+        let crop_held = page
+            .task
+            .budget
+            .resources
+            .image_file_bytes
+            .checked_add(65_536)
+            .and_then(|bytes| bytes.checked_mul(page.native_crops.len() as u64))
             .ok_or_else(|| anyhow!("ocr_native_crop_working_limit"))?;
         for image in &page.task.images {
             let copy = u64::from(image.width)
                 .checked_mul(u64::from(image.height))
                 .and_then(|n| n.checked_mul(8))
                 .and_then(|n| n.checked_add(page.task.budget.resources.image_pixel_buffer_bytes))
-                .and_then(|n| n.checked_add(image.artifact.bytes * 3 + 65_536))
-                .and_then(|n| n.checked_add(crop_held + 64 * 1024 * 42 + 4096))
+                .and_then(|n| {
+                    image
+                        .artifact
+                        .bytes
+                        .checked_mul(3)
+                        .and_then(|b| b.checked_add(n))
+                })
+                .and_then(|n| n.checked_add(65_536))
+                .and_then(|n| n.checked_add(crop_held))
+                .and_then(|n| n.checked_add(64 * 1024 * 42 + 4096))
                 .ok_or_else(|| anyhow!("ocr_native_crop_working_limit"))?;
             ensure!(
                 copy <= page.task.budget.resources.owned_working_bytes,
@@ -359,7 +410,7 @@ impl NativeOcrSession {
         for (index, image) in page.task.images.iter().enumerate() {
             ensure!(
                 image.artifact.bytes > 0
-                    && image.artifact.bytes <= FRAME_BYTES
+                    && image.artifact.bytes <= image_limits.image_file_bytes
                     && u64::from(image.width) * u64::from(image.height) <= 16 * 1024 * 1024,
                 "ocr_native_source_image_limit"
             );
@@ -369,7 +420,14 @@ impl NativeOcrSession {
                 .and_then(|bytes| {
                     bytes.checked_add(page.task.budget.resources.image_pixel_buffer_bytes)
                 })
-                .and_then(|bytes| bytes.checked_add(image.artifact.bytes * 3 + 65_536))
+                .and_then(|bytes| {
+                    image
+                        .artifact
+                        .bytes
+                        .checked_mul(3)
+                        .and_then(|n| n.checked_add(bytes))
+                })
+                .and_then(|bytes| bytes.checked_add(65_536))
                 .ok_or_else(|| anyhow!("ocr_native_copy_working_limit"))?;
             let _copy_lease = working
                 .as_ref()
@@ -422,7 +480,8 @@ impl NativeOcrSession {
             "source_sha256":page.task.source_sha256,"prepared_sha256":page.task.prepared_sha256,
             "runtime_profile_sha256":runtime,"deadline_unix_ms":deadline_unix_ms,
             "max_tool_calls":8,"max_turns":1,"frame_bytes":FRAME_BYTES,
-            "image_transport_reserved_bytes":IMAGE_BYTES,
+            "image_transport_reserved_bytes":image_limits.image_transport_bytes,
+            "image_limits":image_limits,
             "image_root":image_root,"receipt_root":receipt_root,
             "permissions_profile_sha256":permission_sha,"images":grants
         });
@@ -785,7 +844,8 @@ fn ready_value(manifest: &Value, digest: &str) -> Value {
         "permissions_profile_id":PERMISSIONS_ID,"permissions_profile_sha256":manifest["permissions_profile_sha256"],
         "environment_ids":["local"],"environment_id_argument_admitted":false,
         "max_tool_calls":8,"max_turns":1,"max_seconds":180,"deadline_unix_ms":manifest["deadline_unix_ms"],
-        "frame_bytes":FRAME_BYTES,"image_transport_reserved_bytes":IMAGE_BYTES,
+        "frame_bytes":FRAME_BYTES,"image_transport_reserved_bytes":manifest["image_transport_reserved_bytes"],
+        "image_limits":manifest["image_limits"],
         "tool_counter_before_lookup_hooks_handler":true,"native_image_read_bounded":true,
         "tool_counter_before_argument_parse":true,
         "normalized_request_profile_verified_before_send":true,
@@ -906,6 +966,11 @@ fn validate_receipts(
     turn: &str,
     task: &OcrTask,
 ) -> Result<Vec<OcrImageDelivery>> {
+    let image_limits = task.budget.resources.native_image_limits()?;
+    ensure!(
+        manifest["image_limits"] == serde_json::to_value(&image_limits)?,
+        "ocr_native_image_limits_changed"
+    );
     let count = mediated
         .len()
         .checked_add(native.len())
@@ -1020,13 +1085,13 @@ fn validate_receipts(
             .ok_or_else(|| anyhow!("ocr_native_prepared_digest"))?;
         ensure!(
             payload_bytes > 0
-                && payload_bytes <= FRAME_BYTES
+                && payload_bytes <= image_limits.image_file_bytes
                 && width > 0
                 && height > 0
                 && u64::from(width) * u64::from(height) <= 16 * 1024 * 1024
                 && wire > payload_bytes
-                && wire <= FRAME_BYTES
-                && cumulative <= IMAGE_BYTES,
+                && wire <= image_limits.image_wire_bytes
+                && cumulative <= image_limits.image_transport_bytes,
             "ocr_native_prepared_bounds"
         );
         ensure!(
@@ -1124,7 +1189,7 @@ fn validate_receipts(
             .checked_add(wire)
             .ok_or_else(|| anyhow!("ocr_native_transport_overflow"))?;
         ensure!(
-            cumulative == total && total <= IMAGE_BYTES,
+            cumulative == total && total <= image_limits.image_transport_bytes,
             "ocr_native_cumulative_transport"
         );
     }

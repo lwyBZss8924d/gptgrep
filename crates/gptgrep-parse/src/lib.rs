@@ -61,7 +61,7 @@ pub use ocr_compat::{
     compatibility_task_digest, validate_compatibility_result,
 };
 pub use office::{is_office_extension, office_preparation_profile_digest};
-pub use resource::ResourceBudget;
+pub use resource::{NativeImageLimits, ResourceBudget};
 pub use rich::native_text_metadata::{
     NATIVE_FONT_WORD_RECIPE, NativeBounds, NativeCharacter, NativeFontInfo, NativeGeometry,
     NativeTextMetadata, native_font_word_profile_digest, validate_native_text_metadata,

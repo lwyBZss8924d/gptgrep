@@ -475,7 +475,7 @@ async fn char_and_raster_limits_reject_before_their_output_artifacts() {
             .await
             .unwrap_err()
             .to_string()
-            .contains("image exceeds frozen")
+            .contains("image exceeds admitted")
     );
     assert!(
         !std::fs::read_dir(prepared.staging_root())

@@ -38,6 +38,64 @@ fn profile() -> OcrRuntimeProfile {
 }
 
 #[test]
+fn configured_page_admits_real_png_above_default_and_binds_profile_manifest_ready() {
+    let mut fixture = Fixture::new();
+    let png = crate::ocr_tests::configured_image_fixture_png();
+    let resources = &mut fixture.task.budget.resources;
+    resources.image_file_bytes = 4_194_304;
+    resources.image_base64_bytes = 5_592_408;
+    resources.image_file_bytes_per_page = 4_194_304;
+    let image = &mut fixture.task.images[0];
+    fs::write(&image.path, &png).unwrap();
+    image.width = 1024;
+    image.height = 1024;
+    image.artifact.bytes = png.len() as u64;
+    image.artifact.sha256 = hash(&png);
+    image.artifact.id = gptgrep_parse::artifact_id(
+        &fixture.task.source_sha256,
+        &image.artifact.profile_sha256,
+        &image.artifact.kind,
+        Some(1),
+        None,
+        &image.artifact.sha256,
+    )
+    .unwrap();
+    fixture.task.task_sha256 = gptgrep_parse::ocr_task_digest(&fixture.task).unwrap();
+    fixture.task.id = format!("ocr-{}", fixture.task.task_sha256);
+    let selected = OcrRuntimeProfile::unqualified_native_with_resources(
+        "a".repeat(40),
+        H.into(),
+        H.into(),
+        H.into(),
+        &fixture.task.budget.resources,
+    )
+    .unwrap();
+    validate_resource_profile(&fixture.task, &selected).unwrap();
+    assert!(validate_resource_profile(&fixture.task, &profile()).is_err());
+    assert_ne!(selected.sha256().unwrap(), profile().sha256().unwrap());
+    assert!(!selected.image_qualification_accepted());
+    let native = session(&fixture);
+    assert_eq!(
+        native.manifest["image_limits"],
+        serde_json::to_value(&selected.native_viewer.unwrap().image_limits).unwrap()
+    );
+    assert_eq!(
+        native.ready["image_limits"],
+        native.manifest["image_limits"]
+    );
+    assert_eq!(native.grants[0].bytes, png.len() as u64);
+    assert_eq!(
+        fs::read(native.image_root.join("image-1.png")).unwrap(),
+        png
+    );
+    let mut lower = fixture.task.clone();
+    lower.budget.resources = ResourceBudget::default();
+    lower.task_sha256 = gptgrep_parse::ocr_task_digest(&lower).unwrap();
+    lower.id = format!("ocr-{}", lower.task_sha256);
+    assert!(PreparedPage::new(lower, fixture.dir.path()).is_err());
+}
+
+#[test]
 fn native_structured_output_declares_scalar_types_and_preserves_exact_identities() {
     let fixture = Fixture::new();
     let schema = crate::ocr_protocol::native_output_schema(&fixture.task);
@@ -420,10 +478,7 @@ fn native_contract_requires_fresh_crop_profile_qualification_while_guard_abi_sta
     assert!(INSTRUCTIONS.contains("never a substitute for an original image"));
     assert!(INSTRUCTIONS.contains("never crop coordinates"));
     assert_eq!(MANIFEST_SCHEMA, "gptgrep.native-ocr.admission.v1");
-    assert_eq!(
-        (FRAME_BYTES, RPC_BYTES, IMAGE_BYTES),
-        (4 * 1024 * 1024, 8 * 1024 * 1024, 8 * 1024 * 1024)
-    );
+    assert_eq!((FRAME_BYTES, RPC_BYTES), (4 * 1024 * 1024, 8 * 1024 * 1024));
     let mut stale = candidate.clone();
     stale.native_viewer.as_mut().unwrap().guard_contract_sha256 = H.into();
     assert!(stale.validate().is_err());
@@ -726,9 +781,23 @@ fn standalone_command_uses_exact_leaf_permissions_and_separate_native_partition(
     ));
     assert_eq!(
         native.manifest["image_transport_reserved_bytes"],
-        json!(IMAGE_BYTES)
+        json!(
+            fixture
+                .task
+                .budget
+                .resources
+                .native_image_limits()
+                .unwrap()
+                .image_transport_bytes
+        )
     );
-    assert_eq!(RPC_BYTES + IMAGE_BYTES, fixture.task.budget.transport_bytes);
+    assert!(
+        RPC_BYTES
+            + native.manifest["image_transport_reserved_bytes"]
+                .as_u64()
+                .unwrap()
+            <= fixture.task.budget.transport_bytes
+    );
     let mut changed = fixture.task.clone();
     changed.budget.max_tool_calls = 9;
     assert!(validate_task_budget(&changed).is_err());

@@ -299,6 +299,11 @@ fn per_source_native_image_receipt_admission_and_catalogue_scopes_cannot_be_reus
             image_catalog_path: fixture.base.join(format!("catalog-{index}.ndjson")),
             owner_admission_sha256: "a".repeat(64),
             image_wire_bytes: 33554432,
+            image_limits: gptgrep_host::parse_agent_driver::document_native_image_limits(
+                &gptgrep_parse::ResourceBudget::default(),
+                33_554_432,
+            )
+            .unwrap(),
         });
         loaded.insert(
             format!("source-{index}"),

@@ -600,6 +600,7 @@ pub fn prepare_rich_multimodal_search(
             && (1..=4).contains(&options.max_concurrent_batches)
             && (1..=MAX_OUTPUT).contains(&options.max_output_bytes)
             && (1..=MAX_METADATA).contains(&options.max_metadata_bytes)
+            && options.resources.image_file_bytes <= gptgrep_jev::MAX_IMAGE_BYTES as u64
             && options.min_score.is_finite()
             && (0.0..=1.0).contains(&options.min_score)
             && options

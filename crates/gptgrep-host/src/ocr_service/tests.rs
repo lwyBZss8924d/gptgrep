@@ -293,6 +293,33 @@ async fn in_memory_http_auth_mode_body_and_busy_refuse_before_execution() {
         .is_empty()
     );
 }
+
+#[tokio::test]
+async fn larger_native_image_configuration_does_not_expand_http_compatibility_body() {
+    let root = private_root();
+    let mut service = service(root.path());
+    let resources = &mut Arc::get_mut(&mut service).unwrap().resources;
+    resources.image_file_bytes = 4_194_304;
+    resources.image_base64_bytes = 5_592_408;
+    resources.validate().unwrap();
+    let request = Request::builder()
+        .method("POST")
+        .uri("/ocr")
+        .header("content-type", "multipart/form-data; boundary=fixed")
+        .header("authorization", "Bearer 12345678901234567890123456789012")
+        .body(Full::new(Bytes::from(vec![
+            0;
+            1_048_576
+                + MULTIPART_OVERHEAD
+                + 1
+        ])))
+        .unwrap();
+    assert_eq!(
+        service.handle(request).await.status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert!(service.jobs.lock().unwrap().is_empty());
+}
 #[test]
 fn durable_claim_unknown_cache_digest_and_phase_capacity_are_preserved() {
     let dir = private_root();

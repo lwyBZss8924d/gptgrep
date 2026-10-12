@@ -74,6 +74,8 @@ struct Control {
     authorization_receipt_sha256: String,
     timeout_seconds: u64,
     #[serde(default)]
+    resources: ResourceBudget,
+    #[serde(default)]
     original_clock: Option<RunClockAnchor>,
 }
 
@@ -208,6 +210,7 @@ impl Evidence {
 }
 
 fn validate(control: &Control) -> Result<()> {
+    control.resources.validate()?;
     ensure!(
         control.schema == "gptgrep.native-page-probe.control.v1"
             && (1..=900).contains(&control.timeout_seconds)
@@ -305,7 +308,7 @@ fn validate(control: &Control) -> Result<()> {
             ),
             "probe_raster_source_required"
         );
-        verify_pin(source, ResourceBudget::default().image_file_bytes)?;
+        verify_pin(source, control.resources.image_file_bytes)?;
     }
     verify_pin(&control.native_binary, 1_073_741_824)?;
     verify_pin(&control.profile.guard_source, 4_194_304)?;
@@ -313,11 +316,12 @@ fn validate(control: &Control) -> Result<()> {
 }
 
 fn runtime_profile(control: &Control) -> Result<OcrRuntimeProfile> {
-    OcrRuntimeProfile::unqualified_native(
+    OcrRuntimeProfile::unqualified_native_with_resources(
         control.profile.source_revision.clone(),
         control.profile.protocol_schema_sha256.clone(),
         control.native_binary.sha256.clone(),
         control.profile.guard_source.sha256.clone(),
+        &control.resources,
     )
 }
 
@@ -393,7 +397,7 @@ async fn run(control: &Control, control_sha256: &str, evidence: &mut Evidence) -
         "runtime_profile":profile,"runtime_profile_sha256":runtime_sha,
         "qualification_accepted":false,"actual_served_profile_verified":false}),
     )?;
-    let budget = ResourceBudget::default();
+    let budget = control.resources.clone();
     let mut arms = Vec::with_capacity(2);
     // Prepare and validate BOTH complete sources before the first model call.
     for source in &control.sources {

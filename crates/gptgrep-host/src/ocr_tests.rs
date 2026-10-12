@@ -23,6 +23,24 @@ use tokio::io::{AsyncWrite, BufReader};
 
 const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
+pub(crate) fn configured_image_fixture_png() -> Vec<u8> {
+    let mut seed = 17u32;
+    let pixels = (0..1024 * 1024 * 3)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        })
+        .collect::<Vec<_>>();
+    let mut png = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(&pixels, 1024, 1024, image::ExtendedColorType::Rgb8)
+        .unwrap();
+    assert!(png.len() > 1_048_576 && png.len() <= 4_194_304);
+    png
+}
+
 pub(crate) struct Fixture {
     pub dir: tempfile::TempDir,
     pub task: OcrTask,

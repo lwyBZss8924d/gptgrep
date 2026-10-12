@@ -8,15 +8,24 @@ The branch is a collaboration snapshot, not an accepted first release.
 
 ## Goal and current cursor
 
-The goal is a complete local agent search harness: whole-document parsing in
-bounded batches, native multimodal OCR, source-bound document trees and tgrep,
-Decisions routing/reranking, and actual Codex retrieval. The selected comparison
-is **GPTgrep + Codex versus the same bare Codex reader**, over 62 tasks and 34
-documents, producing 124 paired SEARCH trials. INDEX preparation is excluded
-from the primary SEARCH reward and cost and reported separately.
+The core optimization goal is the actual **GPTgrep harness versus bare Codex
+ablation study**: the same Codex reader over **62 tasks and 34 documents**,
+producing **124 paired SEARCH trials**, followed by Judge and failure analysis.
+INDEX preparation is excluded from the primary SEARCH reward and cost and
+reported separately. Whole-document parsing, native PTC OCR, document trees,
+tgrep and Decisions routing/reranking support this comparison; component
+completion does not complete the goal.
 
 The current cursor is **repair and validate native parse/OCR/index → complete the
 frozen index → run paired SEARCH → Judge → analyze failures → next Opt**.
+The required parsing/OCR workflow is full native PTC coding with native built-ins,
+shell, `view_image`, CV and Skills through the available GPTgrep, tgrep and lit
+CLIs/APIs, without requiring a fixed sequence of GPTgrep tool calls.
+The current fixed Page/Document tool allowlists leave that requirement open;
+their guard checks and qualifications cover scoped components only. New fixed
+Page/Document qualifications are not prerequisites for the mainline PTC work.
+Job resource choices belong in configuration, while authentication, sandbox and
+evaluator custody remain enforced.
 The full comparison has not run. No measured retrieval advantage is claimed.
 The independent PageIndex G5 first-release gate remains **HOLD**; its thresholds
 are unchanged in [SPEC](../SPEC.md).
@@ -29,7 +38,7 @@ establish a retrieval advantage.
 | --- | --- | --- |
 | D1 | Pinned embedded engine with exact regex parity | **Done, scoped.** tgrep 1.1.0 source/license identity, indexed/direct parity and explicit rebuild boundary accepted |
 | D2 | Typed concurrent Decisions with verified image transport | **Done, scoped.** Text/image transport, wire contract, shared accounting and failure handling accepted; provider failures and unknown usage retained |
-| D3 | Source-bound rich parsing and v2 artifact manifest | **Active.** Earlier parsing criteria remain accepted; complete native viewer/Document-agent/OCR/index integration and the 34-document generation still require acceptance |
+| D3 | Source-bound rich parsing and v2 artifact manifest | **Active.** Earlier parsing criteria remain accepted; full native PTC coding for parsing/OCR, complete index integration and the 34-document generation still require acceptance |
 | D4 | Explicit OCR completes all required content before publication | **Done, scoped.** OCR contract and component acceptance retained; every required task must still succeed before a new full generation can publish |
 | D5 | Generation-pinned batch operations with shared reader | **Done, scoped.** Stable batch order, item/global errors, bounded output, cursors and shared ledger behavior accepted |
 | D6 | Visual recall, reranking and delivered evidence citations | **Active.** Independent visual retrieval, source-bound crops and reader citation checks implemented; current live integration and utility remain to be established |
@@ -53,13 +62,17 @@ historical verdicts. This compact projection records their aggregate outcomes.
 | 2026-10-11, historical full34 attempt | OCR response contained eight unplanned region IDs for one planned region; terminal failure after about 131 seconds | Original failure retained; later region-binding acceptance does not qualify a complete generation |
 | 2026-10-12, earlier integrated source round | Integrated source checks passed: 986 Rust tests, 4 ignored; formatting, Clippy, 11 offline cases, 71 full62 wrapper tests and 25 Node wrapper tests, with 1 skipped. CLI release build completed | OCR and Decisions source changes received scoped independent review; complete native document integration remains active |
 | 2026-10-12, native Page OCR | Fresh live run passed 2/2 synthetic image cases in about 81 seconds; original region IDs and bounding boxes matched exactly | Independent review accepted image delivery, region binding and paired image influence only; full34/full62 acceptance remains pending |
-| 2026-10-12, latest full34 attempt | Terminal failure after 750.688 seconds: ten complete OCR pages, one partial required region and eleven terminal OCR reservations; no generation published | Required content remains incomplete; a new 200-DPI single-page experiment tests a generic 100-DPI legibility hypothesis, not an accepted fix |
+| 2026-10-12, latest full34 attempt | Terminal failure after 750.688 seconds: ten complete OCR pages, one partial required region and eleven terminal OCR reservations; no generation published | All 34 documents remain unpublished; the next evidence must exercise the full native PTC parsing/OCR workflow and configured image resources |
 | 2026-10-12, current Python wrapper round | All 80 full62 wrapper tests passed; the wrapper generates and verifies all 124 tasks using the selected seed, randomized pair order and within-pair arm order | Source evidence only; the actual full62 export, SEARCH and Judge remain pending, and G5 remains HOLD |
-| 2026-10-12, private Decisions integration | Per-trial preparation and request-ID isolation repair received scoped source acceptance; the actual private Linux build and 13 tests passed | Package qualification and actual Ask remain pending; source acceptance does not establish live integration or full62 acceptance |
+| 2026-10-12, configured image resources | Workspace checks passed 994 Rust tests with 4 ignored, formatting, Clippy and 11 offline evaluation cases. The CLI and qualification probe built, and the patched native guard built with 23 native tests passing | Scoped fixed-guard source and synthetic validation only; full native PTC parsing/OCR remains active, and earlier live qualifications do not qualify the new tuple |
+| 2026-10-12, direct native extraction | One complete PDF at 200 DPI produced all 16 PNG pages under the configured 4 MiB per-image limit: largest 2,976,169 bytes, total 30,425,938 bytes; no OCR invoked | Confirms parsing and encoded-image admission for this source; OCR legibility and complete-document acceptance remain pending |
+| 2026-10-12, private Decisions integration | Per-trial preparation and request-ID isolation repair received scoped source acceptance; the private Linux build and 13 tests passed. A current-source Ask received two real known-settled Decisions responses, totaling $0.0001347 | Native reader permission projection failed before `turn/start`; Ask, complete SEARCH/Judge and full62 remain unaccepted |
 
-The next Opt step is to test the image-legibility hypothesis and validate the
-complete native document pipeline, publish the complete frozen index, then
-execute all 124 SEARCH trials and their separate Judge stage.
+The next Opt step is the smallest full native PTC parsing/OCR implementation and
+actual qualification using the configured image limits, plus repair of the native
+reader permission projection. OCR legibility, the complete native document
+pipeline and the frozen index must then pass before all 124 SEARCH trials and
+their separate Judge stage.
 
 ## Recent checks and retained failures
 
@@ -78,9 +91,26 @@ trial and no retries. The actual full62 export and concrete task sequence still
 need to be generated and verified before launch. The private
 per-trial Decisions preparation and request-ID isolation repair received
 independent acceptance within its source scope. Its actual private Linux build
-and **13 tests** passed; package qualification and an actual Ask remain pending.
-These results are separate from the earlier Rust, offline and Node checks and do
-not establish complete SEARCH/Judge or live retrieval acceptance.
+and **13 tests** passed. A current-source Ask received **two real known-settled
+Decisions responses**, totaling **$0.0001347**, but the native reader permission
+projection failed before `turn/start`. This does not establish accepted Ask or
+complete SEARCH/Judge. These results are separate from the earlier Rust, offline
+and Node checks.
+
+The configurable image-resource round passed **994 Rust tests**, with **0 failed**
+and **4 ignored**, plus formatting and Clippy with warnings denied. Its frozen
+CLI passed **11 offline evaluation cases** with **zero provider requests**.
+The focused parser and host/CLI results are included in that workspace count;
+they are not additional tests. The normal CLI and native Page qualification probe
+built, and the patched native guard built and passed **23 native tests**. The
+parser's encoded image-file, base64 and per-page capacities
+now come from the existing parse-agent control; native Page and Document profiles
+bind the selected limits through admission and readiness evidence. The previous
+1 MiB value remains the default. Decisions and the HTTP `/ocr` compatibility
+endpoint retain their separate 1 MiB image contracts. See the
+[configuration example](architecture.md#prepared-document-agent). These focused
+fixed-guard checks do not carry forward earlier live qualification to the new
+binary/profile tuple or establish the required full native PTC parsing/OCR.
 
 The first full-workspace run encountered a busy OCR ledger lock. A direct
 filesystem experiment showed that an inherited descriptor could retain the
@@ -104,11 +134,16 @@ index or the paired SEARCH experiment.
 
 The latest full34 attempt failed after **750.688 seconds**. It completed OCR for
 **ten pages**, left **one required region partial**, and recorded **eleven terminal
-OCR reservations**. It published **no generation**. A new single-page experiment
-at **200 DPI** is testing the generic hypothesis that **100-DPI** input limits
-image legibility. This hypothesis is not an accepted fix, and the original
-131-second region-ID failure remains in the retained history. The complete
-full62 SEARCH/Judge comparison remains pending; **G5 remains HOLD**.
+OCR reservations**. It published **no generation**; all **34 documents** remain
+unpublished. A bounded higher-resolution extraction isolated the encoded PNG
+writer's 1 MiB cap as its failure, after raster geometry admission. With the
+configured 4 MiB capacity, direct native extraction of **one complete PDF at
+200 DPI** produced **16/16 PNG pages**, with a largest image of **2,976,169 bytes**
+and **30,425,938 total bytes**. No OCR or model ran in that extraction check.
+The generic hypothesis that **100-DPI** input limits OCR legibility remains
+unproven; actual native PTC OCR qualification and the selected 200-DPI experiment
+remain pending. The original 131-second region-ID failure remains in the retained
+history. Complete full62 SEARCH/Judge remains pending; **G5 remains HOLD**.
 
 Earlier image, OCR timeout, parsing, source-review and build failures remain in
 the private experiment history. This document publishes aggregate outcomes only;

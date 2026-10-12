@@ -34,6 +34,8 @@ const MULTIPART_OVERHEAD: usize = 16_384;
 const RESPONSE_BYTES: usize = 262_144;
 const CATALOG_BYTES: usize = 8_388_608;
 const CLAIM_BYTES: usize = 1_048_576;
+// The public /ocr compatibility contract is independent of native page OCR.
+const COMPATIBILITY_IMAGE_BYTES: u64 = 1_048_576;
 pub(crate) mod working;
 use working::{LeasedResponse, WorkingBudget, WorkingLease};
 // Retained roots/profiles, two headers, and eight bounded HTTP/error buffers.
@@ -462,8 +464,15 @@ impl Service {
             .try_acquire_owned()
             .map_err(|_| ServiceFailure::Busy)?;
         let content = single_header(&parts.headers, header::CONTENT_TYPE)?;
+        let compatibility_image_limit = usize::try_from(
+            self.resources
+                .image_file_bytes
+                .min(COMPATIBILITY_IMAGE_BYTES),
+        )?;
         let body_limit = if compatibility {
-            usize::try_from(self.resources.image_file_bytes)? + MULTIPART_OVERHEAD
+            compatibility_image_limit
+                .checked_add(MULTIPART_OVERHEAD)
+                .ok_or(ServiceFailure::BodyLimit)?
         } else {
             TASK_BYTES
         };
@@ -505,8 +514,7 @@ impl Service {
                 self.compatibility.is_some(),
                 ServiceFailure::ModeUnavailable
             );
-            let image =
-                parse_multipart(&content, &bytes, self.resources.image_file_bytes as usize)?;
+            let image = parse_multipart(&content, &bytes, compatibility_image_limit)?;
             let (width, height) = png_header(&image.bytes, &self.resources)?;
             // Header/count admission precedes the decoder and every later native buffer.
             lease.grow_to(

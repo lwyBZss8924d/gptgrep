@@ -954,6 +954,7 @@ fn named_permissions_expose_only_the_private_image_directory() -> Result<()> {
         image_catalog_path: "/synthetic/catalog.ndjson".into(),
         owner_admission_sha256: "a".repeat(64),
         image_wire_bytes: 33_554_432,
+        image_limits: document_native_image_limits(&ResourceBudget::default(), 33_554_432).unwrap(),
     };
     let policy = document_permissions_config(Some(&native));
     let text = policy.to_string();
@@ -1075,6 +1076,7 @@ fn legacy_document_ready_cannot_authorize_a_turn_or_weaken_the_manifest_abi() ->
         image_catalog_path: root.join("catalog.ndjson"),
         owner_admission_sha256: "3".repeat(64),
         image_wire_bytes: 33_554_432,
+        image_limits: document_native_image_limits(&ResourceBudget::default(), 33_554_432).unwrap(),
     };
     let mut session = native::NativeSession::prepare(
         &native,
@@ -1085,7 +1087,7 @@ fn legacy_document_ready_cannot_authorize_a_turn_or_weaken_the_manifest_abi() ->
     )?;
     let manifest_bytes = fs::read(&native.admission_path)?;
     let manifest: Value = serde_json::from_slice(&manifest_bytes)?;
-    assert_eq!(manifest.as_object().expect("manifest object").len(), 15);
+    assert_eq!(manifest.as_object().expect("manifest object").len(), 16);
     assert!(manifest.get("max_seconds").is_none());
     let ready = json!({"schema_version":"gptgrep.native-document.ready.v1","required":true,
         "admission_sha256":sha(&manifest_bytes),"task_sha256":backend.prepared.task_sha256,
@@ -1093,7 +1095,7 @@ fn legacy_document_ready_cannot_authorize_a_turn_or_weaken_the_manifest_abi() ->
         "runtime_profile_sha256":config.runtime_profile.sha256,"permissions_profile_id":"gptgrep_native_document",
         "permissions_profile_sha256":manifest["permissions_profile_sha256"],"environment_ids":["local"],
         "environment_id_argument_admitted":false,"max_tool_calls":64,"max_turns":1,"max_seconds":900,
-        "deadline_unix_ms":manifest["deadline_unix_ms"],"frame_bytes":4_194_304,"image_transport_reserved_bytes":33_554_432,
+        "deadline_unix_ms":manifest["deadline_unix_ms"],"frame_bytes":4_194_304,"image_transport_reserved_bytes":33_554_432,"image_limits":manifest["image_limits"],
         "tool_counter_before_lookup_hooks_handler":true,"tool_counter_before_argument_parse":true,
         "normalized_request_profile_verified_before_send":true,"native_image_read_bounded":true,
         "assembled_image_receipts_required":true,"requested_model":"gpt-6-luna","requested_effort":"max",
@@ -1128,6 +1130,9 @@ struct RetainedNativeBackend {
 }
 #[cfg(unix)]
 impl DocumentBackend for RetainedNativeBackend {
+    fn resource_budget(&self) -> ResourceBudget {
+        self.resources.clone()
+    }
     fn prepared(&self) -> &DocumentPreparedState {
         self.inner.prepared()
     }
@@ -1150,6 +1155,58 @@ impl DocumentBackend for RetainedNativeBackend {
     fn verify_complete(&self) -> Result<DocumentVerifiedProduct> {
         self.inner.verify_complete()
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn document_image_configuration_binds_original_resources_before_catalog_writes() -> Result<()> {
+    let (_temporary, config, mut native, mut backend) = retained_native_fixture()?;
+    let png = crate::ocr_tests::configured_image_fixture_png();
+    let image = &mut backend.inner.images[0];
+    fs::write(&image.copied_path, &png)?;
+    image.width = 1024;
+    image.height = 1024;
+    image.artifact.bytes = png.len() as u64;
+    image.artifact.sha256 = sha(&png);
+    backend.resources.image_file_bytes = 4_194_304;
+    backend.resources.image_base64_bytes = 5_592_408;
+    native.image_limits =
+        document_native_image_limits(&backend.resources, native.image_wire_bytes)?;
+    assert!(native.image_limits.image_wire_bytes > 4_194_304);
+    let mut wrong = native.clone();
+    wrong.image_limits.image_file_bytes -= 1;
+    assert!(
+        native::NativeSession::prepare(
+            &wrong,
+            &config,
+            &backend,
+            &DocumentWorking::new(67_108_864),
+            Instant::now() + Duration::from_secs(30)
+        )
+        .is_err()
+    );
+    assert!(!native.admission_path.exists());
+    assert!(!native.image_catalog_path.exists());
+    let _session = native::NativeSession::prepare(
+        &native,
+        &config,
+        &backend,
+        &DocumentWorking::new(67_108_864),
+        Instant::now() + Duration::from_secs(30),
+    )?;
+    let manifest: Value = serde_json::from_slice(&fs::read(&native.admission_path)?)?;
+    assert_eq!(
+        manifest["image_limits"],
+        serde_json::to_value(&native.image_limits)?
+    );
+    assert_eq!(
+        manifest["image_transport_reserved_bytes"],
+        native.image_wire_bytes
+    );
+    let catalog: Value = serde_json::from_slice(&fs::read(&native.image_catalog_path)?)?;
+    assert_eq!(catalog["bytes"], png.len());
+    assert_eq!(catalog["sha256"], sha(&png));
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1204,6 +1261,7 @@ fn retained_native_fixture() -> Result<(
         image_catalog_path: root.join("catalog.ndjson"),
         owner_admission_sha256: "3".repeat(64),
         image_wire_bytes: 33_554_432,
+        image_limits: document_native_image_limits(&ResourceBudget::default(), 33_554_432).unwrap(),
     };
     Ok((
         temporary,
@@ -1305,6 +1363,7 @@ fn native_document_qualification_rejects_page_scope_and_different_binary_binding
         image_catalog_path: root.join("catalog"),
         owner_admission_sha256: "a".repeat(64),
         image_wire_bytes: 33_554_432,
+        image_limits: document_native_image_limits(&ResourceBudget::default(), 33_554_432).unwrap(),
     });
     let profile = RuntimeProfile {
         schema: "gptgrep.parse-agent.document-runtime-profile.v1".into(),
@@ -1324,6 +1383,7 @@ fn native_document_qualification_rejects_page_scope_and_different_binary_binding
             schema: "gptgrep.native-document.guard-profile.v1".into(),
             source_sha256: "3".repeat(64),
             contract_sha256: document_guard_contract_sha256()?,
+            image_limits: config.native_viewer.as_ref().unwrap().image_limits.clone(),
         }),
     };
     assert!(qualification::accepted(&config, &profile).is_err());
@@ -1613,7 +1673,8 @@ fn duration_profile_value(config: &DocumentAgentControl, duration: Option<Value>
         "native_document_guard":{
             "schema":"gptgrep.native-document.guard-profile.v1",
             "source_sha256":"3".repeat(64),
-            "contract_sha256":document_guard_contract_sha256()?
+            "contract_sha256":document_guard_contract_sha256()?,
+            "image_limits":config.native_viewer.as_ref().map(|n| &n.image_limits).cloned().unwrap_or(document_native_image_limits(&ResourceBudget::default(), 33_554_432)?)
         }
     });
     if let Some(duration) = duration {
@@ -1629,6 +1690,30 @@ fn duration_profile(
     Ok(serde_json::from_value(duration_profile_value(
         config, duration,
     )?)?)
+}
+
+#[cfg(unix)]
+#[test]
+fn document_qualification_binds_the_selected_cumulative_image_allowance() -> Result<()> {
+    let (_temporary, mut config, native, backend) = retained_native_fixture()?;
+    config.native_viewer = Some(native);
+    let baseline = qualification::expected(&config, &duration_profile(&config, None)?)?;
+    let native = config.native_viewer.as_mut().unwrap();
+    native.image_wire_bytes = 16_777_216;
+    native.image_limits =
+        document_native_image_limits(&backend.resources, native.image_wire_bytes)?;
+    let changed = qualification::expected(&config, &duration_profile(&config, None)?)?;
+    assert_eq!(baseline.image_transport_reserved_bytes, 33_554_432);
+    assert_eq!(changed.image_transport_reserved_bytes, 16_777_216);
+    assert_eq!(
+        changed.rpc_transport_reserved_bytes,
+        baseline.rpc_transport_reserved_bytes
+    );
+    assert_ne!(
+        changed.generic_runtime_profile_sha256,
+        baseline.generic_runtime_profile_sha256
+    );
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1676,7 +1761,7 @@ fn document_duration_binds_all_18_fields_and_preserves_absent_900_digest() -> Re
         "standalone_app_server":profile.standalone_app_server,"codex_binary_sha256":profile.codex_binary_sha256,
         "descriptor_sha256":profile.descriptor_sha256,"permissions_template_sha256":profile.permissions_template_sha256,
         "tools_sha256":profile.tools_sha256,"instructions_sha256":profile.instructions_sha256,
-        "native_document_guard":{"schema":guard.schema,"source_sha256":guard.source_sha256,"contract_sha256":guard.contract_sha256}
+        "native_document_guard":{"schema":guard.schema,"source_sha256":guard.source_sha256,"contract_sha256":guard.contract_sha256,"image_limits":guard.image_limits}
     }));
     assert!(legacy_generic.get("max_seconds").is_none());
     assert_eq!(
@@ -1749,7 +1834,7 @@ fn selected_document_duration_is_emitted_in_admission_and_ready_only_when_explic
         );
         assert_eq!(
             manifest.as_object().unwrap().len(),
-            if duration.is_some() { 16 } else { 15 }
+            if duration.is_some() { 17 } else { 16 }
         );
         let ready = json!({"schema_version":"gptgrep.native-document.ready.v1","required":true,
             "admission_sha256":sha(&bytes),"task_sha256":backend.prepared().task_sha256,
@@ -1757,7 +1842,7 @@ fn selected_document_duration_is_emitted_in_admission_and_ready_only_when_explic
             "runtime_profile_sha256":config.runtime_profile.sha256,"permissions_profile_id":"gptgrep_native_document",
             "permissions_profile_sha256":manifest["permissions_profile_sha256"],"environment_ids":["local"],
             "environment_id_argument_admitted":false,"max_tool_calls":64,"max_turns":1,"max_seconds":selected,
-            "deadline_unix_ms":manifest["deadline_unix_ms"],"frame_bytes":4_194_304,"image_transport_reserved_bytes":33_554_432,
+            "deadline_unix_ms":manifest["deadline_unix_ms"],"frame_bytes":4_194_304,"image_transport_reserved_bytes":33_554_432,"image_limits":manifest["image_limits"],
             "tool_counter_before_lookup_hooks_handler":true,"tool_counter_before_argument_parse":true,
             "normalized_request_profile_verified_before_send":true,"native_image_read_bounded":true,
             "assembled_image_receipts_required":true,"requested_model":"gpt-6-luna","requested_effort":"max",

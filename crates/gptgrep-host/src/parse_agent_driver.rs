@@ -3,7 +3,7 @@
 use crate::transport::{BudgetedReader, TransportBudget};
 use anyhow::{Result, anyhow, ensure};
 use gptgrep_jev::RunClockAnchor;
-use gptgrep_parse::{ArtifactRef, BoundingBox};
+use gptgrep_parse::{ArtifactRef, BoundingBox, NativeImageLimits, ResourceBudget};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -100,6 +100,24 @@ pub struct DocumentNativeControl {
     pub image_catalog_path: PathBuf,
     pub owner_admission_sha256: String,
     pub image_wire_bytes: u64,
+    pub image_limits: NativeImageLimits,
+}
+/// Derive per-image bounds from the existing parser admission. Document turns
+/// select their cumulative image allowance independently from their RPC budget.
+pub fn document_native_image_limits(
+    resources: &ResourceBudget,
+    image_transport_bytes: u64,
+) -> Result<NativeImageLimits> {
+    let mut limits = resources.native_image_limits()?;
+    limits.image_transport_bytes = image_transport_bytes;
+    limits.validate()?;
+    ensure!(
+        image_transport_bytes
+            .checked_add(33_554_432)
+            .is_some_and(|total| total <= resources.owned_working_bytes),
+        "document_native_image_working_admission"
+    );
+    Ok(limits)
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -170,6 +188,7 @@ struct NativeDocumentGuardProfile {
     schema: String,
     source_sha256: String,
     contract_sha256: String,
+    image_limits: NativeImageLimits,
 }
 
 /// Logical buffer accounting inside the separately subtracted document allowance.
@@ -307,6 +326,11 @@ pub struct DocumentVerifiedProduct {
 pub trait DocumentBackend: Send {
     fn prepared(&self) -> &DocumentPreparedState;
     fn images(&self) -> &[DocumentImageGrant];
+    /// A backend selecting larger image budgets returns its retained parser
+    /// admission. Backends without this capability keep the default admission.
+    fn resource_budget(&self) -> ResourceBudget {
+        ResourceBudget::default()
+    }
     fn reserve_retained(&self, bytes: u64) -> Result<()>;
     fn call<'a>(
         &'a mut self,
@@ -661,7 +685,7 @@ fn validate_profile(control: &DocumentAgentControl) -> Result<RuntimeProfile> {
         "document_permissions"
     );
     let max_seconds = profile.selected_max_seconds(control)?;
-    if control.native_viewer.is_some() {
+    if let Some(native_control) = &control.native_viewer {
         let guard = profile
             .native_document_guard
             .as_ref()
@@ -669,7 +693,8 @@ fn validate_profile(control: &DocumentAgentControl) -> Result<RuntimeProfile> {
         ensure!(
             guard.schema == "gptgrep.native-document.guard-profile.v1"
                 && valid_hash(&guard.source_sha256)
-                && guard.contract_sha256 == native::contract_sha256_for(max_seconds)?,
+                && guard.contract_sha256 == native::contract_sha256_for(max_seconds)?
+                && guard.image_limits == native_control.image_limits,
             "document_native_guard_required"
         );
     }

@@ -4,7 +4,6 @@ use super::*;
 use std::collections::BTreeMap;
 const FRAME: u64 = 4_194_304;
 const RPC: u64 = 33_554_432;
-const IMAGE: u64 = 33_554_432;
 // R10 Document policy: ready + turn + 64 calls, each with up to three
 // native-image receipts, at the unchanged 16 KiB per-receipt ceiling.
 const RECEIPT_STAGING: u64 = (2 + 64 * (1 + 3)) * 16_384;
@@ -37,7 +36,7 @@ pub(super) fn contract_sha256_for(max_seconds: u64) -> Result<String> {
         "admission":"gptgrep.native-document.admission.v1","ready":"gptgrep.native-document.ready.v1",
         "receipt":"gptgrep.native-document.receipt.v1","mode":"document","native_tool":"view_image",
         "dynamic_namespace":"gptgrep_parse","dynamic_function":"toolbox","max_tool_calls":64,"max_turns":1,
-        "max_seconds":max_seconds,"frame_bytes":FRAME,"rpc_bytes":RPC,"image_bytes":IMAGE,
+        "max_seconds":max_seconds,"frame_bytes":FRAME,"rpc_bytes":RPC,"image_limits":"resource_budget_derived_v1",
         "counter":"before_argument_parse_lookup_hooks_handler; failed and duplicate submissions charged",
         "normalized_request_profile_verified_before_send":true,
         "permissions_profile_id":PERMISSIONS,"filesystem":"root deny and private image directory read",
@@ -80,9 +79,10 @@ pub(super) fn validate_control(
     native: &DocumentNativeControl,
     control: &DocumentAgentControl,
 ) -> Result<()> {
+    native.image_limits.validate()?;
     ensure!(
         valid_hash(&native.owner_admission_sha256)
-            && native.image_wire_bytes == IMAGE
+            && native.image_wire_bytes == native.image_limits.image_transport_bytes
             && control.limits.max_tool_calls == 64
             && (1000..=3_600_000).contains(&control.limits.timeout_ms)
             && control.limits.timeout_ms.is_multiple_of(1000)
@@ -169,6 +169,12 @@ impl NativeSession {
             "document_duration_caller_mismatch"
         );
         let prepared = backend.prepared();
+        let resources = backend.resource_budget();
+        ensure!(
+            config.image_limits
+                == document_native_image_limits(&resources, config.image_wire_bytes)?,
+            "document_native_original_resource_limits"
+        );
         ensure!(
             !backend.images().is_empty()
                 && backend.images().len() == prepared.original_rendition_artifacts,
@@ -195,11 +201,12 @@ impl NativeSession {
         let mut ids = BTreeSet::new();
         let mut rows = Vec::new();
         for image in backend.images() {
+            resources.admit_image(image.width, image.height, image.artifact.bytes)?;
             ensure!(
                 image.source_sha256 == prepared.source_sha256
                     && image.prepared_sha256 == prepared.prepared_sha256
                     && image.artifact.bytes > 0
-                    && image.artifact.bytes <= 1_048_576
+                    && image.artifact.bytes <= config.image_limits.image_file_bytes
                     && image
                         .artifact
                         .id
@@ -246,7 +253,12 @@ impl NativeSession {
                 rendition_sha256: image.artifact.profile_sha256.clone(),
             });
         }
-        verify_image_namespace(&config.image_root, &image_directory, &paths)?;
+        verify_image_namespace(
+            &config.image_root,
+            &image_directory,
+            &paths,
+            config.image_limits.image_file_bytes,
+        )?;
         rows.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
         let mut catalog_bytes = Vec::new();
         for row in &rows {
@@ -289,7 +301,8 @@ impl NativeSession {
             "task_sha256":prepared.task_sha256,"source_sha256":prepared.source_sha256,"prepared_sha256":prepared.prepared_sha256,
             "runtime_profile_sha256":control.runtime_profile.sha256,"deadline_unix_ms":fixed_deadline,
             "max_tool_calls":64,"max_turns":1,"frame_bytes":FRAME,
-            "image_transport_reserved_bytes":IMAGE,"image_root":config.image_root,"receipt_root":config.receipt_root,
+            "image_transport_reserved_bytes":config.image_wire_bytes,"image_limits":config.image_limits,
+            "image_root":config.image_root,"receipt_root":config.receipt_root,
             "permissions_profile_sha256":permission_sha256,"images":[],
             "image_catalog":{"path":catalog.path,"bytes":catalog.bytes,"sha256":catalog.sha256,"count":rows.len()}});
         if let Some(seconds) = max_seconds {
@@ -306,7 +319,7 @@ impl NativeSession {
             "permissions_profile_id":PERMISSIONS,"permissions_profile_sha256":permission_sha256,
             "environment_ids":["local"],"environment_id_argument_admitted":false,
             "max_tool_calls":64,"max_turns":1,"max_seconds":selected_seconds,"deadline_unix_ms":fixed_deadline,
-            "frame_bytes":FRAME,"image_transport_reserved_bytes":IMAGE,
+            "frame_bytes":FRAME,"image_transport_reserved_bytes":config.image_wire_bytes,"image_limits":config.image_limits,
             "tool_counter_before_lookup_hooks_handler":true,"tool_counter_before_argument_parse":true,
             "normalized_request_profile_verified_before_send":true,"native_image_read_bounded":true,
             "assembled_image_receipts_required":true,"requested_model":DOCUMENT_MODEL,"requested_effort":"max",
@@ -379,7 +392,12 @@ impl NativeSession {
         ensure!(self.initialized, "document_native_required_ready");
         let _receipts = self.working.reserve(16_384 * 42 * 4)?;
         read_pin(&self.catalog, 4_194_304)?;
-        verify_image_namespace(&self.control.image_root, &self.image_directory, &self.paths)?;
+        verify_image_namespace(
+            &self.control.image_root,
+            &self.image_directory,
+            &self.paths,
+            self.control.image_limits.image_file_bytes,
+        )?;
         ensure!(
             stable_directory(
                 &open_directory(&self.control.receipt_root)?,
@@ -472,12 +490,12 @@ impl NativeSession {
                 .ok_or_else(|| anyhow!("document_native_prepared_hash"))?;
             ensure!(
                 payload > 0
-                    && payload <= FRAME
+                    && payload <= self.control.image_limits.image_file_bytes
                     && pixels > 0
                     && pixels <= 16 * 1024 * 1024
                     && wire > payload
-                    && wire <= FRAME
-                    && cumulative <= IMAGE,
+                    && wire <= self.control.image_limits.image_wire_bytes
+                    && cumulative <= self.control.image_wire_bytes,
                 "document_native_prepared_bounds"
             );
             ensure!(
@@ -617,7 +635,12 @@ fn read_receipt(root: &Path, leaf: &str) -> Result<Value> {
     );
     gptgrep_jev::parse_unique_json(&bytes).map_err(|_| anyhow!("document_native_receipt_json"))
 }
-fn verify_image_namespace(root: &Path, held: &File, paths: &BTreeSet<String>) -> Result<()> {
+fn verify_image_namespace(
+    root: &Path,
+    held: &File,
+    paths: &BTreeSet<String>,
+    image_file_bytes: u64,
+) -> Result<()> {
     ensure!(
         stable_directory(&open_directory(root)?, held),
         "document_native_image_directory_changed"
@@ -629,7 +652,7 @@ fn verify_image_namespace(root: &Path, held: &File, paths: &BTreeSet<String>) ->
             actual.len() < paths.len() && path.to_str().is_some_and(|path| paths.contains(path)),
             "document_native_extra_image"
         );
-        let metadata = regular(&path, 1_048_576)?;
+        let metadata = regular(&path, image_file_bytes)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;

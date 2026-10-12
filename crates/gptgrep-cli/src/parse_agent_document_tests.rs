@@ -754,6 +754,11 @@ async fn native_image_discovery_projects_only_the_frozen_original_grant() -> Res
             image_catalog_path: fixture.root.join("unused-catalog.ndjson"),
             owner_admission_sha256: "a".repeat(64),
             image_wire_bytes: 33_554_432,
+            image_limits: gptgrep_host::parse_agent_driver::document_native_image_limits(
+                &gptgrep_parse::ResourceBudget::default(),
+                33_554_432,
+            )
+            .unwrap(),
         })
         .await?;
     assert_eq!(
@@ -933,6 +938,11 @@ async fn native_image_handoff_keeps_shared_staging_quota_and_clock_refusals() ->
                 image_catalog_path: fixture.root.join("never-catalog.ndjson"),
                 owner_admission_sha256: "a".repeat(64),
                 image_wire_bytes: 33_554_432,
+                image_limits: gptgrep_host::parse_agent_driver::document_native_image_limits(
+                    &gptgrep_parse::ResourceBudget::default(),
+                    33_554_432,
+                )
+                .unwrap(),
             })
             .await
             .unwrap_err();

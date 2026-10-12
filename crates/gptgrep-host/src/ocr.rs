@@ -451,6 +451,7 @@ impl OcrHostExecutor {
                 "ocr_native_compatibility_not_qualified"
             );
             crate::ocr_native::validate_task_budget(&task)?;
+            crate::ocr_native::validate_resource_profile(&task, &self.config.runtime_profile)?;
             if !require_qualified {
                 self.native_probe_admission
                     .as_ref()
@@ -1129,8 +1130,13 @@ impl PreparedPage {
             "ocr_image_file_admission"
         );
         let mut bytes = Vec::with_capacity(usize::try_from(length)?);
-        file.take(budget.image_file_bytes + 1)
-            .read_to_end(&mut bytes)?;
+        file.take(
+            budget
+                .image_file_bytes
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("ocr_image_read_limit_overflow"))?,
+        )
+        .read_to_end(&mut bytes)?;
         ensure!(
             bytes.len() as u64 == length && hash(&bytes) == digest,
             "ocr_image_changed"
@@ -1157,7 +1163,8 @@ impl PreparedPage {
                 .checked_mul(u64::from(image.height))
                 .and_then(|p| p.checked_mul(8))
                 .and_then(|p| p.checked_add(budget.image_pixel_buffer_bytes))
-                .and_then(|p| p.checked_add(length.saturating_mul(3) + 65_536))
+                .and_then(|p| length.checked_mul(3).and_then(|n| n.checked_add(p)))
+                .and_then(|p| p.checked_add(65_536))
                 .ok_or_else(|| anyhow!("ocr_owned_working_admission"))?;
             ensure!(
                 working <= budget.owned_working_bytes,

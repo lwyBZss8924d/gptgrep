@@ -1079,6 +1079,9 @@ impl Backend {
     }
 }
 impl DocumentBackend for Backend {
+    fn resource_budget(&self) -> gptgrep_parse::ResourceBudget {
+        self.session.budget.clone()
+    }
     fn prepared(&self) -> &DocumentPreparedState {
         &self.prepared
     }
