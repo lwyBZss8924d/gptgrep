@@ -345,6 +345,14 @@ Jev coverage and usage alongside Codex usage, and the overall deadline includes
 initial retrieval. Empty or stale scopes do not establish successful reranking.
 Summary and retrieval use actual source evidence; model-produced citations must
 resolve to evidence issued during that run and remain fresh at completion.
+The retrieval reader's instructions (restricted and native) add two generic
+answer rules: lead with the direct answer in the form the question asks for and
+commit to an answer that the delivered evidence supports, reserving
+`insufficient_evidence` for when no reading is supported; and, when the question
+depends on a specific passage, resolve the in-text references it relies on
+(footnote or endnote markers, citation numbers, see-table or see-section
+pointers) by reading the referenced note or section before answering. Every
+evidence and citation rule is unchanged.
 
 `HostConfig.native_ptc` (default false) and `--native-ptc` select native
 execution for the final retrieval reader. An existing named permission profile
