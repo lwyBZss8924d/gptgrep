@@ -138,7 +138,12 @@ class HarborMaterializationTests(unittest.TestCase):
         self.assertEqual(result["preflight"]["tool_budget"]["treatment_max_tool_calls"], 8)
         self.assertEqual([warning["code"] for warning in result["preflight"]["warnings"]],
                          ["treatment_tool_cap_may_bind_before_deadline"])
-        reader_policies, budget_scopes = set(), set()
+        # Decisions run in the treatment's GPTgrep host process, outside the Codex
+        # tool sandbox, so the job keeps the OpenRouter key reference (never a value).
+        job_record = json.loads((self.root / "dataset.job.json").read_text())
+        self.assertEqual(job_record["agents"][0]["env"], {"OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}"})
+        self.assertEqual(job_record["verifier"]["env"], {})
+        reader_policies, budget_scopes, pair_policies = set(), set(), {}
         for record in result["tasks"]:
             task = output / record["task_name"]
             config = TaskConfig.model_validate(tomllib.loads((task / "task.toml").read_text()))
@@ -163,6 +168,12 @@ class HarborMaterializationTests(unittest.TestCase):
             treatment = record["binding"]["arm"] == "gptgrep"
             self.assertEqual((task / "environment/corpus/.gptgrep/index.bin").exists(), treatment)
             reader_policies.add((task / "environment/config.toml").read_bytes())
+            pair_policies.setdefault(record["binding"]["pair_id"], {})[record["binding"]["arm"]] = (
+                task / "environment/config.toml").read_bytes()
+            # The container keeps network for the native CLI's model connection
+            # and the product's host-side Decisions requests; tools have none.
+            self.assertEqual(tomllib.loads((task / "task.toml").read_text())["environment"]["network_mode"],
+                             "public")
             for directory, key in (("environment", "reader_file"), ("tests", "judge_file")):
                 compose = json.loads((task / directory / "docker-compose.yaml").read_text())
                 mounts = compose["services"]["main"]["volumes"]
@@ -192,6 +203,15 @@ class HarborMaterializationTests(unittest.TestCase):
             self.assertFalse((task / "tests/corpus").exists())
         self.assertEqual(reader_policies, {model_config(PROFILE, "reader")})
         self.assertEqual(len(budget_scopes), 1)
+        # Both arms of every pair receive identical reader configuration bytes,
+        # with no hosted web search and no model-tool network.
+        self.assertEqual(len(pair_policies), 62)
+        for policies in pair_policies.values():
+            self.assertEqual(set(policies), {"gptgrep", "raw_only"})
+            self.assertEqual(policies["gptgrep"], policies["raw_only"])
+        policy = tomllib.loads(next(iter(reader_policies)).decode())
+        self.assertEqual(policy["web_search"], "disabled")
+        self.assertIs(policy["permissions"]["full62_reader"]["network"]["enabled"], False)
 
     def test_treatment_tool_cap_accepts_adapter_maximum_and_warns_below_parity_floor(self):
         self.runtime["max_tool_calls"] = MAX_TOOL_CALLS
@@ -397,8 +417,8 @@ class NativePolicyTests(unittest.TestCase):
         self.assertEqual(fs["/data/corpus"], "read")
         for path in (CODEX_HOME, "/tests", "/solution", "/logs", "/opt/full62-private"):
             self.assertEqual(fs[path], "deny")
-        self.assertTrue(config["permissions"]["full62_reader"]["network"]["enabled"])
-        self.assertEqual(config["web_search"], "live")
+        self.assertFalse(config["permissions"]["full62_reader"]["network"]["enabled"])
+        self.assertEqual(config["web_search"], "disabled")
         self.assertEqual(config["features"], {
             "shell_tool": True, "view_image": True, "unified_exec": True,
             "multi_agent": True, "plugins": True, "apps": True,

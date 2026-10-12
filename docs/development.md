@@ -315,8 +315,9 @@ no automatic retry.
 
 Raw Codex receives only original documents and may extract/render during SEARCH.
 GPTgrep receives the same bytes plus a frozen index built before question access.
-Both readers use the same selected native binary and generic raw-document tools.
-The Judge runs in a separate environment with the complete answer and frozen
+Both readers use the same selected native binary and generic raw-document tools,
+with identical configuration bytes that disable hosted web search and model-tool
+network access. The Judge runs in a separate environment with the complete answer and frozen
 reference, not the reader's history. Task failures stay in the denominator;
 unavailable judging stays unknown. INDEX and Judge costs are separate from
 question-dependent SEARCH. See the [evaluation protocol](design/agentic-search-evaluation.md)

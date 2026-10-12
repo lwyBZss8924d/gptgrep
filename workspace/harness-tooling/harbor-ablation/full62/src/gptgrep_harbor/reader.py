@@ -49,9 +49,10 @@ def reader_argv(config, binding, question):
 
 
 def raw_prompt(config, question):
+    # States the enforced reader policy: web search and model-tool network are disabled.
     return prompt_bytes("Answer the question using only the protocol-scoped raw document at "
               + config["raw_document"] + ". You may inspect that document with native tools. "
-              "Do not use external search. Give the complete answer and source locations "
+              "No external search or network access is available. Give the complete answer and source locations "
               "when available. Question:\n" + question)
 
 

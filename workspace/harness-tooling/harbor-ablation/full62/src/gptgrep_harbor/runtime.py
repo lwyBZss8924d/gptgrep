@@ -197,7 +197,7 @@ def auth_paths(value):
 
 
 def model_config(profile, role):
-    """Both reader arms receive exactly these same bytes and filesystem policy."""
+    """Both reader arms receive exactly these same bytes, filesystem and network policy."""
     require(role in ("reader", "judge"), "native_role")
     name = "full62_" + role
     settings = {
@@ -205,7 +205,10 @@ def model_config(profile, role):
         "service_tier": profile["service_tier"], "model_provider": "openai",
         "cli_auth_credentials_store": "file", "forced_login_method": "chatgpt",
         "approval_policy": "never", "default_permissions": name,
-        "web_search": "live" if role == "reader" else "disabled",
+        # No reader or Judge has external access: no hosted web search here and
+        # no model-tool network below. GPTgrep's Decisions requests come from its
+        # host process, outside this Codex tool sandbox.
+        "web_search": "disabled",
     }
     lines = [key + " = " + json.dumps(value) for key, value in settings.items()]
     enabled = "true" if role == "reader" else "false"
@@ -229,7 +232,7 @@ def model_config(profile, role):
         lines.append(json.dumps(path) + ' = "deny"')
     if role == "judge":
         lines.append('"/data" = "deny"')
-    lines += ["", "[permissions." + name + ".network]", "enabled = " + enabled, ""]
+    lines += ["", "[permissions." + name + ".network]", "enabled = false", ""]
     return "\n".join(lines).encode()
 
 

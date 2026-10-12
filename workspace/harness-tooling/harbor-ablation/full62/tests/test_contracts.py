@@ -510,6 +510,28 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
         completed, _ = self.run_reader(legacy_report())
         self.assertIs(completed["/logs/agent/operational.json"]["insufficient_evidence"], False)
 
+    def test_treatment_product_keeps_openrouter_key_while_reader_tools_have_no_network(self):
+        import tomllib
+        from gptgrep_harbor.runtime import model_config
+        outputs, child = self.run_reader(legacy_report(),
+                                         environ={"PATH": "/usr/bin", "OPENROUTER_API_KEY": "synthetic-only"})
+        version_call, product_call = child.call_args_list
+        # Decisions requests come from the GPTgrep host process, outside the
+        # Codex tool sandbox whose network the shared reader policy disables.
+        self.assertEqual(product_call.args[0][0], "/synthetic/gptgrep")
+        self.assertEqual(product_call.kwargs["env"]["OPENROUTER_API_KEY"], "synthetic-only")
+        self.assertNotIn("OPENROUTER_API_KEY", version_call.kwargs["env"])
+        self.assertEqual(outputs["/answer/answer.json"]["status"], "response")
+        policy = tomllib.loads(model_config(PROFILE, "reader").decode())
+        self.assertEqual(policy["web_search"], "disabled")
+        self.assertIs(policy["permissions"]["full62_reader"]["network"]["enabled"], False)
+
+    def test_bare_prompt_states_the_enforced_no_external_search_policy(self):
+        prompt = reader.raw_prompt({"raw_document": "/data/corpus/synthetic.txt"}, self.question).decode()
+        self.assertIn("No external search or network access is available.", prompt)
+        self.assertNotIn("Do not use external search", prompt)
+        self.assertTrue(prompt.endswith("Question:\n" + self.question))
+
     def test_other_legacy_statuses_are_zero_and_never_judged(self):
         for status, answer in (("failed", "partial synthetic text"), ("interrupted", "partial synthetic text"),
                                ("insufficient_evidence", "   ")):
@@ -593,13 +615,13 @@ class NativeDirectToolPolicyTests(unittest.TestCase):
             "shell_tool": True, "view_image": True, "unified_exec": True,
             "multi_agent": True, "plugins": True, "apps": True,
             "tool_suggest": True, "code_mode": {"enabled": True}, "code_mode_host": {"enabled": True}})
-        self.assertEqual(config["web_search"], "live")
+        self.assertEqual(config["web_search"], "disabled")
         self.assertEqual(config["default_permissions"], "full62_reader")
         self.assertEqual(config["model"], PROFILE["model"])
         self.assertEqual(config["model_reasoning_effort"], PROFILE["reasoning_effort"])
         self.assertEqual(config["service_tier"], PROFILE["service_tier"])
         policy = config["permissions"]["full62_reader"]
-        self.assertTrue(policy["network"]["enabled"])
+        self.assertFalse(policy["network"]["enabled"])
         self.assertEqual(policy["filesystem"]["/data/corpus"], "read")
         self.assertEqual(policy["filesystem"]["/tmp/full62-work"], "write")
         self.assertEqual(policy["filesystem"]["/opt/full62-home"], "deny")
