@@ -509,7 +509,9 @@ and 65,536 encoded request bytes. Shared role definitions are bounded to 2,048
 bytes. Admission measures the complete request, including escaping and metadata,
 and rejects overflow explicitly.
 
-Eligibility and the original literal-anchor bypass are unchanged. Eligible
+Eligibility and the original literal-anchor bypass are unchanged. When no window
+is eligible, the three highest-scoring windows become `below_floor_fallback`
+candidates, flagged `below_threshold` as in the ordinary relevance path. Eligible
 windows sort by original anchor group, role (`direct_support`,
 `source_local_incomplete`, `background`, `no_support`), descending relevance, then
 stable source coordinates. Direct support covers at least one requested fact;
