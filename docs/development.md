@@ -108,7 +108,10 @@ Provide `OPENROUTER_API_KEY` only to the invoking GPTgrep process through your
 secret manager. Do not place its value in a command example, JSON control or
 checked-in environment file. The default model is
 `openai/gpt-6-luna-decisions`; `typesafe/jev-1.13` is an explicit text-only legacy
-choice. Codex authentication and the Decisions credential are independent.
+choice. An OpenRouter alias such as `~typesafe/jev-latest` is also text-only. It is
+admitted only when the served build has the same author and family, for example
+`typesafe/jev-1.13-20260917`. Codex authentication and the Decisions credential
+are independent.
 
 ```sh
 "$GPTGREP_BIN" search 'How are snapshots retained?' ./evals/fixtures/corpus \
@@ -119,10 +122,47 @@ choice. Codex authentication and the Decisions credential are independent.
 ```
 
 These are live, model-assisted commands. Failures remain explicit, and unknown
-usage/cost remains null. `--decisions-budget FILE` joins a separately initialized,
-matching owner ledger; it does not create a campaign or renew consumed allowance.
-Without it, the product uses a finite single-invocation context. A public checkout
-does not inherit another operator's budget or existing campaign controls.
+usage/cost remains null. A failed `judge` returns code `decisions_judge_failed`
+with a sanitized `judge` object. That object has the requested and served models,
+whether a send started, usage/cost or a null reason, and latency. Without
+`--decisions-budget`, the product uses a finite single-invocation context. A public
+checkout does not inherit another operator's budget or existing campaign controls.
+
+### Shared submission budget
+
+`--decisions-budget FILE` only joins an existing matching ledger; it never creates
+a campaign or renews consumed allowance. The run owner initializes a new ledger
+once, before the run, in a private directory:
+
+```sh
+install -d -m 700 "$RUN_DIR"
+"$GPTGREP_BIN" decisions-budget init --run-id "$RUN_ID" --plan-file "$PLAN" \
+  --deadline-seconds 1800 --max-submissions 2 \
+  --ledger "$RUN_DIR/ledger.json" --output "$RUN_DIR/budget.json"
+"$GPTGREP_BIN" --decisions-budget "$RUN_DIR/budget.json" judge --input "$REQUEST" --json
+"$GPTGREP_BIN" decisions-budget status --control "$RUN_DIR/budget.json" --json
+```
+
+`init` calls `ExecutionContext::new(run_id, sha256(plan file), now + N seconds,
+max_submissions)` and attaches the ledger with `with_new_ledger`, the create-only
+form of `with_ledger`. Both paths must be absolute. The ledger, its `.lock`
+sidecar and the control file must not exist; init never joins, resets, renews or
+replaces them. The lock records the immutable header and the original
+same-boot clock anchor. The control file (`gptgrep.decisions-budget-contract.v1`)
+is written completely with mode 0600 and published without replacement. A second
+`init` for the same paths fails and leaves the ledger and control unchanged. Use a
+new ledger for a new run.
+
+`status` reads the control, lock and journal without locking or writing. It
+reports reservations by outcome (`reserved`, `in_flight`, `unknown`, `terminal`),
+`remaining_submissions`, occupied slots, requested selectors and
+`deadline_state` (`open`, `expired` or `clock_binding_unavailable`). It also
+reports `admission_open`, and it stays readable after the deadline. Every
+reservation is permanent, including failed and unknown outcomes. A joined process
+therefore stops at `max_submissions` with `Decisions submission budget exhausted`
+before any POST. The ledger bounds submissions, not dollars. Enforce a spend cap
+outside the product: multiply the remaining submissions by a reviewed worst-case
+price per call. Optionally also set a provider-side key limit.
 
 ## Native parsing, OCR and complete index publication
 

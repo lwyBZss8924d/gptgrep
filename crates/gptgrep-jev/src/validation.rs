@@ -1,5 +1,5 @@
 use crate::{
-    DecisionAnswer, DecisionFailure, DecisionResponse, FailedResponseUsage,
+    DecisionAnswer, DecisionFailure, DecisionResponse, FailedResponseMetadata, FailedResponseUsage,
     MAX_PROVIDER_METADATA_BYTES, MAX_QUESTIONS, MAX_RESPONSE_BYTES,
 };
 use anyhow::{Result, anyhow, ensure};
@@ -192,15 +192,18 @@ fn response_checked(
     );
     let value = unique_json(bytes).map_err(|_| DecisionFailure::invalid_json())?;
     let usage = FailedResponseUsage::from_response(&value);
+    let metadata = FailedResponseMetadata::from_response(&value);
     validate_response(value, questions)
         .and_then(|response| {
+            // Exact selectors keep equality/canonical mapping; `~` aliases admit
+            // only a concrete same-author, same-family build (see models.rs).
             ensure!(
                 requested.is_none_or(|model| crate::response_model_matches(model, &response.model)),
                 "Decisions response model does not match the requested model"
             );
             Ok(response)
         })
-        .map_err(|error| DecisionFailure::validation(&error, usage).into())
+        .map_err(|error| DecisionFailure::validation(&error, usage, metadata).into())
 }
 
 fn validate_response(value: Value, questions: &Value) -> Result<DecisionResponse> {

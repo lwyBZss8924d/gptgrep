@@ -2,6 +2,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use gptgrep_core::SearchOptions;
 
+mod decisions_budget;
+mod judge;
 mod parse_agent;
 mod parse_agent_index;
 use serde_json::{Value, json};
@@ -407,6 +409,42 @@ enum ParseAgentCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum DecisionsBudgetCommand {
+    /// Create a NEW same-host Decisions ledger and its 0600 control file; never joins, resets or renews.
+    Init {
+        #[arg(long, value_name = "ID")]
+        run_id: String,
+        #[arg(
+            long,
+            value_name = "FILE",
+            help = "Regular file (<= 1 MiB); plan_digest is the SHA-256 of its bytes"
+        )]
+        plan_file: PathBuf,
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..=86400))]
+        deadline_seconds: u64,
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=200))]
+        max_submissions: u32,
+        #[arg(
+            long,
+            value_name = "ABS_PATH",
+            help = "New absolute journal path; it and its .lock sidecar must not exist"
+        )]
+        ledger: PathBuf,
+        #[arg(
+            long,
+            value_name = "ABS_CONTROL_JSON",
+            help = "New absolute control path, written once with mode 0600"
+        )]
+        output: PathBuf,
+    },
+    /// Read-only reservations by outcome, remaining allowance and deadline.
+    Status {
+        #[arg(long, value_name = "FILE")]
+        control: PathBuf,
+    },
+}
+
 #[derive(Debug)]
 struct OcrServeError(&'static str);
 impl std::fmt::Display for OcrServeError {
@@ -427,6 +465,11 @@ enum Command {
     Ocr {
         #[command(subcommand)]
         command: OcrCommand,
+    },
+    /// Initialize or inspect a same-host Decisions submission ledger; JSON output, no network.
+    DecisionsBudget {
+        #[command(subcommand)]
+        command: DecisionsBudgetCommand,
     },
     /// Rerank exact source-bound v2 references; JSON output, no document routing.
     Rerank {
@@ -905,17 +948,48 @@ fn contract() -> Value {
         "report_schema":"gptgrep.source-continuation.v1","additional_model_calls":0
     });
     contract["global_options"] = json!({"decisions-budget": {
-        "type":"file", "optional":true, "schema":"gptgrep.decisions-budget-contract.v1",
+        "type":"file", "optional":true, "schema":gptgrep_jev::DECISIONS_BUDGET_CONTRACT_SCHEMA,
         "control_bytes":16384, "effect":"join existing shared original-clock ledger for search hybrid/semantic, judge, ask, summarize and non-plan enrich",
-        "initialization":false, "missing_files":"error", "without_file":"single-invocation bounded context",
-        "local_commands":"regex/lexical, schema, doctor and enrich --plan-only do not open it"
+        "initialization":false, "initializer":"gptgrep decisions-budget init (separate command; this option only joins)",
+        "missing_files":"error", "without_file":"single-invocation bounded context",
+        "local_commands":"regex/lexical, schema, doctor, decisions-budget and enrich --plan-only do not open it"
     }});
+    contract["commands"]["decisions-budget"] = json!({
+        "init_usage":"gptgrep decisions-budget init --run-id ID --plan-file FILE --deadline-seconds N --max-submissions N --ledger ABS_PATH --output ABS_CONTROL_JSON",
+        "status_usage":"gptgrep decisions-budget status --control FILE --json",
+        "effect":"init creates a NEW same-host Decisions ledger (journal plus .lock holding the immutable header and original clock anchor) and writes its portable control file once; status reads them without locking, creating or writing",
+        "init_options":{"run-id":"1..256 bytes without control characters","plan-file":"regular file up to 1048576 bytes; plan_digest is the lowercase SHA-256 of its bytes",
+            "deadline-seconds":{"type":"integer","minimum":1,"maximum":86400,"effect":"deadline_unix_ms = now + N seconds; fixed for the run"},
+            "max-submissions":{"type":"integer","minimum":1,"maximum":200},
+            "ledger":"absolute; existing parent; the journal and its .lock sidecar must not exist",
+            "output":"absolute control path; must not exist; written completely with mode 0600 and published without replacement"},
+        "refusals":"relative paths, missing parents, or any existing ledger, lock or control path; init never joins, resets, renews or replaces",
+        "control_schema":gptgrep_jev::DECISIONS_BUDGET_CONTRACT_SCHEMA,
+        "control_fields":["schema_version","run_id","plan_digest","deadline_unix_ms","max_submissions","ledger_path"],
+        "init_output_schema":decisions_budget::INIT_SCHEMA,
+        "status_output_schema":gptgrep_jev::DECISIONS_BUDGET_STATUS_SCHEMA,
+        "status_fields":["reservations{total,reserved,in_flight,unknown,terminal}","send_started","submission_observations","remaining_submissions","occupied_slots","requested_models","deadline_unix_ms","deadline_state","wall_remaining_ms","anchor_remaining_ms","admission_open","read_only"],
+        "join":"pass the control file to --decisions-budget for paid commands; reservations are permanent, so a joined run stops at max_submissions with 'Decisions submission budget exhausted' before any POST",
+        "network":false,"output":"always JSON; errors use gptgrep.error.v1 with code decisions_budget_failed"
+    });
     contract["decisions"] = json!({"default_model":gptgrep_jev::DEFAULT_MODEL,
         "legacy_model":gptgrep_jev::LEGACY_MODEL, "legacy_images":false,
-        "model_admission":"exact requested identifier or the observed canonical mapping for Luna Decisions and legacy Jev; no other aliases or fallback",
+        "model_admission":"exact requested identifier; the observed canonical builds for Luna Decisions and legacy Jev; or, for a ~author/family-latest alias, a concrete author/family-VERSION build of the same author and family (VERSION starts with a digit). No other aliases, families, authors or fallback",
+        "aliases":{"syntax":"~author/family-latest","example":"~typesafe/jev-latest","admits":"author/family-VERSION, e.g. typesafe/jev-1.13 or typesafe/jev-1.13-20260917",
+            "rejects":"another author or family, variants such as :free, other aliases, and malformed aliases (before any request)","images":false,
+            "accounting":"requested_model and the served model are reported separately"},
+        "canonical_builds":{gptgrep_jev::DEFAULT_MODEL:gptgrep_jev::DEFAULT_MODEL_CANONICAL,gptgrep_jev::LEGACY_MODEL:gptgrep_jev::LEGACY_MODEL_CANONICAL},
+        "images":"exact Luna Decisions selector or its canonical build only; aliases and other models reject typed input.images and raw image parts before reservation or submission",
+        "raw_image_parts":"any object at any depth of a raw state or questions with an image_url or input_image member or type; strings are literal text and never image parts",
         "typed_wire":"flat literal text plus PNG/JPEG image_url data URLs; local source bindings excluded",
         "limits":{"text_envelope_bytes":gptgrep_jev::MAX_REQUEST_BYTES,"body_bytes":gptgrep_jev::MAX_MULTIMODAL_REQUEST_BYTES,
             "images":gptgrep_jev::MAX_IMAGES,"image_file_bytes":gptgrep_jev::MAX_IMAGE_BYTES,"response_bytes":gptgrep_jev::MAX_RESPONSE_BYTES}});
+    contract["commands"]["judge"]["output"] = json!({
+        "success":"validated Decisions response JSON; model is the served build, requested_model is the selector sent",
+        "failure":{"code":judge::JUDGE_FAILURE_CODE,"field":"judge","schema":judge::JUDGE_FAILURE_SCHEMA,
+            "fields":["stage","requested_model","submission","served_model","provider_response_id","provider","usage","usage_presence","usage_unavailable_reason","cost_usd","cost_unavailable_reason","failure","latency_ms","elapsed_ms","execution"],
+            "submission":["not_submitted","sent_response_received","sent_outcome_unknown"],
+            "unknowns":"missing usage or cost stays null with a reason; never zero-filled; no bodies, headers, URLs or keys"}});
     contract["commands"]["judge"]["input"] = json!({"one_of":[
         {"state":"JSON","questions":"Choice/Noul/Score map"},
         {"input":{"text":[{"source":{"source_id":"string","unit_id":"string","source_sha256":"sha256"},"text":"literal string"}],
@@ -993,7 +1067,7 @@ fn contract() -> Value {
 }
 
 fn llms() -> &'static str {
-    "# GPTgrep\n\nLocal vectorless retrieval helper for agents. No MCP server.\n\n1. gptgrep index ./docs --json\n1r. gptgrep index ./documents --ocr auto --plan-only --json\n1n. gptgrep index ./native-documents --ocr off --json\n1a. gptgrep enrich ./docs --ledger-path /path/to/private/enrich.jsonl --max-builder-calls 100 --max-jev-calls 100 --plan-only --json\n2. gptgrep search 'concept in natural language' ./docs --json\n3. gptgrep search 'pattern' ./docs --mode regex --json\n4. gptgrep tree manual.pdf --root ./docs --json\n5. gptgrep read DOCUMENT_ID:NODE_ID --root ./docs --json\n6. gptgrep batch --root ./docs --input operations.json --json\n7. gptgrep batch --rich --root ./docs --input rich-operations.json\n\nBatch accepts gptgrep.batch.request.v1 JSON, pins one generation and preserves operation order. Local search/catalog/tree/read operations share bounded output reservations. Batch hybrid/semantic are currently rejected before provider work; inspect each item status and coverage.\n\nRich batch request shape: send one JSON object, not a bare operation array. schema_version and operations are required. generation defaults to the string CURRENT; budget may be omitted or partially specified, with defaults shown by --schema. Every operation requires the discriminator op and a unique id (1..128 UTF-8 bytes, no control characters). Unknown fields are rejected. Start with this local request in rich-operations.json:\n\n```json\n{\n  \"schema_version\": \"gptgrep.batch.rich.request.v1\",\n  \"generation\": \"CURRENT\",\n  \"budget\": {\n    \"max_operations\": 1,\n    \"max_output_bytes\": 16384,\n    \"max_decisions_submissions\": 0\n  },\n  \"operations\": [\n    {\n      \"op\": \"inspect_documents\",\n      \"id\": \"documents-1\",\n      \"fields\": [\n        \"path\",\n        \"title\",\n        \"pages\"\n      ],\n      \"page_size\": 5\n    }\n  ]\n}\n```\n\nRun gptgrep batch --rich --root ./docs --input rich-operations.json. For a follow-up, copy the exact response generation object and use a returned document path; operations cannot refer to another item in the same batch. Replace both generation fields and manual.pdf in this template before running it:\n\n```json\n{\n  \"schema_version\": \"gptgrep.batch.rich.request.v1\",\n  \"generation\": {\n    \"generation\": \"replace-with-returned-generation\",\n    \"manifest_sha256\": \"0000000000000000000000000000000000000000000000000000000000000000\"\n  },\n  \"budget\": {\n    \"max_operations\": 1,\n    \"max_output_bytes\": 16384,\n    \"max_decisions_submissions\": 0\n  },\n  \"operations\": [\n    {\n      \"op\": \"inspect_pages\",\n      \"id\": \"pages-1\",\n      \"document\": \"manual.pdf\",\n      \"fields\": [\n        \"page\",\n        \"native_text\",\n        \"metadata_artifact\"\n      ],\n      \"page_size\": 1\n    }\n  ]\n}\n```\n\nThe zero max_decisions_submissions allowance keeps these examples local. Read item status and coverage; retain the exact generation and operation options when using a returned cursor. Inspect commands.batch.rich.required_operation_fields in --schema output for other operations.\n\nFor a separately published v2 generation, batch --rich accepts gptgrep.batch.rich.request.v1 with inspect_documents, inspect_pages, inspect_native_metadata, read_artifact, search_artifacts, inspect_visual, read_visual and explicit search_multimodal. Document/page enumeration returns indexed metadata only. inspect_native_metadata takes a page metadata artifact_id, closed fields and item_fields, collection, optional path object_id, page_size, max_output_bytes and coverage.cursor. It returns verified structural geometry/characters/words with mandatory source and artifact identities; it is metadata_only and never citation authority. Object summaries and selected path segments paginate independently; old geometry is rebuild_required and an indivisible first row that cannot fit is output_budget_insufficient. Text read/search preserve typed native/OCR evidence; their cursors bind generation and operation options. Search pages cover a bounded max_hits window; inspect truncation and exhaustion. Opt-in inspect_visual takes scope (document_ids, first_page, last_page), query, max_candidates and its own cursor; use result.next_cursor and retain the batch output budget and per-item reservation when continuing. read_visual takes rendition_id and returns complete image_base64 plus pinned candidate metadata; no image byte windows, truncation or cursor. Both visual operations reuse the generation resource budget and report actual_image_delivery=false and citation_authority=false. They establish local observations, not model delivery or citation rights. The seven deterministic operations remain local and perform zero model submissions. search_multimodal requires mandatory document routing then source-bound text/visual reranking on the same finite Decisions context. All complete item output shares and worst-case call shares are prepared before the first submit. budget.max_decisions_submissions defaults to8 (hard cap200); no operation borrows a later share. Paid results have no inference cursor, preserve partial attempt receipts, and grant no reader citation rights. Required paid failure stops later paid items while independent local items may continue. model_submissions is null when exact batch attribution is unavailable; scheduled attempts and shared context snapshots are separate. Numeric cost telemetry is a labelled lossy finite_f64 projection with full usage SHA; missing cost remains null. Explicit rerank --root ROOT --input FILE_OR_DASH accepts gptgrep.rich_rerank.request.v1 with query and unique {id,evidence} candidates. It resolves exact pinned native/OCR text windows and visual refs, scores only that supplied pool using the same rubric, and creates neither routing-pass nor citation rights. The equivalent rich batch rerank operation shares the same prepaid output/call reservations. Caller text/image bytes/URLs, implicit dependencies and inference cursors are rejected.\n\nJev routing/reranking is required by default search, ask and summarize. OPENROUTER_API_KEY must be supplied for model-assisted runs; failures never silently downgrade to local retrieval. Explicit regex/lexical and enrich --plan-only remain offline. Enrich is an explicit Codex/Jev step that creates non-citable navigation hints after local indexing. Use --document RELATIVE_PATH to scope before candidate budgets. The default Decisions model is openai/gpt-6-luna-decisions; native Codex defaults separately to gpt-6-luna/max/fast. Hybrid/semantic and judge send bounded data to OpenRouter Decisions. Judge input accepts state/questions or typed input.text/input.images with explicit source bindings and local PNG/JPEG paths. --decisions-budget FILE joins an existing original-clock shared budget; it never initializes or resets a ledger. Without the file, paid calls share their single-invocation bounded client context. Explicit --model typesafe/jev-1.13 remains text-only. Inspect coverage, source_fresh, coordinate_system and text_truncated before citing evidence. The main agent performs reasoning and controls follow-up reads. Use search QUERY ROOT --multimodal or ask QUESTION ROOT --multimodal on a published v2 rich generation. Both retain one generation and one finite Decisions context, perform mandatory document routing, and rerank a union of text and independent visual candidates. Scope with --document PATH; bound --window-bytes, --max-visual-candidates, --max-concurrent-batches, --max-image-bytes, --max-image-pixels, --max-metadata-bytes and --max-output-bytes. --multimodal-timeout limits the same invocation and never extends an existing shared deadline. Search returns gptgrep.rich_multimodal_search.v1 JSON with model-exposure-only evidence and no citation rights. Ask uses native gpt-6-luna/max/fast, accepts --max-citations 1..8, and issues typed text/image citations only after actual complete reader delivery and freshness checks. Inspect coverage/truncation and actual observations; implementation and offline mocks do not qualify actual image influence/native runtime. No legacy generation, regex/lexical, grep-window or planning fallback is allowed. Foreground OCR is available through the native and incur CLIs: gptgrep ocr serve --config CONTROL_JSON --token-env GPTGREP_OCR_SERVE_TOKEN. It uses explicit server-held task custody, the selected native runtime, a finite original-anchor phase and authenticated loopback only. Legacy image profiles retain their qualification requirements. The optional --initialize-ledger creates or joins the exact namespace without reset or renewal. /ocr is separately qualified PNG multipart compatibility with model-reported uncalibrated confidence and no generation authority. Ordinary queries never start OCR; listener/native qualification remains pending. Rich ingestion supports lossless UTF-8 text/Markdown, PDF, PNG and restricted baseline JPEG. Office uses one bounded LibreOffice conversion; a working converter is required and real Office runtime qualification remains pending. The full JPEG family remains unsupported. New files require reindexing. --schema provides the command contract.\n\nUse gptgrep parse-agent serve --config CONTROL_JSON --expected-control-sha256 SHA for a bounded foreground LiteParse toolbox. An external Codex/PTC agent can prepare a registered source, extract all native pages, inspect complete page/artifact/metadata inventories through continuations, read full images or crops, request selected per-page OCR, and finalize. The exact control snapshot owns source aliases, budgets, paths and original OCR context; model JSON cannot admit a source path or submit paid OCR results. For deterministic complete parsing use gptgrep parse-agent run --config CONTROL_JSON --expected-control-sha256 SHA --source ALIAS --mode off|auto --output FILE. Auto refuses incomplete required OCR; off reports required_ocr_complete honestly. The product file contains complete RichParsedDocument fields and is not generation publication. Serve and run remain independently usable deterministic/external PTC surfaces. Explicit gptgrep parse-agent agent --config CONTROL_JSON --expected-control-sha256 SHA --document-agent-control DOCUMENT_CONTROL_JSON --expected-document-agent-control-sha256 SHA --source ALIAS --output FILE launches the selected standalone Codex app-server document turn with the bounded gptgrep_parse.toolbox. It requests gpt-6-luna/max/fast (normalized priority); actual served identity remains unknown. Legacy guarded document view_image requires its accepted binary/profile/guard qualification, complete source-bound pre-turn image catalogue and private image-only permission scope. Native Document/OCR execution uses the caller-selected tools, permissions, job budgets and original deadline. Retained fixed Page/Document transports keep their original profile contracts. Complete verified parser extraction, artifact metadata and required OCR cover every original page; actual model inspection is partial coverage, not a full metadata-read requirement. Dynamic images/crops remain mediated transport; native crop child augmentation is separate. For complete typed indexing use gptgrep index ROOT --parse-agent-config CONTROL_JSON --expected-parse-agent-config-sha256 SHA --document-agent-controls REGISTRY_JSON --expected-document-agent-controls-sha256 SHA. The closed gptgrep.parse-agent.index-controls.v1 registry pins the config and one distinct admitted document control per registered source alias. All controls and the complete supported corpus inventory are checked before any turn, then pins/inventory are rechecked before publish. One invocation retains the original clock, OCR context, request quota and shared ResourceBudget across source transfers; the generation writer consumes owned verified products without reparse. Unsupported file counts are reported separately and excess supported files are refused, never truncated. Omit all four flags to retain ordinary index behavior; do not mix legacy rich/OCR or optimize-merge controls. Explicit parse-agent qualify accepts a pinned private qualification purpose and writes evidence only to a fresh private file with --evidence-output; that evidence is not accepted qualification or publication. Native page OCR profiles and old DynamicImages qualifications remain separate.\n"
+    "# GPTgrep\n\nLocal vectorless retrieval helper for agents. No MCP server.\n\n1. gptgrep index ./docs --json\n1r. gptgrep index ./documents --ocr auto --plan-only --json\n1n. gptgrep index ./native-documents --ocr off --json\n1a. gptgrep enrich ./docs --ledger-path /path/to/private/enrich.jsonl --max-builder-calls 100 --max-jev-calls 100 --plan-only --json\n2. gptgrep search 'concept in natural language' ./docs --json\n3. gptgrep search 'pattern' ./docs --mode regex --json\n4. gptgrep tree manual.pdf --root ./docs --json\n5. gptgrep read DOCUMENT_ID:NODE_ID --root ./docs --json\n6. gptgrep batch --root ./docs --input operations.json --json\n7. gptgrep batch --rich --root ./docs --input rich-operations.json\n\nBatch accepts gptgrep.batch.request.v1 JSON, pins one generation and preserves operation order. Local search/catalog/tree/read operations share bounded output reservations. Batch hybrid/semantic are currently rejected before provider work; inspect each item status and coverage.\n\nRich batch request shape: send one JSON object, not a bare operation array. schema_version and operations are required. generation defaults to the string CURRENT; budget may be omitted or partially specified, with defaults shown by --schema. Every operation requires the discriminator op and a unique id (1..128 UTF-8 bytes, no control characters). Unknown fields are rejected. Start with this local request in rich-operations.json:\n\n```json\n{\n  \"schema_version\": \"gptgrep.batch.rich.request.v1\",\n  \"generation\": \"CURRENT\",\n  \"budget\": {\n    \"max_operations\": 1,\n    \"max_output_bytes\": 16384,\n    \"max_decisions_submissions\": 0\n  },\n  \"operations\": [\n    {\n      \"op\": \"inspect_documents\",\n      \"id\": \"documents-1\",\n      \"fields\": [\n        \"path\",\n        \"title\",\n        \"pages\"\n      ],\n      \"page_size\": 5\n    }\n  ]\n}\n```\n\nRun gptgrep batch --rich --root ./docs --input rich-operations.json. For a follow-up, copy the exact response generation object and use a returned document path; operations cannot refer to another item in the same batch. Replace both generation fields and manual.pdf in this template before running it:\n\n```json\n{\n  \"schema_version\": \"gptgrep.batch.rich.request.v1\",\n  \"generation\": {\n    \"generation\": \"replace-with-returned-generation\",\n    \"manifest_sha256\": \"0000000000000000000000000000000000000000000000000000000000000000\"\n  },\n  \"budget\": {\n    \"max_operations\": 1,\n    \"max_output_bytes\": 16384,\n    \"max_decisions_submissions\": 0\n  },\n  \"operations\": [\n    {\n      \"op\": \"inspect_pages\",\n      \"id\": \"pages-1\",\n      \"document\": \"manual.pdf\",\n      \"fields\": [\n        \"page\",\n        \"native_text\",\n        \"metadata_artifact\"\n      ],\n      \"page_size\": 1\n    }\n  ]\n}\n```\n\nThe zero max_decisions_submissions allowance keeps these examples local. Read item status and coverage; retain the exact generation and operation options when using a returned cursor. Inspect commands.batch.rich.required_operation_fields in --schema output for other operations.\n\nFor a separately published v2 generation, batch --rich accepts gptgrep.batch.rich.request.v1 with inspect_documents, inspect_pages, inspect_native_metadata, read_artifact, search_artifacts, inspect_visual, read_visual and explicit search_multimodal. Document/page enumeration returns indexed metadata only. inspect_native_metadata takes a page metadata artifact_id, closed fields and item_fields, collection, optional path object_id, page_size, max_output_bytes and coverage.cursor. It returns verified structural geometry/characters/words with mandatory source and artifact identities; it is metadata_only and never citation authority. Object summaries and selected path segments paginate independently; old geometry is rebuild_required and an indivisible first row that cannot fit is output_budget_insufficient. Text read/search preserve typed native/OCR evidence; their cursors bind generation and operation options. Search pages cover a bounded max_hits window; inspect truncation and exhaustion. Opt-in inspect_visual takes scope (document_ids, first_page, last_page), query, max_candidates and its own cursor; use result.next_cursor and retain the batch output budget and per-item reservation when continuing. read_visual takes rendition_id and returns complete image_base64 plus pinned candidate metadata; no image byte windows, truncation or cursor. Both visual operations reuse the generation resource budget and report actual_image_delivery=false and citation_authority=false. They establish local observations, not model delivery or citation rights. The seven deterministic operations remain local and perform zero model submissions. search_multimodal requires mandatory document routing then source-bound text/visual reranking on the same finite Decisions context. All complete item output shares and worst-case call shares are prepared before the first submit. budget.max_decisions_submissions defaults to8 (hard cap200); no operation borrows a later share. Paid results have no inference cursor, preserve partial attempt receipts, and grant no reader citation rights. Required paid failure stops later paid items while independent local items may continue. model_submissions is null when exact batch attribution is unavailable; scheduled attempts and shared context snapshots are separate. Numeric cost telemetry is a labelled lossy finite_f64 projection with full usage SHA; missing cost remains null. Explicit rerank --root ROOT --input FILE_OR_DASH accepts gptgrep.rich_rerank.request.v1 with query and unique {id,evidence} candidates. It resolves exact pinned native/OCR text windows and visual refs, scores only that supplied pool using the same rubric, and creates neither routing-pass nor citation rights. The equivalent rich batch rerank operation shares the same prepaid output/call reservations. Caller text/image bytes/URLs, implicit dependencies and inference cursors are rejected.\n\nJev routing/reranking is required by default search, ask and summarize. OPENROUTER_API_KEY must be supplied for model-assisted runs; failures never silently downgrade to local retrieval. Explicit regex/lexical and enrich --plan-only remain offline. Enrich is an explicit Codex/Jev step that creates non-citable navigation hints after local indexing. Use --document RELATIVE_PATH to scope before candidate budgets. The default Decisions model is openai/gpt-6-luna-decisions; native Codex defaults separately to gpt-6-luna/max/fast. Hybrid/semantic and judge send bounded data to OpenRouter Decisions. Judge input accepts state/questions or typed input.text/input.images with explicit source bindings and local PNG/JPEG paths. --decisions-budget FILE joins an existing original-clock shared budget; it never initializes or resets a ledger. Create a new ledger once with gptgrep decisions-budget init --run-id ID --plan-file FILE --deadline-seconds N --max-submissions N --ledger ABS_PATH --output ABS_CONTROL_JSON; it refuses existing ledger, lock and control paths and writes a 0600 control file. Inspect it read-only with gptgrep decisions-budget status --control FILE --json. Without the file, paid calls share their single-invocation bounded client context. Explicit --model typesafe/jev-1.13 remains text-only. An alias such as --model '~typesafe/jev-latest' is text-only and admits only a concrete same-author, same-family build such as typesafe/jev-1.13-20260917; requested_model and the served model are reported separately. Judge failures use code decisions_judge_failed with a judge object: submission state, served model, usage and cost or null with a reason, and latency. Inspect coverage, source_fresh, coordinate_system and text_truncated before citing evidence. The main agent performs reasoning and controls follow-up reads. Use search QUERY ROOT --multimodal or ask QUESTION ROOT --multimodal on a published v2 rich generation. Both retain one generation and one finite Decisions context, perform mandatory document routing, and rerank a union of text and independent visual candidates. Scope with --document PATH; bound --window-bytes, --max-visual-candidates, --max-concurrent-batches, --max-image-bytes, --max-image-pixels, --max-metadata-bytes and --max-output-bytes. --multimodal-timeout limits the same invocation and never extends an existing shared deadline. Search returns gptgrep.rich_multimodal_search.v1 JSON with model-exposure-only evidence and no citation rights. Ask uses native gpt-6-luna/max/fast, accepts --max-citations 1..8, and issues typed text/image citations only after actual complete reader delivery and freshness checks. Inspect coverage/truncation and actual observations; implementation and offline mocks do not qualify actual image influence/native runtime. No legacy generation, regex/lexical, grep-window or planning fallback is allowed. Foreground OCR is available through the native and incur CLIs: gptgrep ocr serve --config CONTROL_JSON --token-env GPTGREP_OCR_SERVE_TOKEN. It uses explicit server-held task custody, the selected native runtime, a finite original-anchor phase and authenticated loopback only. Legacy image profiles retain their qualification requirements. The optional --initialize-ledger creates or joins the exact namespace without reset or renewal. /ocr is separately qualified PNG multipart compatibility with model-reported uncalibrated confidence and no generation authority. Ordinary queries never start OCR; listener/native qualification remains pending. Rich ingestion supports lossless UTF-8 text/Markdown, PDF, PNG and restricted baseline JPEG. Office uses one bounded LibreOffice conversion; a working converter is required and real Office runtime qualification remains pending. The full JPEG family remains unsupported. New files require reindexing. --schema provides the command contract.\n\nUse gptgrep parse-agent serve --config CONTROL_JSON --expected-control-sha256 SHA for a bounded foreground LiteParse toolbox. An external Codex/PTC agent can prepare a registered source, extract all native pages, inspect complete page/artifact/metadata inventories through continuations, read full images or crops, request selected per-page OCR, and finalize. The exact control snapshot owns source aliases, budgets, paths and original OCR context; model JSON cannot admit a source path or submit paid OCR results. For deterministic complete parsing use gptgrep parse-agent run --config CONTROL_JSON --expected-control-sha256 SHA --source ALIAS --mode off|auto --output FILE. Auto refuses incomplete required OCR; off reports required_ocr_complete honestly. The product file contains complete RichParsedDocument fields and is not generation publication. Serve and run remain independently usable deterministic/external PTC surfaces. Explicit gptgrep parse-agent agent --config CONTROL_JSON --expected-control-sha256 SHA --document-agent-control DOCUMENT_CONTROL_JSON --expected-document-agent-control-sha256 SHA --source ALIAS --output FILE launches the selected standalone Codex app-server document turn with the bounded gptgrep_parse.toolbox. It requests gpt-6-luna/max/fast (normalized priority); actual served identity remains unknown. Legacy guarded document view_image requires its accepted binary/profile/guard qualification, complete source-bound pre-turn image catalogue and private image-only permission scope. Native Document/OCR execution uses the caller-selected tools, permissions, job budgets and original deadline. Retained fixed Page/Document transports keep their original profile contracts. Complete verified parser extraction, artifact metadata and required OCR cover every original page; actual model inspection is partial coverage, not a full metadata-read requirement. Dynamic images/crops remain mediated transport; native crop child augmentation is separate. For complete typed indexing use gptgrep index ROOT --parse-agent-config CONTROL_JSON --expected-parse-agent-config-sha256 SHA --document-agent-controls REGISTRY_JSON --expected-document-agent-controls-sha256 SHA. The closed gptgrep.parse-agent.index-controls.v1 registry pins the config and one distinct admitted document control per registered source alias. All controls and the complete supported corpus inventory are checked before any turn, then pins/inventory are rechecked before publish. One invocation retains the original clock, OCR context, request quota and shared ResourceBudget across source transfers; the generation writer consumes owned verified products without reparse. Unsupported file counts are reported separately and excess supported files are refused, never truncated. Omit all four flags to retain ordinary index behavior; do not mix legacy rich/OCR or optimize-merge controls. Explicit parse-agent qualify accepts a pinned private qualification purpose and writes evidence only to a fresh private file with --evidence-output; that evidence is not accepted qualification or publication. Native page OCR profiles and old DynamicImages qualifications remain separate.\n"
 }
 
 fn emit(value: &Value) -> Result<()> {
@@ -1374,6 +1448,32 @@ async fn run(cli: Cli) -> Result<i32> {
                 return Err(OcrServeError("ocr_serve_incompatible_decisions_budget").into());
             }
             return run_ocr_serve(command).await;
+        }
+        Command::DecisionsBudget { command } => {
+            if cli.decisions_budget.is_some() {
+                return Err(decisions_budget::DecisionsBudgetCommandError(
+                    "decisions-budget commands take their own control or ledger; omit the global --decisions-budget".into(),
+                )
+                .into());
+            }
+            emit(&match command {
+                DecisionsBudgetCommand::Init {
+                    run_id,
+                    plan_file,
+                    deadline_seconds,
+                    max_submissions,
+                    ledger,
+                    output,
+                } => decisions_budget::init(
+                    &run_id,
+                    &plan_file,
+                    deadline_seconds,
+                    max_submissions,
+                    &ledger,
+                    &output,
+                )?,
+                DecisionsBudgetCommand::Status { control } => decisions_budget::status(&control)?,
+            })?;
         }
         Command::Rerank {
             root,
@@ -1862,23 +1962,34 @@ async fn run(cli: Cli) -> Result<i32> {
             emit(&result)?;
         }
         Command::Judge { input, model } => {
-            let mut bytes = Vec::new();
-            std::fs::File::open(input)?
-                .take(gptgrep_jev::MAX_REQUEST_BYTES as u64 + 1)
-                .read_to_end(&mut bytes)?;
-            if bytes.len() > gptgrep_jev::MAX_REQUEST_BYTES {
-                bail!("judge input exceeds 64 KiB limit");
-            }
-            let data = gptgrep_jev::parse_unique_json(&bytes)?;
-            let client = gptgrep_jev::JevClient::from_env(model.as_deref())?;
-            let client = match decisions_context(cli.decisions_budget.as_deref())? {
-                Some(context) => client.with_execution_context(context),
-                None => client,
-            };
-            let prepared = prepare_judge(&client, &data)?;
-            emit(&serde_json::to_value(
-                client.submit_prepared(prepared).await?,
-            )?)?;
+            let started = std::time::Instant::now();
+            let requested = model
+                .clone()
+                .unwrap_or_else(|| gptgrep_jev::DEFAULT_MODEL.into());
+            let data = (|| -> Result<Value> {
+                let mut bytes = Vec::new();
+                std::fs::File::open(&input)?
+                    .take(gptgrep_jev::MAX_REQUEST_BYTES as u64 + 1)
+                    .read_to_end(&mut bytes)?;
+                if bytes.len() > gptgrep_jev::MAX_REQUEST_BYTES {
+                    bail!("judge input exceeds 64 KiB limit");
+                }
+                Ok(gptgrep_jev::parse_unique_json(&bytes)?)
+            })()
+            .map_err(|error| {
+                judge::JudgeFailure::before_submission("input", &requested, &error, started, None)
+            })?;
+            let client = (|| -> Result<gptgrep_jev::JevClient> {
+                let client = gptgrep_jev::JevClient::from_env(model.as_deref())?;
+                Ok(match decisions_context(cli.decisions_budget.as_deref())? {
+                    Some(context) => client.with_execution_context(context),
+                    None => client,
+                })
+            })()
+            .map_err(|error| {
+                judge::JudgeFailure::before_submission("client", &requested, &error, started, None)
+            })?;
+            emit(&judge::run(client, &data, started).await?)?;
         }
 
         Command::Doctor => {
@@ -2043,7 +2154,10 @@ async fn run(cli: Cli) -> Result<i32> {
 async fn main() {
     let cli = Cli::parse();
     let as_json = cli.json
-        || matches!(&cli.command, Some(Command::Ocr { .. }))
+        || matches!(
+            &cli.command,
+            Some(Command::Ocr { .. } | Command::DecisionsBudget { .. })
+        )
         || matches!(
             &cli.command,
             Some(
@@ -2123,6 +2237,12 @@ async fn main() {
                                     partial.code
                                 } else if error.is::<gptgrep_core::JevSearchError>() {
                                     "jev_search_failed"
+                                } else if error.is::<judge::JudgeFailure>() {
+                                    judge::JUDGE_FAILURE_CODE
+                                } else if error
+                                    .is::<decisions_budget::DecisionsBudgetCommandError>()
+                                {
+                                    "decisions_budget_failed"
                                 } else if error.is::<gptgrep_host::HostCapabilityError>() {
                                     "host_no_evidence_tools"
                                 } else {
@@ -2138,6 +2258,9 @@ async fn main() {
                 let mut report = json!({"schema_version":"gptgrep.error.v1","ok":false,"code":code,"error":diagnostic});
                 if let Some(partial) = error.downcast_ref::<gptgrep_core::JevSearchError>() {
                     report["retrieval"] = serde_json::to_value(partial).unwrap_or(Value::Null);
+                }
+                if let Some(failure) = error.downcast_ref::<judge::JudgeFailure>() {
+                    report["judge"] = serde_json::to_value(failure.report()).unwrap_or(Value::Null);
                 }
                 if let Some(partial) = error.downcast_ref::<gptgrep_host::HostRetrievalError>() {
                     report["host_retrieval"] = serde_json::to_value(partial).unwrap_or(Value::Null);
@@ -2461,6 +2584,111 @@ mod query_plan_cli_tests {
             .is_ok()
         );
     }
+
+    #[test]
+    fn decisions_budget_commands_and_alias_admission_are_discoverable() {
+        let init = Cli::try_parse_from([
+            "gptgrep",
+            "decisions-budget",
+            "init",
+            "--run-id",
+            "synthetic-run",
+            "--plan-file",
+            "plan.json",
+            "--deadline-seconds",
+            "600",
+            "--max-submissions",
+            "2",
+            "--ledger",
+            "/abs/ledger.json",
+            "--output",
+            "/abs/control.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            init.command,
+            Some(Command::DecisionsBudget {
+                command: DecisionsBudgetCommand::Init {
+                    deadline_seconds: 600,
+                    max_submissions: 2,
+                    ..
+                }
+            })
+        ));
+        for (option, invalid) in [("--deadline-seconds", "0"), ("--max-submissions", "201")] {
+            let mut args = vec![
+                "gptgrep",
+                "decisions-budget",
+                "init",
+                "--run-id",
+                "r",
+                "--plan-file",
+                "p",
+                "--deadline-seconds",
+                "60",
+                "--max-submissions",
+                "1",
+                "--ledger",
+                "/l",
+                "--output",
+                "/o",
+            ];
+            let index = args.iter().position(|arg| *arg == option).unwrap();
+            args[index + 1] = invalid;
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        assert!(
+            Cli::try_parse_from([
+                "gptgrep",
+                "decisions-budget",
+                "status",
+                "--control",
+                "control.json",
+                "--json"
+            ])
+            .is_ok()
+        );
+        let contract = contract();
+        let budget = &contract["commands"]["decisions-budget"];
+        assert!(
+            budget["init_usage"]
+                .as_str()
+                .unwrap()
+                .contains("--plan-file FILE --deadline-seconds N")
+        );
+        assert_eq!(
+            budget["status_output_schema"],
+            gptgrep_jev::DECISIONS_BUDGET_STATUS_SCHEMA
+        );
+        assert_eq!(
+            contract["global_options"]["decisions-budget"]["initialization"],
+            false
+        );
+        assert_eq!(
+            contract["decisions"]["aliases"]["example"],
+            "~typesafe/jev-latest"
+        );
+        assert_eq!(contract["decisions"]["aliases"]["images"], false);
+        assert!(
+            contract["decisions"]["raw_image_parts"]
+                .as_str()
+                .unwrap()
+                .contains("image_url or input_image member or type")
+        );
+        assert_eq!(
+            contract["decisions"]["canonical_builds"][gptgrep_jev::LEGACY_MODEL],
+            gptgrep_jev::LEGACY_MODEL_CANONICAL
+        );
+        assert_eq!(
+            contract["commands"]["judge"]["output"]["failure"]["code"],
+            judge::JUDGE_FAILURE_CODE
+        );
+        assert!(llms().contains("gptgrep decisions-budget init --run-id ID"));
+        assert!(llms().contains("gptgrep decisions-budget status --control FILE --json"));
+        assert!(llms().contains("~typesafe/jev-latest"));
+        assert!(llms().contains("decisions_judge_failed"));
+    }
+
     #[test]
     fn planning_is_explicit_and_limited_to_ask() {
         let plain =

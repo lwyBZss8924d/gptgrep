@@ -7,22 +7,30 @@ mod clock;
 mod execution;
 mod failure;
 mod input;
+mod models;
 #[cfg(test)]
 mod observer_tests;
 mod roles;
 mod validation;
 pub use clock::RunClockAnchor;
 pub use execution::{
-    DecisionsBudget, ExecutionContext, ExecutionSnapshot, MAX_CONCURRENT_REQUESTS, MAX_SUBMISSIONS,
+    DECISIONS_BUDGET_CONTRACT_SCHEMA, DECISIONS_BUDGET_STATUS_SCHEMA, DecisionsBudget,
+    DecisionsBudgetStatus, ExecutionContext, ExecutionSnapshot, MAX_CONCURRENT_REQUESTS,
+    MAX_SUBMISSIONS, ReservationOutcomeCounts,
 };
 pub use failure::{
-    DecisionFailure, DecisionFailureDiagnostic, DecisionFailureKind, FailedResponseUsage,
-    UsageObservation, UsagePresence,
+    DecisionFailure, DecisionFailureDiagnostic, DecisionFailureKind, FailedResponseMetadata,
+    FailedResponseUsage, UsageObservation, UsagePresence,
 };
 pub use input::{
     DecisionInput, ImageEvidence, MAX_IMAGE_BASE64_BYTES, MAX_IMAGE_BYTES,
     MAX_IMAGE_PIXEL_BUFFER_BYTES, MAX_IMAGE_PIXELS, MAX_IMAGES, MAX_MULTIMODAL_REQUEST_BYTES,
     MAX_TOTAL_IMAGE_PIXELS, PreparedImageQualification, SourceBinding, TextEvidence,
+};
+pub(crate) use models::luna_decisions_model;
+pub use models::{
+    DEFAULT_MODEL_CANONICAL, LEGACY_MODEL_CANONICAL, MODEL_ALIAS_PREFIX, ModelAlias,
+    contains_image_part, is_model_alias, model_accepts_images, response_model_matches,
 };
 pub use roles::{
     EvidenceRole, EvidenceRoleCandidate, EvidenceRoleResponse, MAX_ROLE_CANDIDATES,
@@ -44,24 +52,6 @@ use std::{collections::BTreeMap, net::IpAddr, sync::Arc, time::Duration};
 pub const DEFAULT_MODEL: &str = "openai/gpt-6-luna-decisions";
 /// Explicit legacy text-only model. Never selected as fallback.
 pub const LEGACY_MODEL: &str = "typesafe/jev-1.13";
-
-/// Admit an exact requested identifier or an observed canonical identifier for
-/// the two supported aliases. Other models require exact equality.
-pub fn response_model_matches(requested: &str, actual: &str) -> bool {
-    requested == actual
-        || matches!(
-            (requested, actual),
-            (DEFAULT_MODEL, "openai/gpt-6-luna-decisions-20261006")
-                | (LEGACY_MODEL, "typesafe/jev-1.13-20260917")
-        )
-}
-
-pub(crate) fn luna_decisions_model(model: &str) -> bool {
-    matches!(
-        model,
-        DEFAULT_MODEL | "openai/gpt-6-luna-decisions-20261006"
-    )
-}
 pub const DEFAULT_ENDPOINT: &str = "https://openrouter.ai/api/alpha/decisions";
 /// A local application cap, not a provider-advertised limit.
 pub const MAX_QUESTIONS: usize = 64;
@@ -296,10 +286,8 @@ impl JevClient {
             "Jev endpoint requires a host"
         );
         let model = model.unwrap_or(DEFAULT_MODEL);
-        ensure!(
-            !model.trim().is_empty() && model.len() <= 256 && !model.chars().any(char::is_control),
-            "Invalid Jev model identifier"
-        );
+        // Malformed `~` aliases fail here, before any context, reservation or body.
+        models::validate_requested_model(model)?;
         let mut authorization = HeaderValue::from_str(&format!("Bearer {api_key}"))
             .map_err(|_| anyhow!("Invalid Jev API key header"))?;
         authorization.set_sensitive(true);
@@ -338,6 +326,13 @@ impl JevClient {
         &self.execution
     }
 
+    /// The requested model selector sent in every prepared body. Responses keep
+    /// their own served identifier; an alias selector is admitted per
+    /// [`response_model_matches`].
+    pub fn requested_model(&self) -> &str {
+        &self.model
+    }
+
     /// Install before preparing requests. Existing prepared identities are
     /// invalidated so a request cannot bypass a newly attached observer.
     pub fn with_decision_observer(mut self, observer: Arc<dyn DecisionObserver>) -> Self {
@@ -358,6 +353,10 @@ impl JevClient {
     /// Validate and serialize once, so a caller can durably reserve the exact
     /// encoded request size and digest before sending it. Oversized requests
     /// fail before network I/O; callers own any explicit splitting policy.
+    /// Raw JSON passes through unchanged for Luna Decisions. Every other
+    /// selector, including each `~` alias, is text-only: an image part anywhere
+    /// in `state` or `questions` (see [`contains_image_part`]) is refused here,
+    /// before any reservation or submission.
     pub fn prepare_decision(&self, state: Value, questions: Value) -> Result<PreparedDecision> {
         self.execution.remaining()?;
         let body = self.request_body(state, &questions)?;
@@ -533,6 +532,11 @@ impl JevClient {
 
     fn request_body(&self, state: Value, questions: &Value) -> Result<Vec<u8>> {
         validation::request(&state, questions)?;
+        ensure!(
+            model_accepts_images(&self.model)
+                || !(contains_image_part(&state) || contains_image_part(questions)),
+            models::IMAGES_REQUIRE_LUNA
+        );
         let body = serde_json::to_vec(&json!({
             "model": self.model,
             "state": state,
@@ -693,6 +697,47 @@ mod tests {
         assert!(rerank_questions("", std::slice::from_ref(&candidate)).is_err());
         assert!(rerank_questions("query", &[candidate.clone(), candidate.clone()]).is_err());
         assert!(rerank_questions("query", &vec![candidate; MAX_QUESTIONS + 1]).is_err());
+    }
+
+    #[test]
+    fn raw_image_parts_are_refused_for_text_only_selectors_and_kept_for_luna() {
+        let state = json!(["Synthetic caption.",
+            {"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}}]);
+        let questions = json!({"q":{"type":"noul","instructions":"Is a mark visible?"}});
+        for model in [
+            "~typesafe/jev-latest",
+            LEGACY_MODEL,
+            LEGACY_MODEL_CANONICAL,
+            "explicit/other",
+        ] {
+            let client = JevClient::new("synthetic-test-key", Some(model)).unwrap();
+            let error = client
+                .request_body(state.clone(), &questions)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, models::IMAGES_REQUIRE_LUNA, "{model}");
+            // An image part inside question instructions is refused the same way.
+            let in_questions = json!({"q":{"type":"noul","instructions":
+                [{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]}});
+            assert!(
+                client
+                    .request_body(json!("Synthetic caption."), &in_questions)
+                    .is_err()
+            );
+            // Literal text that only mentions image parts is still sent.
+            assert!(
+                client
+                    .request_body(json!({"note":"image_url data:image/png"}), &questions)
+                    .is_ok()
+            );
+        }
+        for model in [DEFAULT_MODEL, DEFAULT_MODEL_CANONICAL] {
+            let client = JevClient::new("synthetic-test-key", Some(model)).unwrap();
+            let body: Value =
+                serde_json::from_slice(&client.request_body(state.clone(), &questions).unwrap())
+                    .unwrap();
+            assert_eq!(body["state"], state);
+        }
     }
 
     #[test]

@@ -167,6 +167,18 @@ gptgrep judge --input evals/requests/decision-smoke.json \
   --model '~typesafe/jev-latest' --json
 ```
 
+`~typesafe/jev-latest` is an OpenRouter alias: the catalog resolves it to the
+latest build of the Jev family, and the response returns the build that answered.
+GPTgrep admits an `~author/family-latest` alias only when the served model is a
+concrete build of the same author and family, `author/family-VERSION` with a
+version starting with a digit. For this alias, `typesafe/jev-1.13` and
+`typesafe/jev-1.13-20260917` are admitted. Another author, another family such as
+`typesafe/jevx-2`, a `:free` variant or another alias is rejected. That rejection
+happens after the call was charged. A malformed alias is rejected before any request.
+Aliases are text-only: typed images and raw image parts are refused before any
+request. The judge output reports `requested_model` separately from
+the served `model`. Pin the canonical build when results must stay comparable.
+
 Jev uses OpenRouter's typed **Decisions API**, not chat completions. It supplies
 dynamic Choice/Noul/Score judgments; application code retains parsing, offsets,
 arithmetic and workflow execution. The response records the actual returned
@@ -367,7 +379,11 @@ Codex reasoning uses `gpt-6-luna`, `max`, and `fast` independently. Responses re
 actual returned model metadata; admission requires the requested identifier or the
 observed canonical mapping (`openai/gpt-6-luna-decisions-20261006` for Luna and
 `typesafe/jev-1.13-20260917` for legacy Jev). Other explicit models require exact
-identifier equality. No guessed dated aliases or fallback models are accepted.
+identifier equality. An explicit `~author/family-latest` alias admits only a
+concrete `author/family-VERSION` build of the same author and family. Aliases are
+text-only, and a malformed alias fails before any request. No guessed dated
+identifiers, other families or fallback models are accepted. Reports keep the
+requested selector and the served model separate.
 
 `gptgrep judge --input evidence.json --json` also accepts the normal typed image
 contract: `input.text` contains `{source, text}` objects and `input.images` contains
@@ -378,20 +394,55 @@ bytes are admitted as bounded snapshots and sent in order as flat `image_url`
 data URLs. Source bindings and local paths stay out of the provider body. The
 64 KiB control/text envelope, four-image cap, per-image 1 MiB/8 million pixel cap,
 24 million total pixel cap, 8 MiB request cap and 1 MiB response cap remain explicit.
-Legacy Jev rejects typed images before submission. Refusals, unknown answers,
-partial bodies and malformed responses do not become successful decisions.
+Legacy Jev, other exact models and every alias reject typed images before
+reservation or submission. A raw `{state, questions}` input is held to the same
+rule: for these selectors, any object in `state` or `questions` with an `image_url`
+or `input_image` member or `type` is refused before reservation. Strings stay
+literal text. Luna receives the raw JSON unchanged.
+Refusals, unknown answers, partial bodies and malformed responses do not become
+successful decisions.
+
+A successful judge prints the validated response, where `model` is the served build,
+plus `requested_model`. A failed judge exits 2 with `gptgrep.error.v1`, code
+`decisions_judge_failed` and a `judge` object (`gptgrep.judge-failure.v1`). The
+object contains the stage, the requested and served models, and the provider
+response ID. It also records whether a send started (`not_submitted`,
+`sent_response_received` or `sent_outcome_unknown`). Reported usage and
+`cost_usd` appear when available. Otherwise they are null with a reason such as
+`not_submitted`, `http_status_body_not_read` or `cost_null`. The object also carries
+the latency, the failure diagnostic and the context's admission snapshot.
+It never contains request or response bodies, headers, URLs or keys.
 
 For a shared experiment, add `--decisions-budget budget.json` to hybrid/semantic
 search, judge, ask, summarize, or non-plan enrich. The portable control file is at
 most 16 KiB and contains `schema_version: "gptgrep.decisions-budget-contract.v1"`,
 `run_id`, `plan_digest`, `deadline_unix_ms`, `max_submissions` and an absolute
-`ledger_path`. A trusted owner must already have initialized that matching ledger.
-The CLI joins its original clock and consumed reservations; missing files or a
-changed run, deadline, plan or cap are errors. It never creates or resets a ledger.
+`ledger_path`. The option joins an existing matching ledger: its original clock and
+consumed reservations. Missing files or a changed run, deadline, plan or cap are
+errors, and it never creates or resets a ledger. Create a new ledger once with:
+
+```sh
+gptgrep decisions-budget init --run-id smoke-1 --plan-file plan.json \
+  --deadline-seconds 1800 --max-submissions 2 \
+  --ledger /abs/private/ledger.json --output /abs/private/budget.json
+gptgrep decisions-budget status --control /abs/private/budget.json --json
+```
+
+`init` sets `plan_digest` to the SHA-256 of the plan file and the deadline to now
+plus N seconds. It creates the journal and its `.lock` sidecar with the original
+clock anchor, then writes the control file once with mode 0600. It refuses
+relative paths and any existing ledger, lock or control path; it never joins, resets,
+renews or replaces. `status` is read-only. It reports reservations by outcome
+(`reserved`, `in_flight`, `unknown`, `terminal`), remaining submissions, requested
+selectors, the deadline state and whether admission is open. It stays readable
+after the deadline. Reservations are permanent: a joined run stops at
+`max_submissions` with `Decisions submission budget exhausted` before any POST.
 Routing, reranking and follow-up host clients share the same context. Without the
 option, calls use a bounded single-invocation context. Regex/lexical, schema,
-doctor and enrich `--plan-only` do not open the budget file. Numeric usage and cost
-remain reported provider metadata; absent fields remain unavailable.
+doctor, `decisions-budget` and enrich `--plan-only` do not open the budget file.
+Numeric usage and cost remain reported provider metadata; absent fields remain
+unavailable. The ledger counts submissions, not USD. Any spend cap is enforced
+outside the product, for example as submissions multiplied by a worst-case call price.
 
 
 `search --multimodal` and `ask --multimodal` connect the v2 rich generation to the normal Decisions and native reader workflows:

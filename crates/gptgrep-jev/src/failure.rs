@@ -93,6 +93,54 @@ impl FailedResponseUsage {
     }
 }
 
+/// Bounded provider identity fields from a parsed but rejected response.
+///
+/// `model` is the served identifier the provider returned, `id` its response
+/// (generation) identifier and `provider` the serving provider name. Each is
+/// retained only as a nonblank string of at most
+/// [`crate::MAX_PROVIDER_METADATA_BYTES`] bytes without control characters;
+/// anything else is `invalid` with no value. No other response field is kept.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct FailedResponseMetadata {
+    pub model: UsageObservation<String>,
+    pub id: UsageObservation<String>,
+    pub provider: UsageObservation<String>,
+}
+
+impl FailedResponseMetadata {
+    pub(crate) fn from_response(value: &Value) -> Self {
+        let field = |name: &str| match value.get(name) {
+            None => UsageObservation {
+                presence: UsagePresence::Absent,
+                value: None,
+            },
+            Some(Value::Null) => UsageObservation {
+                presence: UsagePresence::Null,
+                value: None,
+            },
+            Some(Value::String(text))
+                if !text.trim().is_empty()
+                    && text.len() <= crate::MAX_PROVIDER_METADATA_BYTES
+                    && !text.chars().any(char::is_control) =>
+            {
+                UsageObservation {
+                    presence: UsagePresence::Reported,
+                    value: Some(text.clone()),
+                }
+            }
+            Some(_) => UsageObservation {
+                presence: UsagePresence::Invalid,
+                value: None,
+            },
+        };
+        Self {
+            model: field("model"),
+            id: field("id"),
+            provider: field("provider"),
+        }
+    }
+}
+
 /// This is an observation, not a model/cost/citation acceptance or a retry permit.
 /// Usage is independently checked numeric provider metadata from unique JSON; invalid
 /// answers remain rejected and reported cost does not establish a final bill.
@@ -103,10 +151,15 @@ pub struct DecisionFailureDiagnostic {
     pub response_bytes: Option<usize>,
     pub validation_code: Option<&'static str>,
     pub reported_usage: Option<FailedResponseUsage>,
+    /// Served model, response ID and provider of a parsed but rejected response.
+    /// Absent when no unique JSON response body was available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_metadata: Option<FailedResponseMetadata>,
 }
 
 /// Downcast an unsuccessful client result to retain safe typed observations.
-/// No request, response, URL, headers, provider text or underlying error is stored.
+/// No request, URL, headers, provider text or underlying error is stored; a parsed
+/// rejected response contributes only numeric usage and bounded identity metadata.
 #[derive(Debug, Clone)]
 pub struct DecisionFailure {
     diagnostic: DecisionFailureDiagnostic,
@@ -188,6 +241,7 @@ impl DecisionFailure {
                 response_bytes: bytes,
                 validation_code: None,
                 reported_usage: None,
+                response_metadata: None,
             },
             message,
         }
@@ -202,7 +256,11 @@ impl DecisionFailure {
         )
     }
 
-    pub(crate) fn validation(error: &anyhow::Error, usage: FailedResponseUsage) -> Self {
+    pub(crate) fn validation(
+        error: &anyhow::Error,
+        usage: FailedResponseUsage,
+        metadata: FailedResponseMetadata,
+    ) -> Self {
         // Only our validator's known static messages can become public diagnostics.
         // An unexpected future error falls back to a fixed string, never its Display.
         let (code, message) = match error.to_string().as_str() {
@@ -278,6 +336,7 @@ impl DecisionFailure {
         let mut failure = Self::new(kind, message, None, None);
         failure.diagnostic.validation_code = Some(code);
         failure.diagnostic.reported_usage = Some(usage);
+        failure.diagnostic.response_metadata = Some(metadata);
         failure
     }
 

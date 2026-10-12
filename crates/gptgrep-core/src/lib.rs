@@ -299,7 +299,13 @@ pub struct Metrics {
     pub jev_calls_attempted: usize,
     /// Successful validated Jev responses observed by this search.
     pub jev_requests: usize,
+    /// Served (provider-returned) model of each validated response.
     pub jev_models: Vec<String>,
+    /// Requested Decisions selector of each logical call attempt, in attempt
+    /// order. It differs from the served build for canonical mappings and
+    /// `~` aliases; both are reported so neither is inferred from the other.
+    #[serde(default)]
+    pub jev_requested_models: Vec<String>,
     pub jev_usage: Vec<Value>,
     pub jev_candidate_bytes: usize,
 }
@@ -2037,6 +2043,9 @@ async fn collect_candidate_view(
         if !routing.is_empty() {
             metrics.jev_candidate_bytes += routing.iter().map(|c| c.text.len()).sum::<usize>();
             metrics.jev_calls_attempted += 1;
+            metrics
+                .jev_requested_models
+                .push(client.requested_model().to_owned());
             observe_jev(
                 observer,
                 "document_routing",
@@ -2160,6 +2169,9 @@ async fn score_candidates(
             .collect();
         metrics.jev_candidate_bytes += candidates.iter().map(|c| c.text.len()).sum::<usize>();
         metrics.jev_calls_attempted += 1;
+        metrics
+            .jev_requested_models
+            .push(client.requested_model().to_owned());
         observe_jev(
             observer,
             "evidence_reranking",
@@ -3276,6 +3288,11 @@ mod tests {
                 "openai/gpt-6-luna-decisions-20261006"
             ]
         );
+        // The requested selector and the served canonical build stay separate.
+        assert_eq!(
+            report.metrics.jev_requested_models,
+            [gptgrep_jev::DEFAULT_MODEL, gptgrep_jev::DEFAULT_MODEL]
+        );
         let events = events.lock().unwrap();
         assert_eq!(events.len(), 4);
         assert_eq!(
@@ -3384,6 +3401,11 @@ mod tests {
         assert_eq!(
             failure.metrics.jev_models,
             ["openai/gpt-6-luna-decisions-20261006"]
+        );
+        // Both attempts, including the failed one, retain their requested selector.
+        assert_eq!(
+            failure.metrics.jev_requested_models,
+            [gptgrep_jev::DEFAULT_MODEL, gptgrep_jev::DEFAULT_MODEL]
         );
         assert_eq!(failure.metrics.jev_usage[0]["cost"], json!(0.001));
         assert_eq!(failure.coverage.scoped_files, 1);

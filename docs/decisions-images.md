@@ -66,9 +66,31 @@ without provider fallback, redirects or implicit retries.
 
 Documented syntax does not establish actual backend image interpretation,
 semantic eligibility, useful answers or a gateway refusal mapping. Unknown or
-unsupported response forms continue to fail closed. The ordinary
-`prepare_input` method still rejects image inputs. This experimental API does
-not wire images into the CLI, select a new default model, promote the ordinary
-image gate, or authorize a live qualification attempt. A separately admitted
-phase must bind source and body digests, controls, deadline, accounting and
-complete output capacity before submission.
+unsupported response forms continue to fail closed.
+
+The ordinary `prepare_input` method uses this same flat codec. It applies to the
+exact Luna Decisions selector `openai/gpt-6-luna-decisions` and its canonical build
+`openai/gpt-6-luna-decisions-20261006`. Images are therefore wired into the CLI:
+
+- `gptgrep judge --input FILE --json` accepts typed `input.text` and `input.images`
+  with local PNG/JPEG paths.
+- `search --multimodal`, `ask --multimodal`, `rerank` and the rich batch
+  `search_multimodal` and `rerank` operations send admitted visual evidence
+  through the same Luna codec.
+
+Legacy `typesafe/jev-1.13`, other exact models and every `~author/family-latest`
+alias are text-only. They keep the `{evidence:[...]}` text object and reject
+images in `prepare_input`, before any reservation or submission. The raw
+`{state, questions}` route (`prepare_decision`, `decide` and `gptgrep judge` with a
+raw `state`) applies the same rule to these selectors. Any object in `state` or
+`questions` with an `image_url` or `input_image` member or `type` is refused before
+any reservation or submission. Strings are literal text, never image parts. Luna
+receives raw JSON unchanged. An alias can
+resolve to a later build outside the pinned Luna identities, so it is never
+treated as Luna. `prepare_image_qualification` remains the stricter explicit
+wrapper: it also requires the exact alpha endpoint and the bare Luna selector.
+
+Implementation and offline loopback checks do not qualify actual image influence.
+A live image qualification needs a separately approved phase. That phase must
+bind source and body digests, controls, deadline, accounting and complete output
+capacity before submission.

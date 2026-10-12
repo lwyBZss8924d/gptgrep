@@ -52,9 +52,13 @@ question-dependent SEARCH; PageIndex G5 remains a separate first-release gate.
 
 Decisions defaults to `openai/gpt-6-luna-decisions`, with bounded flat typed
 PNG/JPEG input and exact returned-model admission. `typesafe/jev-1.13` remains an
-explicit text-only option. One optional existing-ledger `ExecutionContext` is
-shared by routing, reranking and host follow-ups; joining it never renews the
-original clock or consumed allowance. Native Codex selection stays separate.
+explicit text-only option. An explicit `~author/family-latest` alias is text-only
+and admits only a concrete same-author, same-family build. Reports keep the
+requested selector and the served model separate. One optional existing-ledger
+`ExecutionContext` is shared by routing, reranking and host follow-ups. Joining it
+never renews the original clock or consumed allowance. A new ledger is created once
+by `gptgrep decisions-budget init`, and `status` observes it read-only. Native
+Codex selection stays separate.
 
 The host profile defaults are `model = "gpt-6-luna"` and
 `model_reasoning_effort = "max"`, with `service_tier = "fast"`, as selected for this project. They are local
