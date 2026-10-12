@@ -43,6 +43,10 @@ the original invocation's shared admission.
   schema, document trees and selected-node reads for programmatic tool composition.
 - Use a pinned tgrep-core package for lexical candidate filtering. Verify actual
   regex matches after filtering, including patterns that cannot use trigrams.
+  Lexical and hybrid seeds keep at most 16 query terms after dropping a fixed
+  English function-word list and short ASCII-letter tokens. When more remain, a
+  bounded first 64 are ranked by scoped document frequency, rarer first and
+  terms absent from the scope last; later terms are not ranked.
 - Use Jev through its typed Decisions API for semantic document routing and
   candidate reranking. Default search, ask and summarize require this stage and
   fail explicitly if its credentials or service are unavailable. A received

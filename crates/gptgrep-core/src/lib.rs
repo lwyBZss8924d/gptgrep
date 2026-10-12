@@ -284,6 +284,14 @@ pub struct Hit {
     pub citation: String,
 }
 
+impl Hit {
+    /// A delivered low-confidence fallback candidate: below the relevance floor
+    /// and not a retained literal anchor. It never counts as a passing match.
+    pub fn is_below_threshold_fallback(&self) -> bool {
+        self.below_threshold && !self.literal_anchor
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Coverage {
     pub indexed_files: usize,
@@ -297,7 +305,9 @@ pub struct Coverage {
     pub retained_literal_anchors: usize,
     /// Below-floor candidates delivered, flagged `below_threshold`, because no
     /// reranked candidate met the relevance floor (at most three; otherwise 0).
-    /// They are also counted in `filtered_candidates`.
+    /// Counted after the result limit and the final freshness check, so it
+    /// equals the flagged hits actually returned. They are also counted in
+    /// `filtered_candidates`.
     #[serde(default)]
     pub below_threshold_fallback: usize,
     pub stale_files: Vec<String>,
@@ -2394,11 +2404,7 @@ async fn score_candidates(
     metrics: &mut Metrics,
     started: Instant,
 ) -> Result<()> {
-    let CandidateBatch {
-        hits,
-        coverage,
-        warnings,
-    } = batch;
+    let CandidateBatch { hits, coverage, .. } = batch;
     if !hits.is_empty() {
         let candidates: Vec<_> = hits
             .iter()
@@ -2491,7 +2497,8 @@ async fn score_candidates(
         if passing == 0 {
             // Never deliver an empty seed when candidates exist: keep the best
             // few by score, each flagged as below the floor. They never count
-            // as passing, and the reader is told they are low confidence.
+            // as passing. finish_candidate_batch counts the ones actually
+            // delivered and tells the reader they are low confidence.
             hits.sort_by(|a, b| {
                 b.score
                     .total_cmp(&a.score)
@@ -2500,11 +2507,6 @@ async fn score_candidates(
             });
             hits.truncate(BELOW_THRESHOLD_FALLBACK);
             coverage.below_threshold_fallback = hits.len();
-            warnings.push(format!(
-                "No reranked candidate met the relevance floor {}; delivered the top {} as low-confidence candidates flagged below_threshold=true. They did not pass the floor; verify them before relying on them.",
-                options.min_score,
-                hits.len()
-            ));
         } else {
             hits.retain(|h| h.literal_anchor || !h.below_threshold);
         }
@@ -2525,7 +2527,11 @@ fn finish_candidate_batch(
     options: &SearchOptions,
     batch: &mut CandidateBatch,
 ) {
-    let CandidateBatch { hits, coverage, .. } = batch;
+    let CandidateBatch {
+        hits,
+        coverage,
+        warnings,
+    } = batch;
     coverage.truncated |= hits.len() > options.limit;
     hits.truncate(options.limit);
     // Recheck selected originals after potentially slow remote inference.
@@ -2549,6 +2555,20 @@ fn finish_candidate_batch(
             false
         }
     });
+    if coverage.below_threshold_fallback > 0 {
+        // Report the fallback candidates actually delivered after the result
+        // limit and the final freshness check, not those first selected.
+        coverage.below_threshold_fallback = hits
+            .iter()
+            .filter(|hit| hit.is_below_threshold_fallback())
+            .count();
+        if coverage.below_threshold_fallback > 0 {
+            warnings.push(format!(
+                "No reranked candidate met the relevance floor {}; the hits flagged below_threshold=true are the highest-scoring low-confidence candidates (at most {BELOW_THRESHOLD_FALLBACK}), counted in coverage.below_threshold_fallback. They did not pass the floor; verify them before relying on them.",
+                options.min_score
+            ));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4302,6 +4322,69 @@ mod tests {
         let value = serde_json::to_value(&report)?;
         assert_eq!(value["hits"][0]["below_threshold"], true);
         assert_eq!(value["coverage"]["below_threshold_fallback"], 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fallback_count_and_warning_describe_only_delivered_hits() -> Result<()> {
+        let directory = floor_corpus().await?;
+        let (client, server) = mock_jev_scored(vec![200], Arc::new(below_floor_score)).await?;
+        let limited = search_with_client(
+            directory.path(),
+            "unrelated survey question",
+            &SearchOptions {
+                mode: "semantic".into(),
+                limit: 1,
+                ..Default::default()
+            },
+            &client,
+        )
+        .await?;
+        server.await?;
+        // The result limit keeps one flagged candidate; the count matches it.
+        assert_eq!(limited.hits.len(), 1);
+        assert_eq!(limited.hits[0].title, "Beta");
+        assert!(limited.hits[0].is_below_threshold_fallback());
+        assert_eq!(limited.coverage.below_threshold_fallback, 1);
+        assert!(limited.coverage.truncated);
+        let warnings: Vec<_> = limited
+            .warnings
+            .iter()
+            .filter(|warning| warning.contains("low-confidence candidates"))
+            .collect();
+        assert_eq!(warnings.len(), 1);
+        assert!(!warnings[0].contains("top 3"));
+        // A fallback candidate whose source changes before delivery is neither
+        // delivered nor counted, and no low-confidence delivery is announced.
+        let changed = directory.path().join("notes.md");
+        let (client, server) = mock_jev_scored(
+            vec![200],
+            Arc::new(move |text: &str| {
+                fs::write(&changed, "# Alpha\nchanged after reranking\n").unwrap();
+                below_floor_score(text)
+            }),
+        )
+        .await?;
+        let stale = search_with_client(
+            directory.path(),
+            "unrelated survey question",
+            &SearchOptions {
+                mode: "semantic".into(),
+                ..Default::default()
+            },
+            &client,
+        )
+        .await?;
+        server.await?;
+        assert!(stale.hits.is_empty());
+        assert_eq!(stale.coverage.below_threshold_fallback, 0);
+        assert_eq!(stale.coverage.stale_files, ["notes.md"]);
+        assert!(
+            !stale
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("low-confidence"))
+        );
         Ok(())
     }
 

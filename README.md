@@ -202,6 +202,9 @@ count retained below the floor; their model scores are preserved unchanged.
 If no candidate meets the floor, the top three are still returned as
 low-confidence candidates flagged `below_threshold: true`, with
 `coverage.below_threshold_fallback` and a warning; they never count as passing.
+Such a search exits 0 because hits are returned; plain-text output prints these
+candidates as grep context lines (`PATH-LINE-TEXT`), never as `PATH:LINE:TEXT`
+matches, so check `below_threshold` in `--json` output.
 
 ## Local Codex host
 

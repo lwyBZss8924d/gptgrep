@@ -284,9 +284,14 @@ When no reranked candidate passes the floor (and none is a literal anchor), the
 search does not return an empty set: it delivers the top three candidates by
 score, each flagged `below_threshold`, counts them in
 `coverage.below_threshold_fallback` (they remain in `filtered_candidates`) and
-adds a warning that they are low-confidence candidates. They never count as
-passing; a host seed reports `filtered_all`. Evidence-role ordering and the rich
-text/multimodal paths keep their existing floor without this fallback.
+adds a warning that they are low-confidence candidates. The count and warning
+describe the flagged hits actually returned after the result limit and the final
+freshness check. They never count as passing; a host seed reports `filtered_all`.
+Plain-text `search` prints them with grep's context separator (`PATH-LINE-TEXT`)
+instead of as `PATH:LINE:TEXT` matches, and the exit status is 0 because hits are
+returned. Evidence-role ordering applies the same fallback (eligibility
+`below_floor_fallback`); the rich text/multimodal paths keep their existing floor
+without it.
 No-answer cases, literal queries and natural-language questions are separate evals.
 
 Decisions uses `/api/alpha/decisions`, a 20-second request deadline, no redirects

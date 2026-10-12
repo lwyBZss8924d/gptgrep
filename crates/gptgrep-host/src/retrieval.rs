@@ -402,6 +402,14 @@ impl Evidence {
                 }
                 ensure!(!found.hits.is_empty(), "host_jev_seed_delivery_failed");
                 found.hits.pop();
+                // The reader's fallback count describes only the hits it receives.
+                if found.coverage.below_threshold_fallback > 0 {
+                    found.coverage.below_threshold_fallback = found
+                        .hits
+                        .iter()
+                        .filter(|hit| hit.is_below_threshold_fallback())
+                        .count();
+                }
             };
             ensure!(original_hits == 0 || !found.hits.is_empty(), "host_jev_seed_delivery_failed");
             if let Some(diagnostics) = &mut found.evidence_roles {
@@ -866,6 +874,14 @@ impl Evidence {
                 }
                 ensure!(!found.hits.is_empty(), "host_jev_seed_delivery_failed");
                 found.hits.pop();
+                // The reader's fallback count describes only the hits it receives.
+                if found.coverage.below_threshold_fallback > 0 {
+                    found.coverage.below_threshold_fallback = found
+                        .hits
+                        .iter()
+                        .filter(|hit| hit.is_below_threshold_fallback())
+                        .count();
+                }
             }
             ensure!(
                 original_hits == 0 || !found.hits.is_empty(),

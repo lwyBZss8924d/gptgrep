@@ -111,7 +111,9 @@ HTTP 429/500/502/503/504 时最多重试一次，且不超出原始请求时限�
 对于单个完整词元的精确查询，即使 Jev 给出低分，混合搜索的词法路径也会保留经过验证的词元匹配。
 结果会显示 `literal_anchor`，以及低于门槛但仍被保留的结果数量；模型分数保持原值。
 若没有候选达到门槛，仍会返回分数最高的三个低置信度候选，标记 `below_threshold: true`，
-并附带 `coverage.below_threshold_fallback` 与警告；它们从不算作通过门槛。
+并附带 `coverage.below_threshold_fallback` 与警告；它们从不算作通过门槛。由于返回了结果，
+退出码为 0；纯文本输出将这些候选打印为 grep 上下文行（`PATH-LINE-TEXT`），而不是
+`PATH:LINE:TEXT` 匹配，因此请检查 `--json` 输出中的 `below_threshold`。
 
 ## 本地 Codex 宿主
 

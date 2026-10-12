@@ -138,6 +138,79 @@ fn role_order_preserves_anchor_precedence_floor_and_stable_span_ties() -> Result
 }
 
 #[test]
+fn all_below_floor_judgments_deliver_the_best_few_as_flagged_fallback() -> Result<()> {
+    use EvidenceRole::*;
+    let hits: Vec<_> = (0..5)
+        .map(|index| hit_window(index, &format!("Invented window {index}.")))
+        .collect();
+    let mut diagnostic = prepare(&hits)?;
+    diagnostic.observe(&response(&[
+        (Background, 0.10),
+        (DirectSupport, 0.40),
+        (NoSupport, 0.05),
+        (SourceLocalIncomplete, 0.30),
+        (DirectSupport, 0.20),
+    ]))?;
+    let mut batch = CandidateBatch {
+        hits,
+        coverage: Coverage::default(),
+        warnings: vec![],
+    };
+    diagnostic.order(&mut batch, &SearchOptions::default())?;
+    // No candidate passes: the three highest scores are delivered, flagged.
+    let mut delivered: Vec<_> = batch.hits.iter().map(|hit| hit.byte_start).collect();
+    delivered.sort_unstable();
+    assert_eq!(delivered, [100, 300, 400]);
+    assert!(
+        batch
+            .hits
+            .iter()
+            .all(|hit| hit.below_threshold && hit.is_below_threshold_fallback())
+    );
+    assert_eq!(batch.coverage.below_threshold_fallback, 3);
+    // Every judged candidate stays counted as below the floor.
+    assert_eq!(batch.coverage.filtered_candidates, 5);
+    for index in [1, 3, 4] {
+        assert_eq!(
+            diagnostic.candidates[index].eligibility,
+            Some(CandidateEligibility::BelowFloorFallback)
+        );
+        assert_eq!(
+            diagnostic.candidates[index].disposition,
+            CandidateDisposition::AwaitingDelivery
+        );
+    }
+    for index in [0, 2] {
+        assert_eq!(
+            diagnostic.candidates[index].eligibility,
+            Some(CandidateEligibility::NotEligible)
+        );
+        assert_eq!(
+            diagnostic.candidates[index].disposition,
+            CandidateDisposition::ExcludedRelevanceFloor
+        );
+    }
+    diagnostic.validate_bound()?;
+    // One passing candidate keeps the floor and needs no fallback.
+    let hits: Vec<_> = (0..2)
+        .map(|index| hit_window(index, &format!("Invented window {index}.")))
+        .collect();
+    let mut diagnostic = prepare(&hits)?;
+    diagnostic.observe(&response(&[(Background, 0.10), (DirectSupport, 0.90)]))?;
+    let mut batch = CandidateBatch {
+        hits,
+        coverage: Coverage::default(),
+        warnings: vec![],
+    };
+    diagnostic.order(&mut batch, &SearchOptions::default())?;
+    assert_eq!(batch.hits.len(), 1);
+    assert!(!batch.hits[0].below_threshold);
+    assert_eq!(batch.coverage.below_threshold_fallback, 0);
+    assert_eq!(batch.coverage.filtered_candidates, 1);
+    Ok(())
+}
+
+#[test]
 fn clipping_equal_to_another_assessment_cannot_borrow_its_role() -> Result<()> {
     let full = hit_window(
         0,
