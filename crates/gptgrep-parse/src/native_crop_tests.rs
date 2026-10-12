@@ -194,6 +194,7 @@ fn result(task: &OcrTask, image_deliveries: Vec<OcrImageDelivery>) -> OcrPageRes
             status: OcrRegionStatus::Complete,
         }],
         receipt: OcrReceipt {
+            native_agent: None,
             model: task.profile.model.clone(),
             profile_sha256: ocr_profile_digest(&task.profile).unwrap(),
             runtime_profile_sha256: H.into(),

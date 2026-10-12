@@ -1,0 +1,18 @@
+{
+  "binding": "same source revision",
+  "files": [
+    {
+      "file": "AUTHORS",
+      "git_blob": "7397b2bd6a8580d51fe7b23783f8f1a05fa70291",
+      "sha256": "ff92bed461f50338dd703a9ba9aee496a425957873df1d91192776e4bdf5dda7",
+      "url": "https://raw.githubusercontent.com/r-efi/r-efi/97b55bed1c2c91dcbf787674849f05337ff80b33/AUTHORS"
+    }
+  ],
+  "license_revision": "97b55bed1c2c91dcbf787674849f05337ff80b33",
+  "package": "r-efi",
+  "package_archive_sha256": "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f",
+  "package_vcs_revision": "97b55bed1c2c91dcbf787674849f05337ff80b33",
+  "repository": "https://github.com/r-efi/r-efi",
+  "schema_version": "gptgrep.license-supplement.v1",
+  "version": "5.3.0"
+}

@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import tomllib
 from urllib.parse import urlsplit
 
 
@@ -80,12 +81,55 @@ def supplement_files(package: dict, repo: Path) -> tuple[list[tuple[Path, str]],
         return [], None
     provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
     package_root = Path(package["manifest_path"]).parent
-    vcs = json.loads((package_root / ".cargo_vcs_info.json").read_text(encoding="utf-8"))
-    if (provenance["package"], provenance["version"], provenance["package_vcs_revision"]) != (
-        package["name"], package["version"], vcs["git"]["sha1"]
-    ):
+    if (provenance["package"], provenance["version"]) != (package["name"], package["version"]):
         raise ValueError(f"license supplement does not bind the installed {package['name']} source")
-    if provenance["license_revision"] != provenance["package_vcs_revision"]:
+    vcs_path = package_root / ".cargo_vcs_info.json"
+    if vcs_path.is_file():
+        vcs = json.loads(vcs_path.read_text(encoding="utf-8"))
+        if provenance["package_vcs_revision"] != vcs["git"]["sha1"]:
+            raise ValueError("license supplement VCS revision does not match")
+    else:
+        # Some historical archives omit VCS metadata. Bind those to the locked
+        # archive and compare every packaged source file with a pinned upstream
+        # tree. Generated release payloads have separate SHA256 bindings.
+        if provenance.get("package_vcs_revision") is not None:
+            raise ValueError("license supplement invents unavailable VCS metadata")
+        comparison = provenance["source_comparison"]
+        if (comparison["repository"] != package["repository"]
+                or comparison["revision"] != provenance["license_revision"]
+                or not re.fullmatch(r"[0-9a-f]{40}", comparison["revision"])):
+            raise ValueError("license supplement repository comparison does not match")
+        public_source(comparison["repository"])
+        locked = tomllib.loads((repo / "Cargo.lock").read_text(encoding="utf-8"))["package"]
+        checksums = [entry.get("checksum") for entry in locked
+                     if (entry["name"], entry["version"], entry.get("source"))
+                     == (package["name"], package["version"], package.get("source"))]
+        if checksums != [provenance["package_archive_sha256"]]:
+            raise ValueError("license supplement archive checksum does not match Cargo.lock")
+        tracked = comparison["tracked_files"]
+        generated = comparison.get("generated_files", {})
+        if not {"Cargo.toml.orig", "src/lib.rs"} <= tracked.keys() or tracked.keys() & generated.keys():
+            raise ValueError("license supplement lacks its manifest/source comparison")
+        actual = {item.relative_to(package_root).as_posix() for item in package_root.rglob("*")
+                  if item.is_file() and item.name not in {
+                      ".cargo-ok", ".cargo-checksum.json", "Cargo.toml"}}
+        if actual != tracked.keys() | generated.keys():
+            raise ValueError("license supplement comparison omits packaged files")
+        for relative, expected in tracked.items():
+            item = package_root / relative
+            if item.is_symlink() or item.resolve() != item or not item.is_relative_to(package_root):
+                raise ValueError("license supplement source path is invalid")
+            data = item.read_bytes()
+            if hashlib.sha1(f"blob {len(data)}\0".encode() + data).hexdigest() != expected["git_blob_sha1"]:
+                raise ValueError("license supplement tracked source no longer matches")
+        for relative, expected in generated.items():
+            item = package_root / relative
+            if item.is_symlink() or item.resolve() != item or not item.is_relative_to(package_root):
+                raise ValueError("license supplement generated path is invalid")
+            if digest(item) != expected:
+                raise ValueError("license supplement generated payload no longer matches")
+    if (provenance["package_vcs_revision"] is not None
+            and provenance["license_revision"] != provenance["package_vcs_revision"]):
         comparison = provenance["comparison"]
         if comparison["commits"] != 1 or comparison["changed_files"] != ["LICENSE"]:
             raise ValueError("unsupported post-release license source change")
@@ -106,9 +150,14 @@ def supplement_files(package: dict, repo: Path) -> tuple[list[tuple[Path, str]],
     return files, provenance
 
 
-def collect(repo: Path, target: str, destination: Path, require_complete: bool = False) -> dict:
+def collect(repo: Path, target: str, destination: Path, require_complete: bool = False,
+            *, all_dependencies: bool = False) -> dict:
     repo = repo.resolve()
-    command = ["cargo", "metadata", "--locked", "--format-version", "1", "--filter-platform", target]
+    command = ["cargo", "metadata", "--locked", "--format-version", "1"]
+    if all_dependencies:
+        command.append("--offline")
+    else:
+        command.extend(["--filter-platform", target])
     completed = subprocess.run(command, cwd=repo, check=True, capture_output=True, text=True)
     metadata = json.loads(completed.stdout)
     packages = {entry["id"]: entry for entry in metadata["packages"]}
@@ -116,7 +165,7 @@ def collect(repo: Path, target: str, destination: Path, require_complete: bool =
     roots = [key for key, entry in packages.items() if entry["name"] == "gptgrep-cli" and key in metadata["workspace_members"]]
     if len(roots) != 1:
         raise ValueError("expected one workspace gptgrep-cli package")
-    queue, selected = list(roots), set()
+    queue, selected = list(packages) if all_dependencies else list(roots), set()
     while queue:
         current = queue.pop()
         if current in selected:
@@ -155,7 +204,9 @@ def collect(repo: Path, target: str, destination: Path, require_complete: bool =
             missing.append({"name": package["name"], "version": package["version"], "declared_license": package.get("license")})
     inventory = {
         "schema_version": "gptgrep.licenses.v1", "target": target,
-        "scope": "normal and build dependencies reachable from gptgrep-cli; dev edges excluded",
+        "scope": ("all resolved workspace dependencies, including dev and conditional targets"
+                  if all_dependencies else
+                  "normal and build dependencies reachable from gptgrep-cli; dev edges excluded"),
         "complete": not missing, "packages": records, "missing_license_files": missing,
         "note": "SPDX declarations are retained as metadata; only listed source files were copied. This inventory does not replace the files or a license compatibility review.",
     }
@@ -172,8 +223,11 @@ def main() -> None:
     parser.add_argument("--target", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--require-complete", action="store_true")
+    parser.add_argument("--all-dependencies", action="store_true",
+                        help="Collect every resolved source for a vendored source SDK")
     args = parser.parse_args()
-    inventory = collect(args.repo_root, args.target, args.output, args.require_complete)
+    inventory = collect(args.repo_root, args.target, args.output, args.require_complete,
+                        all_dependencies=args.all_dependencies)
     print(json.dumps({"complete": inventory["complete"], "packages": len(inventory["packages"]), "missing_license_files": inventory["missing_license_files"]}))
 
 

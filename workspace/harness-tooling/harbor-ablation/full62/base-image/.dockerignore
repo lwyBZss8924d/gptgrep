@@ -3,6 +3,9 @@
 !requirements.lock
 !probe.py
 !codex
+!codex-code-mode-host
+!host-provenance.json
+!host.sigstore
 !bwrap
 !helper-record.json
 !COPYING.bubblewrap

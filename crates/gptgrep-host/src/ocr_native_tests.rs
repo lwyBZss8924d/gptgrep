@@ -841,6 +841,7 @@ fn portable_native_metadata_preserves_artifact_binding_and_rejects_mixed_transpo
             status: OcrRegionStatus::Complete,
         }],
         receipt: OcrReceipt {
+            native_agent: None,
             model: task.profile.model.clone(),
             profile_sha256: ocr_profile_digest(&task.profile).unwrap(),
             request_sha256: H.into(),

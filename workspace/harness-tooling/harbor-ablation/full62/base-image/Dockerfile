@@ -9,11 +9,14 @@ ARG DEBIAN_SNAPSHOT
 ARG POPPLER_VERSION
 ARG CODEX_SHA256
 ARG BWRAP_SHA256
+ARG CODE_MODE_HOST_SHA256
 ARG TARGETPLATFORM
 ENV PYTHONDONTWRITEBYTECODE=1 UV_PYTHON_DOWNLOADS=never
 COPY --from=uv /uv /usr/local/bin/uv
 COPY requirements.lock probe.py /usr/local/share/full62-base/
 COPY codex /usr/local/bin/codex
+COPY --chmod=0555 codex-code-mode-host /usr/local/bin/codex-code-mode-host
+COPY host-provenance.json host.sigstore /usr/local/share/full62-code-mode-host/
 COPY --chmod=0555 bwrap /usr/local/bin/codex-resources/bwrap
 COPY helper-record.json COPYING.bubblewrap LICENSE.codex /usr/local/share/full62-sandbox-helper/
 RUN test -n "$DEBIAN_SNAPSHOT" && test -n "$POPPLER_VERSION" && test -n "$CODEX_SHA256" \
@@ -29,6 +32,8 @@ RUN test -n "$DEBIAN_SNAPSHOT" && test -n "$POPPLER_VERSION" && test -n "$CODEX_
     && uv pip sync --system --require-hashes --only-binary=:all: --no-cache \
       /usr/local/share/full62-base/requirements.lock \
     && printf '%s  %s\n' "$CODEX_SHA256" /usr/local/bin/codex | sha256sum --check - \
+    && test -n "$CODE_MODE_HOST_SHA256" \
+    && printf '%s  %s\n' "$CODE_MODE_HOST_SHA256" /usr/local/bin/codex-code-mode-host | sha256sum --check - \
     && test -n "$BWRAP_SHA256" \
     && printf '%s  %s\n' "$BWRAP_SHA256" /usr/local/bin/codex-resources/bwrap | sha256sum --check - \
     && chmod 755 /usr/local/bin/codex \

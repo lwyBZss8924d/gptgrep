@@ -1365,6 +1365,7 @@ async fn publish_saved_ocr(root: &Path) -> Result<GenerationPin> {
             status: OcrRegionStatus::Complete,
         }],
         receipt: OcrReceipt {
+            native_agent: None,
             model: task.profile.model.clone(),
             profile_sha256: ocr_profile_digest(&task.profile)?,
             request_sha256: "1".repeat(64),
@@ -1664,6 +1665,7 @@ fn native_metadata_offline_ocr(task: &OcrTask) -> Result<OcrPageResult> {
             })
             .collect(),
         receipt: OcrReceipt {
+            native_agent: None,
             model: task.profile.model.clone(),
             profile_sha256: ocr_profile_digest(&task.profile)?,
             request_sha256: "1".repeat(64),

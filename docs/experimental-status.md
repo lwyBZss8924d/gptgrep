@@ -1,7 +1,7 @@
 # Experimental development status
 
 Updated **2026-10-12 UTC**. This is a public, aggregate development checkpoint for
-the experimental source branch `codex/gptgrep-experimental-20261012` in
+the unified runtime source branch `codex/gptgrep-unified-runtime-20261012` in
 [`lwyBZss8924d/gptgrep`](https://github.com/lwyBZss8924d/gptgrep).
 Use the checked-out commit and its validation results when comparing changes.
 The branch is a collaboration snapshot, not an accepted first release.
@@ -21,9 +21,11 @@ frozen index → run paired SEARCH → Judge → analyze failures → next Opt**
 The required parsing/OCR workflow is full native PTC coding with native built-ins,
 shell, `view_image`, CV and Skills through the available GPTgrep, tgrep and lit
 CLIs/APIs, without requiring a fixed sequence of GPTgrep tool calls.
-The current fixed Page/Document tool allowlists leave that requirement open;
-their guard checks and qualifications cover scoped components only. New fixed
-Page/Document qualifications are not prerequisites for the mainline PTC work.
+The native Document and OCR paths now use caller-selected native capabilities,
+permissions and job budgets, with a shared runtime package staged into each
+actual working directory. The retained fixed Page/Document guard checks and
+qualifications cover scoped components only; new fixed-image qualifications are
+not prerequisites for the mainline PTC work.
 Job resource choices belong in configuration, while authentication, sandbox and
 evaluator custody remain enforced.
 The full comparison has not run. No measured retrieval advantage is claimed.
@@ -63,18 +65,49 @@ historical verdicts. This compact projection records their aggregate outcomes.
 | 2026-10-12, earlier integrated source round | Integrated source checks passed: 986 Rust tests, 4 ignored; formatting, Clippy, 11 offline cases, 71 full62 wrapper tests and 25 Node wrapper tests, with 1 skipped. CLI release build completed | OCR and Decisions source changes received scoped independent review; complete native document integration remains active |
 | 2026-10-12, native Page OCR | Fresh live run passed 2/2 synthetic image cases in about 81 seconds; original region IDs and bounding boxes matched exactly | Independent review accepted image delivery, region binding and paired image influence only; full34/full62 acceptance remains pending |
 | 2026-10-12, latest full34 attempt | Terminal failure after 750.688 seconds: ten complete OCR pages, one partial required region and eleven terminal OCR reservations; no generation published | All 34 documents remain unpublished; the next evidence must exercise the full native PTC parsing/OCR workflow and configured image resources |
-| 2026-10-12, current Python wrapper round | All 80 full62 wrapper tests passed; the wrapper generates and verifies all 124 tasks using the selected seed, randomized pair order and within-pair arm order | Source evidence only; the actual full62 export, SEARCH and Judge remain pending, and G5 remains HOLD |
+| 2026-10-12, earlier Python wrapper round | All 80 full62 wrapper tests passed; the wrapper generates and verifies all 124 tasks using the selected seed, randomized pair order and within-pair arm order | Source evidence only; the actual full62 export, SEARCH and Judge remain pending, and G5 remains HOLD |
 | 2026-10-12, configured image resources | Workspace checks passed 994 Rust tests with 4 ignored, formatting, Clippy and 11 offline evaluation cases. The CLI and qualification probe built, and the patched native guard built with 23 native tests passing | Scoped fixed-guard source and synthetic validation only; full native PTC parsing/OCR remains active, and earlier live qualifications do not qualify the new tuple |
 | 2026-10-12, direct native extraction | One complete PDF at 200 DPI produced all 16 PNG pages under the configured 4 MiB per-image limit: largest 2,976,169 bytes, total 30,425,938 bytes; no OCR invoked | Confirms parsing and encoded-image admission for this source; OCR legibility and complete-document acceptance remain pending |
 | 2026-10-12, private Decisions integration | Per-trial preparation and request-ID isolation repair received scoped source acceptance; the private Linux build and 13 tests passed. A current-source Ask received two real known-settled Decisions responses, totaling $0.0001347 | Native reader permission projection failed before `turn/start`; Ask, complete SEARCH/Judge and full62 remain unaccepted |
+| 2026-10-12, unified native runtime source | Formatting, Clippy, 1,024 Rust tests with 4 ignored, 142 evaluator tests and 11 offline cases passed. The repaired full62 wrapper passed all 83 tests; five staging scenarios and the direct Rust API example passed | Source and synthetic checks only; SDK package consumer validation, complete index, paired SEARCH/Judge and source delivery remain separate |
 
-The next Opt step is the smallest full native PTC parsing/OCR implementation and
-actual qualification using the configured image limits, plus repair of the native
-reader permission projection. OCR legibility, the complete native document
-pipeline and the frozen index must then pass before all 124 SEARCH trials and
-their separate Judge stage.
+The current source round unifies native Document/OCR execution, configuration,
+the [runtime package](../runtime/codex/STAGING.md), the
+[incur CLI](../packages/cli/README.md), and the [public Rust APIs](rust-sdk.md).
+The package contains four Skills and three native roles; the caller selects its
+root and pins its manifest. GPTgrep stages it into each actual Document/OCR
+working directory, checks exact enabled Skills through native discovery, and
+binds the role configuration files explicitly. Skill availability and submitted
+Skill inputs remain distinct from observed body use. The CLI exposes 21 native
+operations plus its discovery helpers, including foreground parse-agent and OCR
+commands. The Rust example composes index, search and node reading directly.
+Source checks and package consumer evidence are recorded separately from the
+pending complete 34-document index and all 124 SEARCH trials with their separate
+Judge stage. The original experimental branch remains a historical source cursor.
 
 ## Recent checks and retained failures
+
+The unified native runtime round passed **1,024 Rust tests**, with **0 failed**
+and **4 ignored**, plus formatting and Clippy with warnings denied. Its frozen
+native CLI passed **11 offline evaluation cases** with **zero provider requests**,
+and the evaluator's own **142 tests** passed. The direct Rust API example built
+and ran two composed local queries with verified citations. The runtime staging
+regression passed fresh staging, existing-file refusal and three deterministic
+late path-replacement cases. The incur wrapper's separate producer suite passed
+**37 tests**, with **1 skipped** for its optional real-native metadata fixture.
+
+The full62 Python wrapper suite passed **all 83 tests**. The subsequent runtime
+package integration passed **10 focused bundle-reader tests** and **7 package
+self-tests**. A retained replay confirms that the earlier reader rejected the
+new producer's runtime metadata before creating output; the repaired reader
+accepts the complete pinned assets and rejects detached metadata. These focused
+checks do not constitute a new full-wrapper run.
+An earlier
+82-test run failed in two timeout/cancellation subcases when macOS rejected a
+second process-group signal after termination. The repair requires bounded child
+reaping even when signalling fails and reports cleanup failure explicitly; the
+original failure remains retained. Earlier compilation and synthetic-fixture
+failures in this source round remain in the private validation history.
 
 The earlier integrated source round passed **986 Rust tests**, with **0 failed**
 and **4 ignored**, plus formatting and Clippy with warnings denied. Its frozen CLI
@@ -84,7 +117,7 @@ wrapper suite passed **71 tests**, and its Node wrapper passed **25**, with
 An older integrated round passed **977 Rust tests** and **11 offline evaluation
 cases**; its receipts remain historical.
 
-The current Python wrapper round passed **all 80 tests**. Its paired-order
+An earlier Python wrapper round passed **all 80 tests**. Its paired-order
 implementation retains all **124 tasks**, randomizing the 62 pair blocks and
 each pair's arm order using a seed selected before outcomes, with one concurrent
 trial and no retries. The actual full62 export and concrete task sequence still

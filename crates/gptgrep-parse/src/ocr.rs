@@ -183,9 +183,27 @@ pub struct OcrNativeImageDelivery {
     pub native_crop: Option<crate::NativeOcrCropProof>,
 }
 
+/// Native agent execution evidence. It binds an actual structured task to the
+/// unchanged source; it does not claim guarded image transport or provider ingestion.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OcrNativeAgentReceipt {
+    pub schema_version: String,
+    pub task_sha256: String,
+    pub execution_sha256: String,
+    pub native_items_sha256: String,
+    pub tool_calls: usize,
+    pub tool_budget: usize,
+    pub image_views: usize,
+    pub turn_completed: bool,
+    pub source_verified_before_and_after: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OcrReceipt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_agent: Option<OcrNativeAgentReceipt>,
     pub model: String,
     pub profile_sha256: String,
     pub request_sha256: String,
@@ -515,6 +533,21 @@ pub fn validate_ocr_result_metadata(task: &OcrTask, result: &OcrPageResult) -> R
             && result.receipt.profile_sha256 == ocr_profile_digest(&task.profile)?,
         "OCR result model/profile mismatch"
     );
+    if let Some(agent) = &result.receipt.native_agent {
+        ensure!(
+            agent.schema_version == "gptgrep.ocr.native-agent-receipt.v1"
+                && agent.task_sha256 == task.task_sha256
+                && valid_digest(&agent.execution_sha256)
+                && valid_digest(&agent.native_items_sha256)
+                && agent.tool_budget > 0
+                && agent.tool_calls <= agent.tool_budget
+                && agent.image_views <= agent.tool_calls
+                && agent.turn_completed
+                && agent.source_verified_before_and_after
+                && result.receipt.image_deliveries.is_empty(),
+            "OCR native agent execution mismatch"
+        );
+    }
     ensure!(
         result.receipt.image_deliveries.len() <= task.budget.max_tool_calls as usize,
         "OCR image delivery count exceeds tool budget"
@@ -628,12 +661,14 @@ pub fn validate_ocr_result_metadata(task: &OcrTask, result: &OcrPageResult) -> R
             && image_pixels <= task.budget.resources.image_pixels_per_page,
         "OCR native supplemental page budget"
     );
-    ensure!(
-        task.images
-            .iter()
-            .all(|image| delivered.contains(&image.artifact.id)),
-        "OCR required image delivery incomplete"
-    );
+    if result.receipt.native_agent.is_none() {
+        ensure!(
+            task.images
+                .iter()
+                .all(|image| delivered.contains(&image.artifact.id)),
+            "OCR required image delivery incomplete"
+        );
+    }
     ensure!(
         result.regions.len() <= task.budget.resources.ocr_regions,
         "resource_limit: OCR result regions"

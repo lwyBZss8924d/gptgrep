@@ -68,6 +68,38 @@ def check_helper(platform):
     return value
 
 
+def check_code_mode_host(platform, runtime_binary):
+    directory = Path("/usr/local/share/full62-code-mode-host")
+    metadata = directory / "host-provenance.json"
+    if metadata.stat().st_size > 65536:
+        raise ValueError("native_code_mode_host_metadata_bound")
+    value = json.loads(metadata.read_bytes())
+    binary = Path("/usr/local/bin/codex-code-mode-host")
+    target, machine = {"linux/amd64": ("x86_64-unknown-linux-musl", 62),
+                       "linux/arm64": ("aarch64-unknown-linux-musl", 183)}[platform]
+    archive = "codex-code-mode-host-" + target + ".tar.gz"
+    if (value["schema"] != "gptgrep.native-code-mode-host.v1" or
+            value["release_tag"] != "rust-v0.162.1" or value["platform"] != platform or
+            value["source_commit"] != "092d3acd6bec3e3a14bdc7e7a2810ab628ab759d" or
+            value["runtime_binary"] != runtime_binary or
+            Path(runtime_binary["path"]).with_name("codex-code-mode-host") != binary or
+            value["archive"]["name"] != archive or
+            value["archive"]["url"] != "https://github.com/openai/codex/releases/download/rust-v0.162.1/" + archive or
+            not 64 <= binary.stat().st_size <= 2**30 or file_pin(binary) != value["binary"] or
+            stat.S_IMODE(binary.stat().st_mode) != 0o555):
+        raise ValueError("native_code_mode_host_installed_pair")
+    with binary.open("rb") as source:
+        header = source.read(64)
+    if header[:6] != b"\x7fELF\x02\x01" or int.from_bytes(header[18:20], "little") != machine:
+        raise ValueError("native_code_mode_host_linux_elf")
+    signature = directory / "host.sigstore"
+    if (not 0 < signature.stat().st_size <= 65536 or file_pin(signature) != value["sigstore"] or
+            value.get("attestation_verification") not in ("not_performed", "verified") or
+            value.get("source_and_digest_consistency_verified") is not True):
+        raise ValueError("native_code_mode_host_evidence")
+    return value
+
+
 def main():
     parser = argparse.ArgumentParser()
     for name in ("python-image", "uv-image", "debian-snapshot", "poppler-version", "platform"):
@@ -95,6 +127,8 @@ def main():
               "native_source_commit": "092d3acd6bec3e3a14bdc7e7a2810ab628ab759d",
               "binaries": binaries, "pdf_tool_versions": versions,
               "native_sandbox_helpers": {"bwrap": check_helper(args.platform)},
+              "native_code_mode_host": check_code_mode_host(args.platform, binaries["codex"]),
+              "native_code_mode_host_protocol_executed": False,
               "native_helper_digest_compatibility_verified": False,
               "requirements": file_pin(Path(__file__).with_name("requirements.lock")),
               "capabilities": ["python3", "POSIX shell", "Pillow==12.3.0", "pdftotext", "pdftoppm"],

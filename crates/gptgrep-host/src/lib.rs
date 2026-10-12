@@ -17,6 +17,8 @@ mod ocr;
 mod ocr_accounting;
 mod ocr_compat;
 mod ocr_native;
+pub(crate) use ocr::agent as ocr_agent;
+pub use ocr_agent::NativeAgentRuntimeProfile;
 mod ocr_protocol;
 mod ocr_service;
 #[cfg(test)]
@@ -48,7 +50,13 @@ pub use ocr_service::{
 mod jev_accounting;
 mod model_attempts;
 mod native_ptc;
+pub(crate) mod native_runtime;
+pub use native_runtime::NativeRuntimePackage;
+mod native_skills;
+pub use native_skills::NativeSkillInput;
+mod native_task;
 pub use native_ptc::{NativeCommandStatus, NativePtcReport, NativeToolKind, NativeToolObservation};
+pub use native_task::{NativeTaskReport, NativeTaskRequest, run_native_task};
 mod navigation;
 mod query_plan;
 mod retrieval;
@@ -107,9 +115,19 @@ pub struct HostConfig {
     /// Explicit existing named permission profile. Legacy read-only mode is used
     /// when omitted; a selected profile must be acknowledged before a turn.
     pub permission_profile: Option<String>,
-    /// Opt in to native shell/exec and view_image for the final retrieval reader.
-    /// Requires a named permission profile; native budgets are observed after execution may start.
+    /// Use native Codex capabilities under the selected named permissions.
+    /// Native budgets are observed after execution may start.
     pub native_ptc: bool,
+    /// Explicit native capability overrides; other selected runtime settings are inherited.
+    pub native_capabilities: std::collections::BTreeMap<String, serde_json::Value>,
+    /// Explicit pinned Skill inputs for native turns; unselected runtime Skills remain inherited.
+    pub native_skills: Vec<NativeSkillInput>,
+    /// Selected frozen native project package, staged into the actual native task cwd.
+    pub native_runtime_package: Option<crate::NativeRuntimePackage>,
+    /// Existing working directory for a native task; omitted requests use an owned temporary directory.
+    pub working_dir: Option<PathBuf>,
+    /// Additional process environment names withheld from this selected runtime.
+    pub excluded_env_vars: Vec<String>,
     pub model: String,
     pub reasoning_effort: String,
     pub service_tier: String,
@@ -138,6 +156,11 @@ impl Default for HostConfig {
             codex_state_dir: None,
             permission_profile: None,
             native_ptc: false,
+            native_capabilities: Default::default(),
+            native_skills: Vec::new(),
+            native_runtime_package: None,
+            working_dir: None,
+            excluded_env_vars: Vec::new(),
             model: DEFAULT_MODEL.into(),
             reasoning_effort: DEFAULT_REASONING_EFFORT.into(),
             service_tier: DEFAULT_SERVICE_TIER.into(),
@@ -292,6 +315,7 @@ async fn execute_with_client(
             Some(planner_deadline), protocol::RunOptions {
                 observer: Some(planner.observer()),
                 max_output_bytes: Some(query_plan::MAX_PLAN_OUTPUT_BYTES),
+                ..Default::default()
             },
         ).await.and_then(|completion| query_plan::validate_plan(question, &completion.value));
         if let Some(report) = &mut query_plan_report {
@@ -324,7 +348,7 @@ async fn execute_with_client(
             evidence: &mut evidence,
         },
         Some(deadline),
-        protocol::RunOptions { observer: Some(reader.observer()), max_output_bytes: None },
+        protocol::RunOptions { observer: Some(reader.observer()), max_output_bytes: None, ..Default::default() },
     )
     .await?;
     stage="citation_validation";
@@ -339,6 +363,7 @@ async fn execute_with_client(
         elapsed_ms:_,
         stderr_bytes,
         stderr_truncated,
+        ..
     } = completed;
     let mut warnings = result.warnings;
     warnings.push("Citation validation checks issued snapshot identity and current source freshness; it does not prove semantic entailment.".into());
@@ -473,6 +498,7 @@ struct ProcessOutcome {
     elapsed_ms: u128,
     stderr_bytes: Option<u64>,
     stderr_truncated: Option<bool>,
+    transport_bytes: usize,
 }
 
 async fn run_process_until(
@@ -481,8 +507,12 @@ async fn run_process_until(
     deadline: Option<tokio::time::Instant>,
     options: protocol::RunOptions<'_>,
 ) -> Result<ProcessOutcome> {
-    let deadline = deadline
-        .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs));
+    let deadline = match deadline {
+        Some(value) => value,
+        None => tokio::time::Instant::now()
+            .checked_add(Duration::from_secs(config.timeout_secs))
+            .ok_or_else(|| anyhow!("host_deadline_overflow"))?,
+    };
     ensure!(
         tokio::time::Instant::now() < deadline,
         "host_deadline_exceeded"
@@ -494,7 +524,46 @@ async fn run_process_until(
         .codex_home
         .canonicalize()
         .map_err(|_| anyhow!("Selected CODEX_HOME is unavailable"))?;
-    let cwd = tempfile::Builder::new().prefix("gptgrep-host-").tempdir()?;
+    let temporary_cwd = if config.working_dir.is_none() {
+        Some(tempfile::Builder::new().prefix("gptgrep-host-").tempdir()?)
+    } else {
+        None
+    };
+    let cwd = match &config.working_dir {
+        Some(path) => {
+            let canonical = path.canonicalize()?;
+            ensure!(
+                canonical == *path && canonical.is_dir(),
+                "host_native_working_directory"
+            );
+            canonical
+        }
+        None => temporary_cwd
+            .as_ref()
+            .expect("owned temporary cwd")
+            .path()
+            .canonicalize()
+            .map_err(|_| anyhow!("host_native_working_directory"))?,
+    };
+    let mut selected_config = config.clone();
+    if native_ptc {
+        if let Some(package) = &config.native_runtime_package {
+            let staged = native_runtime::stage_native_runtime(package, &cwd)?;
+            selected_config.native_skills.extend(staged.skills);
+            for (key, value) in staged.role_capabilities {
+                selected_config
+                    .native_capabilities
+                    .entry(key)
+                    .or_insert(value);
+            }
+        }
+        native_skills::validate(&selected_config.native_skills)?;
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "host_deadline_exceeded"
+        );
+    }
+    let config = &selected_config;
     let binary = if Path::new(&config.codex_bin).components().count() > 1 {
         PathBuf::from(&config.codex_bin)
             .canonicalize()
@@ -503,15 +572,35 @@ async fn run_process_until(
         PathBuf::from(&config.codex_bin)
     };
     ensure!(home.is_dir(), "Selected CODEX_HOME must be a directory");
-    let mut command = process_command(
+    let capabilities = if native_ptc {
+        native_ptc::runtime_config(config)?
+    } else {
+        protocol::base_config()
+    };
+    let mut command = process_command_with_config(
         &binary,
-        cwd.path(),
+        &cwd,
         &home,
         config.codex_state_dir.as_deref(),
+        &capabilities,
     )?;
+    for name in &config.excluded_env_vars {
+        ensure!(
+            !name.is_empty() && !name.contains('=') && !name.chars().any(char::is_control),
+            "host_excluded_environment_name"
+        );
+        command.env_remove(name);
+    }
     if native_ptc {
-        for override_value in native_ptc::STARTUP_OVERRIDES {
-            command.arg("-c").arg(override_value);
+        for name in [
+            "GPTGREP_NATIVE_OCR_REQUIRED",
+            "GPTGREP_NATIVE_OCR_ADMISSION",
+            "GPTGREP_NATIVE_OCR_ADMISSION_SHA256",
+            "GPTGREP_NATIVE_DOCUMENT_REQUIRED",
+            "GPTGREP_NATIVE_DOCUMENT_ADMISSION",
+            "GPTGREP_NATIVE_DOCUMENT_ADMISSION_SHA256",
+        ] {
+            command.env_remove(name);
         }
     }
     if let Some(profile) = &config.permission_profile {
@@ -542,6 +631,9 @@ async fn run_process_until(
     let mut child = command
         .spawn()
         .map_err(|_| anyhow!("Could not start the configured Codex app-server"))?;
+    if let Some(proof) = options.cleanup_proof {
+        proof.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
     let mut process_group = process_group::OwnedGroup::new(&child)?;
     let stdin = child
         .stdin
@@ -581,7 +673,7 @@ async fn run_process_until(
     let session = protocol::run_observed_budget(
         stdout,
         stdin,
-        cwd.path(),
+        &cwd,
         config,
         workflow,
         trace,
@@ -591,7 +683,7 @@ async fn run_process_until(
     );
     let outcome=tokio::time::timeout_at(deadline,async {
         // There is exactly one designated failure waiter for this invocation.
-        tokio::select! { biased; _=transport.exceeded()=>transport.check_host().and_then(|()|Err(anyhow!("host_transport_unknown"))), result=session=>result }
+        tokio::select! { biased; _=ocr::cancellation_wait(options.cancel)=>Err(anyhow!("host_native_task_cancelled")), _=transport.exceeded()=>transport.check_host().and_then(|()|Err(anyhow!("host_transport_unknown"))), result=session=>result }
     }).await;
     // Capture primary invocation classification before cleanup can change the
     // meter or clock. Only a typed timeout is normalized as a timeout.
@@ -611,6 +703,11 @@ async fn run_process_until(
         Ok(Ok(Ok(metrics))) => Ok(metrics),
         _ => Err(anyhow!("host_stderr_cleanup_unknown")),
     };
+    if drain.is_ok()
+        && let Some(proof) = options.cleanup_proof
+    {
+        proof.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     let (result, stderr_bytes, stderr_truncated) =
         finalize_captured_invocation(invocation, &transport, drain)?;
     if let Some(observer) = options.observer {
@@ -622,6 +719,7 @@ async fn run_process_until(
         elapsed_ms: started.elapsed().as_millis(),
         stderr_bytes: Some(stderr_bytes),
         stderr_truncated: Some(stderr_truncated),
+        transport_bytes: transport.used(),
     })
 }
 
@@ -687,11 +785,22 @@ fn native_state_paths(state: Option<&Path>) -> Result<Option<(PathBuf, PathBuf)>
     Ok(Some((state, logs)))
 }
 
+#[cfg(test)]
 fn process_command(
     binary: &Path,
     cwd: &Path,
     home: &Path,
     state: Option<&Path>,
+) -> Result<Command> {
+    process_command_with_config(binary, cwd, home, state, &protocol::base_config())
+}
+
+fn process_command_with_config(
+    binary: &Path,
+    cwd: &Path,
+    home: &Path,
+    state: Option<&Path>,
+    capabilities: &serde_json::Value,
 ) -> Result<Command> {
     let state = native_state_paths(state)?;
     let mut command = Command::new(binary);
@@ -728,7 +837,10 @@ fn process_command(
             .arg("-c")
             .arg(format!("log_dir={}", serde_json::to_string(&logs)?));
     }
-    for (key, value) in protocol::base_config().as_object().expect("static object") {
+    for (key, value) in capabilities
+        .as_object()
+        .expect("validated configuration object")
+    {
         command
             .arg("-c")
             .arg(format!("{key}={}", protocol::toml_override(value)?));
@@ -738,6 +850,9 @@ fn process_command(
 
 fn validate_config(config: &HostConfig, question: &str) -> Result<()> {
     native_ptc::enabled(config, false)?;
+    if config.native_ptc {
+        native_skills::validate(&config.native_skills)?;
+    }
     native_state_paths(config.codex_state_dir.as_deref())?;
     if let Some(profile) = &config.permission_profile {
         ensure!(
@@ -753,12 +868,14 @@ fn validate_config(config: &HostConfig, question: &str) -> Result<()> {
         "Question must contain 1..8192 bytes"
     );
     ensure!(
-        (1..=900).contains(&config.timeout_secs),
-        "Host timeout must be 1..900 seconds"
+        config.timeout_secs > 0 && (config.native_ptc || config.timeout_secs <= 900),
+        "Host timeout must be positive and within the selected execution mode"
     );
     ensure!(
-        (1..=64).contains(&config.max_tool_calls),
-        "Host tool-call limit must be 1..64"
+        config.max_tool_calls > 0
+            && config.max_tool_calls < usize::MAX
+            && (config.native_ptc || config.max_tool_calls <= 64),
+        "Host tool-call limit must be positive and within the selected execution mode"
     );
     ensure!(
         !config.model.is_empty()

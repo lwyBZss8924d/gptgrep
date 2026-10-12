@@ -24,11 +24,16 @@ pub struct OcrExecutionLimits {
 }
 impl OcrExecutionLimits {
     pub fn validate(&self) -> Result<()> {
+        let minimum = u64::try_from(self.max_admissions)
+            .ok()
+            .and_then(|n| n.checked_mul(512))
+            .and_then(|n| n.checked_add(4096));
         ensure!(
-            (1..=1024).contains(&self.max_admissions)
-                && (1..=MAX_OCR_CONCURRENCY).contains(&self.max_concurrency)
-                && (8192..=1_048_576).contains(&self.ledger_bytes)
-                && 4096u64 + self.max_admissions as u64 * 512 <= self.ledger_bytes,
+            self.max_admissions > 0
+                && self.max_concurrency > 0
+                && self.ledger_bytes >= 8192
+                && usize::try_from(self.ledger_bytes).is_ok()
+                && minimum.is_some_and(|n| n <= self.ledger_bytes),
             "ocr_phase_limits"
         );
         Ok(())
@@ -882,6 +887,34 @@ fn require_original(stored: &RunClockAnchor, original: &RunClockAnchor) -> Resul
 mod phase_tests {
     use super::*;
     const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    #[test]
+    fn explicit_corpus_limits_can_exceed_legacy_phase_defaults() {
+        OcrExecutionLimits {
+            max_admissions: 4096,
+            max_concurrency: 8,
+            ledger_bytes: 4096 * 512 + 4096,
+        }
+        .validate()
+        .unwrap();
+        assert!(
+            OcrExecutionLimits {
+                max_admissions: 4096,
+                max_concurrency: 8,
+                ledger_bytes: 4096 * 512
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            OcrExecutionLimits {
+                max_admissions: usize::MAX,
+                max_concurrency: 1,
+                ledger_bytes: u64::MAX
+            }
+            .validate()
+            .is_err()
+        );
+    }
     #[tokio::test]
     async fn finite_phase_is_shared_and_unknowns_never_refund_or_reset() {
         let context = OcrExecutionContext::pure_fixture(50);
@@ -924,7 +957,7 @@ mod phase_tests {
         require_original(&context.0.header.clock, &context.0.header.clock).unwrap();
         for limit in [
             OcrExecutionLimits {
-                max_admissions: 1025,
+                max_admissions: 0,
                 max_concurrency: 2,
                 ledger_bytes: 1_048_576,
             },

@@ -10,7 +10,7 @@ import unittest
 import sys
 from unittest.mock import AsyncMock, patch
 from types import SimpleNamespace
-from bundle_fixtures import bundle_fixture, sandbox_helper_fixture
+from bundle_fixtures import bundle_fixture, code_mode_host_fixture, sandbox_helper_fixture
 
 from harbor.models.agent.context import AgentContext
 from harbor.models.job.config import JobConfig
@@ -59,8 +59,8 @@ class HarborMaterializationTests(unittest.TestCase):
             "decisions_ledger_dir": "/synthetic-private/ledger",
             "admitted": True, "admission": None, "account_scope": "Dev/Test/Eval", "platform": "linux/amd64",
             "run_id": "synthetic-full62", "jobs_dir": str(self.root / "jobs"),
-            "reader_base_binary": {"path": "/opt/codex", "bytes": 1, "sha256": "b" * 64},
-            "codex_binary": "/opt/codex", "gptgrep_binary": "/opt/gptgrep", "codex_home": CODEX_HOME,
+            "reader_base_binary": {"path": "/usr/local/bin/codex", "bytes": 1, "sha256": "b" * 64},
+            "codex_binary": "/usr/local/bin/codex", "gptgrep_binary": "/opt/gptgrep", "codex_home": CODEX_HOME,
             "gptgrep_binary_pin": {"path": "/opt/gptgrep", "bytes": 1, "sha256": "c" * 64},
             "judge_profile": {"model": "synthetic-frozen-judge", "reasoning_effort": "high", "service_tier": "default"},
             "permitted_tools": {"gptgrep": ["native shell", "GPTgrep"], "raw_only": ["native shell"]},
@@ -85,6 +85,8 @@ class HarborMaterializationTests(unittest.TestCase):
         tools["binaries"]["codex"] = self.runtime["reader_base_binary"]
         _, helper = sandbox_helper_fixture(self.root / "helper")
         tools["native_sandbox_helpers"] = {"bwrap": helper}
+        _, host = code_mode_host_fixture(self.root / "host", self.runtime["reader_base_binary"])
+        tools["native_code_mode_host"] = host
         self.runtime["base_tool_environment"] = {"image": self.runtime["images"]["raw_only"],
             "provenance": write_pin(self.root / "base-tools.json", tools)}
         product = self.root / "product"
@@ -318,15 +320,19 @@ class NativePolicyTests(unittest.TestCase):
         self.assertEqual(fs["/data/corpus"], "read")
         for path in (CODEX_HOME, "/tests", "/solution", "/logs", "/opt/full62-private"):
             self.assertEqual(fs[path], "deny")
-        self.assertFalse(config["permissions"]["full62_reader"]["network"]["enabled"])
+        self.assertTrue(config["permissions"]["full62_reader"]["network"]["enabled"])
+        self.assertEqual(config["web_search"], "live")
         self.assertEqual(config["features"], {
-            "shell_tool": True, "view_image": True, "code_mode_only": False, "code_mode_prewarm": False,
-            "code_mode": {"enabled": False, "direct_only_tool_namespaces": ["functions"]},
-            "code_mode_host": {"enabled": False, "disable_in_process_fallback": True}})
+            "shell_tool": True, "view_image": True, "unified_exec": True,
+            "multi_agent": True, "plugins": True, "apps": True,
+            "tool_suggest": True, "code_mode": {"enabled": True}, "code_mode_host": {"enabled": True}})
         judge = tomllib.loads(model_config(PROFILE, "judge").decode())
+        self.assertEqual(judge["web_search"], "disabled")
+        self.assertFalse(judge["permissions"]["full62_judge"]["network"]["enabled"])
         self.assertEqual(judge["features"], {
-            **config["features"], "shell_tool": False, "view_image": False,
-            "code_mode": {"enabled": False, "direct_only_tool_namespaces": []}})
+            "shell_tool": False, "view_image": False, "code_mode_only": False, "code_mode_prewarm": False,
+            "code_mode": {"enabled": False, "direct_only_tool_namespaces": []},
+            "code_mode_host": {"enabled": False, "disable_in_process_fallback": True}})
 
     def test_product_credential_never_reaches_native_environment(self):
         source = {"PATH": "/usr/bin", "OPENROUTER_API_KEY": "synthetic-only", "HTTPS_PROXY": "http://synthetic-proxy",

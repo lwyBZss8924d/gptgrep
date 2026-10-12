@@ -19,6 +19,9 @@ BASE_CAPABILITIES = ("python3", "POSIX shell", "Pillow==12.3.0", "pdftotext", "p
 SANDBOX_HELPER_PATH = "/usr/local/bin/codex-resources/bwrap"
 SANDBOX_HELPER_DATA = "/usr/local/share/full62-sandbox-helper"
 SANDBOX_HELPER_MAX_BYTES = 8 * 1024 * 1024
+CODE_MODE_HOST_PATH = "/usr/local/bin/codex-code-mode-host"
+CODE_MODE_HOST_DATA = "/usr/local/share/full62-code-mode-host"
+CODE_MODE_HOST_MAX_BYTES = 2**30
 API_ENV = {"OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL", "OPENAI_ORG_ID",
            "OPENAI_ORGANIZATION", "OPENAI_PROJECT_ID", "AZURE_OPENAI_API_KEY",
            "AZURE_OPENAI_ENDPOINT", "OPENAI_ACCESS_TOKEN", "CHATGPT_ACCESS_TOKEN"}
@@ -65,6 +68,56 @@ def sandbox_helper_identity(value, platform):
     return value
 
 
+def code_mode_host_identity(value, platform, runtime_binary):
+    """Bind the bundled companion to the same release, platform and native CLI."""
+    targets = {"linux/amd64": "x86_64-unknown-linux-musl", "linux/arm64": "aarch64-unknown-linux-musl"}
+    require(platform in targets, "native_code_mode_host_platform")
+    require(isinstance(value, dict) and value.get("schema") == "gptgrep.native-code-mode-host.v1" and
+            value.get("release_tag") == "rust-v" + CODEX_VERSION and
+            value.get("source_commit") == CODEX_SOURCE_COMMIT and
+            value.get("platform") == platform, "native_code_mode_host_release")
+    require(value.get("runtime_binary") == runtime_binary and
+            str(PurePosixPath(runtime_binary["path"]).with_name("codex-code-mode-host")) ==
+            CODE_MODE_HOST_PATH, "native_code_mode_host_pair")
+    binary = value.get("binary")
+    require(isinstance(binary, dict) and set(binary) == {"path", "bytes", "sha256"} and
+            binary["path"] == CODE_MODE_HOST_PATH, "native_code_mode_host_binary_pin")
+    integer(binary["bytes"], 64, CODE_MODE_HOST_MAX_BYTES)
+    digest(binary["sha256"])
+    archive = value.get("archive")
+    name = "codex-code-mode-host-" + targets[platform] + ".tar.gz"
+    require(isinstance(archive, dict) and archive.get("name") == name and
+            archive.get("url") == "https://github.com/openai/codex/releases/download/rust-v" +
+            CODEX_VERSION + "/" + name, "native_code_mode_host_official_asset")
+    integer(archive.get("bytes"), 1, CODE_MODE_HOST_MAX_BYTES)
+    digest(archive.get("sha256"))
+    signature = value.get("sigstore")
+    require(isinstance(signature, dict) and set(signature) == {"path", "bytes", "sha256"} and
+            signature["path"] == CODE_MODE_HOST_DATA + "/host.sigstore",
+            "native_code_mode_host_sigstore_pin")
+    integer(signature["bytes"], 1, 65536)
+    digest(signature["sha256"])
+    # This field reports evidence supplied by the owner. Pin checks do not verify
+    # the cryptographic signature or prove that the host protocol has executed.
+    require(value.get("attestation_verification") in ("not_performed", "verified") and
+            value.get("source_and_digest_consistency_verified") is True,
+            "native_code_mode_host_evidence")
+    return value
+
+
+def check_code_mode_host(value, platform):
+    """Check installed companion bytes and architecture without launching it."""
+    copy_asset(value["binary"], CODE_MODE_HOST_MAX_BYTES)
+    copy_asset(value["sigstore"], 65536)
+    mode = os.stat(value["binary"]["path"]).st_mode
+    require(mode & 0o111 and not mode & 0o6000, "native_code_mode_host_executable_mode")
+    with open(value["binary"]["path"], "rb") as source:
+        header = source.read(64)
+    machine = {"linux/amd64": 62, "linux/arm64": 183}[platform]
+    require(len(header) == 64 and header[:6] == b"\x7fELF\x02\x01" and
+            int.from_bytes(header[18:20], "little") == machine, "native_code_mode_host_linux_elf")
+
+
 def base_tools_identity(pin):
     """A common image's offline build receipt; not model permission proof."""
     value = parse(pinned(pin, 65536))
@@ -86,6 +139,9 @@ def base_tools_identity(pin):
     helpers = value.get("native_sandbox_helpers")
     require(isinstance(helpers, dict) and set(helpers) == {"bwrap"}, "native_sandbox_helper_required")
     sandbox_helper_identity(helpers["bwrap"], value["build_inputs"]["platform"])
+    require("native_code_mode_host" in value, "native_code_mode_host_required")
+    code_mode_host_identity(value["native_code_mode_host"], value["build_inputs"]["platform"],
+                            value["binaries"]["codex"])
     return value
 
 
@@ -110,6 +166,7 @@ def check_base_tools(config):
     require(mode & 0o111 and not mode & 0o6000, "native_helper_executable_mode")
     for pin in helper["licenses"]:
         copy_asset(pin, 65536)
+    check_code_mode_host(value["native_code_mode_host"], value["build_inputs"]["platform"])
 
 
 def auth_paths(value):
@@ -133,15 +190,23 @@ def model_config(profile, role):
         "model": profile["model"], "model_reasoning_effort": profile["reasoning_effort"],
         "service_tier": profile["service_tier"], "model_provider": "openai",
         "cli_auth_credentials_store": "file", "forced_login_method": "chatgpt",
-        "approval_policy": "never", "default_permissions": name, "web_search": "disabled",
+        "approval_policy": "never", "default_permissions": name,
+        "web_search": "live" if role == "reader" else "disabled",
     }
     lines = [key + " = " + json.dumps(value) for key, value in settings.items()]
     enabled = "true" if role == "reader" else "false"
-    direct_namespaces = ["functions"] if role == "reader" else []
-    lines += ["", "[features]", "shell_tool = " + enabled, "view_image = " + enabled,
-              "code_mode_only = false", "code_mode_prewarm = false",
-              "", "[features.code_mode]", "enabled = false", "direct_only_tool_namespaces = " + json.dumps(direct_namespaces),
-              "", "[features.code_mode_host]", "enabled = false", "disable_in_process_fallback = true"]
+    lines += ["", "[features]", "shell_tool = " + enabled, "view_image = " + enabled]
+    if role == "reader":
+        lines += [feature + " = true" for feature in (
+            "unified_exec", "multi_agent", "plugins", "apps", "tool_suggest")]
+        lines += ["", "[features.code_mode]", "enabled = true",
+                  "", "[features.code_mode_host]", "enabled = true"]
+    else:
+        lines += ["code_mode_only = false", "code_mode_prewarm = false",
+                  "", "[features.code_mode]", "enabled = false",
+                  "direct_only_tool_namespaces = []",
+                  "", "[features.code_mode_host]", "enabled = false",
+                  "disable_in_process_fallback = true"]
     lines += ["", "[permissions." + name + ".filesystem]", '":minimal" = "read"']
     if role == "reader":
         lines += ['"/data/corpus" = "read"', json.dumps(WORK_DIR) + ' = "write"']
@@ -150,7 +215,7 @@ def model_config(profile, role):
         lines.append(json.dumps(path) + ' = "deny"')
     if role == "judge":
         lines.append('"/data" = "deny"')
-    lines += ["", "[permissions." + name + ".network]", "enabled = false", ""]
+    lines += ["", "[permissions." + name + ".network]", "enabled = " + enabled, ""]
     return "\n".join(lines).encode()
 
 

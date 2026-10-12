@@ -15,14 +15,16 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from gptgrep_harbor.common import copy_asset, digest, integer, parse, pinned, put, read, require
 from gptgrep_harbor.adapter import image
-from gptgrep_harbor.runtime import SANDBOX_HELPER_MAX_BYTES, sandbox_helper_identity, validate_asset_path
+from gptgrep_harbor.runtime import (CODE_MODE_HOST_MAX_BYTES, SANDBOX_HELPER_MAX_BYTES,
+                                    code_mode_host_identity, sandbox_helper_identity, validate_asset_path)
 from gptgrep_harbor.product_bundle import (PRODUCT_ENTRYPOINT, PRODUCT_PROVENANCE,
                                           PRODUCT_ROOT, release_bundle)
 
 
 def prepare(config, output):
     require(set(config) == {"platform", "python_image", "uv_image", "debian_snapshot",
-                           "poppler_version", "codex_binary", "native_sandbox_helper", "gptgrep_binary"}, "base_build_fields")
+                           "poppler_version", "codex_binary", "native_sandbox_helper",
+                           "native_code_mode_host", "gptgrep_binary"}, "base_build_fields")
     require(config["gptgrep_binary"] is None, "raw_product_binary_unsupported_use_release_bundle")
     require(config["platform"] in ("linux/amd64", "linux/arm64"), "linux_platform")
     for key in ("python_image", "uv_image"):
@@ -64,6 +66,23 @@ def prepare(config, output):
     machine = {"linux/amd64": 62, "linux/arm64": 183}[config["platform"]]
     require(len(header) == 64 and header[:6] == b"\x7fELF\x02\x01" and
             int.from_bytes(header[18:20], "little") == machine, "native_helper_linux_elf")
+    host_input = config["native_code_mode_host"]
+    require(isinstance(host_input, dict) and set(host_input) == {"binary", "provenance", "sigstore"},
+            "native_code_mode_host_input")
+    for pin in host_input.values():
+        require(isinstance(pin, dict) and set(pin) == {"path", "bytes", "sha256"},
+                "native_code_mode_host_input_pin")
+        validate_asset_path(pin["path"])
+    host = code_mode_host_identity(parse(pinned(host_input["provenance"], 65536)), config["platform"],
+                                  {**config["codex_binary"], "path": "/usr/local/bin/codex"})
+    for key, cap in (("binary", CODE_MODE_HOST_MAX_BYTES), ("sigstore", 65536)):
+        require(all(host_input[key][field] == host[key][field] for field in ("bytes", "sha256")),
+                "native_code_mode_host_input_join")
+        copy_asset(host_input[key], cap)
+    with open(host_input["binary"]["path"], "rb") as source:
+        host_header = source.read(64)
+    require(len(host_header) == 64 and host_header[:6] == b"\x7fELF\x02\x01" and
+            int.from_bytes(host_header[18:20], "little") == machine, "native_code_mode_host_linux_elf")
     root = Path(output).absolute()
     require(root.resolve() == root and not root.exists(), "fresh_physical_build_context")
     root.mkdir(mode=0o700, parents=False)
@@ -73,6 +92,9 @@ def prepare(config, output):
     for name, pin in binaries:
         copy_asset(pin, SANDBOX_HELPER_MAX_BYTES if name == "bwrap" else 2**30, root / name)
     copy_asset(helper_input["provenance"], 65536, root / "helper-record.json")
+    copy_asset(host_input["binary"], CODE_MODE_HOST_MAX_BYTES, root / "codex-code-mode-host")
+    copy_asset(host_input["provenance"], 65536, root / "host-provenance.json")
+    copy_asset(host_input["sigstore"], 65536, root / "host.sigstore")
     for name, pin in helper_input["licenses"].items():
         copy_asset(pin, 65536, root / name)
     build = ["docker", "buildx", "build", "--load", "--platform", config["platform"]]
@@ -80,9 +102,11 @@ def prepare(config, output):
         build += ["--build-arg", key.upper() + "=" + config[key]]
     build += ["--build-arg", "CODEX_SHA256=" + config["codex_binary"]["sha256"]]
     build += ["--build-arg", "BWRAP_SHA256=" + helper_input["binary"]["sha256"]]
+    build += ["--build-arg", "CODE_MODE_HOST_SHA256=" + host_input["binary"]["sha256"]]
     commands = {"common": build + ["--target", "common", "--tag", "gptgrep-full62-common:local", str(root)]}
     return {"build_commands": {role: shlex.join(argv) for role, argv in commands.items()},
             "common_image_for": ["raw_only", "judge"], "native_sandbox_helper": helper,
+            "native_code_mode_host": host, "native_code_mode_host_protocol_executed": False,
             "native_helper_digest_compatibility_verified": False, "actual_build_performed": False}
 
 

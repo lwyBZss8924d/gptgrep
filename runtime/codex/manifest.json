@@ -1,0 +1,93 @@
+{
+  "schema": "gptgrep.native-runtime-package.v1",
+  "files": [
+    {
+      "source_path": "runtime/codex/AGENTS.md",
+      "target_path": "AGENTS.md",
+      "bytes": 2794,
+      "sha256": "f0d64bccb38e70a907f49f2620dce1fc42a967eaf5acce708e44bb63f92c1c0b"
+    },
+    {
+      "source_path": "runtime/codex/agents/gptgrep-document.toml",
+      "target_path": ".codex/agents/gptgrep-document.toml",
+      "bytes": 796,
+      "sha256": "1fa1bd81ef4af4260e64f9b7c7f6aa16f4c7428de054381689134f39723d19ff"
+    },
+    {
+      "source_path": "runtime/codex/agents/gptgrep-ocr.toml",
+      "target_path": ".codex/agents/gptgrep-ocr.toml",
+      "bytes": 747,
+      "sha256": "655debf7121b3bbd32eeabaf9411ad9966474c70145b6e5163f9ab184fb409c5"
+    },
+    {
+      "source_path": "runtime/codex/agents/gptgrep-retrieval.toml",
+      "target_path": ".codex/agents/gptgrep-retrieval.toml",
+      "bytes": 864,
+      "sha256": "0c1f13ec2f33ad28f8770cf5899a04f81d2c393dcfda7d077d2c420678d3a75b"
+    },
+    {
+      "source_path": "skills/gptgrep/SKILL.md",
+      "target_path": ".agents/skills/gptgrep/SKILL.md",
+      "bytes": 5188,
+      "sha256": "d568706b1a1a1551bac00f961f441eb8f4c2506bbd2c3dbeffae77eba32cce9d"
+    },
+    {
+      "source_path": "skills/gptgrep-document/SKILL.md",
+      "target_path": ".agents/skills/gptgrep-document/SKILL.md",
+      "bytes": 4616,
+      "sha256": "acd96b1672dc6b93cbf5670213f501b9aa3d4ea5d9c8151bdc3acdce2cf7c767"
+    },
+    {
+      "source_path": "skills/gptgrep-ocr/SKILL.md",
+      "target_path": ".agents/skills/gptgrep-ocr/SKILL.md",
+      "bytes": 2612,
+      "sha256": "d05a6caf502c1d28c49124047f0cc70e84db082890ddb148d7fadc798ca73ef6"
+    },
+    {
+      "source_path": "skills/gptgrep-retrieval/SKILL.md",
+      "target_path": ".agents/skills/gptgrep-retrieval/SKILL.md",
+      "bytes": 4543,
+      "sha256": "38ffa6378d78e9eb153c72d8b1589258e4ff9ef4571e7fd3fccc8f8540de3544"
+    }
+  ],
+  "skills": [
+    {
+      "name": "gptgrep",
+      "source_path": "skills/gptgrep/SKILL.md",
+      "target_path": ".agents/skills/gptgrep/SKILL.md"
+    },
+    {
+      "name": "gptgrep-document",
+      "source_path": "skills/gptgrep-document/SKILL.md",
+      "target_path": ".agents/skills/gptgrep-document/SKILL.md"
+    },
+    {
+      "name": "gptgrep-ocr",
+      "source_path": "skills/gptgrep-ocr/SKILL.md",
+      "target_path": ".agents/skills/gptgrep-ocr/SKILL.md"
+    },
+    {
+      "name": "gptgrep-retrieval",
+      "source_path": "skills/gptgrep-retrieval/SKILL.md",
+      "target_path": ".agents/skills/gptgrep-retrieval/SKILL.md"
+    }
+  ],
+  "agents": [
+    {
+      "name": "gptgrep-document",
+      "source_path": "runtime/codex/agents/gptgrep-document.toml",
+      "target_path": ".codex/agents/gptgrep-document.toml"
+    },
+    {
+      "name": "gptgrep-ocr",
+      "source_path": "runtime/codex/agents/gptgrep-ocr.toml",
+      "target_path": ".codex/agents/gptgrep-ocr.toml"
+    },
+    {
+      "name": "gptgrep-retrieval",
+      "source_path": "runtime/codex/agents/gptgrep-retrieval.toml",
+      "target_path": ".codex/agents/gptgrep-retrieval.toml"
+    }
+  ],
+  "supervisor_instructions": "AGENTS.md"
+}

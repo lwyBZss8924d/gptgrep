@@ -11,18 +11,28 @@ Local Codex workflows default to `gpt-6-luna`, reasoning effort `max`, and servi
 tier `fast`. Account selection belongs to the caller's private runtime environment;
 workstation-specific account aliases and routing are not part of the public product.
 
-The final retrieval reader may explicitly opt into native PTC with
+The final retrieval reader may explicitly opt into native execution with
 `gptgrep ask --native-ptc --codex-permissions PROFILE`, where PROFILE is an
-existing named permission profile acknowledged by the runtime. The default is
-off; pure completion and query planners cannot enable it. This option allows
-generic native shell/exec, Python/Pillow and image viewing within that profile,
-while web, MCP, Code Mode and permission overrides remain prohibited. Observed
-native command/image items and GPTgrep dynamic calls share `max_tool_calls`.
-App-server item notifications may arrive after execution starts, so native
-accounting is not a pre-execution guard or a hard execution limit. Native
-output grants no citation authority: answers still require GPTgrep-delivered
-source windows or successful read/render issued IDs. Source preparation or
-compilation does not establish native runtime enforcement.
+existing named permission profile acknowledged by the runtime. Native execution
+inherits the selected Codex capabilities and installed Skills, including shell,
+code execution and image viewing, with explicit per-job capability overrides.
+The selected native permissions govern filesystem, network and other effects.
+Pure completion and query planners retain their separate tool-free behavior.
+Observed native items and GPTgrep dynamic calls share the configured tool budget;
+item notifications can arrive after execution starts, so this accounting is not
+a pre-execution guard. Native output does not create GPTgrep citations: answers
+still require delivered source windows or successful read/render issued IDs.
+
+Parser controls can explicitly select native Document execution and native OCR.
+The agent uses the existing prepared-document toolbox; OCR returns a typed result
+bound to the original task, source, page and required regions. Complete-document
+validation and atomic generation publication remain the acceptance path. Native
+agent jobs use their configured tool and deadline budgets without the retained
+fixed Page/Document image-qualification prerequisites. Usable native text and
+ordinary decorative vectors do not require OCR; missing text, uncovered filled
+vectors and independent annotation requirements still do. Caller-selected image
+and retained-staging capacities remain subject to checked actual resource use and
+the original invocation's shared admission.
 
 ## User contract
 

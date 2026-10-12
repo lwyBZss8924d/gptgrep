@@ -59,3 +59,33 @@ fn larger_configuration_cannot_raise_original_server_admission() {
     selected.image_file_bytes_per_page += 1;
     assert!(selected.ensure_same_invocation_within(&admitted).is_err());
 }
+
+#[test]
+fn configured_corpus_staging_exceeds_defaults_but_keeps_atomic_shared_admission() {
+    let admitted = ResourceBudget {
+        document_staging_bytes: 2 * 1024 * 1024 * 1024,
+        run_staging_bytes: 8 * 1024 * 1024 * 1024,
+        owned_working_bytes: 1024 * 1024 * 1024,
+        ..ResourceBudget::default()
+    };
+    admitted.validate().unwrap();
+    let mut selected = admitted.clone();
+    selected.adopt_shared_staging(&admitted).unwrap();
+    selected
+        .reserve_retained_staging(3 * 1024 * 1024 * 1024)
+        .unwrap();
+    assert_eq!(admitted.staging_used(), 3 * 1024 * 1024 * 1024);
+    assert!(
+        selected
+            .reserve_retained_staging(6 * 1024 * 1024 * 1024)
+            .is_err()
+    );
+    assert_eq!(admitted.staging_used(), 3 * 1024 * 1024 * 1024);
+    selected.run_staging_bytes += 1;
+    assert!(selected.ensure_same_invocation_within(&admitted).is_err());
+    assert!(
+        selected
+            .adopt_shared_staging(&ResourceBudget::default())
+            .is_err()
+    );
+}

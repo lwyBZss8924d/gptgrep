@@ -86,6 +86,7 @@ jobs:
           python -m unittest discover -s evals -p 'test_*.py' -v
           python scripts/eval.py --binary target/debug/gptgrep --output .local/ci-eval.json
           python scripts/package_release.py --self-test
+          python scripts/check_runtime_staging.py --script runtime/codex/stage.sh --package . --output "$RUNNER_TEMP/gptgrep-runtime-stage"
       - name: Actual Rust license files
         run: python scripts/collect_licenses.py --target '${{ matrix.target }}' --output .local/ci-licenses --require-complete
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

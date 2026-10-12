@@ -933,6 +933,7 @@ async fn native_and_offline_ocr_search_read_keep_distinct_evidence_receipts() ->
             })
             .collect(),
         receipt: OcrReceipt {
+            native_agent: None,
             model: task.profile.model.clone(),
             profile_sha256: ocr_profile_digest(&task.profile)?,
             request_sha256: "1".repeat(64),

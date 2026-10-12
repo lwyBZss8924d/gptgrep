@@ -388,7 +388,7 @@ fn validate(config: &Control) -> Result<()> {
         );
         code(ocr.runtime_profile.validate(), "parse_agent_ocr_profile")?;
         ensure!(
-            ocr.runtime_profile.image_qualification_accepted(),
+            ocr.runtime_profile.execution_ready(),
             "parse_agent_ocr_qualification_required"
         );
         ensure!(
@@ -587,7 +587,7 @@ impl Session {
             .as_ref()
             .ok_or_else(|| anyhow!("parse_agent_ocr_configuration_required"))?;
         ensure!(
-            config.runtime_profile.image_qualification_accepted(),
+            config.runtime_profile.execution_ready(),
             "parse_agent_ocr_qualification_required"
         );
         let prepared_root = code(

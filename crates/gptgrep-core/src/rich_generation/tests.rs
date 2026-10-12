@@ -69,6 +69,7 @@ fn declared_offline_ocr(task: &gptgrep_parse::OcrTask) -> Result<gptgrep_parse::
             })
             .collect(),
         receipt: OcrReceipt {
+            native_agent: None,
             model: task.profile.model.clone(),
             profile_sha256: ocr_profile_digest(&task.profile)?,
             request_sha256: "1".repeat(64),
@@ -553,8 +554,12 @@ fn native_pdf_fixture() -> Vec<u8> {
 }
 
 fn document_metadata_pdf_fixture() -> Vec<u8> {
+    document_metadata_pdf_with_decoration("")
+}
+
+fn document_metadata_pdf_with_decoration(drawing: &str) -> Vec<u8> {
     let body = format!(
-        "BT /F1 8 Tf 20 180 Td {} ET",
+        "{drawing} BT /F1 8 Tf 20 180 Td {} ET",
         "(Native document metadata accompanies ordinary readable source text.) Tj 0 -12 Td "
             .repeat(12)
     );
@@ -588,6 +593,56 @@ fn document_metadata_pdf_fixture() -> Vec<u8> {
         offsets.len()
     ));
     pdf.into_bytes()
+}
+
+#[tokio::test]
+async fn decorative_vector_native_pages_publish_and_reopen_without_ocr() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    fs::write(
+        root.join("source.pdf"),
+        document_metadata_pdf_with_decoration(
+            "0 0 0 RG 1 w 10 15 m 490 15 l S 0.9 g 10 10 480 20 re f 0 g",
+        ),
+    )?;
+    let budget = ResourceBudget::default();
+    let prepared = gptgrep_parse::prepare_document(
+        &root.join("source.pdf"),
+        &root.join("staging"),
+        &gptgrep_parse::PreparationOptions,
+        &budget,
+    )
+    .await?;
+    let candidate = gptgrep_parse::extract_native(
+        &prepared,
+        &gptgrep_parse::NativeOptions {
+            render_pages: false,
+            ..Default::default()
+        },
+        &budget,
+    )
+    .await?;
+    assert!(candidate.plan().tasks.is_empty());
+    assert!(
+        candidate
+            .pages()
+            .iter()
+            .all(|page| page.coverage == CoverageState::Native)
+    );
+    let parsed =
+        gptgrep_parse::finalize_document(candidate, vec![], gptgrep_parse::OcrMode::Auto, &budget)?;
+    let mut writer = RichGenerationWriter::begin(&root, budget)?;
+    writer.add_document("source.pdf", prepared.staging_root(), parsed)?;
+    let pin = writer.publish()?;
+    let reader = RichGenerationReader::open_pinned(&root, &pin)?;
+    reader.verify_all()?;
+    assert!(
+        reader.manifest()?.documents[0]
+            .pages
+            .iter()
+            .all(|page| page.coverage == CoverageState::Native)
+    );
+    Ok(())
 }
 
 async fn completed_document_metadata(
@@ -778,6 +833,7 @@ async fn real_native_pdf_and_offline_ocr_preserve_raw_artifact_citations() -> Re
             })
             .collect(),
         receipt: OcrReceipt {
+            native_agent: None,
             model: task.profile.model.clone(),
             profile_sha256: ocr_profile_digest(&task.profile)?,
             request_sha256: "1".repeat(64),

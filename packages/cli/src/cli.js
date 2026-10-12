@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 import { Cli, Formatter, z } from 'incur'
 
-import { NativeFailure, runNative } from './native.js'
+import { NativeFailure, runNative, runNativeForeground } from './native.js'
+import { execution, hostExtra, askExtra, indexExtra, extraCommands, flags, maxTimeoutSeconds, validateNativeOptions, workflows } from './commands.js'
 
 const argv = process.argv.slice(2)
 let nativeFailureOutput
+let nativePassthrough = false
 // incur has built-in MCP/update routes; guard them at our executable boundary.
 // Reject those entry points before invoking it; never export a fetch handler.
 if (argv.some((value) => ['--mcp', 'mcp', 'skills', '--update', '--incur-update-check'].includes(value))) {
@@ -27,6 +29,7 @@ const multimodal = {
   maxImagePixels: z.number().int().min(1).max(8000000).optional(),
 }
 const host = {
+  ...hostExtra,
   codexBin: z.string().min(1).default('codex'),
   codexHome: z.string().min(1).optional().describe('Existing account home; native CODEX_HOME default applies when omitted'),
   model: z.string().min(1).max(128).default('gpt-6-luna').describe('Codex reasoning model; separate from the Jev Decisions model'),
@@ -34,8 +37,8 @@ const host = {
   document,
   reasoningEffort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']).default('max'),
   serviceTier: z.enum(['fast', 'priority', 'flex', 'default']).default('fast'),
-  timeout: z.number().int().min(1).max(900).default(180),
-  maxToolCalls: z.number().int().min(1).max(64).default(12),
+  timeout: z.number().int().min(1).max(maxTimeoutSeconds).default(180),
+  maxToolCalls: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).default(12).describe('Observed native/dynamic tool budget; values above 64 require ask nativePtc:true'),
 }
 const requests = {
   search: z.object({
@@ -46,13 +49,15 @@ const requests = {
     document,
     limit: z.number().int().min(1).max(1000).default(20),
     context: z.number().int().min(0).max(100).default(0),
+    maxCandidates: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(),
+    routingDocs: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(),
     minScore: z.number().min(0).max(1).default(0.5).describe('Jev relevance rubric floor; not calibrated confidence'),
     ignoreCase: z.boolean().default(false),
     fixedStrings: z.boolean().default(false),
     decisionsBudget,
     ...multimodal,
   }).strict(),
-  index: z.object({ root, optimizeMerge: z.boolean().default(false) }).strict(),
+  index: z.object({ root, optimizeMerge: z.boolean().default(false), ...indexExtra }).strict(),
   tree: z.object({
     file: z.string().min(1).describe('Source document path'),
     root,
@@ -79,6 +84,7 @@ const requests = {
   status: z.object({ root }).strict(),
   doctor: z.object({}).strict(),
   ask: z.object({
+    ...askExtra,
     question: z.string().min(1).max(8192),
     root,
     ...host,
@@ -88,11 +94,17 @@ const requests = {
     minScore: z.number().min(0).max(1).optional(),
   }).strict(),
   summarize: z.object({
+    decisionsBudget,
     nodeId: z.string().min(1).describe('Verified DOCUMENT_ID:NODE_ID from native search/tree output'),
     root,
     ...host,
   }).strict(),
 }
+
+const { document: _document, jevModel: _jevModel, ...completionHost } = host
+const additional = extraCommands(root, completionHost, decisionsBudget)
+for (const [name, command] of Object.entries(additional)) requests[name] = command.schema
+for (const name of Object.keys(requests)) requests[name] = requests[name].extend({ execution })
 
 const descriptions = {
   search: 'Search with Jev hybrid retrieval by default; select regex or lexical for deterministic primitives.',
@@ -114,6 +126,7 @@ const hostArguments = (r) => [
   ...(r.codexHome === undefined ? [] : [`--codex-home=${r.codexHome}`]),
   ...(r.jevModel === undefined ? [] : [`--jev-model=${r.jevModel}`]),
   ...(r.document === undefined ? [] : [`--document=${r.document}`]),
+  ...flags(r, Object.keys(hostExtra)),
 ]
 const budgetArguments = (r) => r.decisionsBudget === undefined ? [] : [`--decisions-budget=${r.decisionsBudget}`]
 const multimodalArguments = (r) => [
@@ -125,12 +138,12 @@ const multimodalArguments = (r) => [
     .flatMap(([field, flag]) => r[field] === undefined ? [] : [`--${flag}=${r[field]}`]),
 ]
 const argumentsFor = {
-  search: (r) => ['search', '--mode', r.mode, ...(r.multimodal ? [] : ['--limit', String(r.limit), '--context', String(r.context)]), '--min-score', String(r.minScore), ...budgetArguments(r), ...multimodalArguments(r),
+  search: (r) => ['search', '--mode', r.mode, ...(r.multimodal ? [] : ['--limit', String(r.limit), '--context', String(r.context)]), '--min-score', String(r.minScore), ...budgetArguments(r), ...multimodalArguments(r), ...flags(r, ['maxCandidates', 'routingDocs']),
     ...(r.ignoreCase ? ['--ignore-case'] : []), ...(r.fixedStrings ? ['--fixed-strings'] : []),
     ...(r.model === undefined ? [] : [`--model=${r.model}`]),
     ...(r.document === undefined ? [] : [`--document=${r.document}`]),
     '--json', '--', r.query, r.root],
-  index: (r) => ['index', ...(r.optimizeMerge ? ['--optimize-merge'] : []), '--json', '--', r.root],
+  index: (r) => ['index', ...(r.optimizeMerge ? ['--optimize-merge'] : []), ...flags(r, Object.keys(indexExtra)), '--json', '--', r.root],
   tree: (r) => ['tree', `--root=${r.root}`, '--json', '--', r.file],
   read: (r) => ['read', `--root=${r.root}`, '--offset', String(r.offset), '--max-bytes', String(r.maxBytes), '--json', '--', r.nodeId],
   batch: (r) => ['batch', `--root=${r.root}`, '--input=-', ...(r.rich ? ['--rich'] : []),
@@ -142,54 +155,78 @@ const argumentsFor = {
     ...(r.multimodalTimeout===undefined?[]:[`--multimodal-timeout=${r.multimodalTimeout}`]),...budgetArguments(r),'--json'],
   status: (r) => ['status', '--json', '--', r.root],
   doctor: () => ['doctor', '--json'],
-  ask: (r) => ['ask', ...hostArguments(r), ...budgetArguments(r), ...multimodalArguments(r), ...(r.minScore === undefined ? [] : [`--min-score=${r.minScore}`]), '--json', '--', r.question, r.root],
-  summarize: (r) => ['summarize', `--root=${r.root}`, ...hostArguments(r), '--json', '--', r.nodeId],
+  ask: (r) => ['ask', ...hostArguments(r), ...flags(r, Object.keys(askExtra)), ...budgetArguments(r), ...multimodalArguments(r), ...(r.minScore === undefined ? [] : [`--min-score=${r.minScore}`]), '--json', '--', r.question, r.root],
+  summarize: (r) => ['summarize', `--root=${r.root}`, ...hostArguments(r), ...budgetArguments(r), '--json', '--', r.nodeId],
+}
+
+for (const [name, command] of Object.entries(additional)) {
+  descriptions[name] = command.description
+  argumentsFor[name] = command.args
 }
 
 const cli = Cli.create('gptgrep-ai', {
   version: '0.1.0-alpha.1',
-  description: 'Optional schema and formatting interface for native GPTgrep',
+  description: 'Typed native GPTgrep commands, foreground toolboxes and workflow/Rust API discovery. Start with workflows and request-schema.',
   format: 'json',
   config: false,
   sync: false,
   update: false,
 })
 
+const groups = new Map()
 for (const [name, schema] of Object.entries(requests)) {
-  cli.command(name, {
+  const parts = name.split(' ')
+  if (parts.length > 1 && !groups.has(parts[0]))
+    groups.set(parts[0], Cli.create(parts[0], { description: parts[0] === 'ocr' ? 'Explicit native OCR supervision.' : 'Prepared-document parsing and native agent jobs.', config: false, sync: false, update: false }))
+  const target = parts.length > 1 ? groups.get(parts[0]) : cli
+  target.command(parts.at(-1), {
     description: descriptions[name],
     mcp: false,
     env: z.object({
       GPTGREP_BIN: z.string().default('gptgrep').describe('Native executable path; never downloaded implicitly'),
     }),
     options: z.object({
-      request: z.string().default('{}').describe(`JSON request object. Inspect with gptgrep-ai request-schema ${name} --json.`),
+      request: z.string().default('{}').describe(`JSON request object. Inspect with gptgrep-ai request-schema '${name}' --json.`),
     }),
-    output: z.record(z.string(), z.unknown()).describe('Native GPTgrep JSON response, preserved as structured data'),
+    output: additional[name]?.foreground
+      ? z.unknown().describe('Native stdout stream or silent file-output success; no incur envelope or formatting. Wait for process exit and inspect native evidence.')
+      : z.record(z.string(), z.unknown()).describe('Native GPTgrep JSON response, preserved as structured data'),
     async run(c) {
       let request
       try {
         const raw = JSON.parse(c.options.request)
         request = schema.parse(raw)
+        validateNativeOptions(name, request, raw)
         const visualKeys = Object.keys(multimodal).filter((key) => key !== 'multimodal')
         if (['search', 'ask'].includes(name) && !request.multimodal && [...visualKeys, 'maxCitations', ...(name === 'ask' ? ['minScore'] : [])].some((key) => Object.hasOwn(raw, key)))
           throw new Error('Multimodal bounds require multimodal:true.')
         if (name === 'batch' && !request.rich && ['model', 'multimodalTimeout'].some((key) => Object.hasOwn(raw, key)))
           throw new Error('Paid batch options require rich:true.')
         if (name === 'search' && request.multimodal && (request.mode !== 'hybrid'
-            || ['limit', 'context', 'ignoreCase', 'fixedStrings'].some((key) => Object.hasOwn(raw, key))))
+            || ['limit', 'context', 'ignoreCase', 'fixedStrings', 'maxCandidates', 'routingDocs'].some((key) => Object.hasOwn(raw, key))))
           throw new Error('Multimodal search requires hybrid mode and cannot combine legacy grep/window options.')
       } catch (error) {
         return c.error({ code: 'INVALID_REQUEST', message: error.message })
       }
       try {
-        const timeout = name === 'ask' || name === 'summarize' ? (request.timeout + 10) * 1000
-          : name === 'rerank' ? ((request.multimodalTimeout ?? 180) + 10) * 1000 : undefined
-        const input = name === 'batch' ? JSON.stringify(request.batch) : name === 'rerank' ? JSON.stringify(request.rerank) : undefined
+        const defaultTimeout = additional[name]?.timeout?.(request)
+          ?? (name === 'ask' || name === 'summarize' ? (request.timeout + 10) * 1000
+            : (name === 'rerank' || (name === 'batch' && request.rich) || (name === 'search' && request.multimodal)) ? ((request.multimodalTimeout ?? 180) + 10) * 1000
+            : name === 'index' && request.parseAgentConfig ? 0
+            : name === 'index' && request.ocr === 'auto' ? ((request.ocrTimeoutSeconds ?? 1800) + 10) * 1000 : undefined)
+        const timeout = request.execution?.timeoutSeconds === undefined ? defaultTimeout : request.execution.timeoutSeconds * 1000
+        const maxOutputBytes = request.execution?.maxOutputBytes
+        const input = additional[name]?.input?.(request) ?? (name === 'batch' ? JSON.stringify(request.batch) : name === 'rerank' ? JSON.stringify(request.rerank) : undefined)
         if (input !== undefined && Buffer.byteLength(input, 'utf8') > 1048576)
           return c.error({ code: 'INVALID_REQUEST', message: 'Native input exceeds 1048576 UTF-8 bytes.' })
-        return await runNative(argumentsFor[name](request), c.env.GPTGREP_BIN, timeout, input)
+        if (additional[name]?.foreground) {
+          nativePassthrough = true
+          process.exitCode = await runNativeForeground(argumentsFor[name](request), c.env.GPTGREP_BIN, { timeout: timeout ?? 0, maxOutputBytes, tokenEnv: request.tokenEnv })
+          return
+        }
+        return await runNative(argumentsFor[name](request), c.env.GPTGREP_BIN, timeout, input, maxOutputBytes)
       } catch (error) {
+        nativePassthrough = false
         if (error instanceof NativeFailure) {
           process.exitCode = error.exitCode
           nativeFailureOutput = { report: error.report, exitCode: error.exitCode, format: c.format, command: name, written: false }
@@ -201,10 +238,19 @@ for (const [name, schema] of Object.entries(requests)) {
   })
 }
 
+for (const group of groups.values()) cli.command(group)
+
+cli.command('workflows', {
+  description: 'Discover runtime Skills, native components and public Rust APIs; no tool installation or model call.',
+  mcp: false,
+  output: z.record(z.string(), z.unknown()),
+  run() { return workflows },
+})
+
 cli.command('request-schema', {
   description: 'Return JSON Schema for the request object accepted by a command.',
   mcp: false,
-  args: z.object({ command: z.enum(['search', 'index', 'tree', 'read', 'batch', 'rerank', 'status', 'doctor', 'ask', 'summarize']) }),
+  args: z.object({ command: z.enum(Object.keys(requests)).describe('For nested commands pass one quoted name, e.g. parse-agent run') }),
   output: z.record(z.string(), z.unknown()),
   run(c) {
     return z.toJSONSchema(requests[c.args.command])
@@ -225,6 +271,7 @@ await cli.serve(argv, {
   // Published incur 0.5.1 still advertises disabled integration routes. Keep its
   // generated help accurate for this guarded wrapper, without changing JSON.
   stdout: (value) => {
+    if (nativePassthrough) return
     // incur's successful return-value path wraps data in ok:true. A recognized
     // native failure keeps its full report and cannot acquire that success flag.
     if (nativeFailureOutput) {

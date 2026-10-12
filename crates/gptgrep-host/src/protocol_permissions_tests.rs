@@ -68,12 +68,23 @@ async fn named_profile_uses_permissions_without_legacy_overrides() {
     for sandbox in [
         json!({"type":"readOnly","networkAccess":false}),
         named_workspace_projection(),
+        json!({"type":"workspaceWrite","writableRoots":["/work/output","/data/derived"],
+            "networkAccess":false,"excludeTmpdirEnvVar":false,"excludeSlashTmp":true}),
+        json!({"type":"workspaceWrite","writableRoots":["/work/output"],
+            "networkAccess":true,"excludeTmpdirEnvVar":false,"excludeSlashTmp":false}),
     ] {
         let mut response = thread_response();
-        response["sandbox"] = sandbox;
+        response["sandbox"] = sandbox.clone();
         response["activePermissionProfile"] = json!({"id":"gptgrep_reader","extends":null});
         let (result, sent) = exchange(Some("gptgrep_reader"), response).await;
-        assert!(result.is_ok(), "{:?}", result.err());
+        let outcome = result.unwrap();
+        assert_eq!(
+            outcome.permission_observation,
+            Some(json!({
+                "source":"native_thread_start","permission_profile":"gptgrep_reader",
+                "sandbox":sandbox,"granular_enforcement_verified":false
+            }))
+        );
         assert_eq!(
             request(&sent, "initialize")["capabilities"]["experimentalApi"],
             true
@@ -113,62 +124,25 @@ async fn missing_or_wrong_profile_acknowledgment_refuses_before_turn() {
 }
 
 #[tokio::test]
-async fn named_profile_refuses_weakened_approval_network_or_legacy_roots() {
-    let mut cases = vec![
-        ("approvalPolicy", json!("on-request")),
-        ("sandbox", json!({"type":"readOnly","networkAccess":true})),
-        (
-            "sandbox",
-            json!({"type":"workspaceWrite","networkAccess":false}),
-        ),
-        ("sandbox", json!({"type":"readOnly"})),
-        (
-            "sandbox",
-            json!({"type":"dangerFullAccess","networkAccess":false}),
-        ),
-        (
-            "sandbox",
-            json!({"type":"externalSandbox","networkAccess":false}),
-        ),
-    ];
-    for (field, value) in [
-        ("writableRoots", None),
-        ("writableRoots", Some(Value::Null)),
-        ("writableRoots", Some(json!(["/corpus"]))),
-        ("excludeTmpdirEnvVar", None),
-        ("excludeTmpdirEnvVar", Some(json!(false))),
-        ("excludeSlashTmp", None),
-        ("excludeSlashTmp", Some(json!(false))),
-        ("networkAccess", None),
-        ("networkAccess", Some(json!(true))),
-    ] {
-        let mut sandbox = named_workspace_projection();
-        if let Some(value) = value {
-            sandbox[field] = value;
-        } else {
-            sandbox.as_object_mut().unwrap().remove(field);
-        }
-        cases.push(("sandbox", sandbox));
-    }
-    for (key, value) in cases {
-        let mut response = thread_response();
-        response["activePermissionProfile"] = json!({"id":"gptgrep_reader"});
-        response[key] = value;
-        let (result, sent) = exchange(Some("gptgrep_reader"), response).await;
-        let error = result.err().expect("weakened envelope must fail");
-        assert!(error.to_string().contains(if key == "approvalPolicy" {
-            "approval policy"
-        } else {
-            "named permission sandbox envelope"
-        }));
-        assert!(sent.iter().all(|message| message["method"] != "turn/start"));
-    }
+async fn named_profile_still_requires_selected_approval_before_turn() {
+    let mut response = thread_response();
+    response["activePermissionProfile"] = json!({"id":"gptgrep_reader"});
+    response["approvalPolicy"] = json!("on-request");
+    let (result, sent) = exchange(Some("gptgrep_reader"), response).await;
+    assert!(
+        result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("approval policy")
+    );
+    assert!(sent.iter().all(|message| message["method"] != "turn/start"));
 }
 
 #[tokio::test]
 async fn default_profile_preserves_legacy_wire_and_needs_no_named_acknowledgment() {
     let (result, sent) = exchange(None, thread_response()).await;
-    assert!(result.is_ok(), "{:?}", result.err());
+    assert!(result.unwrap().permission_observation.is_none());
     let thread = request(&sent, "thread/start");
     assert_eq!(thread["sandbox"], "read-only");
     assert!(thread.get("permissions").is_none());
@@ -183,15 +157,21 @@ async fn default_profile_preserves_legacy_wire_and_needs_no_named_acknowledgment
     assert_eq!(thread["approvalPolicy"], "never");
     assert_eq!(turn["approvalPolicy"], "never");
 
-    let mut projected = thread_response();
-    projected["sandbox"] = named_workspace_projection();
-    let (result, sent) = exchange(None, projected).await;
-    assert!(
-        result
-            .err()
-            .expect("default cannot accept workspaceWrite")
-            .to_string()
-            .contains("read-only sandbox")
-    );
-    assert!(sent.iter().all(|message| message["method"] != "turn/start"));
+    for sandbox in [
+        named_workspace_projection(),
+        json!({"type":"readOnly","networkAccess":true}),
+        json!({"type":"dangerFullAccess"}),
+    ] {
+        let mut projected = thread_response();
+        projected["sandbox"] = sandbox;
+        let (result, sent) = exchange(None, projected).await;
+        assert!(
+            result
+                .err()
+                .expect("default must retain read-only network-disabled policy")
+                .to_string()
+                .contains("read-only sandbox")
+        );
+        assert!(sent.iter().all(|message| message["method"] != "turn/start"));
+    }
 }

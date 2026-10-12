@@ -117,6 +117,7 @@ impl OcrRuntimeProfile {
             operator_catalog_sha256: catalog_sha256()?,
             tool_policy_sha256: policy_sha256()?,
             accepted_image_qualification_sha256: None,
+            native_agent: None,
             native_viewer: Some(NativeViewerRuntimeProfile {
                 schema_version: "gptgrep.ocr.native-viewer-profile.v1".into(),
                 guard_source_sha256,

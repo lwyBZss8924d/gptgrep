@@ -27,6 +27,9 @@ use crate::{
     ocr_protocol,
 };
 
+#[path = "ocr_agent.rs"]
+pub(crate) mod agent;
+
 pub const DEFAULT_OCR_MODEL: &str = "gpt-6-luna";
 const DESCRIPTOR_SCHEMA: &str = "gptgrep.ocr.runtime-profile.v1";
 
@@ -35,10 +38,11 @@ const DESCRIPTOR_SCHEMA: &str = "gptgrep.ocr.runtime-profile.v1";
 pub enum OcrImageTransport {
     DynamicImages,
     NativeViewer,
+    NativeAgent,
 }
 
 /// The descriptor is an operator-owned request assumption, not provider capability evidence.
-/// A paired qualification receipt must be accepted before ordinary parser execution.
+/// Legacy image transports require a paired receipt; native agent tasks use the selected job profile.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OcrRuntimeProfile {
@@ -52,6 +56,9 @@ pub struct OcrRuntimeProfile {
     /// Absent for immutable DynamicImages v1 profiles and their historical digests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_viewer: Option<crate::ocr_native::NativeViewerRuntimeProfile>,
+    /// General native Codex execution selected by the job, without legacy image qualification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_agent: Option<crate::ocr_agent::NativeAgentRuntimeProfile>,
 }
 
 impl OcrRuntimeProfile {
@@ -70,12 +77,19 @@ impl OcrRuntimeProfile {
             tool_policy_sha256: Self::tool_policy_sha256()?,
             accepted_image_qualification_sha256: None,
             native_viewer: None,
+            native_agent: None,
         };
         profile.validate()?;
         Ok(profile)
     }
     pub fn validate(&self) -> Result<()> {
-        let schema = if self.native_viewer.is_some() {
+        ensure!(
+            self.native_viewer.is_none() || self.native_agent.is_none(),
+            "ocr_runtime_mode_conflict"
+        );
+        let schema = if self.native_agent.is_some() {
+            crate::ocr_agent::PROFILE_SCHEMA
+        } else if self.native_viewer.is_some() {
             crate::ocr_native::PROFILE_SCHEMA
         } else {
             DESCRIPTOR_SCHEMA
@@ -93,7 +107,17 @@ impl OcrRuntimeProfile {
             valid_digest(&self.protocol_schema_sha256) && valid_digest(&self.codex_binary_sha256),
             "ocr_runtime_profile_digest"
         );
-        let (catalog, policy) = if self.native_viewer.is_some() {
+        let (catalog, policy) = if let Some(agent) = &self.native_agent {
+            agent.validate()?;
+            ensure!(
+                self.accepted_image_qualification_sha256.is_none(),
+                "ocr_native_agent_legacy_qualification"
+            );
+            (
+                crate::ocr_agent::catalog_sha256()?,
+                crate::ocr_agent::policy_sha256()?,
+            )
+        } else if self.native_viewer.is_some() {
             (
                 crate::ocr_native::catalog_sha256()?,
                 crate::ocr_native::policy_sha256()?,
@@ -120,13 +144,22 @@ impl OcrRuntimeProfile {
         Ok(())
     }
     pub fn image_qualification_accepted(&self) -> bool {
+        if self.native_agent.is_some() {
+            return false;
+        }
         match &self.native_viewer {
             Some(native) => native.accepted_qualification.is_some(),
             None => self.accepted_image_qualification_sha256.is_some(),
         }
     }
+    /// Whether the selected execution mode has its required runtime inputs.
+    pub fn execution_ready(&self) -> bool {
+        self.native_agent.is_some() || self.image_qualification_accepted()
+    }
     pub fn transport(&self) -> OcrImageTransport {
-        if self.native_viewer.is_some() {
+        if self.native_agent.is_some() {
+            OcrImageTransport::NativeAgent
+        } else if self.native_viewer.is_some() {
             OcrImageTransport::NativeViewer
         } else {
             OcrImageTransport::DynamicImages
@@ -356,6 +389,10 @@ impl OcrHostExecutor {
         require_qualified: bool,
         cancel: Option<OcrCancellation>,
     ) -> Result<OcrProbeReport> {
+        if self.config.transport == OcrImageTransport::NativeAgent {
+            ensure!(crops.is_empty(), "ocr_native_agent_uses_native_derivatives");
+            return self.execute_agent_page(task, cancel).await;
+        }
         let runtime_digest = self.config.runtime_profile.sha256()?;
         let completed = self
             .run_owned_page_with_crops(
@@ -381,6 +418,7 @@ impl OcrHostExecutor {
             status: wire.status,
             regions: wire.regions,
             receipt: OcrReceipt {
+                native_agent: None,
                 model: DEFAULT_OCR_MODEL.into(),
                 profile_sha256: ocr_profile_digest(&outcome.page.task.profile)?,
                 runtime_profile_sha256: runtime_digest.clone(),
@@ -794,11 +832,10 @@ impl Drop for OcrCleanupState {
 }
 impl OcrCleanup {
     pub fn working_bytes(max_operations: usize) -> Result<u64> {
-        ensure!(
-            (1..=64).contains(&max_operations),
-            "ocr_cleanup_record_limit"
-        );
-        Ok(max_operations as u64 * 1024)
+        ensure!(max_operations > 0, "ocr_cleanup_record_limit");
+        u64::try_from(max_operations)?
+            .checked_mul(1024)
+            .ok_or_else(|| anyhow!("ocr_cleanup_record_limit"))
     }
     pub fn new(max_operations: usize) -> Result<Self> {
         Self::working_bytes(max_operations)?;
@@ -936,7 +973,7 @@ impl OcrCancellation {
         }
     }
 }
-async fn cancellation_wait(cancel: Option<&OcrCancellation>) {
+pub(crate) async fn cancellation_wait(cancel: Option<&OcrCancellation>) {
     match cancel {
         Some(value) => value.wait_service().await,
         None => std::future::pending().await,
@@ -1488,15 +1525,15 @@ fn resolve_binary(name: &str) -> Result<PathBuf> {
 }
 
 fn retain_raw(root: &Path, digest: &str, bytes: &[u8]) -> Result<()> {
-    ensure!(bytes.len() <= 256 * 1024, "ocr_raw_result_limit");
+    retain_raw_with_limit(root, digest, bytes, 256 * 1024)
+}
+fn retain_raw_with_limit(root: &Path, digest: &str, bytes: &[u8], limit: u64) -> Result<()> {
+    ensure!(bytes.len() as u64 <= limit, "ocr_raw_result_limit");
     fs::create_dir_all(root)?;
     let root = root.canonicalize()?;
     let path = root.join(format!("ocr-{digest}.json"));
     if path.exists() {
-        ensure!(
-            hash_file(&path, 256 * 1024)? == digest,
-            "ocr_raw_result_changed"
-        );
+        ensure!(hash_file(&path, limit)? == digest, "ocr_raw_result_changed");
         return Ok(());
     }
     let mut output = OpenOptions::new().create_new(true).write(true).open(path)?;

@@ -44,6 +44,34 @@ def sandbox_helper_fixture(root, platform="linux/amd64"):
     return {"binary": pin(binary), "provenance": pin(metadata), "licenses": licenses}, record
 
 
+def code_mode_host_fixture(root, runtime_binary, platform="linux/amd64"):
+    """Authored companion metadata and ELF header; no native host is executed."""
+    from gptgrep_harbor.runtime import CODEX_SOURCE_COMMIT, CODE_MODE_HOST_DATA, CODE_MODE_HOST_PATH
+    root.mkdir(exist_ok=True)
+    target, machine = {"linux/amd64": ("x86_64-unknown-linux-musl", 62),
+                       "linux/arm64": ("aarch64-unknown-linux-musl", 183)}[platform]
+    elf = bytearray(64)
+    elf[:6] = b"\x7fELF\x02\x01"
+    struct.pack_into("<H", elf, 18, machine)
+    binary = root / "codex-code-mode-host"
+    binary.write_bytes(bytes(elf))
+    binary.chmod(0o555)
+    signature = root / "host.sigstore"
+    signature.write_bytes(b"authored synthetic signature metadata; no cryptographic verification")
+    archive = "codex-code-mode-host-" + target + ".tar.gz"
+    record = {"schema": "gptgrep.native-code-mode-host.v1", "release_tag": "rust-v0.162.1",
+              "source_commit": CODEX_SOURCE_COMMIT, "platform": platform,
+              "runtime_binary": dict(runtime_binary),
+              "binary": {**pin(binary), "path": CODE_MODE_HOST_PATH},
+              "archive": {"name": archive, "bytes": 1, "sha256": "a" * 64,
+                  "url": "https://github.com/openai/codex/releases/download/rust-v0.162.1/" + archive},
+              "sigstore": {**pin(signature), "path": CODE_MODE_HOST_DATA + "/host.sigstore"},
+              "attestation_verification": "not_performed", "source_and_digest_consistency_verified": True}
+    metadata = root / "host-provenance.json"
+    metadata.write_bytes(canonical(record))
+    return {"binary": pin(binary), "provenance": pin(metadata), "sigstore": pin(signature)}, record
+
+
 def bundle_fixture(root, *, change=None, omit=None, extra=None, member_change=None):
     target = "x86_64-unknown-linux-gnu"
     elf = bytearray(64)

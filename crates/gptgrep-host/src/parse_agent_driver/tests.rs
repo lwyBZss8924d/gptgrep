@@ -165,6 +165,7 @@ fn control() -> Result<DocumentAgentControl> {
         deadline_unix_ms: 999999,
         limits: limits(),
         native_viewer: None,
+        native_execution: None,
         document_image_qualification: None,
     })
 }
@@ -182,11 +183,14 @@ fn thread_response() -> Value {
         "sandbox":{"type":"readOnly","networkAccess":false},"reasoningEffort":"max","serviceTier":"priority"})
 }
 fn startup_with_thread(auth: &str, response: Value) -> Vec<u8> {
+    startup_with_config(auth, response, json!({"mcp_servers":{},"tools":{}}))
+}
+fn startup_with_config(auth: &str, response: Value, config: Value) -> Vec<u8> {
     let mut script = Vec::new();
     for value in [
         json!({"id":1,"result":{}}),
         json!({"id":2,"result":{"account":{"type":auth}}}),
-        json!({"id":3,"result":{"config":{"mcp_servers":{},"tools":{}}}}),
+        json!({"id":3,"result":{"config":config}}),
         json!({"id":4,"result":response}),
         json!({"id":5,"result":{"turn":{"id":"synthetic-turn"}}}),
     ] {
@@ -199,13 +203,16 @@ fn tool(call: &str, op: &str) -> Value {
     "turnId":"synthetic-turn","callId":call,"namespace":NAMESPACE,"tool":TOOL,"arguments":{"op":op}}})
 }
 fn finish() -> Vec<u8> {
+    finish_with_items(Vec::new())
+}
+fn finish_with_items(items: Vec<Value>) -> Vec<u8> {
     let mut script = Vec::new();
     script.extend(line(json!({"method":"item/completed","params":{"threadId":"synthetic-thread",
     "turnId":"synthetic-turn","item":{"type":"agentMessage","id":"synthetic-answer","phase":"final_answer",
     "text":json!({"status":"complete","handle":"a".repeat(64)}).to_string()}}})));
     script.extend(line(
         json!({"method":"turn/completed","params":{"threadId":"synthetic-thread",
-        "turn":{"id":"synthetic-turn","status":"completed","error":null,"items":[]}}}),
+        "turn":{"id":"synthetic-turn","status":"completed","error":null,"items":items}}}),
     ));
     script
 }
@@ -218,12 +225,20 @@ async fn replay_captured(
     captured: Arc<Mutex<Vec<u8>>>,
 ) -> Result<DocumentAgentOutcome> {
     let config = control()?;
+    replay_control(script, backend, captured, &config).await
+}
+async fn replay_control(
+    script: &[u8],
+    backend: &mut Backend,
+    captured: Arc<Mutex<Vec<u8>>>,
+    config: &DocumentAgentControl,
+) -> Result<DocumentAgentOutcome> {
     let budget = TransportBudget::new(config.limits.total_rpc_bytes);
     let writer = Captured(captured);
     run_protocol(
         script,
         writer,
-        &config,
+        config,
         backend,
         DocumentRunBudget {
             working: DocumentWorking::new(config.limits.working_bytes),
@@ -246,6 +261,418 @@ fn sent_frames(captured: &Arc<Mutex<Vec<u8>>>) -> Vec<Value> {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect()
+}
+
+fn native_execution_control() -> Result<DocumentAgentControl> {
+    let mut config = control()?;
+    config.native_execution = Some(DocumentNativeExecution {
+        native_skills: Vec::new(),
+        native_runtime_package: None,
+        permission_profile: "synthetic-native".into(),
+        capabilities: BTreeMap::from([
+            ("features.code_mode.enabled".into(), json!(true)),
+            ("features.code_mode_host.enabled".into(), json!(true)),
+            ("features.plugins".into(), json!(true)),
+            ("features.apps".into(), json!(true)),
+            ("features.hooks".into(), json!(true)),
+            ("web_search".into(), json!("live")),
+        ]),
+    });
+    config.limits.timeout_ms = 3_600_000;
+    Ok(config)
+}
+fn native_execution_startup() -> Vec<u8> {
+    let mut response = thread_response();
+    response["activePermissionProfile"]["id"] = json!("synthetic-native");
+    response["sandbox"] = json!({"type":"dangerFullAccess","networkAccess":true});
+    startup_with_config(
+        "chatgpt",
+        response,
+        json!({
+            "mcp_servers":{"synthetic":{"enabled":true}},
+            "tools":{"synthetic_native_tool":{"enabled":true}},
+            "web_search":"live"
+        }),
+    )
+}
+fn item_event(method: &str, item: Value) -> Value {
+    json!({"method":method,"params":{"threadId":"synthetic-thread",
+        "turnId":"synthetic-turn","item":item}})
+}
+
+#[tokio::test]
+async fn native_document_inherits_capabilities_and_observes_tools_without_legacy_guard()
+-> Result<()> {
+    let config = native_execution_control()?;
+    let mut script = line(json!({"method":"mcpServer/startupStatus/updated",
+        "params":{"name":"synthetic","status":"ready"}}));
+    script.extend(native_execution_startup());
+    let native_items = [
+        json!({"type":"commandExecution","id":"native-command","status":"completed"}),
+        json!({"type":"imageView","id":"native-image"}),
+        json!({"type":"fileChange","id":"native-edit","status":"completed"}),
+        json!({"type":"mcpToolCall","id":"native-mcp","status":"completed"}),
+        json!({"type":"collabAgentToolCall","id":"native-agent","status":"completed"}),
+        json!({"type":"webSearch","id":"native-web"}),
+        json!({"type":"imageGeneration","id":"native-generation"}),
+        json!({"type":"sleep","id":"native-sleep"}),
+    ];
+    let mut started = native_items[0].clone();
+    started["status"] = json!("inProgress");
+    script.extend(line(item_event("item/started", started)));
+    script.extend(line(
+        json!({"method":"item/commandExecution/outputDelta","params":{
+        "threadId":"synthetic-thread","turnId":"synthetic-turn","delta":"synthetic progress"}}),
+    ));
+    script.extend(line(json!({"method":"hook/completed","params":{
+        "threadId":null,"turnId":null,"status":"completed"}})));
+    for item in &native_items {
+        script.extend(line(item_event("item/completed", item.clone())));
+    }
+    for kind in [
+        "hookPrompt",
+        "functionCallOutput",
+        "plan",
+        "subAgentActivity",
+        "enteredReviewMode",
+        "exitedReviewMode",
+        "contextCompaction",
+    ] {
+        script.extend(line(item_event(
+            "item/completed",
+            json!({"type":kind,"id":kind}),
+        )));
+    }
+    script.extend(line(tool("native-finalize", "finalize")));
+    script.extend(line(item_event(
+        "item/completed",
+        json!({
+            "type":"dynamicToolCall","id":"native-finalize","namespace":NAMESPACE,"tool":TOOL
+        }),
+    )));
+    script.extend(finish_with_items(native_items.to_vec()));
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let mut backend = Backend::new();
+    let result = replay_control(&script, &mut backend, captured.clone(), &config).await?;
+    assert_eq!(backend.calls, 1);
+    assert!(backend.finalized);
+    assert!(result.verified_product.all_source_artifacts_verified);
+    assert!(!result.verified_product.model_inspection_complete);
+    assert!(!result.native_viewer_enabled);
+    assert!(!result.native_receipts_verified);
+    assert!(!result.native_image_influence_qualified);
+    let report = result.native_ptc.as_ref().unwrap();
+    assert_eq!(report.native_tool_calls, 8);
+    assert_eq!(report.dynamic_requests_charged, 1);
+    assert_eq!(report.combined_tool_calls, 9);
+    assert_eq!(result.tool_submissions, 9);
+    assert!(report.successful_turn_completed_observed);
+    assert!(!report.pre_execution_guard);
+    assert!(!report.budget_exceeded);
+    assert!(
+        report
+            .items
+            .iter()
+            .all(|item| item.completed_observed && item.final_snapshot_observed)
+    );
+    assert_eq!(
+        result.permission_observation,
+        Some(json!({
+            "source":"native_thread_start","permission_profile":"synthetic-native",
+            "sandbox":{"type":"dangerFullAccess","networkAccess":true},
+            "granular_enforcement_verified":false
+        }))
+    );
+    let frames = sent_frames(&captured);
+    for method in ["thread/start", "turn/start"] {
+        let params = &frames
+            .iter()
+            .find(|frame| frame["method"] == method)
+            .unwrap()["params"];
+        assert_eq!(params["permissions"], "synthetic-native");
+        assert!(params.get("sandbox").is_none());
+        assert_eq!(params["model"], DOCUMENT_MODEL);
+        assert_eq!(params["serviceTier"], "fast");
+    }
+    let params = &frames
+        .iter()
+        .find(|frame| frame["method"] == "thread/start")
+        .unwrap()["params"];
+    assert_eq!(params["config"]["features.code_mode.enabled"], true);
+    assert_eq!(params["config"]["features.code_mode_host.enabled"], true);
+    assert_eq!(params["config"]["web_search"], "live");
+    assert!(params["config"].get("mcp_servers").is_none());
+    assert!(params["config"].get("cloud.skills.enabled").is_none());
+    assert!(params["config"].get("project_doc_max_bytes").is_none());
+    for key in [
+        "environments",
+        "runtimeWorkspaceRoots",
+        "selectedCapabilityRoots",
+    ] {
+        assert!(params.get(key).is_none());
+    }
+    assert_eq!(params["dynamicTools"], tools());
+    assert_eq!(params["baseInstructions"], NATIVE_INSTRUCTIONS);
+    assert!(!NATIVE_INSTRUCTIONS.contains("eight-tools"));
+    assert!(
+        !NATIVE_INSTRUCTIONS.contains("Do not use first-N/answer-location/benchmark priors, shell")
+    );
+    let command = command(&config, None)?;
+    let args = command
+        .as_std()
+        .get_args()
+        .map(|arg| arg.to_string_lossy())
+        .collect::<Vec<_>>();
+    assert!(
+        !args
+            .iter()
+            .any(|arg| arg.starts_with("model_catalog_json="))
+    );
+    assert!(
+        !args
+            .iter()
+            .any(|arg| arg.starts_with("permissions.gptgrep_native_document."))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_document_shares_dynamic_and_observed_budgets_before_backend_dispatch() -> Result<()>
+{
+    for native_first in [true, false] {
+        let mut config = native_execution_control()?;
+        config.limits.max_tool_calls = 1;
+        let mut script = native_execution_startup();
+        let native = line(item_event(
+            "item/completed",
+            json!({"type":"imageView","id":"native-one"}),
+        ));
+        let dynamic = line(tool("native-finalize", "finalize"));
+        if native_first {
+            script.extend(native);
+            script.extend(dynamic);
+        } else {
+            script.extend(dynamic);
+            script.extend(native);
+        }
+        script.extend(finish());
+        let mut backend = Backend::new();
+        let error = replay_control(
+            &script,
+            &mut backend,
+            Arc::new(Mutex::new(Vec::new())),
+            &config,
+        )
+        .await
+        .err()
+        .expect("combined budget must fail");
+        assert_eq!(error.to_string(), "host_native_ptc_tool_budget_exhausted");
+        assert_eq!(backend.calls, usize::from(!native_first));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_document_requires_typed_finalization_complete_observations_and_profile_ack()
+-> Result<()> {
+    let config = native_execution_control()?;
+    for (finalize, complete) in [(false, true), (true, false)] {
+        let mut script = native_execution_startup();
+        script.extend(line(item_event(
+            if complete {
+                "item/completed"
+            } else {
+                "item/started"
+            },
+            json!({"type":"commandExecution","id":"native-one",
+                "status":if complete {"completed"} else {"inProgress"}}),
+        )));
+        if finalize {
+            script.extend(line(tool("native-finalize", "finalize")));
+        }
+        script.extend(finish());
+        let mut backend = Backend::new();
+        let error = replay_control(
+            &script,
+            &mut backend,
+            Arc::new(Mutex::new(Vec::new())),
+            &config,
+        )
+        .await
+        .err()
+        .expect("incomplete execution must fail");
+        assert_eq!(
+            error.to_string(),
+            if finalize {
+                "host_native_ptc_incomplete_item"
+            } else {
+                "synthetic not finalized"
+            }
+        );
+    }
+    let mut script = startup("chatgpt"); // The legacy ACK cannot acknowledge the selected native profile.
+    script.extend(line(tool("native-finalize", "finalize")));
+    script.extend(finish());
+    let mut backend = Backend::new();
+    let error = replay_control(
+        &script,
+        &mut backend,
+        Arc::new(Mutex::new(Vec::new())),
+        &config,
+    )
+    .await
+    .err()
+    .expect("wrong profile must fail");
+    assert_eq!(error.to_string(), "document_permission_profile");
+    assert_eq!(backend.calls, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_document_keeps_tool_namespace_and_legacy_native_item_refusals() -> Result<()> {
+    let config = native_execution_control()?;
+    let mut wrong_tool = tool("wrong-tool", "finalize");
+    wrong_tool["params"]["namespace"] = json!("unregistered");
+    let mut script = native_execution_startup();
+    script.extend(line(wrong_tool));
+    let mut backend = Backend::new();
+    let error = replay_control(
+        &script,
+        &mut backend,
+        Arc::new(Mutex::new(Vec::new())),
+        &config,
+    )
+    .await
+    .err()
+    .expect("wrong tool must fail");
+    assert_eq!(error.to_string(), "document_tool_namespace");
+    assert_eq!(backend.calls, 0);
+    let mut script = startup("chatgpt");
+    script.extend(line(item_event(
+        "item/completed",
+        json!({"type":"hookPrompt","id":"hook"}),
+    )));
+    let error = replay(&script, &mut backend)
+        .await
+        .err()
+        .expect("legacy mode remains restricted");
+    assert_eq!(error.to_string(), "document_native_tool_not_admitted");
+    Ok(())
+}
+
+#[test]
+fn native_document_bindings_are_explicit_and_legacy_controls_remain_optional() -> Result<()> {
+    let mut config = native_execution_control()?;
+    let execution = config.native_execution.as_ref().unwrap();
+    let bindings = document_native_execution_bindings(execution)?;
+    assert_eq!(
+        bindings.descriptor_sha256,
+        sha(&serde_json::to_vec(&bindings.model_descriptor)?)
+    );
+    assert_eq!(
+        bindings.permissions_config_sha256,
+        sha(&serde_json::to_vec(&bindings.permissions_config)?)
+    );
+    assert_eq!(
+        bindings.permissions_template_sha256,
+        sha(&serde_json::to_vec(&native::canonical(
+            bindings.permissions_config.clone()
+        ))?)
+    );
+    assert_eq!(bindings.tools_sha256, document_tool_policy_sha256()?);
+    assert_ne!(bindings.instructions_sha256, document_instructions_sha256());
+    assert_eq!(
+        bindings.model_descriptor["model_catalog"],
+        "selected_native_runtime_configuration"
+    );
+    assert_eq!(
+        bindings.permissions_config["default_permissions"],
+        execution.permission_profile
+    );
+    assert!(
+        bindings
+            .permissions_config
+            .get("permissions.synthetic-native.network.enabled")
+            .is_none()
+    );
+    let legacy = serde_json::to_value(control()?)?;
+    assert!(legacy.get("native_execution").is_none());
+    assert!(
+        serde_json::from_value::<DocumentAgentControl>(legacy)?
+            .native_execution
+            .is_none()
+    );
+    let default_overrides: DocumentNativeExecution =
+        serde_json::from_value(json!({"permission_profile":"synthetic-native"}))?;
+    assert!(default_overrides.capabilities.is_empty());
+    let mut overridden = default_overrides.clone();
+    overridden
+        .capabilities
+        .insert("features.shell_tool".into(), json!(false));
+    assert_eq!(
+        document_native_execution_bindings(&overridden)?.permissions_config["features.shell_tool"],
+        false
+    );
+    for profile in ["", "invalid profile", "invalid/profile"] {
+        let mut invalid = default_overrides.clone();
+        invalid.permission_profile = profile.into();
+        assert!(document_native_execution_bindings(&invalid).is_err());
+    }
+    config.document_image_qualification = Some(DocumentImageQualification {
+        path: "/synthetic/qualification".into(),
+        bytes: 1,
+        sha256: "f".repeat(64),
+    });
+    assert_eq!(
+        validate_execution_mode(&config).unwrap_err().to_string(),
+        "document_native_execution_exclusive"
+    );
+    config.document_image_qualification = None;
+    config.native_viewer = Some(DocumentNativeControl {
+        image_root: "/synthetic/images".into(),
+        receipt_root: "/synthetic/receipts".into(),
+        admission_path: "/synthetic/admission.json".into(),
+        image_catalog_path: "/synthetic/catalog.json".into(),
+        owner_admission_sha256: "f".repeat(64),
+        image_wire_bytes: 33_554_432,
+        image_limits: document_native_image_limits(&ResourceBudget::default(), 33_554_432)?,
+    });
+    assert_eq!(
+        validate_execution_mode(&config).unwrap_err().to_string(),
+        "document_native_execution_exclusive"
+    );
+    Ok(())
+}
+
+#[test]
+fn native_document_duration_uses_caller_limits_without_legacy_ceiling() -> Result<()> {
+    let mut config = native_execution_control()?;
+    let bindings = document_native_execution_bindings(config.native_execution.as_ref().unwrap())?;
+    let mut profile: RuntimeProfile = serde_json::from_value(json!({
+        "schema":"gptgrep.parse-agent.document-runtime-profile.v1",
+        "source_revision":"1".repeat(40),"protocol_schema_sha256":"2".repeat(64),
+        "codex_binary_sha256":config.codex_bin.sha256,
+        "descriptor_sha256":bindings.descriptor_sha256,
+        "permissions_config_sha256":bindings.permissions_config_sha256,
+        "permissions_template_sha256":bindings.permissions_template_sha256,
+        "tools_sha256":bindings.tools_sha256,"instructions_sha256":bindings.instructions_sha256,
+        "standalone_app_server":true
+    }))?;
+    config.limits.timeout_ms = 7_200_000;
+    assert_eq!(profile.selected_max_seconds(&config)?, 7200);
+    profile.max_seconds = Some(7200);
+    assert_eq!(profile.selected_max_seconds(&config)?, 7200);
+    config.limits.timeout_ms = 7_200_001;
+    assert!(profile.selected_max_seconds(&config).is_err());
+    profile.max_seconds = None;
+    assert_eq!(profile.selected_max_seconds(&config)?, 7201);
+    config.limits.timeout_ms = 86_400_001;
+    assert!(profile.selected_max_seconds(&config).is_err());
+    config.limits.timeout_ms = 7_200_000;
+    config.native_execution = None;
+    profile.max_seconds = Some(7200);
+    assert!(profile.selected_max_seconds(&config).is_err());
+    Ok(())
 }
 
 #[tokio::test]
@@ -1016,6 +1443,7 @@ async fn incoming_overflow_and_total_wire_failure_precede_tree_or_backend_alloca
         transport,
         deadline: Instant::now() + Duration::from_secs(1),
         messages: 0,
+        native_execution: false,
     };
     assert!(rpc.receive().await.is_err());
     assert_eq!(rpc.messages, 0);
@@ -1028,6 +1456,7 @@ async fn incoming_overflow_and_total_wire_failure_precede_tree_or_backend_alloca
         transport,
         deadline: Instant::now() + Duration::from_secs(1),
         messages: 0,
+        native_execution: false,
     };
     assert!(rpc.send(json!({"id":1})).await.is_err());
     assert!(rpc.writer.is_empty());

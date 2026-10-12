@@ -1,4 +1,4 @@
-//! Parser admission limits with configurable encoded-image capacity.
+//! Parser admission limits with configurable image and retained-staging capacity.
 
 use std::io::{self, Write};
 use std::sync::{
@@ -121,7 +121,12 @@ impl ResourceBudget {
             let value = value.as_u64().expect("unsigned budget");
             let configurable = matches!(
                 field.as_str(),
-                "image_file_bytes" | "image_base64_bytes" | "image_file_bytes_per_page"
+                "image_file_bytes"
+                    | "image_base64_bytes"
+                    | "image_file_bytes_per_page"
+                    | "document_staging_bytes"
+                    | "run_staging_bytes"
+                    | "owned_working_bytes"
             );
             ensure!(
                 value > 0
@@ -143,6 +148,9 @@ impl ResourceBudget {
             .checked_add(self.image_base64_bytes)
             .ok_or_else(|| anyhow::anyhow!("resource_limit: encoded image working overflow"))?;
         usize::try_from(encoded_working)?;
+        usize::try_from(self.document_staging_bytes)?;
+        usize::try_from(self.run_staging_bytes)?;
+        usize::try_from(self.owned_working_bytes)?;
         // Capacities need not all fit at once: text-only work can select a
         // smaller working/staging envelope. Actual render, decode, encoding and
         // retention paths reserve their checked byte totals before allocation.

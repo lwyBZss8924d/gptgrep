@@ -109,6 +109,7 @@ async fn protocol_attempt(
         protocol::RunOptions {
             observer: Some(attempt.observer()),
             max_output_bytes: output_limit,
+            ..Default::default()
         },
     )
     .await;
@@ -424,6 +425,7 @@ async fn schema_failure_keeps_process_metadata_usage_and_retry_events() {
         protocol::RunOptions {
             observer: Some(planner.observer()),
             max_output_bytes: Some(4096),
+            ..Default::default()
         },
     )
     .await;
@@ -474,6 +476,7 @@ async fn supplied_absolute_deadline_is_not_refreshed_by_completion_or_retry() {
         protocol::RunOptions {
             observer: Some(planner.observer()),
             max_output_bytes: Some(4096),
+            ..Default::default()
         },
     )
     .await;
@@ -510,6 +513,7 @@ async fn cancelling_completion_retains_observed_attempt_and_stops_owned_process(
             protocol::RunOptions {
                 observer: Some(planner.observer()),
                 max_output_bytes: Some(4096),
+                ..Default::default()
             },
         )
         .await;

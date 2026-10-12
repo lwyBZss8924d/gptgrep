@@ -9,7 +9,7 @@ native parse/OCR path and the full62 Harbor adapter. Read the
 ## Checkout and storage
 
 ```sh
-git clone --branch codex/gptgrep-experimental-20261012 \
+git clone --branch codex/gptgrep-unified-runtime-20261012 \
   https://github.com/lwyBZss8924d/gptgrep.git
 cd gptgrep
 git rev-parse HEAD
@@ -47,9 +47,9 @@ gateway policy. Local IPC and provider egress are separate readiness checks.
 | GPTgrep | Rust/Cargo with edition 2024; CI selects Rust 1.96.0, rustfmt and Clippy; use `Cargo.lock` |
 | Native parsing | Pinned LiteParse Rust source and PDFium `chromium/8058`; an existing LibreOffice installation for Office conversion |
 | Codex login and ordinary reader | Caller-selected official Codex CLI; the Harbor common base pins 0.162.1 |
-| Native Page/Document image path | Separately built pinned standalone app-server derivative described below |
+| Native Document/OCR runtime | Caller-selected pinned standalone app-server; retained fixed-image profiles use the derivative described below |
 | Python tools | uv-managed Python 3.12+; the common evaluation image uses Python 3.13 |
-| Raw-document evaluation tools | Python, Pillow 12.3.0, Poppler `pdftotext`/`pdftoppm`, shell, and the same native reader in both arms |
+| Raw-document evaluation tools | Python, Pillow 12.3.0, Poppler `pdftotext`/`pdftoppm`, shell, and matching Codex/Code Mode host binaries in both arms |
 | Harbor | Exact `harbor==0.24.0` from the adapter's `uv.lock`, plus an independently managed Docker/Buildx environment |
 | Optional wrapper | Node 24 and pnpm 11.24.0, using `packages/cli/pnpm-lock.yaml` |
 
@@ -134,7 +134,16 @@ OCR is a failure. A zero-model preparation is available as:
 "$GPTGREP_BIN" index /absolute/owned/documents --rich --plan-only --json
 ```
 
-For agentic parsing, build the derivative at
+The current native Document/OCR execution path uses caller-selected native tools,
+Skills, permissions and job budgets. Set `DocumentAgentControl.native_execution`
+and an OCR profile built with `OcrRuntimeProfile::with_native_agent`. Their optional
+`native_runtime_package` selects an absolute package root and exact manifest
+SHA-256. [Runtime staging](../runtime/codex/STAGING.md) describes the four Skills,
+three roles, actual working-directory projection and explicit role bindings.
+The [incur CLI](../packages/cli/README.md) exposes the same native operations;
+[Rust API composition](rust-sdk.md) provides a direct API example.
+
+For retained fixed-image execution, build the derivative at
 [patches/codex-native-viewer](../patches/codex-native-viewer/README.md). Its upstream
 pin is Codex `rust-v0.162.1`, commit
 `092d3acd6bec3e3a14bdc7e7a2810ab628ab759d`; the derived version is
@@ -147,14 +156,14 @@ The advanced workflow requires operator-created inputs:
 | Input | Contract and purpose |
 | --- | --- |
 | Parse control | `gptgrep.parse-agent.control.v1`: exact source aliases/pins, staging, resource/toolbox bounds, and optional original OCR context; see the [CLI control types](../crates/gptgrep-cli/src/parse_agent.rs) |
-| Document control | One source-bound `DocumentAgentControl`: selected standalone binary, account/state, permissions, runtime profile, native image qualification and limits; see [driver types](../crates/gptgrep-host/src/parse_agent_driver.rs) |
+| Document control | One source-bound `DocumentAgentControl`: selected standalone binary, account/state, permissions, runtime profile, native execution selection and limits; see [driver types](../crates/gptgrep-host/src/parse_agent_driver.rs) |
 | Index registry | `gptgrep.parse-agent.index-controls.v1`: exact parse-control pin and one document-control pin per selected supported source |
-| OCR qualification/phase | Accepted Page runtime profile and existing original-clock OCR phase/ledger; required OCR shares that context across the document invocation |
+| OCR runtime/phase | Native-agent runtime profile or accepted legacy Page profile, plus the original-clock OCR phase/ledger shared across the document invocation |
 
-The source provides the schemas and qualification frontdoors. It does **not**
-provide a one-command generator for a newly accepted native profile, publish the
-owner's private controls, or certify a new workstation. Build and qualify those
-inputs first. The following commands show the actual interface after that work;
+The source provides schemas, the `native_execution_profiles` Rust example for
+deterministic native profile metadata, and legacy qualification frontdoors.
+Callers provide their own pinned binary, permissions, account, source controls and
+job configuration. The following commands show the actual interface after that work;
 the variables refer to your own existing controls and their SHA-256 values.
 
 ```sh
@@ -179,7 +188,7 @@ the variables refer to your own existing controls and their SHA-256 values.
 ```
 
 `serve` is foreground NDJSON for an external PTC caller; it waits for requests.
-`run` executes deterministic stages and optionally qualified OCR when `--mode auto`
+`run` executes deterministic stages and optionally selected OCR when `--mode auto`
 is explicitly selected. `agent` runs one native Document turn over the toolbox.
 Those three produce no generation themselves; the last command imports complete,
 verified owned products and atomically publishes the generation. `parse-agent
@@ -188,10 +197,11 @@ qualify` records private image evidence, not an automatically accepted profile.
 Processing windows bound intermediate work without a whole-document page-count
 cap. Every source page, metadata inventory and required OCR result must be covered
 before publication. Logical buffer/staging reservations are not process RSS or
-physical disk measurements. Page OCR retains eight tools, one turn and 180 seconds;
-Document defaults to 64 tools, one turn and 900 seconds, with an explicitly bound
-duration up to 3,600 seconds. The effective deadline is the smallest applicable
-document, frontend/session and original phase deadline.
+physical disk measurements. Native execution uses the caller's tool, timeout,
+output, OCR admission and staging budgets. Fixed Page/Document profiles retain
+their original limits. The effective deadline is the smallest applicable
+document, frontend/session and original phase deadline; source completeness is
+checked independently of how much metadata the model inspected.
 
 After a successful rich generation, `search --multimodal`, `ask --multimodal`
 and `batch --rich` consume its source-bound text/images. Ordinary queries do not
@@ -211,6 +221,9 @@ uv pip sync --python "$GPTGREP_DEV_ROOT/eval-venv/bin/python" evals/requirements
 "$GPTGREP_DEV_ROOT/eval-venv/bin/python" -B -m unittest discover -s evals -p 'test_*.py'
 "$GPTGREP_DEV_ROOT/eval-venv/bin/python" -B scripts/eval.py \
   --binary "$GPTGREP_BIN" --output "$GPTGREP_DEV_ROOT/results/offline-eval.json"
+"$GPTGREP_DEV_ROOT/eval-venv/bin/python" -B scripts/check_runtime_staging.py \
+  --script runtime/codex/stage.sh --package . \
+  --output "$GPTGREP_DEV_ROOT/results/runtime-staging"
 pnpm --dir packages/cli install --frozen-lockfile --ignore-scripts
 pnpm --dir packages/cli test
 ```

@@ -29,7 +29,7 @@ fn termination_cancels_host_and_its_launcher_descendant() {
     .unwrap();
     let launcher = root.join("mock-codex.sh");
     // The owned fixture ignores protocol input so the host is pending at initialization.
-    let script = "#!/bin/sh\necho $$ > \"$GPTGREP_TEST_PID_DIR/server.pid\"\nsleep 60 &\necho $! > \"$GPTGREP_TEST_PID_DIR/descendant.pid\"\nwait\n";
+    let script = "#!/bin/sh\necho $$ > \"$GPTGREP_TEST_PID_DIR/server.pid.pending\"\nmv \"$GPTGREP_TEST_PID_DIR/server.pid.pending\" \"$GPTGREP_TEST_PID_DIR/server.pid\"\nsleep 60 &\necho $! > \"$GPTGREP_TEST_PID_DIR/descendant.pid.pending\"\nmv \"$GPTGREP_TEST_PID_DIR/descendant.pid.pending\" \"$GPTGREP_TEST_PID_DIR/descendant.pid\"\nwait\n";
     fs::write(&launcher, script).unwrap();
     fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
     let mut child = Command::new(binary)

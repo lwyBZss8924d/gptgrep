@@ -197,7 +197,11 @@ impl Backend {
         control: &DocumentAgentControl,
         working: &DocumentWorking,
     ) -> Result<Self> {
-        let max_operations = control.limits.max_tool_calls.min(64);
+        let max_operations = if control.native_execution.is_some() {
+            control.limits.max_tool_calls
+        } else {
+            control.limits.max_tool_calls.min(64)
+        };
         let cleanup_working = working.reserve(OcrCleanup::working_bytes(max_operations)?)?;
         let ocr_cleanup = OcrCleanup::new(max_operations)?;
         session.ocr_cleanup = Some(ocr_cleanup.clone());

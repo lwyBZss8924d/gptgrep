@@ -157,7 +157,8 @@ file capacity, which must fit the per-page capacity. Checked pixel, decode,
 working-memory and document/run staging admission still applies to actual work;
 setting a larger encoded capacity cannot raise the original invocation's server
 limits or replace its shared staging counter. Pixel/decode limits retain their
-existing defaults and ceilings. Text-only work may select a smaller memory or
+existing defaults and ceilings. Document and run staging capacities are caller
+configurable; retained artifacts share the original invocation counter. Text-only work may select a smaller memory or
 staging envelope without reserving unused image capacity.
 
 Native Page profiles derive `image_limits` from those resources, with separate
@@ -306,35 +307,43 @@ initial retrieval. Empty or stale scopes do not establish successful reranking.
 Summary and retrieval use actual source evidence; model-produced citations must
 resolve to evidence issued during that run and remain fresh at completion.
 
-`HostConfig.native_ptc` (default false) and the Ask-only `--native-ptc` flag
-enable generic native shell/exec, Python/Pillow and `view_image` for the final
-retrieval reader. A selected existing `permission_profile` is required before
-startup; the current profile acknowledgment, approval-never and network-disabled
-envelope checks are unchanged. Only shell and image-view feature flags are
-enabled. MCP, web, Code Mode/code_mode_host and other integrations stay disabled;
-the reader must not request additional permissions, install tools or start
-services. Query planners clear the flag, and pure completion rejects it before
-starting a process or sending RPC.
+`HostConfig.native_ptc` (default false) and `--native-ptc` select native
+execution for the final retrieval reader. An existing named permission profile
+must be acknowledged before the turn. Native configuration inherits the selected
+runtime's Code Mode, MCP, web and other capabilities, then applies
+`HostConfig.native_capabilities`; shell and image viewing are enabled by default.
+The runtime owns the named policy. Its reported sandbox projection is retained
+as private observation and does not establish granular enforcement. Query
+planners clear the flag and pure completion rejects native execution.
 
-`native_ptc::Tracker` observes only `commandExecution` and `imageView` items
-after thread/turn binding and finite ID/status validation. Started/completed and
-the final snapshot of one ID count once; replays, changed kinds and inconsistent
-terminal statuses fail. These observations and validated direct GPTgrep request
-IDs share the original `max_tool_calls`. An over-budget dynamic call is denied
-before dispatch. The first observed native excess is retained and stops the host,
-but item notifications may follow execution startup. This is observation-based
-accounting, not pre-execution admission or a hard execution limit; it makes no
-claim about the runtime's native guard or OS process completion.
+`native_ptc::Tracker` counts native command, image, file-change, MCP, collaborator,
+web, generation and sleep items after thread/turn binding. Lifecycle events and
+one final snapshot for an ID count once; changed kinds or inconsistent statuses
+fail. These observations and direct GPTgrep request IDs share the job's configured
+`max_tool_calls`. A dynamic excess is denied before dispatch; an observed native
+excess stops the host after execution may already have started. Reports retain
+hashed IDs and lifecycle/status metadata without commands, output, image paths,
+cwd or process IDs. GPTgrep tool receipts and citation validation retain their
+existing meaning.
 
-Existing model-attempt reports retain `native_ptc` only when selected, including
-on failure: combined/native/dynamic counts, finite lifecycle/status fields and
-SHA-256 item identifiers, with at most `max_tool_calls + 1` native entries.
-Commands, outputs, image paths, cwd, process IDs and raw item payloads are absent
-from this metadata. Existing GPTgrep tool receipts keep their original meaning.
-Shell output and processed images do not mint citations; only actual GPTgrep
-source delivery and the original successful read/render issued IDs authorize
-the unchanged text/visual citation checks. The independent Page/Document
-parse-agent guards and runtime-profile contracts are outside this option.
+`run_native_task` provides structured native work with caller instructions,
+state, JSON schema, working directory and original deadline. It validates the
+actual final JSON, captures native usage and permission observations, and returns
+a report only after the owned process group is stopped and reaped.
+`OcrRuntimeProfile::with_native_agent` selects this path for `OcrHostExecutor`.
+The agent can inspect original source and supplied renditions, run code and CV
+libraries, and choose useful image derivatives. Source hashes are checked before
+and after execution; the typed OCR validator checks task identity, required
+regions and completion before the existing parser can ingest the result. The
+private native report is retained by digest, and portable receipts distinguish
+native execution from the older guarded-image transport. Cancellation retains
+unknown provider accounting while owned process cleanup is awaited.
+
+Document controls use an explicit `native_execution` selection at the existing
+Document driver. It retains the real `gptgrep_parse.toolbox` operations and
+complete backend verification while inheriting native runtime capabilities.
+Legacy fixed Page/Document image profiles and qualification receipts remain
+available for their original execution modes.
 
 Authentication, source retrieval, inference, citation validation and task
 acceptance are separate outcomes. A successful child process is insufficient.

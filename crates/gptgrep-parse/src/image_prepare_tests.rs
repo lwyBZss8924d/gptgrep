@@ -183,7 +183,14 @@ async fn bounded_png_pdf_roundtrip_preserves_geometry_pixels_and_one_conversion(
 async fn native_metadata_binds_vector_classifier_and_original_cropped_rotated_frame() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("native.pdf");
-    let content = "0 0 0 rg 20 30 50 50 re f BT /F1 12 Tf 40 60 Td (tiny) Tj ET";
+    let mut content = String::from("0 0 0 rg 20 30 50 50 re f BT /F1 8 Tf 30 250 Td ");
+    for row in 0..18 {
+        if row > 0 {
+            content.push_str("0 -9 Td ");
+        }
+        content.push_str(&format!("(Native text row {row} remains searchable) Tj "));
+    }
+    content.push_str("ET");
     let bytes = crate::tests::pdf_objects(&[
         "<< /Type /Catalog /Pages 2 0 R >>".into(),
         "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
@@ -224,11 +231,19 @@ async fn native_metadata_binds_vector_classifier_and_original_cropped_rotated_fr
     .unwrap();
     assert_eq!(metadata["complexity"], serialized_value(&page.complexity));
     assert_eq!(metadata["complexity"]["needs_ocr"], true);
+    assert!(page.complexity.text_coverage >= 0.15);
+    assert!(
+        page.complexity
+            .uncovered_vector_area
+            .is_some_and(|area| area >= 400.0)
+    );
     assert!(
         metadata["complexity"]["reasons"]
             .as_array()
             .unwrap()
-            .contains(&serde_json::json!("vector-text"))
+            .contains(&serde_json::json!("vector-text")),
+        "{:?}",
+        page.complexity
     );
     assert!(
         metadata["objects"]

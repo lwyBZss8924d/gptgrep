@@ -57,6 +57,7 @@ fn complete_result(task: &OcrTask, text: &str) -> OcrPageResult {
             })
             .collect(),
         receipt: OcrReceipt {
+            native_agent: None,
             model: task.profile.model.clone(),
             profile_sha256: ocr_profile_digest(&task.profile).unwrap(),
             request_sha256: "1".repeat(64),
@@ -301,7 +302,7 @@ async fn crop_rotation_userunit_and_blank_coverage_are_explicit() {
 }
 
 #[tokio::test]
-async fn vector_paths_require_ocr_and_count_admission_precedes_materialization() {
+async fn vectors_without_native_text_require_ocr_and_count_admission_precedes_materialization() {
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("vector.pdf");
     let drawing = "0 0 0 rg 10 10 50 50 re f";
@@ -336,7 +337,7 @@ async fn vector_paths_require_ocr_and_count_admission_precedes_materialization()
             .complexity
             .reasons
             .iter()
-            .any(|reason| reason.as_str() == "vector-text")
+            .any(|reason| reason.as_str() == "no-text")
     );
     let text = "Visible vector label\nAxis units";
     let result = complete_result(&candidate.plan().tasks[0], text);
@@ -701,6 +702,124 @@ async fn visible_annotation_appearances_cannot_be_verified_blank_or_bypass_ocr()
         let rich = finalize_document(candidate, vec![], OcrMode::Auto, &budget).unwrap();
         assert!(rich.document.text.contains("Synthetic row 9 has evidence"));
         assert_eq!(rich.unmapped_merged_lines, 0);
+    }
+}
+
+fn vector_classifier_pdf(drawing: &str, native_text: bool) -> Vec<u8> {
+    let mut content = drawing.to_string();
+    if native_text {
+        content.push_str(" BT /F1 12 Tf 20 180 Td ");
+        for row in 0..10 {
+            if row > 0 {
+                content.push_str("0 -15 Td ");
+            }
+            content.push_str(&format!(
+                "(Native content row {row} keeps evidence searchable) Tj "
+            ));
+        }
+        content.push_str("ET");
+    }
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Resources << /Font << /F1 5 0 R >> /XObject << /Im 6 0 R >> >> /Contents 4 0 R >>".into(),
+        format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+        "<< /Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /ASCIIHexDecode /Length 9 >>\nstream\n00808000>\nendstream".into(),
+    ];
+    crate::tests::pdf_objects(&objects)
+}
+
+#[tokio::test]
+async fn decorative_vectors_do_not_replace_usable_native_text_with_required_ocr() {
+    for drawing in [
+        "0 0 0 RG 1 w 10 15 m 290 15 l S",
+        "0.9 g 10 10 280 25 re f 0 g",
+        "0 g 10 10 4 4 re f",
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("native-with-decoration.pdf");
+        std::fs::write(&source, vector_classifier_pdf(drawing, true)).unwrap();
+        let budget = ResourceBudget::default();
+        let prepared = prepare_document(
+            &source,
+            &directory.path().join("stage"),
+            &PreparationOptions,
+            &budget,
+        )
+        .await
+        .unwrap();
+        let candidate = extract_native(
+            &prepared,
+            &NativeOptions {
+                dpi: 72.,
+                ..Default::default()
+            },
+            &budget,
+        )
+        .await
+        .unwrap();
+        candidate.prepared.verify(&budget).unwrap();
+        let page = &candidate.pages()[0];
+        assert_eq!(page.coverage, CoverageState::Native);
+        assert!(!page.complexity.needs_ocr);
+        assert!(page.complexity.uncovered_vector_area.unwrap() < 400.);
+        assert!(candidate.plan().tasks.is_empty());
+        let document = finalize_document(candidate, vec![], OcrMode::Auto, &budget).unwrap();
+        assert!(document.document.text.contains("Native content row 9"));
+        assert_eq!(document.coverage[0].1, CoverageState::Native);
+    }
+}
+
+#[tokio::test]
+async fn uncovered_filled_vectors_and_missing_native_text_still_require_ocr() {
+    use liteparse::ocr_merge::ComplexityReason;
+    let outlines = "0 g 15 10 12 12 re f 35 10 12 12 re f 55 10 12 12 re f 75 10 12 12 re f";
+    for (drawing, native_text, reason) in [
+        (outlines, true, ComplexityReason::VectorText),
+        (outlines, false, ComplexityReason::NoText),
+        (
+            "q 300 0 0 200 0 0 cm /Im Do Q",
+            false,
+            ComplexityReason::Scanned,
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("missing-native-content.pdf");
+        std::fs::write(&source, vector_classifier_pdf(drawing, native_text)).unwrap();
+        let budget = ResourceBudget::default();
+        let prepared = prepare_document(
+            &source,
+            &directory.path().join("stage"),
+            &PreparationOptions,
+            &budget,
+        )
+        .await
+        .unwrap();
+        let candidate = extract_native(
+            &prepared,
+            &NativeOptions {
+                dpi: 72.,
+                ..Default::default()
+            },
+            &budget,
+        )
+        .await
+        .unwrap();
+        candidate.prepared.verify(&budget).unwrap();
+        let page = &candidate.pages()[0];
+        assert_eq!(page.coverage, CoverageState::RequiredOcr);
+        assert!(page.complexity.reasons.contains(&reason));
+        assert_eq!(candidate.plan().tasks.len(), 1);
+        if native_text {
+            assert!(page.complexity.uncovered_vector_area.unwrap() >= 400.);
+        }
+        assert!(
+            finalize_document(candidate, vec![], OcrMode::Auto, &budget)
+                .unwrap_err()
+                .to_string()
+                .contains("coverage incomplete")
+        );
     }
 }
 

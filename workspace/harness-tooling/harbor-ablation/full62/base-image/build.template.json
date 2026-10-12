@@ -18,5 +18,6 @@
     "provenance": null,
     "licenses": {"COPYING.bubblewrap": null, "LICENSE.codex": null}
   },
+  "native_code_mode_host": {"binary": null, "provenance": null, "sigstore": null},
   "gptgrep_binary": null
 }

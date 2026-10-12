@@ -19,6 +19,73 @@ fn command(id: &str, status: &str) -> Value {
         "aggregatedOutput":"private-output-sentinel","processId":"private-process-sentinel"})
 }
 
+#[test]
+fn native_item_families_keep_their_actual_status_contracts() {
+    let mut tracker = Tracker::new(128).unwrap();
+    for (index, kind) in ["fileChange", "mcpToolCall", "collabAgentToolCall"]
+        .into_iter()
+        .enumerate()
+    {
+        let id = format!("tool-{index}");
+        tracker
+            .observe(
+                &json!({"type":kind,"id":id,"status":"inProgress"}),
+                ItemEvent::Started,
+            )
+            .unwrap();
+        tracker
+            .observe(
+                &json!({"type":kind,"id":id,"status":"completed"}),
+                ItemEvent::Completed,
+            )
+            .unwrap();
+        tracker
+            .observe(
+                &json!({"type":kind,"id":id,"status":"completed"}),
+                ItemEvent::FinalSnapshot,
+            )
+            .unwrap();
+    }
+    tracker
+        .observe(
+            &json!({"type":"collabAgentToolCall","id":"interrupted","status":"interrupted"}),
+            ItemEvent::FinalSnapshot,
+        )
+        .unwrap();
+    for kind in ["webSearch", "sleep", "imageGeneration"] {
+        let item = json!({"type":kind,"id":kind,"status":"runtime-owned-value"});
+        tracker.observe(&item, ItemEvent::Started).unwrap();
+        tracker.observe(&item, ItemEvent::Completed).unwrap();
+        tracker.observe(&item, ItemEvent::FinalSnapshot).unwrap();
+    }
+    let report = tracker.report();
+    assert_eq!(report.native_tool_calls, 7);
+    assert!(
+        report
+            .items
+            .iter()
+            .filter(|item| matches!(
+                item.kind,
+                NativeToolKind::WebSearch | NativeToolKind::Sleep | NativeToolKind::ImageGeneration
+            ))
+            .all(|item| item.status.is_none() && item.completed_observed)
+    );
+    for (kind, status) in [
+        ("mcpToolCall", "declined"),
+        ("commandExecution", "interrupted"),
+        ("fileChange", "unknown"),
+    ] {
+        assert!(
+            tracker
+                .observe(
+                    &json!({"type":kind,"id":"invalid","status":status}),
+                    ItemEvent::FinalSnapshot
+                )
+                .is_err()
+        );
+    }
+}
+
 fn image(id: &str) -> Value {
     json!({"type":"imageView","id":id,"path":"/private/image-sentinel.png"})
 }
@@ -168,12 +235,18 @@ async fn opt_in_exposes_direct_tools_without_fallback_and_preserves_the_permissi
     assert!(result.is_ok(), "{:?}", result.err());
     let default_thread = request(&restricted, "thread/start");
     let native_thread = request(&opted, "thread/start");
-    let mut expected_config = default_thread["config"].clone();
-    expected_config["features.shell_tool"] = json!(true);
-    expected_config["features.view_image"] = json!(true);
-    expected_config["features.code_mode.direct_only_tool_namespaces"] =
-        json!(["gptgrep", "functions"]);
-    expected_config["features.code_mode_host.disable_in_process_fallback"] = json!(true);
+    for key in [
+        "environments",
+        "runtimeWorkspaceRoots",
+        "selectedCapabilityRoots",
+    ] {
+        assert!(native_thread.get(key).is_none());
+        assert_eq!(default_thread[key], json!([]));
+    }
+    let mut expected_config = crate::native_ptc::runtime_config(&config(true, 12)).unwrap();
+    expected_config["model_reasoning_effort"] = json!(crate::DEFAULT_REASONING_EFFORT);
+    expected_config["service_tier"] = json!(crate::DEFAULT_SERVICE_TIER);
+    expected_config["features.fast_mode"] = json!(true);
     assert_eq!(native_thread["config"], expected_config);
     assert_eq!(default_thread["config"]["features.shell_tool"], false);
     assert_eq!(default_thread["config"]["features.view_image"], false);
@@ -186,16 +259,14 @@ async fn opt_in_exposes_direct_tools_without_fallback_and_preserves_the_permissi
         false
     );
     assert_eq!(default_thread["sandbox"], "read-only");
-    assert_eq!(
-        native_thread["config"]["mcp_servers"]["inherited"],
-        json!({"enabled":false})
-    );
-    assert_eq!(native_thread["config"]["features.code_mode.enabled"], false);
-    assert_eq!(
-        native_thread["config"]["features.code_mode_host.enabled"],
-        false
-    );
-    assert_eq!(native_thread["config"]["web_search"], "disabled");
+    for key in [
+        "mcp_servers",
+        "features.code_mode.enabled",
+        "features.code_mode_host.enabled",
+        "web_search",
+    ] {
+        assert!(native_thread["config"].get(key).is_none());
+    }
     for method in ["thread/start", "turn/start"] {
         let params = request(&opted, method);
         assert_eq!(params["permissions"], "native_ptc_reader");
@@ -219,8 +290,8 @@ async fn opt_in_exposes_direct_tools_without_fallback_and_preserves_the_permissi
     assert!(original.contains("Do not run commands, access browsers"));
     assert!(!original.contains("Native PTC"));
     let instructions = native_thread["baseInstructions"].as_str().unwrap();
-    assert!(instructions.contains("generic Python, including Pillow"));
-    assert!(instructions.contains("never create citable evidence"));
+    assert!(instructions.contains("installed Skills"));
+    assert!(instructions.contains("does not create a GPTgrep citation"));
     assert!(!instructions.contains("Do not run commands, access browsers"));
     let native = attempt.native_ptc.unwrap();
     assert_eq!(native.combined_tool_calls, 0);
@@ -229,10 +300,15 @@ async fn opt_in_exposes_direct_tools_without_fallback_and_preserves_the_permissi
         native.observation,
         "app_server_items_after_possible_execution"
     );
+    let mut selected = config(true, 128);
+    selected
+        .native_capabilities
+        .insert("features.code_mode.enabled".into(), json!(true));
     assert_eq!(
-        crate::native_ptc::STARTUP_OVERRIDES,
-        ["features.shell_tool=true", "features.view_image=true"]
+        crate::native_ptc::runtime_config(&selected).unwrap()["features.code_mode.enabled"],
+        true
     );
+    assert!(Tracker::new(128).is_ok());
 }
 
 #[tokio::test]
@@ -460,7 +536,7 @@ fn snapshot_only_completion_is_counted_but_replays_kind_changes_and_bad_ids_fail
             .is_err()
     );
     assert!(Tracker::new(0).is_err());
-    assert!(Tracker::new(65).is_err());
+    assert!(Tracker::new(usize::MAX).is_err());
 }
 
 #[test]

@@ -26,6 +26,13 @@ TARGETS = {"linux/amd64": ("x86_64-unknown-linux-gnu", 62),
            "linux/arm64": ("aarch64-unknown-linux-gnu", 183)}
 REQUIRED = {"gptgrep", "gptgrep.bin", "lib/libpdfium.so", "LICENSE", "THIRD_PARTY.md",
             "third-party/rust/inventory.json"}
+RUNTIME_SKILLS = ["gptgrep", "gptgrep-document", "gptgrep-ocr", "gptgrep-retrieval"]
+RUNTIME_ROLES = ["gptgrep-document", "gptgrep-ocr", "gptgrep-retrieval"]
+RUNTIME_FILES = {"runtime/codex/AGENTS.md", "runtime/codex/DEPENDENCIES.md",
+                 "runtime/codex/STAGING.md", "runtime/codex/assets.sha256",
+                 "runtime/codex/manifest.json", "runtime/codex/stage.sh",
+                 *("skills/" + name + "/SKILL.md" for name in RUNTIME_SKILLS),
+                 *("runtime/codex/agents/" + name + ".toml" for name in RUNTIME_ROLES)}
 
 
 def member_path(value):
@@ -64,8 +71,9 @@ def release_bundle(bundle, platform, destination=None):
     archive = pinned(bundle["archive"], MAX_ARCHIVE)
     metadata = pinned(bundle["release_metadata"])
     release = parse(metadata)
-    require(set(release) == {"schema_version", "version", "target", "source_revision", "source_dirty",
-                             "binary", "pdfium", "rust_licenses", "files"} and
+    fields = {"schema_version", "version", "target", "source_revision", "source_dirty",
+              "binary", "pdfium", "rust_licenses", "files"}
+    require(set(release) in (fields, fields | {"native_runtime_package"}) and
             release["schema_version"] == "gptgrep.release.v1" and
             release["target"] == TARGETS[platform][0], "bundle_release_schema")
     require(isinstance(release["version"], str) and
@@ -79,6 +87,18 @@ def release_bundle(bundle, platform, destination=None):
     for name, value in files.items():
         member_path(name)
         digest(value)
+    if "native_runtime_package" in release:
+        runtime = release["native_runtime_package"]
+        require(type(runtime) is dict and set(runtime) == {
+            "root", "manifest", "manifest_sha256", "skills", "roles", "files"}
+            and runtime["root"] == "." and runtime["manifest"] == "runtime/codex/manifest.json"
+            and runtime["skills"] == RUNTIME_SKILLS and runtime["roles"] == RUNTIME_ROLES,
+            "bundle_runtime_schema")
+        require(type(runtime["files"]) is dict and set(runtime["files"]) == RUNTIME_FILES
+                and RUNTIME_FILES <= files.keys()
+                and all(runtime["files"][name] == files[name] for name in RUNTIME_FILES)
+                and runtime["manifest_sha256"] == files[runtime["manifest"]],
+                "bundle_runtime_manifest_join")
     require(release["binary"] == {"file": "gptgrep.bin", "sha256": files["gptgrep.bin"]} and
             release["pdfium"].get("library") == "lib/libpdfium.so" and
             release["pdfium"].get("library_sha256") == files["lib/libpdfium.so"], "bundle_binary_library_join")

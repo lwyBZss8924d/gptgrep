@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import tarfile
 import tempfile
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -19,6 +20,53 @@ class ProductBundleTests(unittest.TestCase):
         temp = tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"])
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name).resolve()
+
+    def runtime_bundle(self, root, change=None):
+        repo = Path(__file__).resolve().parents[5]
+        scripts = repo / "scripts"
+        spec = importlib.util.spec_from_file_location("package_release_runtime_fixture", scripts / "package_release.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.path.insert(0, str(scripts))
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            sys.path.pop(0)
+
+        def attach(release, files):
+            copied = root / "runtime-copy"
+            runtime = module.copy_runtime_assets(repo, copied)
+            release["native_runtime_package"] = {"root": ".", **runtime}
+            for name, digest in runtime["files"].items():
+                files[name] = (copied / name).read_bytes()
+                release["files"][name] = digest
+            if change:
+                change(release, files)
+        return bundle_fixture(root, change=attach)
+
+    def test_actual_packager_runtime_assets_join_and_stage_with_the_bundle(self):
+        dest = self.root / "installed"
+        bundle = self.runtime_bundle(self.root)
+        result = product.release_bundle(bundle, "linux/amd64", dest)
+        self.assertTrue(product.RUNTIME_FILES <= result["files"].keys())
+        for name in product.RUNTIME_FILES:
+            self.assertEqual((dest / name).read_bytes(), (self.root / "runtime-copy" / name).read_bytes())
+
+    def test_runtime_declarations_cannot_detach_from_pinned_bundle_files(self):
+        variants = {
+            "manifest": lambda value: value.update(manifest_sha256="0" * 64),
+            "file": lambda value: value["files"].update({"skills/gptgrep/SKILL.md": "0" * 64}),
+            "missing": lambda value: value["files"].pop("runtime/codex/stage.sh"),
+            "root": lambda value: value.update(root="/another/root"),
+            "skills": lambda value: value.update(skills=[]),
+        }
+        for name, change in variants.items():
+            with self.subTest(name=name):
+                root = self.root / name
+                root.mkdir()
+                bundle = self.runtime_bundle(root, lambda release, files: change(release["native_runtime_package"]))
+                with self.assertRaisesRegex(ValueError, "bundle_runtime_"):
+                    product.release_bundle(bundle, "linux/amd64", root / "absent")
+                self.assertFalse((root / "absent").exists())
 
     def test_valid_bundle_preserves_every_payload_and_binds_launcher_not_elf(self):
         bundle = bundle_fixture(self.root)

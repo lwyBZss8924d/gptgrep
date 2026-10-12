@@ -50,9 +50,9 @@ pub use native_graphics::{
     native_metadata_working_upper, validate_native_graphics_metadata,
 };
 pub use ocr::{
-    OcrExecutor, OcrImage, OcrImageDelivery, OcrNativeImageDelivery, OcrNativeImageReference,
-    OcrPageResult, OcrProfile, OcrReceipt, OcrRegion, OcrRegionResult, OcrRegionStatus,
-    OcrResultStatus, OcrTask, OcrTaskBudget, ocr_profile_digest, ocr_task_digest,
+    OcrExecutor, OcrImage, OcrImageDelivery, OcrNativeAgentReceipt, OcrNativeImageDelivery,
+    OcrNativeImageReference, OcrPageResult, OcrProfile, OcrReceipt, OcrRegion, OcrRegionResult,
+    OcrRegionStatus, OcrResultStatus, OcrTask, OcrTaskBudget, ocr_profile_digest, ocr_task_digest,
     validate_ocr_result, validate_ocr_result_metadata, validate_ocr_task,
     validate_ocr_task_metadata, validate_rendition, validate_rendition_metadata,
 };
@@ -70,7 +70,7 @@ pub use rich::{
     ConversionIdentity, CoverageState, NativeCandidate, NativeOptions, NativePage, OcrMode,
     OcrPlan, PreparationOptions, PreparedDocument, PreparedImageGeometry, PreparedSummary,
     RICH_PARSER, RichParsedDocument, SegmentMap, extract_native, finalize_document,
-    prepare_document,
+    native_page_complexity, prepare_document,
 };
 pub use rich_text::{
     PlaintextMetadata, plaintext_native_profile_digest, plaintext_preparation_profile_digest,

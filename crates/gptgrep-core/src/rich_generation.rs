@@ -2257,6 +2257,13 @@ fn verify_document(
                 page.number,
                 budget,
             )?;
+            if page.coverage != CoverageState::ValidatedOcr {
+                ensure!(
+                    !gptgrep_parse::native_page_complexity(&typed.page, &typed.image_rects)?
+                        .needs_ocr,
+                    "saved native geometry requires OCR coverage"
+                );
+            }
             // Generic records never enter the legacy path/image-only decoder.
             NativeCoverageMetadata {
                 page: NativeCoveragePage {
@@ -2326,7 +2333,7 @@ fn verify_document(
                     ),
             "native image classifier inputs differ from retained objects"
         );
-        if page.coverage != CoverageState::ValidatedOcr {
+        if page.coverage != CoverageState::ValidatedOcr && !graphics_recipe {
             ensure!(
                 metadata.objects.paths == 0,
                 "saved vector objects require OCR coverage"

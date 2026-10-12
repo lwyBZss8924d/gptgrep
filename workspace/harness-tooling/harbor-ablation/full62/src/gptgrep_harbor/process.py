@@ -77,22 +77,23 @@ def run(argv, *, cwd, timeout, env, input_bytes=None):
     except (ValueError, TimeoutError, subprocess.TimeoutExpired, OSError):
         failure = "cancelled" if cancelled else "child_failed_or_limit"
     finally:
-        # Signal only the live group created by this invocation. Drain descriptors
-        # never extends the fixed deadline; descendants in the group are stopped.
-        if child is not None:
+        # Never signal a numeric group after reaping its leader. A normal
+        # leader exit does not independently prove that all descendants exited.
+        if child is not None and child.returncode is None:
             try:
                 os.killpg(child.pid, signal.SIGTERM)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 pass
-            try:
-                child.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                pass
+            time.sleep(0.1)
             try:
                 os.killpg(child.pid, signal.SIGKILL)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 pass
-            child.wait(timeout=1)
+            # Signal failure is not exit evidence; only this wait establishes reap.
+            try:
+                child.wait(timeout=2)
+            except (subprocess.TimeoutExpired, OSError):
+                failure = "child_cleanup_failed"
         for key in list(selector.get_map().values()):
             key.fileobj.close()
         selector.close()

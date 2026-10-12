@@ -62,6 +62,9 @@ pub(crate) struct Outcome {
     pub answer: String,
     pub usage: Option<Value>,
     pub warnings: Vec<String>,
+    /// Native-reported named-profile metadata, not proof of granular enforcement.
+    pub permission_observation: Option<Value>,
+    pub native_ptc: Option<crate::NativePtcReport>,
 }
 
 pub(crate) fn base_config() -> Value {
@@ -192,11 +195,21 @@ pub(crate) enum Workflow<'a> {
         state: &'a Value,
         schema: &'a Value,
     },
+    NativeTask {
+        instructions: &'a str,
+        state: &'a Value,
+        schema: &'a Value,
+    },
 }
 
 impl Workflow<'_> {
     pub(crate) fn native_ptc_enabled(&self, config: &HostConfig) -> Result<bool> {
-        crate::native_ptc::enabled(config, matches!(self, Self::Completion { .. }))
+        let enabled = crate::native_ptc::enabled(config, matches!(self, Self::Completion { .. }))?;
+        ensure!(
+            enabled || !matches!(self, Self::NativeTask { .. }),
+            "host_native_task_requires_native_ptc"
+        );
+        Ok(enabled)
     }
 
     fn rich(&self) -> Option<&crate::rich_text::RichEvidence> {
@@ -242,6 +255,8 @@ pub(crate) async fn run<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
 pub(crate) struct RunOptions<'a> {
     pub observer: Option<&'a ModelAttemptObserver>,
     pub max_output_bytes: Option<usize>,
+    pub cancel: Option<&'a crate::ocr::OcrCancellation>,
+    pub cleanup_proof: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
 #[cfg(test)]
@@ -281,7 +296,15 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
     deadline: Instant,
 ) -> Result<Outcome> {
     let is_completion = matches!(&workflow, Workflow::Completion { .. });
+    let is_native_task = matches!(&workflow, Workflow::NativeTask { .. });
+    let is_structured = is_completion || is_native_task;
     let native_ptc_enabled = workflow.native_ptc_enabled(config)?;
+    let native_skills = if native_ptc_enabled {
+        config.native_skills.as_slice()
+    } else {
+        &[]
+    };
+    crate::native_skills::validate(native_skills)?;
     let mut native_ptc = if native_ptc_enabled {
         Some(crate::native_ptc::Tracker::new(config.max_tool_calls)?)
     } else {
@@ -319,25 +342,24 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
     let configuration = configured["config"]
         .as_object()
         .ok_or_else(|| anyhow!("Codex effective configuration unavailable"))?;
-    let mut thread_config = base_config();
-    if native_ptc_enabled {
-        thread_config["features.shell_tool"] = json!(true);
-        thread_config["features.view_image"] = json!(true);
-        thread_config["features.code_mode.direct_only_tool_namespaces"] =
-            json!(["gptgrep", "functions"]);
-        thread_config["features.code_mode_host.disable_in_process_fallback"] = json!(true);
-    }
-    let mut disabled = serde_json::Map::new();
-    if let Some(servers) = configuration.get("mcp_servers") {
-        let servers = servers
-            .as_object()
-            .ok_or_else(|| anyhow!("Codex MCP configuration has an unsupported shape"))?;
-        ensure!(servers.len() <= 128, "Too many inherited MCP servers");
-        for name in servers.keys() {
-            disabled.insert(name.clone(), json!({"enabled":false}));
+    let mut thread_config = if native_ptc_enabled {
+        crate::native_ptc::runtime_config(config)?
+    } else {
+        base_config()
+    };
+    if !native_ptc_enabled {
+        let mut disabled = serde_json::Map::new();
+        if let Some(servers) = configuration.get("mcp_servers") {
+            let servers = servers
+                .as_object()
+                .ok_or_else(|| anyhow!("Codex MCP configuration has an unsupported shape"))?;
+            ensure!(servers.len() <= 128, "Too many inherited MCP servers");
+            for name in servers.keys() {
+                disabled.insert(name.clone(), json!({"enabled":false}));
+            }
         }
+        thread_config["mcp_servers"] = Value::Object(disabled);
     }
-    thread_config["mcp_servers"] = Value::Object(disabled);
     thread_config["model_reasoning_effort"] = json!(config.reasoning_effort);
     thread_config["service_tier"] = json!(config.service_tier);
     // Fast's request/config alias is normalized only when this feature is enabled.
@@ -346,6 +368,18 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
         thread_config["features.fast_mode"] = json!(true);
     }
     drop(configured);
+    let native_skill_observation = if native_skills.is_empty() {
+        None
+    } else {
+        let listed = rpc
+            .request(101, "skills/list", crate::native_skills::list_params(cwd))
+            .await?;
+        Some(crate::native_skills::observe_list(
+            cwd,
+            native_skills,
+            &listed,
+        )?)
+    };
     let (instructions, prompt, schema, tools, max_output_bytes) = match &workflow {
         Workflow::Retrieval {
             question,
@@ -381,6 +415,17 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
             crate::rich_multimodal::tools(evidence.document.as_deref()),
             65536,
         ),
+        Workflow::NativeTask {
+            instructions,
+            state,
+            schema,
+        } => (
+            (*instructions).to_owned(),
+            (*state).clone(),
+            (*schema).clone(),
+            json!([]),
+            options.max_output_bytes.unwrap_or(128 * 1024),
+        ),
         Workflow::Completion {
             instructions,
             state,
@@ -398,7 +443,7 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
     let max_output_bytes = options
         .max_output_bytes
         .map_or(max_output_bytes, |limit| limit.min(max_output_bytes));
-    let mut instructions = if is_completion || workflow.rich().is_some() {
+    let mut instructions = if is_structured || workflow.rich().is_some() {
         instructions
     } else {
         format!("{instructions}\n\n{}", retrieval::limits_guidance())
@@ -422,9 +467,9 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
     append_source_continuation(
         &mut instructions,
         config.source_continuation,
-        !is_completion,
+        !is_structured,
     );
-    if native_ptc_enabled {
+    if native_ptc_enabled && !is_native_task {
         instructions = crate::native_ptc::instructions(instructions);
     }
     let mut thread_params = json!({
@@ -435,6 +480,12 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
         "config":thread_config,"baseInstructions":instructions,
         "dynamicTools":tools
     });
+    if native_ptc_enabled {
+        let object = thread_params.as_object_mut().expect("thread parameters");
+        object.remove("environments");
+        object.remove("runtimeWorkspaceRoots");
+        object.remove("selectedCapabilityRoots");
+    }
     if let Some(profile) = &config.permission_profile {
         thread_params
             .as_object_mut()
@@ -455,31 +506,31 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
         thread["approvalPolicy"] == "never",
         "Codex did not accept the required approval policy"
     );
-    if let Some(profile) = &config.permission_profile {
-        // Profile provenance plus the compatibility envelope is not proof of
-        // granular filesystem enforcement. Named profiles with finite writes
-        // can project to workspaceWrite without any broad legacy writable root.
+    let mut permission_observation = if let Some(profile) = &config.permission_profile {
+        // The explicitly selected native profile owns policy resolution and
+        // enforcement. Its legacy sandbox projection is observation only.
         ensure!(
             thread["activePermissionProfile"]["id"].as_str() == Some(profile.as_str()),
             "Codex did not acknowledge the requested permission profile"
         );
-        let sandbox = &thread["sandbox"];
-        let finite_named_projection = sandbox["type"] == "workspaceWrite"
-            && sandbox["writableRoots"]
-                .as_array()
-                .is_some_and(Vec::is_empty)
-            && sandbox["excludeTmpdirEnvVar"] == true
-            && sandbox["excludeSlashTmp"] == true;
-        ensure!(
-            sandbox["networkAccess"] == false
-                && (sandbox["type"] == "readOnly" || finite_named_projection),
-            "Codex did not accept the required named permission sandbox envelope"
-        );
+        Some(json!({
+            "source":"native_thread_start",
+            "permission_profile":profile,
+            "sandbox":thread["sandbox"],
+            "granular_enforcement_verified":false
+        }))
     } else {
         ensure!(
             thread["sandbox"]["type"] == "readOnly" && thread["sandbox"]["networkAccess"] == false,
             "Codex did not accept the required read-only sandbox"
         );
+        None
+    };
+    if let Some(skills) = native_skill_observation {
+        let observation = permission_observation
+            .as_mut()
+            .ok_or_else(|| anyhow!("host_native_skills_permission_observation"))?;
+        observation["native_skills"] = skills;
     }
     let effort = thread["reasoningEffort"].as_str().map(str::to_owned);
     if let Some(ref value) = effort {
@@ -550,6 +601,7 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
             .remove("sandboxPolicy");
         turn_params["permissions"] = json!(profile);
     }
+    crate::native_skills::append_inputs(&mut turn_params["input"], native_skills)?;
     rpc.send(json!({"id":4,"method":"turn/start","params":turn_params}))
         .await?;
     if let Some(evidence) = workflow.rich() {
@@ -589,6 +641,10 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
             );
             bind_turn(&mut turn_id, &params["turnId"])?;
             observe_turn(options.observer, &turn_id)?;
+            if is_native_task {
+                rpc.deny(id.clone()).await?;
+                return Err(anyhow!("host_native_task_unregistered_dynamic_tool"));
+            }
             if let Some(native) = native_ptc.as_mut() {
                 let allowed = params["tool"].as_str().is_some_and(|tool| {
                     if workflow.rich().is_some() {
@@ -760,6 +816,9 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
                     rpc.deny(id.clone()).await?;
                     return Err(anyhow!("Pure completion attempted to invoke a tool"));
                 }
+                Workflow::NativeTask { .. } => {
+                    unreachable!("native task dynamic requests are rejected before dispatch")
+                }
             };
             rpc.send(json!({"id":id,"result":result})).await?;
             continue;
@@ -796,7 +855,11 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
                     }
                     native.check_non_native(item)?;
                 }
-                validate_workflow_item(item, workflow.rich().is_some())?;
+                validate_workflow_item(item, workflow.rich().is_some(), native_ptc_enabled)?;
+                ensure!(
+                    !(is_native_task && kind == "dynamicToolCall"),
+                    "host_native_task_unregistered_dynamic_tool"
+                );
                 ensure!(
                     !(is_completion && kind == "dynamicToolCall"),
                     "Pure completion emitted a tool item"
@@ -808,7 +871,7 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
                     let text = item["text"]
                         .as_str()
                         .ok_or_else(|| anyhow!("Codex agent message has no text"))?;
-                    output_limit(text.len(), max_output_bytes, is_completion)?;
+                    output_limit(text.len(), max_output_bytes, is_structured)?;
                     answer = Some(text.to_owned());
                 }
             }
@@ -878,7 +941,15 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
                             }
                             native.check_non_native(item)?;
                         }
-                        validate_workflow_item(item, workflow.rich().is_some())?;
+                        validate_workflow_item(
+                            item,
+                            workflow.rich().is_some(),
+                            native_ptc_enabled,
+                        )?;
+                        ensure!(
+                            !(is_native_task && item["type"] == "dynamicToolCall"),
+                            "host_native_task_unregistered_dynamic_tool"
+                        );
                         ensure!(
                             !(is_completion && item["type"] == "dynamicToolCall"),
                             "Pure completion emitted a tool item"
@@ -887,7 +958,7 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
                             let text = item["text"]
                                 .as_str()
                                 .ok_or_else(|| anyhow!("Invalid final message"))?;
-                            output_limit(text.len(), max_output_bytes, is_completion)?;
+                            output_limit(text.len(), max_output_bytes, is_structured)?;
                             answer = Some(text.to_owned());
                         }
                     }
@@ -958,6 +1029,8 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
         answer: answer.ok_or_else(|| anyhow!("Codex completed without a final answer"))?,
         usage,
         warnings,
+        permission_observation,
+        native_ptc: native_ptc.as_ref().map(crate::native_ptc::Tracker::report),
     })
 }
 
@@ -984,7 +1057,23 @@ fn acknowledged_service_tier(thread: &Value, requested: &str) -> Result<Option<S
 fn validate_item(item: &Value) -> Result<()> {
     validate_item_tool(item, false)
 }
-fn validate_workflow_item(item: &Value, rich: bool) -> Result<()> {
+fn validate_workflow_item(item: &Value, rich: bool, native: bool) -> Result<()> {
+    if native
+        && matches!(
+            item["type"].as_str(),
+            Some(
+                "hookPrompt"
+                    | "functionCallOutput"
+                    | "plan"
+                    | "subAgentActivity"
+                    | "enteredReviewMode"
+                    | "exitedReviewMode"
+                    | "contextCompaction"
+            )
+        )
+    {
+        return Ok(());
+    }
     if rich {
         validate_item_tool(item, true)
     } else {
@@ -1312,3 +1401,7 @@ mod permissions_tests;
 #[cfg(test)]
 #[path = "native_ptc_tests.rs"]
 mod native_ptc_tests;
+
+#[cfg(test)]
+#[path = "protocol_native_task_tests.rs"]
+mod native_task_tests;

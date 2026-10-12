@@ -94,6 +94,7 @@ impl Fixture {
             original_clock: clock,
             deadline_unix_ms: 999999,
             limits,
+            native_execution: None,
             native_viewer: None,
             document_image_qualification: None,
         };

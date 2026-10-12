@@ -1,0 +1,48 @@
+{
+  "binding": "locked archive and exact upstream source comparisons",
+  "files": [
+    {
+      "file": "LICENSE-MIT",
+      "git_blob": "9964122648c6348a3c8e61d6d46a87d5942d036c",
+      "sha256": "1c7cf76689c837a68ed8d704994e52a0f2940c087958f860d17f3186afbdcc0c",
+      "url": "https://raw.githubusercontent.com/rustls/rustls-platform-verifier/996b1c903491641b17b3c9afb65d1352f6fc6b76/LICENSE-MIT"
+    },
+    {
+      "file": "LICENSE-APACHE",
+      "git_blob": "261eeb9e9f8b2b4b0d119366dda99c6fd7d35c64",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "url": "https://raw.githubusercontent.com/rustls/rustls-platform-verifier/996b1c903491641b17b3c9afb65d1352f6fc6b76/LICENSE-APACHE"
+    }
+  ],
+  "license_revision": "996b1c903491641b17b3c9afb65d1352f6fc6b76",
+  "package": "rustls-platform-verifier-android",
+  "package_archive_sha256": "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f",
+  "package_vcs_revision": null,
+  "repository": "https://github.com/rustls/rustls-platform-verifier",
+  "schema_version": "gptgrep.license-supplement.v1",
+  "source_comparison": {
+    "generated_files": {
+      "maven/pom.xml": "5468629ab3793f4768c0527b8ecca25219a00b5d9503d1ad657cc664c87e9081",
+      "maven/rustls/rustls-platform-verifier/0.1.1/_remote.repositories": "df2cae67b1175c951353c484a675f9b56a57634e26b1b6cb38ddd74bd180c1ba",
+      "maven/rustls/rustls-platform-verifier/0.1.1/rustls-platform-verifier-0.1.1.aar": "667292cadd8fa589229dd0f716541236a761f29b774930868d218175633830fd",
+      "maven/rustls/rustls-platform-verifier/0.1.1/rustls-platform-verifier-0.1.1.pom": "5468629ab3793f4768c0527b8ecca25219a00b5d9503d1ad657cc664c87e9081",
+      "maven/rustls/rustls-platform-verifier/maven-metadata-local.xml": "151ab31e01d7ad176b02f2b9104d86450a383c4c16281e12eb87ed39ad6bf660"
+    },
+    "note": "Every packaged file is compared with the pinned upstream tree; release-generated Maven payloads, when present, are separately hashed and bound to the verified locked crate archive.",
+    "repository": "https://github.com/rustls/rustls-platform-verifier",
+    "revision": "996b1c903491641b17b3c9afb65d1352f6fc6b76",
+    "tracked_files": {
+      "Cargo.toml.orig": {
+        "git_blob_sha1": "4d2bdceb7244e182257f0f52f2e07acda75c3c67",
+        "upstream_path": "android-release-support/Cargo.toml"
+      },
+      "src/lib.rs": {
+        "git_blob_sha1": "97fb79ada326479f4311fb0b7663bb1a258c3977",
+        "upstream_path": "android-release-support/src/lib.rs"
+      }
+    },
+    "tree_url": "https://api.github.com/repos/rustls/rustls-platform-verifier/git/trees/f7467221ce062d9f4cc26605f7265f086949b17b?recursive=1",
+    "upstream_tree": "f7467221ce062d9f4cc26605f7265f086949b17b"
+  },
+  "version": "0.1.1"
+}

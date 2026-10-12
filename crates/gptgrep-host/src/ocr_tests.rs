@@ -1288,6 +1288,7 @@ for line in sys.stdin:
                 tool_policy_sha256: crate::OcrRuntimeProfile::tool_policy_sha256().unwrap(),
                 accepted_image_qualification_sha256: accepted.then(|| HASH.into()),
                 native_viewer: None,
+                native_agent: None,
             },
             transport: crate::OcrImageTransport::DynamicImages,
         },
@@ -1891,7 +1892,8 @@ async fn retained_document_ocr_journal_failure_is_visible_and_never_synthesizes_
 #[tokio::test]
 async fn document_ocr_cleanup_record_limit_refuses_before_another_worker_or_admission() {
     assert!(crate::OcrCleanup::new(0).is_err());
-    assert!(crate::OcrCleanup::new(65).is_err());
+    assert!(crate::OcrCleanup::new(65).is_ok());
+    assert!(crate::OcrCleanup::new(usize::MAX).is_err());
     assert_eq!(crate::OcrCleanup::working_bytes(64).unwrap(), 65_536);
     let fixture = Fixture::new();
     let (executor, context, _) = mock_executor(&fixture, "complete", false);

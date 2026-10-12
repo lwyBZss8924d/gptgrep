@@ -16,6 +16,11 @@ searches, inspect trees and read bounded nodes before answering.
 
 Experimental collaborators: start with [development and evaluation setup](docs/development.md)
 and the dated [implementation and live-run status](docs/experimental-status.md).
+The unified runtime supplies [four Skills and three native roles](runtime/codex/STAGING.md),
+an [incur CLI covering the native operations](packages/cli/README.md), and
+[direct Rust APIs with a runnable composition example](docs/rust-sdk.md).
+Document/OCR callers choose their native capabilities, permissions, job budgets
+and package root; GPTgrep stages the selected guidance in each actual work directory.
 The core optimization goal is the actual **GPTgrep harness versus bare Codex
 ablation study**: the same reader on 62 paired tasks, with INDEX reported
 separately from SEARCH reward and cost. The source includes the native pipeline
@@ -61,8 +66,8 @@ The native parser dependency downloads its pinned PDFium binary during the first
 build if it is not already provided. Native release archives include a PDFium
 runtime and notices; use their `gptgrep` launcher to select the bundled library.
 Office conversion additionally needs LibreOffice. The default legacy index keeps
-OCR off; explicit rich ingestion and the prepared-document agent support qualified
-native OCR. Missing required OCR fails instead of publishing a partial generation.
+OCR off; explicit rich ingestion and the prepared-document agent support selected
+native OCR runtimes. Missing required OCR fails instead of publishing a partial generation.
 Plaintext/Markdown work without loading PDFium. [Release packaging](docs/release.md) describes the verified platforms and
 relocation checks.
 
@@ -127,7 +132,7 @@ registry selects native agentic parsing and owned-product import. These are
 distinct interfaces with explicit runtime requirements; see [setup](docs/development.md).
 Parse-agent image-file, base64 and per-page byte capacities are configured in the
 control's `resources` object. See the [4 MiB image example](docs/architecture.md#prepared-document-agent)
-for the coupled limits, native profile binding and qualification requirements.
+for the coupled limits, native profile binding and retained fixed-image contracts.
 
 The Rust core provides `DerivedVisualCache` for PNG crops obtained from a
 `VisualGenerationReader` rendition. Each derivative binds its generation, source,
@@ -192,10 +197,11 @@ sandbox_mode = "read-only"
 ```
 
 An existing Codex installation and authenticated local account are required.
-The advanced native Page/Document path also requires the pinned standalone
-[app-server derivative](patches/codex-native-viewer/README.md) and independently
-qualified controls; the ordinary CLI is used for device login and selected reader
-workflows. [Setup](docs/development.md) separates these roles.
+The advanced Document/OCR path selects a pinned standalone app-server and
+source-bound controls. Retained fixed-image profiles use the
+[app-server derivative](patches/codex-native-viewer/README.md) and their separate
+qualifications. The ordinary CLI handles device login and selected reader
+workflows. [Setup](docs/development.md) explains the configuration choices.
 Select the account home explicitly for isolated development. Authentication is
 handled by Codex; GPTgrep does not read or copy its auth cache or install a global
 profile. [Codex authentication](https://learn.chatgpt.com/docs/auth?surface=cli)

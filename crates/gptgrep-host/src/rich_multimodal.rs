@@ -306,6 +306,7 @@ impl PreparedRichMultimodalHost {
             protocol::RunOptions {
                 observer: Some(tracker.observer()),
                 max_output_bytes: Some(65536),
+                ..Default::default()
             },
         )
         .await;

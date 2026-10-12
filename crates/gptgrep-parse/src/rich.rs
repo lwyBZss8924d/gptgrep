@@ -441,11 +441,13 @@ impl NativeCandidate {
                 "native candidate page/native geometry mismatch"
             );
             let annotation_count = self.annotation_counts[index];
+            // Coverage follows the classifier plus the independent annotation
+            // fallback; the presence of vector objects alone is not a reason.
+            let required_ocr = page.complexity.needs_ocr || annotation_count > 0;
             ensure!(
                 page.coverage != CoverageState::ValidatedOcr
                     && (page.coverage == CoverageState::BlankVerified
-                        || (page.coverage == CoverageState::RequiredOcr)
-                            == (page.complexity.needs_ocr || annotation_count > 0)),
+                        || (page.coverage == CoverageState::RequiredOcr) == required_ocr),
                 "native candidate native OCR coverage mismatch"
             );
             ensure!(
@@ -847,6 +849,85 @@ pub(crate) fn admit_staging(used: &mut u64, bytes: u64, budget: &ResourceBudget)
     Ok(())
 }
 
+/// LiteParse 2.15.1's usable-text/image predicates plus its PDF uncovered-fill
+/// rule, applied to the complete admitted viewport geometry. The Office helper
+/// alone assumes vector text cannot exist. Rewalking PDFium here would instead
+/// lose nested images and paths beyond the wrapper's form-depth limit.
+///
+/// Fill filtering and overlap accounting follow LiteParse ab8879623ee45a0b7a775d12b42a9a7ae9dab16b
+/// (`ocr_merge::uncovered_path_area` and PDFium `filled_path_bounds`), Apache-2.0;
+/// the license is retained in vendor/liteparse-pdfium/LICENSE.
+pub fn native_page_complexity(
+    page: &Page,
+    image_rects: &[liteparse::types::Rect],
+) -> Result<stages::PageComplexityStats> {
+    let mut complexity =
+        liteparse::ocr_merge::calculate_native_page_complexity(page, image_rects, 0, 1);
+    if complexity.needs_ocr {
+        return Ok(complexity);
+    }
+    let vectors = page
+        .vector_graphics
+        .as_ref()
+        .context("native vector layout missing before classification")?;
+    let mut uncovered = 0.0_f64;
+    for shape in &vectors.shapes {
+        let bounds = &shape.bbox;
+        if !shape.fill
+            || bounds.width < 3.0
+            || bounds.height < 3.0
+            || (bounds.width > page.page_width * 0.9 && bounds.height > page.page_height * 0.9)
+        {
+            continue;
+        }
+        // derive_layout retains ARGB. Unknown/pattern fills stay conservative.
+        if let Some(color) = shape
+            .fill_color
+            .as_ref()
+            .filter(|color| color.len() == 8)
+            .and_then(|color| u32::from_str_radix(color, 16).ok())
+        {
+            let alpha = color >> 24;
+            let luminance = 0.299 * ((color >> 16) & 255) as f64
+                + 0.587 * ((color >> 8) & 255) as f64
+                + 0.114 * (color & 255) as f64;
+            if alpha < 128 || luminance > 140.0 {
+                continue;
+            }
+        }
+        let area = f64::from(bounds.width) * f64::from(bounds.height);
+        let mut covered = 0.0_f64;
+        for item in &page.text_items {
+            let width = (f64::from(bounds.x) + f64::from(bounds.width))
+                .min(f64::from(item.x) + f64::from(item.width))
+                - f64::from(bounds.x).max(f64::from(item.x));
+            let height = (f64::from(bounds.y) + f64::from(bounds.height))
+                .min(f64::from(item.y) + f64::from(item.height))
+                - f64::from(bounds.y).max(f64::from(item.y));
+            if width > 0.0 && height > 0.0 {
+                covered += width * height;
+                if covered >= area {
+                    break;
+                }
+            }
+        }
+        uncovered += (area - covered).max(0.0);
+    }
+    ensure!(
+        uncovered.is_finite() && uncovered <= f64::from(f32::MAX),
+        "resource_limit: native uncovered vector area overflow"
+    );
+    let uncovered = uncovered as f32;
+    complexity.uncovered_vector_area = Some(uncovered);
+    if uncovered >= 400.0 {
+        complexity
+            .reasons
+            .push(liteparse::ocr_merge::ComplexityReason::VectorText);
+        complexity.needs_ocr = true;
+    }
+    Ok(complexity)
+}
+
 pub(crate) fn extract_sync(
     prepared: PreparedDocument,
     options: NativeOptions,
@@ -1104,7 +1185,6 @@ pub(crate) fn extract_sync(
             )?;
             let object_count = graphics.header.top_level_count;
             let object_bound = graphics.charged_bytes;
-            let vector_count = graphics.paths;
             let image_rects = graphics.image_rects;
             let characters = native_text_metadata::collect_characters(
                 count as u32,
@@ -1166,16 +1246,17 @@ pub(crate) fn extract_sync(
                 form_fields: None,
                 structure_tree: None,
             };
-            // Avoid upstream image_bounds()/vector Vec getters. Inputs to this
-            // pure classifier were admitted by the object-count walk above.
-            // Preserve the pre-G3 classifier inputs; the layout derivative is
-            // assigned only after that original source classification.
-            let mut complexity =
-                liteparse::ocr_merge::calculate_native_page_complexity(&raw, &image_rects, 0, 1);
             let (content_bounds, vector_graphics) =
                 crate::native_graphics::derive_layout(&graphics.header, &graphics.objects)?;
+            ensure!(
+                vector_graphics.shapes.len() == graphics.paths,
+                "native vector classifier shape count mismatch"
+            );
             raw.content_bounds = content_bounds;
             raw.vector_graphics = Some(vector_graphics);
+            // Classify after deriving the complete admitted vector layout, so
+            // rules and shading do not stand in for missing outlined text.
+            let mut complexity = native_page_complexity(&raw, &image_rects)?;
             let held_before_projection = admission.held_upper()?;
             let projection =
                 projection_admission(std::slice::from_ref(&raw), &budget, held_before_projection)?;
@@ -1191,17 +1272,6 @@ pub(crate) fn extract_sync(
                 &budget,
             )?;
             let projected = stages::project(vec![raw.clone()]);
-            if vector_count > 0
-                && !complexity
-                    .reasons
-                    .contains(&liteparse::ocr_merge::ComplexityReason::VectorText)
-            {
-                complexity
-                    .reasons
-                    .push(liteparse::ocr_merge::ComplexityReason::VectorText);
-                complexity.needs_ocr = true;
-                complexity.uncovered_vector_area = None;
-            }
             complexity.layout = Some(stages::layout_complexity(&projected[0]));
             let text = &projected[0].text;
             let empty = raw.text_items.is_empty();

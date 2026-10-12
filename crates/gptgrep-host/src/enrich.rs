@@ -334,6 +334,7 @@ impl Backend for NativeBackend {
             protocol::RunOptions {
                 observer: None,
                 max_output_bytes: Some(16 * 1024),
+                ..Default::default()
             },
         )
         .await

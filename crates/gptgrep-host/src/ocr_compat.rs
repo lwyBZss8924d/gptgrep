@@ -207,6 +207,7 @@ impl OcrHostExecutor {
             status: wire.status,
             regions: wire.regions,
             receipt: OcrReceipt {
+                native_agent: None,
                 model: task.profile.model.clone(),
                 profile_sha256: gptgrep_parse::ocr_profile_digest(&task.profile)?,
                 runtime_profile_sha256: profile.sha256()?,

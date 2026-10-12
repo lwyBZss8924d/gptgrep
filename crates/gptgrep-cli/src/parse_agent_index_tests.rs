@@ -129,6 +129,7 @@ impl Fixture {
                     working_bytes: 67108864,
                     tracking_bytes: 8388608,
                 },
+                native_execution: None,
                 native_viewer: None,
                 document_image_qualification: None,
             };

@@ -199,6 +199,7 @@ mod tests {
                 confidence: 0.73,
             }],
             receipt: OcrReceipt {
+                native_agent: None,
                 model: task.profile.model.clone(),
                 profile_sha256: crate::ocr_profile_digest(&task.profile).unwrap(),
                 runtime_profile_sha256: HASH.into(),

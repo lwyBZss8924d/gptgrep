@@ -1,4 +1,7 @@
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
+import { Transform } from 'node:stream'
+import { StringDecoder } from 'node:string_decoder'
+import { fileURLToPath } from 'node:url'
 
 /** A recognized native failure whose structured evidence must reach the caller. */
 export class NativeFailure extends Error {
@@ -11,6 +14,18 @@ export class NativeFailure extends Error {
 }
 
 function recognizedFailure(report, command) {
+  if (command === 'status' && report.schema_version === 'gptgrep.v1')
+    return report.source_fresh === false && typeof report.generation === 'string'
+      && Array.isArray(report.stale_files) && report.stale_files.length > 0
+      && report.stale_files.every(path => typeof path === 'string' && path.length > 0)
+  if (command === 'index' && report.schema_version === 'gptgrep.rich-ingest.v1')
+    return typeof report.plan_sha256 === 'string' && Array.isArray(report.documents)
+      && Array.isArray(report.blockers) && (report.blockers.length > 0
+        || ['failed_unpublished', 'blocked_unpublished'].includes(report.status))
+  if (command === 'enrich' && report.schema_version === 'gptgrep.enrich.v1')
+    return ['incomplete', 'failed'].includes(report.status) && typeof report.ledger_path === 'string'
+      && typeof report.plan_sha256 === 'string' && report.builder !== null && typeof report.builder === 'object'
+      && report.jev !== null && typeof report.jev === 'object'
   if (report.schema_version === 'gptgrep.error.v1')
     return report.ok === false && typeof report.code === 'string' && report.code.length > 0
       && typeof report.error === 'string' && report.error.length > 0
@@ -39,9 +54,12 @@ function exitCodeFor(error) {
   return 2
 }
 
-function redactor() {
-  const secrets = ['OPENROUTER_API_KEY', 'TYPESAFE_API_KEY', 'OPENAI_API_KEY']
+function selectedSecrets(extraNames = []) {
+  return ['OPENROUTER_API_KEY', 'TYPESAFE_API_KEY', 'OPENAI_API_KEY', ...extraNames]
     .map((name) => process.env[name]).filter((value) => typeof value === 'string' && value.length > 0)
+}
+
+function redactor(secrets = selectedSecrets()) {
   function redact(value) {
     if (typeof value === 'string')
       return secrets.reduce((text, secret) => text.replaceAll(secret, '[REDACTED]'), value)
@@ -54,9 +72,11 @@ function redactor() {
 }
 
 /** Invoke the native binary without a shell and return its JSON object. */
-export function runNative(args, binary = process.env.GPTGREP_BIN || 'gptgrep', timeout = 5 * 60 * 1000, input) {
+export function runNative(args, binary = process.env.GPTGREP_BIN || 'gptgrep', timeout = 5 * 60 * 1000, input, maxOutputBytes = 8 * 1024 * 1024) {
   if (input !== undefined && (typeof input !== 'string' || Buffer.byteLength(input, 'utf8') > 1048576))
     return Promise.reject(new Error('Native stdin must be a UTF-8 string of at most 1048576 bytes.'))
+  if (!Number.isSafeInteger(timeout) || timeout < 0 || timeout > 2147483647 || !Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 1)
+    return Promise.reject(new Error('Native process timeout or output byte budget is invalid.'))
   const redact = redactor()
   return new Promise((resolve, reject) => {
     let stdinError
@@ -64,7 +84,7 @@ export function runNative(args, binary = process.env.GPTGREP_BIN || 'gptgrep', t
     const stdinDone = new Promise((done) => { finishInput = done })
     const child = execFile(binary, args, {
       encoding: 'utf8',
-      maxBuffer: 8 * 1024 * 1024,
+      maxBuffer: maxOutputBytes,
       timeout,
       windowsHide: true,
     }, async (error, stdout, stderr) => {
@@ -117,5 +137,134 @@ export function runNative(args, binary = process.env.GPTGREP_BIN || 'gptgrep', t
     // Preserve its terminal JSON/error instead of allowing EPIPE to crash us.
     child.stdin.on('error', (error) => { stdinError = error; finishInput() })
     child.stdin.end(input, (error) => { stdinError ??= error; finishInput() })
+  })
+}
+
+/** Foreground native protocol/file operation. It never emits a completion envelope. */
+export function runNativeForeground(args, binary = process.env.GPTGREP_BIN || 'gptgrep', {
+  timeout = 0, maxOutputBytes = 8 * 1024 * 1024, tokenEnv,
+} = {}) {
+  if (!Number.isSafeInteger(timeout) || timeout < 0 || timeout > 2147483647 || !Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 1)
+    return Promise.reject(new Error('Native process timeout or output byte budget is invalid.'))
+  if (process.platform === 'win32')
+    return Promise.reject(new Error('Native foreground supervision requires POSIX process groups.'))
+  const secrets = selectedSecrets(tokenEnv ? [tokenEnv] : [])
+  const redact = redactor(secrets)
+  const overlap = Math.max(0, ...secrets.map(secret => secret.length - 1))
+  return new Promise((resolve, reject) => {
+    const anchor = fileURLToPath(new URL('./foreground-child.js', import.meta.url))
+    const child = spawn(process.execPath, [anchor, binary, ...args], {
+      stdio: ['inherit', 'pipe', 'pipe', 'ipc'], detached: true, windowsHide: true,
+    })
+    let bytes = 0
+    let stopCode
+    let killTimer
+    let timer
+    let nativeResult
+    let spawnError
+    let anchorExited = false
+    let groupStopped = false
+    const stopGroup = () => {
+      // This live anchor never voluntarily exits, so its PID cannot be recycled
+      // before this one group signal. An unexpected exit revokes group ownership.
+      if (anchorExited || groupStopped || !child.pid) return
+      try {
+        process.kill(-child.pid, 'SIGKILL')
+        groupStopped = true
+      } catch (error) {
+        spawnError ??= new Error(`Native foreground group cleanup failed (${error.code || 'unknown'}).`)
+      }
+    }
+    const stop = (signal, code) => {
+      stopCode ??= code
+      if (child.connected) child.send({ signal }, () => {})
+      killTimer ??= setTimeout(stopGroup, 5000)
+    }
+    // Keep only a possible secret suffix between chunks; never buffer the entire
+    // NDJSON stream, and redact secrets even when split across OS read boundaries.
+    const output = () => {
+      let pending = ''
+      const decoder = new StringDecoder('utf8')
+      return new Transform({
+        transform(chunk, _encoding, done) {
+          bytes += chunk.length
+          if (bytes > maxOutputBytes) {
+            if (stopCode === undefined) process.stderr.write('Native foreground output exceeded the wrapper byte budget.\n')
+            stop('SIGTERM', 125)
+            done()
+            return
+          }
+          pending += decoder.write(chunk)
+          let end = Math.max(0, pending.length - overlap)
+          for (const secret of secrets) {
+            let start = pending.indexOf(secret)
+            while (start !== -1 && start < end) {
+              if (start + secret.length > end) end = start
+              start = pending.indexOf(secret, start + 1)
+            }
+          }
+          this.push(redact(pending.slice(0, end)))
+          pending = pending.slice(end)
+          done()
+        },
+        flush(done) {
+          if (bytes <= maxOutputBytes) this.push(redact(pending + decoder.end()))
+          done()
+        },
+      })
+    }
+    child.stdout.pipe(output()).pipe(process.stdout, { end: false })
+    child.stderr.pipe(output()).pipe(process.stderr, { end: false })
+    child.on('message', message => {
+      if (message?.type === 'native-exit') {
+        nativeResult = message
+        stopGroup()
+      } else if (message?.type === 'spawn-error') {
+        spawnError = new Error(message.code === 'ENOENT'
+          ? 'Native gptgrep was not found. Install its release binary or set GPTGREP_BIN to its executable path.'
+          : `Native gptgrep could not start (${message.code || 'unknown'}).`)
+        stopGroup()
+      }
+    })
+    child.once('exit', () => {
+      anchorExited = true
+      clearTimeout(killTimer)
+      if (!groupStopped) {
+        spawnError ??= new Error('Native foreground supervisor exited unexpectedly; group ownership is no longer known.')
+        // Unknown descendants may still hold inherited pipes. Stop waiting on
+        // them without scheduling a signal against the now-reaped anchor PID.
+        child.stdout.destroy()
+        child.stderr.destroy()
+      }
+    })
+    const interrupt = () => stop('SIGINT', 130)
+    const terminate = () => stop('SIGTERM', 143)
+    process.on('SIGINT', interrupt)
+    process.on('SIGTERM', terminate)
+    const cleanup = () => {
+      clearTimeout(timer)
+      clearTimeout(killTimer)
+      process.removeListener('SIGINT', interrupt)
+      process.removeListener('SIGTERM', terminate)
+    }
+    if (timeout) timer = setTimeout(() => {
+      process.stderr.write('Native foreground wrapper deadline elapsed; awaiting process termination.\n')
+      stop('SIGTERM', 124)
+    }, timeout)
+    child.once('error', error => {
+      cleanup()
+      reject(new Error(error.code === 'ENOENT'
+        ? 'Native gptgrep was not found. Install its release binary or set GPTGREP_BIN to its executable path.'
+        : `Native gptgrep could not start (${error.code || 'unknown'}).`))
+    })
+    child.once('close', () => {
+      cleanup()
+      if (spawnError) { reject(spawnError); return }
+      if (!groupStopped || (!nativeResult && stopCode === undefined)) {
+        reject(new Error('Native foreground supervisor exited unexpectedly; group ownership is no longer known.'))
+        return
+      }
+      resolve(stopCode ?? (Number.isInteger(nativeResult.code) ? nativeResult.code : exitCodeFor({ signal: nativeResult.signal })))
+    })
   })
 }

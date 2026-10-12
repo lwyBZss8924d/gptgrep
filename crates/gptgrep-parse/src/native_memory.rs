@@ -634,6 +634,7 @@ mod tests {
                 status: OcrRegionStatus::Complete,
             }],
             receipt: OcrReceipt {
+                native_agent: None,
                 model: "model".into(),
                 profile_sha256: "0".repeat(64),
                 request_sha256: "0".repeat(64),
