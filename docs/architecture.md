@@ -267,8 +267,21 @@ the lexical lane and are marked `literal_anchor`; the model score is not rewritt
 This avoids allowing an uncertain semantic judgment to erase a proven grep match.
 No-answer cases, literal queries and natural-language questions are separate evals.
 
-Decisions uses `/api/alpha/decisions`, a 20-second request deadline, no automatic
-retry, no redirects or provider fallback, and at most 64 questions. Text requests
+Decisions uses `/api/alpha/decisions`, a 20-second request deadline, no redirects
+or provider fallback, and at most 64 questions. The default text retrieval client
+(search routing and evidence reranking, including ask/summarize initial and reader
+searches) admits one bounded transient retry: only after a received HTTP 429, 500,
+502, 503 or 504, at most once, with the identical request bytes. It waits a jittered
+250-1000 ms, or a longer numeric `Retry-After`, and retries only if the original
+request deadline still leaves that wait plus 2 seconds; the deadline is never
+renewed. The retry is a separate reservation in the same execution context and is
+skipped when no submission remains. Timeouts, connection or mid-body errors, parse
+and validation failures and other statuses are never retried. Both attempts are
+reported: the failed one keeps its HTTP status in `jev_retried_attempts` and counts
+in `jev_calls_attempted` without a usage entry, so its unknown cost keeps accounting
+incomplete. Judge, enrichment support calls (their own explicit retry plan),
+navigation scans, evidence-role decisions, rich/multimodal and batch submissions
+remain single-submission. Text requests
 and the escaped text/questions envelope retain a 64 KiB limit. Typed Luna image
 requests have an 8 MiB complete-body limit, with at most four PNG/JPEG images,
 1 MiB of compressed bytes and 8 million pixels per image, and 24 million pixels

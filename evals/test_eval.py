@@ -157,6 +157,17 @@ class EvaluationOracleTests(unittest.TestCase):
         ]:
             self.assertIsNone(evaluation.summarize_provider_cost([metrics])["measured_provider_cost_usd"])
 
+    def test_retried_attempt_without_receipt_keeps_total_unknown(self):
+        # A bounded retry: two attempts, one validated response with cost.
+        result = evaluation.summarize_provider_cost([
+            {"jev_calls_attempted": 2, "jev_requests": 1, "jev_usage": [{"cost": 0.01}],
+             "jev_retried_attempts": [{"stage": "evidence_reranking", "http_status": 502,
+                                       "reported_usage": None}]},
+        ])
+        self.assertIsNone(result["measured_provider_cost_usd"])
+        self.assertEqual(result["provider_cost_missing_requests"], 1)
+        self.assertEqual(result["cost_status"], "incomplete_provider_cost_receipts")
+
     def test_no_provider_request_is_not_a_cost_measurement(self):
         result = evaluation.summarize_provider_cost([{"jev_requests": 0, "jev_usage": []}])
         self.assertIsNone(result["measured_provider_cost_usd"])

@@ -1,7 +1,9 @@
 //! Source-bound document snapshots and vectorless retrieval orchestration.
 use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
-use gptgrep_jev::{Candidate, JevClient, RerankResponse};
+use gptgrep_jev::{
+    Candidate, DecisionFailure, DecisionRetriedAttempt, JevClient, RerankResponse, TransientRetry,
+};
 
 pub mod batch;
 mod custody;
@@ -291,11 +293,23 @@ pub struct Coverage {
     pub semantic_scope_complete: bool,
 }
 
+/// One failed Jev submission that the bounded transient retry repeated. The
+/// failed attempt keeps its HTTP status; its usage stays unknown unless the
+/// provider reported it, and is never counted as zero.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JevRetriedAttempt {
+    /// `document_routing` or `evidence_reranking`.
+    pub stage: String,
+    #[serde(flatten)]
+    pub attempt: DecisionRetriedAttempt,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Metrics {
     pub elapsed_ms: u128,
     /// Logical Jev call attempts, including a pre-call observer that may stop
-    /// before network I/O. Never a claim of physical provider requests.
+    /// before network I/O, and each bounded transient retry submission. Never a
+    /// claim of physical provider requests.
     pub jev_calls_attempted: usize,
     /// Successful validated Jev responses observed by this search.
     pub jev_requests: usize,
@@ -308,6 +322,48 @@ pub struct Metrics {
     pub jev_requested_models: Vec<String>,
     pub jev_usage: Vec<Value>,
     pub jev_candidate_bytes: usize,
+    /// Failed submissions repeated by the bounded transient retry, in attempt
+    /// order. They are counted in `jev_calls_attempted` but have no `jev_usage`
+    /// entry: their usage and cost remain unknown, so accounting is incomplete.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jev_retried_attempts: Vec<JevRetriedAttempt>,
+}
+
+/// Count each failed submission that a logical Jev call retried as its own
+/// attempt with the same requested selector. No usage entry is invented.
+fn record_retried_attempts(
+    metrics: &mut Metrics,
+    stage: &str,
+    requested_model: &str,
+    attempts: &[DecisionRetriedAttempt],
+) {
+    for attempt in attempts {
+        metrics.jev_calls_attempted += 1;
+        metrics
+            .jev_requested_models
+            .push(requested_model.to_owned());
+        metrics.jev_retried_attempts.push(JevRetriedAttempt {
+            stage: stage.into(),
+            attempt: attempt.clone(),
+        });
+    }
+}
+
+/// Earlier failed submissions carried by a failure after a bounded retry.
+fn retried_attempts_of(error: &anyhow::Error) -> &[DecisionRetriedAttempt] {
+    error
+        .downcast_ref::<DecisionFailure>()
+        .map_or(&[], |failure| &failure.diagnostic().prior_attempts)
+}
+
+/// The default retrieval client: one bounded retry of transient provider
+/// statuses. Callers that supply their own client keep its configuration.
+fn default_retrieval_client(client: JevClient) -> JevClient {
+    if client.transient_retry().is_some() {
+        client
+    } else {
+        client.with_transient_retry(TransientRetry::standard())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -421,7 +477,13 @@ fn jev_search_error(
     started: Instant,
 ) -> JevSearchError {
     let message = error.to_string();
-    let cause = if message == "OPENROUTER_API_KEY is not available" {
+    let retried = error
+        .downcast_ref::<DecisionFailure>()
+        .filter(|failure| !failure.diagnostic().prior_attempts.is_empty());
+    let cause = if let Some(failure) = retried {
+        // Fixed wording plus numeric statuses and validation codes only.
+        failure.to_string()
+    } else if message == "OPENROUTER_API_KEY is not available" {
         message
     } else if message.contains("API key") {
         "Jev credentials are missing or invalid".into()
@@ -1779,17 +1841,19 @@ async fn search_reader_using_client(
     let client = if model_assisted {
         Some(match supplied_client {
             Some(client) => client.clone(),
-            None => JevClient::from_env(options.model.as_deref()).map_err(|error| {
-                jev_search_error(
-                    "initialization",
-                    error,
-                    &metrics,
-                    &coverage,
-                    options.document.as_deref(),
-                    Some(&snapshot.manifest.generation),
-                    started,
-                )
-            })?,
+            None => JevClient::from_env(options.model.as_deref())
+                .map(default_retrieval_client)
+                .map_err(|error| {
+                    jev_search_error(
+                        "initialization",
+                        error,
+                        &metrics,
+                        &coverage,
+                        options.document.as_deref(),
+                        Some(&snapshot.manifest.generation),
+                        started,
+                    )
+                })?,
         })
     } else {
         None
@@ -2057,17 +2121,33 @@ async fn collect_candidate_view(
                 started,
                 None,
             )?;
-            let ranked = client.rerank(query, &routing).await.map_err(|error| {
-                jev_search_error(
-                    "document_routing",
-                    error,
-                    metrics,
-                    &coverage,
-                    options.document.as_deref(),
-                    Some(&snapshot.manifest.generation),
-                    started,
-                )
-            })?;
+            let ranked = match client.rerank(query, &routing).await {
+                Ok(ranked) => ranked,
+                Err(error) => {
+                    record_retried_attempts(
+                        metrics,
+                        "document_routing",
+                        client.requested_model(),
+                        retried_attempts_of(&error),
+                    );
+                    return Err(jev_search_error(
+                        "document_routing",
+                        error,
+                        metrics,
+                        &coverage,
+                        options.document.as_deref(),
+                        Some(&snapshot.manifest.generation),
+                        started,
+                    )
+                    .into());
+                }
+            };
+            record_retried_attempts(
+                metrics,
+                "document_routing",
+                client.requested_model(),
+                &ranked.retried_attempts,
+            );
             metrics.jev_requests += 1;
             metrics.jev_models.push(ranked.model.clone());
             metrics.jev_usage.push(ranked.usage.clone());
@@ -2183,17 +2263,33 @@ async fn score_candidates(
             started,
             None,
         )?;
-        let ranked = client.rerank(query, &candidates).await.map_err(|error| {
-            jev_search_error(
-                "evidence_reranking",
-                error,
-                metrics,
-                coverage,
-                options.document.as_deref(),
-                Some(&snapshot.manifest.generation),
-                started,
-            )
-        })?;
+        let ranked = match client.rerank(query, &candidates).await {
+            Ok(ranked) => ranked,
+            Err(error) => {
+                record_retried_attempts(
+                    metrics,
+                    "evidence_reranking",
+                    client.requested_model(),
+                    retried_attempts_of(&error),
+                );
+                return Err(jev_search_error(
+                    "evidence_reranking",
+                    error,
+                    metrics,
+                    coverage,
+                    options.document.as_deref(),
+                    Some(&snapshot.manifest.generation),
+                    started,
+                )
+                .into());
+            }
+        };
+        record_retried_attempts(
+            metrics,
+            "evidence_reranking",
+            client.requested_model(),
+            &ranked.retried_attempts,
+        );
         metrics.jev_requests += 1;
         metrics.jev_models.push(ranked.model.clone());
         metrics.jev_usage.push(ranked.usage.clone());
@@ -3451,6 +3547,149 @@ mod tests {
         assert!(failure.metrics.jev_usage.is_empty());
         assert!(!failure.accounting_complete);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn transient_status_is_retried_once_and_both_attempts_are_accounted() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("first.txt"), "needle first evidence")?;
+        fs::write(
+            directory.path().join("second.txt"),
+            "needle second evidence",
+        )?;
+        index(directory.path(), 10).await?;
+        let (client, server) = mock_jev(vec![502, 200, 200]).await?;
+        let client = client.with_transient_retry(TransientRetry::with_jitter(|| 0.0));
+        let events: Arc<Mutex<Vec<JevSearchProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = events.clone();
+        let observer = move |progress: &JevSearchProgress| {
+            recorded.lock().unwrap().push(progress.clone());
+            Ok(())
+        };
+        let report = search_with_client_and_observer(
+            directory.path(),
+            "needle",
+            &SearchOptions::default(),
+            &client,
+            &observer,
+        )
+        .await?;
+        let requests = server.await?;
+        assert_eq!(requests.len(), 3);
+        // The retry repeats the identical routing request.
+        assert_eq!(requests[0], requests[1]);
+        assert_eq!(
+            (
+                report.metrics.jev_calls_attempted,
+                report.metrics.jev_requests
+            ),
+            (3, 2)
+        );
+        assert_eq!(report.metrics.jev_requested_models.len(), 3);
+        // Only validated replies carry usage; the failed attempt stays unknown.
+        assert_eq!(report.metrics.jev_usage.len(), 2);
+        assert_eq!(report.metrics.jev_retried_attempts.len(), 1);
+        let retried = &report.metrics.jev_retried_attempts[0];
+        assert_eq!(retried.stage, "document_routing");
+        assert_eq!(retried.attempt.attempt, 1);
+        assert_eq!(retried.attempt.http_status, Some(502));
+        assert!(retried.attempt.reported_usage.is_none());
+        let metrics = serde_json::to_value(&report.metrics)?;
+        assert_eq!(
+            metrics["jev_retried_attempts"][0]["reported_usage"],
+            Value::Null
+        );
+        assert_eq!(
+            metrics["jev_retried_attempts"][0]["stage"],
+            "document_routing"
+        );
+        let roundtrip: Metrics = serde_json::from_value(metrics)?;
+        assert_eq!(
+            roundtrip.jev_retried_attempts,
+            report.metrics.jev_retried_attempts
+        );
+        assert!(!report.hits.is_empty());
+        let events = events.lock().unwrap();
+        let routed = events
+            .iter()
+            .find(|event| event.stage == "document_routing" && event.event == "after_reply")
+            .unwrap();
+        assert_eq!(routed.metrics.jev_retried_attempts.len(), 1);
+        assert_eq!(
+            (
+                routed.metrics.jev_calls_attempted,
+                routed.metrics.jev_requests
+            ),
+            (2, 1)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repeated_transient_failure_keeps_both_attempts_in_typed_error() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("first.txt"), "needle first evidence")?;
+        fs::write(
+            directory.path().join("second.txt"),
+            "needle second evidence",
+        )?;
+        index(directory.path(), 10).await?;
+        let (client, server) = mock_jev(vec![200, 503, 503]).await?;
+        let client = client.with_transient_retry(TransientRetry::with_jitter(|| 0.0));
+        let error = search_with_client(
+            directory.path(),
+            "needle",
+            &SearchOptions::default(),
+            &client,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(server.await?.len(), 3);
+        let failure = error
+            .downcast_ref::<JevSearchError>()
+            .context("missing typed Jev error")?;
+        assert_eq!(failure.stage, "evidence_reranking");
+        assert_eq!(
+            (
+                failure.metrics.jev_calls_attempted,
+                failure.metrics.jev_requests
+            ),
+            (3, 1)
+        );
+        assert_eq!(failure.metrics.jev_usage.len(), 1);
+        assert_eq!(failure.metrics.jev_retried_attempts.len(), 1);
+        assert_eq!(
+            failure.metrics.jev_retried_attempts[0].stage,
+            "evidence_reranking"
+        );
+        assert_eq!(
+            failure.metrics.jev_retried_attempts[0].attempt.http_status,
+            Some(503)
+        );
+        assert!(failure.cause.contains("after one bounded retry"));
+        assert!(failure.cause.contains("attempt 2: HTTP 503"));
+        assert!(!failure.accounting_complete);
+        let serialized = serde_json::to_string(failure)?;
+        assert!(!serialized.contains("secret-provider-body-sentinel"));
+        Ok(())
+    }
+
+    #[test]
+    fn default_search_client_uses_the_bounded_retry_but_keeps_supplied_policy() {
+        let endpoint = "http://127.0.0.1:9/api/alpha/decisions";
+        let plain = JevClient::with_endpoint("synthetic-core-test-key", None, endpoint).unwrap();
+        assert!(plain.transient_retry().is_none());
+        assert!(default_retrieval_client(plain).transient_retry().is_some());
+        let supplied = JevClient::with_endpoint("synthetic-core-test-key", None, endpoint)
+            .unwrap()
+            .with_transient_retry(TransientRetry::with_jitter(|| 1.0));
+        assert_eq!(
+            default_retrieval_client(supplied)
+                .transient_retry()
+                .unwrap()
+                .backoff(),
+            Duration::from_millis(1000)
+        );
     }
 
     #[tokio::test]

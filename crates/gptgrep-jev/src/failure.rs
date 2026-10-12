@@ -1,10 +1,10 @@
 //! Safe observations from an unsuccessful submission, never response or request contents.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fmt;
+use std::{fmt, time::Duration};
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionFailureKind {
     Timeout,
@@ -17,9 +17,12 @@ pub enum DecisionFailureKind {
     InvalidJson,
     ResponseSchema,
     ResponseValidation,
+    /// The bounded transient retry submission was not admitted or was stopped
+    /// before its HTTP send; any reservation it took remains charged.
+    RetryAdmission,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum UsagePresence {
     Absent,
@@ -28,13 +31,13 @@ pub enum UsagePresence {
     Reported,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UsageObservation<T> {
     pub presence: UsagePresence,
     pub value: Option<T>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FailedResponseUsage {
     pub input_tokens: UsageObservation<u64>,
     pub output_tokens: UsageObservation<u64>,
@@ -141,6 +144,28 @@ impl FailedResponseMetadata {
     }
 }
 
+/// One failed submission of a logical Decisions request that the bounded
+/// transient retry ([`crate::TransientRetry`]) then repeated with identical
+/// bytes. It holds no request or response contents. The failed attempt keeps
+/// its status; its usage and cost stay as reported, or unknown when the
+/// provider reported none. An HTTP error body is not read, so the transient
+/// statuses that admit a retry always leave `reported_usage` unknown (`None`),
+/// never zero.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DecisionRetriedAttempt {
+    /// One-based submission ordinal within the logical request.
+    pub attempt: u32,
+    pub kind: DecisionFailureKind,
+    pub http_status: Option<u16>,
+    /// Provider-reported usage of this failed submission; `None` means unknown.
+    pub reported_usage: Option<FailedResponseUsage>,
+    /// Actual delay before the next submission: the jittered backoff, or a
+    /// longer honoured numeric `Retry-After`.
+    pub retry_wait_ms: u64,
+    /// Numeric `Retry-After` the provider returned for this attempt, if any.
+    pub retry_after_ms: Option<u64>,
+}
+
 /// This is an observation, not a model/cost/citation acceptance or a retry permit.
 /// Usage is independently checked numeric provider metadata from unique JSON; invalid
 /// answers remain rejected and reported cost does not establish a final bill.
@@ -155,6 +180,11 @@ pub struct DecisionFailureDiagnostic {
     /// Absent when no unique JSON response body was available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_metadata: Option<FailedResponseMetadata>,
+    /// Earlier failed submissions of this same logical request that the bounded
+    /// transient retry repeated, oldest first. The fields above describe the
+    /// final submission. Empty, and omitted, when no retry was made.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prior_attempts: Vec<DecisionRetriedAttempt>,
 }
 
 /// Downcast an unsuccessful client result to retain safe typed observations.
@@ -164,11 +194,18 @@ pub struct DecisionFailureDiagnostic {
 pub struct DecisionFailure {
     diagnostic: DecisionFailureDiagnostic,
     message: &'static str,
+    /// Numeric `Retry-After` of an HTTP status failure; never serialized.
+    retry_after: Option<Duration>,
 }
 
 impl DecisionFailure {
     pub fn diagnostic(&self) -> &DecisionFailureDiagnostic {
         &self.diagnostic
+    }
+
+    /// Numeric `Retry-After` returned with an HTTP status failure, if any.
+    pub fn retry_after(&self) -> Option<Duration> {
+        self.retry_after
     }
 
     pub(crate) fn transport(
@@ -201,13 +238,32 @@ impl DecisionFailure {
         Self::new(kind, message, status, bytes)
     }
 
-    pub(crate) fn http(status: u16) -> Self {
-        Self::new(
+    pub(crate) fn http(status: u16, retry_after: Option<Duration>) -> Self {
+        let mut failure = Self::new(
             DecisionFailureKind::HttpStatus,
             "Jev provider returned HTTP",
             Some(status),
             None,
+        );
+        failure.retry_after = retry_after;
+        failure
+    }
+
+    /// The bounded retry submission failed admission or stopped before its
+    /// HTTP send. The underlying admission error text is not retained.
+    pub(crate) fn retry_admission() -> Self {
+        Self::new(
+            DecisionFailureKind::RetryAdmission,
+            "Jev bounded retry was not admitted or sent; any reserved retry submission remains charged",
+            None,
+            None,
         )
+    }
+
+    /// Attach the failed earlier submissions that the bounded retry repeated.
+    pub(crate) fn with_prior_attempts(mut self, prior: Vec<DecisionRetriedAttempt>) -> Self {
+        self.diagnostic.prior_attempts = prior;
+        self
     }
 
     pub(crate) fn response_size(status: u16, bytes: Option<usize>) -> Self {
@@ -228,7 +284,7 @@ impl DecisionFailure {
         )
     }
 
-    fn new(
+    pub(crate) fn new(
         kind: DecisionFailureKind,
         message: &'static str,
         status: Option<u16>,
@@ -242,8 +298,10 @@ impl DecisionFailure {
                 validation_code: None,
                 reported_usage: None,
                 response_metadata: None,
+                prior_attempts: Vec::new(),
             },
             message,
+            retry_after: None,
         }
     }
 
@@ -347,8 +405,65 @@ impl DecisionFailure {
     }
 }
 
+impl DecisionFailure {
+    /// Short sanitized outcome of the final submission after a bounded retry.
+    fn retried_outcome(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let diagnostic = &self.diagnostic;
+        match diagnostic.kind {
+            DecisionFailureKind::HttpStatus => match diagnostic.http_status {
+                Some(status) => write!(f, "HTTP {status}"),
+                None => f.write_str("unavailable HTTP status"),
+            },
+            DecisionFailureKind::Timeout => f.write_str("request timed out, usage may be unknown"),
+            DecisionFailureKind::Deadline => f.write_str(
+                "admission or request deadline expired, any reserved submission remains charged and unknown",
+            ),
+            DecisionFailureKind::Connect | DecisionFailureKind::Transport => {
+                f.write_str("transport failed, usage may be unknown")
+            }
+            DecisionFailureKind::ResponseBody => {
+                f.write_str("response transport failed, usage may be unknown")
+            }
+            DecisionFailureKind::ResponseSize => f.write_str("response exceeded the byte limit"),
+            DecisionFailureKind::InvalidJson => {
+                f.write_str("response is invalid JSON or contains duplicate keys")
+            }
+            DecisionFailureKind::ResponseSchema | DecisionFailureKind::ResponseValidation => write!(
+                f,
+                "response failed validation ({})",
+                diagnostic.validation_code.unwrap_or("other_validation")
+            ),
+            DecisionFailureKind::RetryAdmission => f.write_str(
+                "not admitted or sent, any reserved retry submission remains charged",
+            ),
+        }
+    }
+}
+
 impl fmt::Display for DecisionFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !self.diagnostic.prior_attempts.is_empty() {
+            // One bounded transient retry was made; this failure is its outcome.
+            f.write_str("Jev request failed after one bounded retry (")?;
+            for prior in &self.diagnostic.prior_attempts {
+                match prior.http_status {
+                    Some(status) => write!(f, "attempt {}: HTTP {status}; ", prior.attempt)?,
+                    None => write!(f, "attempt {}: failed; ", prior.attempt)?,
+                }
+            }
+            write!(f, "attempt {}: ", self.diagnostic.prior_attempts.len() + 1)?;
+            self.retried_outcome(f)?;
+            let unknown = self
+                .diagnostic
+                .prior_attempts
+                .iter()
+                .any(|prior| prior.reported_usage.is_none());
+            return f.write_str(if unknown {
+                "); earlier failed attempt usage is unknown; no further retry"
+            } else {
+                "); no further retry"
+            });
+        }
         if self.diagnostic.kind == DecisionFailureKind::HttpStatus {
             match self.diagnostic.http_status {
                 Some(status) => write!(f, "{} {status}; request was not retried", self.message),

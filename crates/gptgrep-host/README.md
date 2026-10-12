@@ -24,11 +24,11 @@ Citations retain each delivered window's offset, continuation cursor, exact byte
 
 - `required: true` and `initial_status`;
 - `requests`: successful validated Jev responses;
-- `attempted_calls`: logical client calls, not proof that HTTP was transmitted;
+- `attempted_calls`: logical client calls, including a bounded transient retry, not proof that HTTP was transmitted;
 - `unobserved_attempts`: attempted calls without validated responses;
 - actual returned `models`, `usage`, `accounting_complete`, and per-search `searches`.
 
-Unknown usage and cost remain unavailable. Coverage is null until the core supplies an observed snapshot. Progress is cumulative within a search: accounting replaces the prior snapshot and aggregates once across distinct searches.
+Retrieval searches use a Jev client with the bounded transient retry: one retry of the identical request only after a received HTTP 429/500/502/503/504, within the original request deadline and the shared submission budget. The failed attempt appears in the search metrics' `jev_retried_attempts` with its HTTP status and null usage, counts as an attempted call, and keeps `accounting_complete: false`. Navigation scans and evidence-role decisions keep single submission. Unknown usage and cost remain unavailable. Coverage is null until the core supplies an observed snapshot. Progress is cumulative within a search: accounting replaces the prior snapshot and aggregates once across distinct searches.
 
 Before provider work, the host creates a private, create-new ledger under `.gptgrep/host-attempts/`. It rejects symlinks and path escapes. On Unix the directory is 0700 when created and files are 0600. This is a local metadata write; read-only mode describes source access and the Codex child, not an absence of runtime receipts. The JSONL ledger is limited to 4 MiB, 1024 events, and 64 KiB per event. Entries are synced before/after client calls and retain stage, hashes, scope, model/usage metadata and bounded receipt summaries—not source text, questions, credentials, or child stderr.
 

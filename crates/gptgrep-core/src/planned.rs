@@ -291,6 +291,9 @@ fn aggregate(operations: &[PlannedSearchEvent], started: Instant) -> Metrics {
             .jev_requested_models
             .extend(operation.metrics.jev_requested_models.clone());
         result.jev_usage.extend(operation.metrics.jev_usage.clone());
+        result
+            .jev_retried_attempts
+            .extend(operation.metrics.jev_retried_attempts.clone());
     }
     result
 }

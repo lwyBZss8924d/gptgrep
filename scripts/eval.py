@@ -41,13 +41,21 @@ def decode_json(raw: str) -> dict[str, Any]:
 
 
 def summarize_provider_cost(metric_samples: list[dict[str, Any]]) -> dict[str, Any]:
-    """Sum explicit per-request provider costs only when every request is matched."""
+    """Sum explicit per-request provider costs only when every request is matched.
+
+    An attempted call without a validated response, such as a failed submission
+    repeated by the bounded transient retry, has unknown cost: the total stays
+    unavailable rather than counting it as zero.
+    """
     requests = missing = extra = 0
     costs: list[Decimal] = []
     for metrics in metric_samples:
         count = metrics.get("jev_requests", 0)
         count = count if type(count) is int and count > 0 else int(metrics.get("jev_used") is True)
         requests += count
+        attempted = metrics.get("jev_calls_attempted")
+        if type(attempted) is int and attempted > count:
+            missing += attempted - count
         usage = metrics.get("jev_usage", [])
         usage = usage if isinstance(usage, list) else []
         extra += max(0, len(usage) - count)

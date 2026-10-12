@@ -1,6 +1,8 @@
 //! Bounded, typed access to OpenRouter's Jev Decisions API.
 //!
 //! No implicit retries, provider fallback, credential-file discovery, or text generation.
+//! A caller may opt a client into one bounded retry of transient provider HTTP
+//! statuses with [`TransientRetry`]; each attempt is a separate charged submission.
 //! See the crate README for the supported request contract and score normalization.
 
 mod clock;
@@ -19,8 +21,8 @@ pub use execution::{
     MAX_SUBMISSIONS, ReservationOutcomeCounts,
 };
 pub use failure::{
-    DecisionFailure, DecisionFailureDiagnostic, DecisionFailureKind, FailedResponseMetadata,
-    FailedResponseUsage, UsageObservation, UsagePresence,
+    DecisionFailure, DecisionFailureDiagnostic, DecisionFailureKind, DecisionRetriedAttempt,
+    FailedResponseMetadata, FailedResponseUsage, UsageObservation, UsagePresence,
 };
 pub use input::{
     DecisionInput, ImageEvidence, MAX_IMAGE_BASE64_BYTES, MAX_IMAGE_BYTES,
@@ -47,7 +49,13 @@ use reqwest::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, net::IpAddr, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    hash::{BuildHasher, Hasher},
+    net::IpAddr,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 pub const DEFAULT_MODEL: &str = "openai/gpt-6-luna-decisions";
 /// Explicit legacy text-only model. Never selected as fallback.
@@ -61,6 +69,15 @@ pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// Returned identifiers are retained verbatim only within this metadata bound.
 pub const MAX_PROVIDER_METADATA_BYTES: usize = 256;
+/// Received HTTP statuses that admit the bounded transient retry. No other
+/// status, transport, timeout, body or validation failure is ever retried.
+pub const TRANSIENT_RETRY_STATUSES: [u16; 5] = [429, 500, 502, 503, 504];
+/// Jittered backoff range before the single transient retry.
+pub const RETRY_BACKOFF_MIN: Duration = Duration::from_millis(250);
+pub const RETRY_BACKOFF_MAX: Duration = Duration::from_millis(1000);
+/// Time the original request deadline must still leave for the retry
+/// submission itself, after its backoff or honoured `Retry-After` wait.
+pub const RETRY_MIN_ATTEMPT_TIME: Duration = Duration::from_secs(2);
 
 const RELEVANCE_LEVELS: [&str; 4] = [
     "Unrelated or contains no useful evidence for the query.",
@@ -96,6 +113,10 @@ pub struct RerankResponse {
     pub provider_response_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// Failed earlier submissions of this request that the bounded transient
+    /// retry repeated; `usage` belongs only to the final validated response.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retried_attempts: Vec<DecisionRetriedAttempt>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -132,6 +153,93 @@ pub struct DecisionResponse {
     pub id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// Failed earlier submissions that the bounded transient retry repeated.
+    /// Set only by this client, never from a provider body.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Vec::is_empty")]
+    pub retried_attempts: Vec<DecisionRetriedAttempt>,
+}
+
+/// Opt-in bounded retry for transient Decisions provider failures.
+///
+/// At most one retry of the identical prepared request is made, and only after
+/// an HTTP response with a status in [`TRANSIENT_RETRY_STATUSES`] was received.
+/// Timeouts, connection and mid-body transport errors, response size, parse or
+/// validation failures and every other status are never retried, because the
+/// provider may have completed the request or the failure is not transient.
+/// The wait is a jittered backoff in [`RETRY_BACKOFF_MIN`]..=[`RETRY_BACKOFF_MAX`]
+/// or a longer numeric `Retry-After` (delta-seconds); other `Retry-After` forms
+/// are ignored. The retry is refused unless the original request deadline still
+/// leaves the wait plus [`RETRY_MIN_ATTEMPT_TIME`]; that deadline is never renewed.
+/// Each attempt is a separate reservation in the client's execution context, and
+/// no retry is made when that context has no submission left. The failed attempt
+/// is reported in `retried_attempts` or the final failure's `prior_attempts`.
+#[derive(Clone)]
+pub struct TransientRetry {
+    jitter: Arc<dyn Fn() -> f64 + Send + Sync>,
+}
+
+impl TransientRetry {
+    /// The bounded policy with process-random jitter.
+    pub fn standard() -> Self {
+        Self {
+            jitter: Arc::new(random_unit),
+        }
+    }
+
+    /// The same policy with an injected jitter source. Each value is clamped to
+    /// 0..=1 (a non-finite value counts as 0) and scales the backoff range.
+    pub fn with_jitter(jitter: impl Fn() -> f64 + Send + Sync + 'static) -> Self {
+        Self {
+            jitter: Arc::new(jitter),
+        }
+    }
+
+    /// One jittered backoff in `RETRY_BACKOFF_MIN..=RETRY_BACKOFF_MAX`.
+    pub fn backoff(&self) -> Duration {
+        let unit = (self.jitter)();
+        let unit = if unit.is_finite() {
+            unit.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        RETRY_BACKOFF_MIN + (RETRY_BACKOFF_MAX - RETRY_BACKOFF_MIN).mul_f64(unit)
+    }
+}
+
+impl std::fmt::Debug for TransientRetry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TransientRetry")
+            .field("max_retries", &1)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Uniform jitter in 0..1 from the standard library's randomly keyed hasher.
+fn random_unit() -> f64 {
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u128(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    );
+    (hasher.finish() >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// A single numeric (delta-seconds) `Retry-After`; absent, repeated, HTTP-date
+/// or malformed values are ignored.
+fn numeric_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let mut values = headers.get_all(reqwest::header::RETRY_AFTER).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    let text = value.to_str().ok()?.trim();
+    if text.is_empty() || text.len() > 10 || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok().map(Duration::from_secs)
 }
 
 /// Metadata derived from the exact bytes handed to the HTTP request builder.
@@ -180,6 +288,7 @@ pub struct JevClient {
     identity: Arc<()>,
     execution: ExecutionContext,
     observer: Option<Arc<dyn DecisionObserver>>,
+    retry: Option<TransientRetry>,
 }
 
 /// One exact validated Decisions request prepared before budget/network admission.
@@ -312,6 +421,7 @@ impl JevClient {
             identity: Arc::new(()),
             execution: ExecutionContext::compatibility(),
             observer: None,
+            retry: None,
         })
     }
 
@@ -339,6 +449,26 @@ impl JevClient {
         self.observer = Some(observer);
         self.identity = Arc::new(());
         self
+    }
+
+    /// Opt this client into the bounded transient retry (see [`TransientRetry`]).
+    /// The policy changes no prepared bytes, model, endpoint or budget binding.
+    /// Without it, every submission is sent exactly once.
+    pub fn with_transient_retry(mut self, retry: TransientRetry) -> Self {
+        self.retry = Some(retry);
+        self
+    }
+
+    /// Restore exact single-submission behavior for callers that own another
+    /// retry or budget contract.
+    pub fn without_transient_retry(mut self) -> Self {
+        self.retry = None;
+        self
+    }
+
+    /// The attached bounded transient retry policy, if any.
+    pub fn transient_retry(&self) -> Option<&TransientRetry> {
+        self.retry.as_ref()
     }
 
     /// Evaluate a bounded set of independent typed questions.
@@ -378,20 +508,45 @@ impl JevClient {
         }
     }
 
-    /// Send exactly the prepared request once and validate the typed response.
+    /// Send the prepared request and validate the typed response. It is sent
+    /// once, or at most twice under an attached [`TransientRetry`].
     pub async fn submit_prepared(&self, prepared: PreparedDecision) -> Result<DecisionResponse> {
+        self.submit_prepared_with(prepared, self.retry.as_ref())
+            .await
+    }
+
+    /// Exactly one submission, regardless of any attached retry policy.
+    pub(crate) async fn submit_prepared_once(
+        &self,
+        prepared: PreparedDecision,
+    ) -> Result<DecisionResponse> {
+        self.submit_prepared_with(prepared, None).await
+    }
+
+    async fn submit_prepared_with(
+        &self,
+        prepared: PreparedDecision,
+        retry: Option<&TransientRetry>,
+    ) -> Result<DecisionResponse> {
         ensure!(
             prepared.requested_model == self.model
                 && prepared.endpoint == self.endpoint
                 && Arc::ptr_eq(&prepared.identity, &self.identity),
             "Prepared Jev decision belongs to a different client, model or endpoint"
         );
-        self.decide_body(prepared.body, &prepared.questions).await
+        self.decide_body(prepared.body, &prepared.questions, retry)
+            .await
     }
 
-    async fn decide_body(&self, body: Vec<u8>, questions: &Value) -> Result<DecisionResponse> {
+    async fn decide_body(
+        &self,
+        body: Vec<u8>,
+        questions: &Value,
+        retry: Option<&TransientRetry>,
+    ) -> Result<DecisionResponse> {
         // Capture before sampling: suspension while checking the original/local
         // clocks must shorten this request, never renew its remaining lifetime.
+        // A bounded retry shares this same absolute deadline.
         let captured = tokio::time::Instant::now();
         let remaining = self.execution.remaining()?;
         let deadline = captured + remaining;
@@ -403,68 +558,68 @@ impl JevClient {
             question_count: questions.as_object().map_or(0, |questions| questions.len()),
         };
         let mut observer_started = false;
+        let mut prior: Vec<DecisionRetriedAttempt> = Vec::new();
         let submitted = async {
-            self.execution.observe_submission().await?;
-            let mut reservation = self.execution.reserve(&digest, &self.model).await?;
-            ensure!(
-                tokio::time::Instant::now() < deadline,
-                "Jev admission deadline expired before send; reserved submission remains charged"
-            );
-            reservation.send_started().await?;
-            ensure!(
-                tokio::time::Instant::now() < deadline,
-                "Jev request deadline expired before send; reserved submission remains charged"
-            );
-            if let Some(observer) = &self.observer {
-                observer_started = true;
-                observer.send_started_with_body(&observation, &body)?;
-                ensure!(
-                    tokio::time::Instant::now() < deadline,
-                    "Jev request deadline expired during send admission; reservation remains charged"
-                );
-            }
-            let mut response = self
-                .http
-                .post(self.endpoint.clone())
-                .header(AUTHORIZATION, self.authorization.clone())
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(body)
-                .send()
+            // Only a retrying client keeps a second copy of the exact bytes.
+            let (first_body, retry_body) = if retry.is_some() {
+                (body.clone(), Some(body))
+            } else {
+                (body, None)
+            };
+            let error = match self
+                .submit_once(
+                    first_body,
+                    questions,
+                    &digest,
+                    &observation,
+                    deadline,
+                    &mut observer_started,
+                )
                 .await
-                .map_err(|error| DecisionFailure::transport(&error, false, None, None))?;
-            let status = response.status().as_u16();
-            if !response.status().is_success() {
-                reservation.terminal().await?;
-                return Err(DecisionFailure::http(status).into());
-            }
-            if response
-                .content_length()
-                .is_some_and(|len| len > MAX_RESPONSE_BYTES as u64)
             {
-                return Err(DecisionFailure::response_size(status, None).into());
+                Ok(response) => return Ok(response),
+                Err(error) => error,
+            };
+            let Some(retry_body) = retry_body else {
+                return Err(error);
+            };
+            let Some((wait, retry_after)) = self.retry_wait(retry, &error, deadline).await else {
+                return Err(error);
+            };
+            let Some(failure) = error.downcast_ref::<DecisionFailure>() else {
+                return Err(error);
+            };
+            let diagnostic = failure.diagnostic();
+            let failed = DecisionRetriedAttempt {
+                attempt: 1,
+                kind: diagnostic.kind,
+                http_status: diagnostic.http_status,
+                reported_usage: diagnostic.reported_usage.clone(),
+                retry_wait_ms: u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+                retry_after_ms: retry_after
+                    .map(|after| u64::try_from(after.as_millis()).unwrap_or(u64::MAX)),
+            };
+            // The failed submission's observer sees its own terminal callback
+            // before the separately admitted retry starts.
+            if std::mem::take(&mut observer_started)
+                && let Some(observer) = &self.observer
+            {
+                observer.failed(&observation)?;
             }
-            let mut bytes = Vec::new();
-            while let Some(chunk) = response.chunk().await.map_err(|error| {
-                DecisionFailure::transport(&error, true, Some(status), Some(bytes.len()))
-            })? {
-                if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
-                    return Err(DecisionFailure::response_size(status, Some(bytes.len())).into());
-                }
-                bytes.extend_from_slice(&chunk);
-            }
-            let result =
-                validation::response_for_model(&bytes, questions, &self.model).map_err(|error| {
-                    if let Some(failure) = error.downcast_ref::<DecisionFailure>() {
-                        failure.clone().with_response(status, bytes.len()).into()
-                    } else {
-                        error
-                    }
-                });
-            reservation.terminal().await?;
-            if let (Some(observer), Ok(response)) = (&self.observer, &result) {
-                observer.validated_response(&observation, response)?;
-            }
-            result
+            prior.push(failed);
+            tokio::time::sleep(wait).await;
+            let mut response = self
+                .submit_once(
+                    retry_body,
+                    questions,
+                    &digest,
+                    &observation,
+                    deadline,
+                    &mut observer_started,
+                )
+                .await?;
+            response.retried_attempts = prior.clone();
+            Ok(response)
         };
         let result = match tokio::time::timeout_at(deadline, submitted).await {
             Ok(result) => result,
@@ -475,6 +630,124 @@ impl JevClient {
             && let Some(observer) = &self.observer
         {
             observer.failed(&observation)?;
+        }
+        match result {
+            Err(error) if !prior.is_empty() => {
+                // A failure after the retry keeps the earlier attempt. An
+                // admission error of the retry is reduced to a fixed kind.
+                let failure = error
+                    .downcast::<DecisionFailure>()
+                    .unwrap_or_else(|_| DecisionFailure::retry_admission());
+                Err(failure.with_prior_attempts(prior).into())
+            }
+            result => result,
+        }
+    }
+
+    /// Admit the bounded retry of one failed submission, returning its wait and
+    /// the honoured numeric `Retry-After`, or `None` for no retry.
+    async fn retry_wait(
+        &self,
+        retry: Option<&TransientRetry>,
+        error: &anyhow::Error,
+        deadline: tokio::time::Instant,
+    ) -> Option<(Duration, Option<Duration>)> {
+        let retry = retry?;
+        let failure = error.downcast_ref::<DecisionFailure>()?;
+        let diagnostic = failure.diagnostic();
+        if diagnostic.kind != DecisionFailureKind::HttpStatus
+            || !diagnostic
+                .http_status
+                .is_some_and(|status| TRANSIENT_RETRY_STATUSES.contains(&status))
+        {
+            return None;
+        }
+        let backoff = retry.backoff();
+        let retry_after = failure.retry_after();
+        let wait = retry_after.map_or(backoff, |after| after.max(backoff));
+        // Never renew the original deadline: the wait and a minimum useful
+        // attempt must both fit inside it, or the original failure is returned.
+        let left = deadline.checked_duration_since(tokio::time::Instant::now())?;
+        if left < wait.checked_add(RETRY_MIN_ATTEMPT_TIME)? {
+            return None;
+        }
+        // The retry is a separate charged submission; never exceed the budget.
+        self.execution
+            .submission_available()
+            .await
+            .then_some((wait, retry_after))
+    }
+
+    /// One reserved, admitted and validated submission of the exact body.
+    async fn submit_once(
+        &self,
+        body: Vec<u8>,
+        questions: &Value,
+        digest: &str,
+        observation: &DecisionRequestObservation<'_>,
+        deadline: tokio::time::Instant,
+        observer_started: &mut bool,
+    ) -> Result<DecisionResponse> {
+        self.execution.observe_submission().await?;
+        let mut reservation = self.execution.reserve(digest, &self.model).await?;
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "Jev admission deadline expired before send; reserved submission remains charged"
+        );
+        reservation.send_started().await?;
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "Jev request deadline expired before send; reserved submission remains charged"
+        );
+        if let Some(observer) = &self.observer {
+            *observer_started = true;
+            observer.send_started_with_body(observation, &body)?;
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "Jev request deadline expired during send admission; reservation remains charged"
+            );
+        }
+        let mut response = self
+            .http
+            .post(self.endpoint.clone())
+            .header(AUTHORIZATION, self.authorization.clone())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await
+            .map_err(|error| DecisionFailure::transport(&error, false, None, None))?;
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let retry_after = numeric_retry_after(response.headers());
+            reservation.terminal().await?;
+            return Err(DecisionFailure::http(status, retry_after).into());
+        }
+        if response
+            .content_length()
+            .is_some_and(|len| len > MAX_RESPONSE_BYTES as u64)
+        {
+            return Err(DecisionFailure::response_size(status, None).into());
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            DecisionFailure::transport(&error, true, Some(status), Some(bytes.len()))
+        })? {
+            if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+                return Err(DecisionFailure::response_size(status, Some(bytes.len())).into());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let result =
+            validation::response_for_model(&bytes, questions, &self.model).map_err(|error| {
+                if let Some(failure) = error.downcast_ref::<DecisionFailure>() {
+                    failure.clone().with_response(status, bytes.len()).into()
+                } else {
+                    error
+                }
+            });
+        reservation.terminal().await?;
+        if let (Some(observer), Ok(response)) = (&self.observer, &result) {
+            observer.validated_response(observation, response)?;
         }
         result
     }
@@ -491,7 +764,8 @@ impl JevClient {
         })
     }
 
-    /// Submit one exact prepared relevance request without retries or fallback.
+    /// Submit one exact prepared relevance request without fallback. It is
+    /// sent once, or at most twice under an attached [`TransientRetry`].
     pub async fn submit_rerank(&self, prepared: PreparedRerank) -> Result<RerankResponse> {
         let result = self.submit_prepared(prepared.request).await?;
         let mut rankings = Vec::with_capacity(prepared.ids.len());
@@ -520,6 +794,7 @@ impl JevClient {
             usage: result.usage,
             provider_response_id: result.id,
             provider: result.provider,
+            retried_attempts: result.retried_attempts,
         })
     }
 
@@ -749,6 +1024,101 @@ mod tests {
         }];
         let (state, questions) = rerank_questions("query", &candidates).unwrap();
         assert!(client.request_body(state, &questions).is_err());
+    }
+
+    #[test]
+    fn only_one_numeric_retry_after_is_honoured() {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+        let parse = |values: &[&str]| {
+            let mut headers = HeaderMap::new();
+            for value in values {
+                headers.append(RETRY_AFTER, HeaderValue::from_str(value).unwrap());
+            }
+            numeric_retry_after(&headers)
+        };
+        assert_eq!(parse(&["1"]), Some(Duration::from_secs(1)));
+        assert_eq!(parse(&["0"]), Some(Duration::ZERO));
+        assert_eq!(parse(&["17 "]), Some(Duration::from_secs(17)));
+        for ignored in [
+            &[][..],
+            &["Wed, 21 Oct 2015 07:28:00 GMT"],
+            &["-1"],
+            &["1.5"],
+            &["2", "2"],
+            &["12345678901"],
+            &[""],
+        ] {
+            assert_eq!(parse(ignored), None, "{ignored:?}");
+        }
+    }
+
+    async fn admitted(
+        client: &JevClient,
+        error: anyhow::Error,
+        policy: Option<&TransientRetry>,
+        deadline: tokio::time::Instant,
+    ) -> Option<(Duration, Option<Duration>)> {
+        client.retry_wait(policy, &error, deadline).await
+    }
+
+    #[tokio::test]
+    async fn only_received_transient_statuses_admit_a_retry() {
+        let client =
+            JevClient::with_endpoint("ordinary-fixture", None, "http://127.0.0.1:9/decisions")
+                .unwrap();
+        let retry = TransientRetry::with_jitter(|| 0.0);
+        let far = tokio::time::Instant::now() + Duration::from_secs(20);
+        for status in TRANSIENT_RETRY_STATUSES {
+            let error = DecisionFailure::http(status, None).into();
+            let wait = admitted(&client, error, Some(&retry), far).await;
+            assert_eq!(wait, Some((RETRY_BACKOFF_MIN, None)), "{status}");
+            // Without the policy nothing is ever retried.
+            let error = DecisionFailure::http(status, None).into();
+            assert!(admitted(&client, error, None, far).await.is_none());
+        }
+        for status in [400, 401, 403, 404, 408, 409, 413, 422, 501, 505] {
+            let error = DecisionFailure::http(status, None).into();
+            assert!(
+                admitted(&client, error, Some(&retry), far).await.is_none(),
+                "{status}"
+            );
+        }
+        for kind in [
+            DecisionFailureKind::Timeout,
+            DecisionFailureKind::Deadline,
+            DecisionFailureKind::Connect,
+            DecisionFailureKind::Transport,
+            DecisionFailureKind::ResponseBody,
+            DecisionFailureKind::ResponseSize,
+            DecisionFailureKind::InvalidJson,
+            DecisionFailureKind::ResponseSchema,
+            DecisionFailureKind::ResponseValidation,
+            DecisionFailureKind::RetryAdmission,
+        ] {
+            let failure = DecisionFailure::new(kind, "synthetic", Some(502), None);
+            assert!(
+                admitted(&client, failure.into(), Some(&retry), far)
+                    .await
+                    .is_none(),
+                "{kind:?}"
+            );
+        }
+        let budget = anyhow!("Decisions submission budget exhausted");
+        assert!(admitted(&client, budget, Some(&retry), far).await.is_none());
+        // A numeric Retry-After longer than the backoff sets the wait.
+        let slow = DecisionFailure::http(503, Some(Duration::from_secs(3))).into();
+        assert_eq!(
+            admitted(&client, slow, Some(&retry), far).await,
+            Some((Duration::from_secs(3), Some(Duration::from_secs(3))))
+        );
+        // A wait that cannot leave the minimum attempt time is refused.
+        let near = tokio::time::Instant::now() + Duration::from_millis(2100);
+        assert!(
+            client
+                .retry_wait(Some(&retry), &DecisionFailure::http(502, None).into(), near)
+                .await
+                .is_none()
+        );
     }
 
     #[test]

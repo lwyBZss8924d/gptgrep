@@ -845,6 +845,9 @@ fn plan_metrics(operations: &BTreeMap<String, PlannedSearchEvent>, elapsed_ms: u
         metrics
             .jev_usage
             .extend(operation.metrics.jev_usage.iter().cloned());
+        metrics
+            .jev_retried_attempts
+            .extend(operation.metrics.jev_retried_attempts.iter().cloned());
     }
     metrics
 }

@@ -315,6 +315,51 @@ async fn initial_jev_pass_is_query_bound_scoped_and_delivered_to_codex() {
 }
 
 #[tokio::test]
+async fn initial_pass_retries_one_transient_status_and_keeps_its_unknown_cost() {
+    let root = corpus().await;
+    // Unscoped two-document corpus: routing, a 502 rerank, then its retry.
+    let (client, server, requests) = mock_jev(vec![(200, 3.0), (502, 0.0), (200, 3.0)]).await;
+    let client = client.with_transient_retry(gptgrep_jev::TransientRetry::with_jitter(|| 0.0));
+    let mut evidence = Evidence::open(root.path(), None).unwrap();
+    let accounting = Accounting::create(root.path(), &evidence.generation).unwrap();
+    evidence
+        .configure(&HostConfig::default(), accounting.clone(), Some(client))
+        .unwrap();
+    evidence
+        .bootstrap("Which transformation removes blank records before assembly?")
+        .await
+        .unwrap();
+    let bodies = server.await.unwrap();
+    assert_eq!(requests.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        bodies[1], bodies[2],
+        "the retry repeats the identical rerank"
+    );
+    assert!(
+        !evidence.initial_payload.as_ref().unwrap()["hits"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let summary = accounting.summary();
+    assert_eq!(summary.initial_status, "reranked");
+    assert_eq!(summary.requests, 2);
+    assert_eq!(summary.attempted_calls, 3);
+    assert_eq!(summary.unobserved_attempts, 1);
+    // Only validated replies carry cost; the failed attempt keeps unknown cost.
+    assert_eq!(summary.usage.len(), 2);
+    assert!(!summary.accounting_complete);
+    let retried = &summary.searches[0].metrics.jev_retried_attempts;
+    assert_eq!(retried.len(), 1);
+    assert_eq!(retried[0].stage, "evidence_reranking");
+    assert_eq!(retried[0].attempt.http_status, Some(502));
+    assert!(retried[0].attempt.reported_usage.is_none());
+    let ledger = std::fs::read_to_string(accounting.path()).unwrap();
+    assert!(ledger.contains("jev_retried_attempts"));
+    assert!(!ledger.contains("private-provider-body-sentinel"));
+}
+
+#[tokio::test]
 async fn partial_rerank_failure_preserves_routing_usage_in_typed_error_and_ledger() {
     let root = corpus().await;
     let (client, server, _) = mock_jev(vec![(200, 3.0), (503, 0.0)]).await;

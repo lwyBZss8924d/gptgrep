@@ -183,7 +183,10 @@ Jev uses OpenRouter's typed **Decisions API**, not chat completions. It supplies
 dynamic Choice/Noul/Score judgments; application code retains parsing, offsets,
 arithmetic and workflow execution. The response records the actual returned
 model, available usage and cost. Unknown metrics remain null. Network/schema
-errors are explicit; there is no silent fallback, redirect or automatic retry.
+errors are explicit; there is no silent fallback or redirect. Default retrieval
+routing/reranking retries a received HTTP 429/500/502/503/504 at most once,
+inside the original request deadline and submission budget; the failed attempt
+stays reported with unknown cost. Timeouts and other failures are not retried.
 
 Hybrid search combines lexical candidates with semantically routed tree nodes.
 The initial policy routes at most 32 document descriptions and reranks at most

@@ -206,6 +206,7 @@ impl Backend for Mock {
             usage: json!({"prompt_tokens":11,"completion_tokens":2,"total_tokens":13,"private":"not-retained"}),
             id: Some(format!("synthetic-jev-{ordinal}")),
             provider: Some("synthetic-provider".into()),
+            retried_attempts: Vec::new(),
         })
     }
 }

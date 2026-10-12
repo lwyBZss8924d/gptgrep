@@ -45,7 +45,11 @@ the original invocation's shared admission.
   regex matches after filtering, including patterns that cannot use trigrams.
 - Use Jev through its typed Decisions API for semantic document routing and
   candidate reranking. Default search, ask and summarize require this stage and
-  fail explicitly if its credentials or service are unavailable. Explicit regex
+  fail explicitly if its credentials or service are unavailable. A received
+  transient HTTP 429, 500, 502, 503 or 504 admits at most one retry of the
+  identical request within the original request deadline and submission budget;
+  both attempts are reported, and the failed attempt's unknown cost is never
+  counted as zero. Explicit regex
   and lexical primitives remain available locally for exact inspection and
   controlled ablations; they do not constitute the complete GPTgrep workflow.
 - Keep exact, lexical and model-assisted results distinguishable. Report budgets,

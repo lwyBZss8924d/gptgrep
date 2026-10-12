@@ -357,6 +357,42 @@ async fn navigation_partial_failure_unknown_ids_and_timeout_retain_observed_usag
 }
 
 #[tokio::test]
+async fn navigation_scan_keeps_single_submission_under_retrying_retrieval_client() -> Result<()> {
+    let (root, navigation) = fixture(vec![TARGET.into()]).await?;
+    // A retry would receive the default successful reply and complete the scan.
+    let server = server(vec![Reply::Failure], false).await?;
+    let accounting = accounting(root.path())?;
+    let mut evidence = Evidence::open(root.path(), None)?;
+    let config = HostConfig {
+        document: Some("notes.txt".into()),
+        query_plan: Some(QueryPlanConfig::default()),
+        navigation: Some(navigation.clone()),
+        ..Default::default()
+    };
+    let client = server
+        .client
+        .clone()
+        .with_transient_retry(gptgrep_jev::TransientRetry::with_jitter(|| 0.0));
+    evidence.configure(&config, accounting.clone(), Some(client))?;
+    assert!(
+        evidence
+            .prepare_navigation(
+                QUESTION,
+                &navigation,
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            )
+            .await
+            .is_err()
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(server.requests.lock().unwrap().len(), 1);
+    let report = accounting.navigation().unwrap();
+    assert_eq!(report.status, "failed");
+    assert_eq!(report.attempted_calls, 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn navigation_empty_scan_still_requires_and_executes_initial_jev_search() -> Result<()> {
     let (root, navigation) = fixture(vec![]).await?;
     let server = server(vec![], false).await?;
