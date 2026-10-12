@@ -200,6 +200,50 @@ class BindingTests(unittest.TestCase):
         self.assertNotIn("child_started_at", receipt["timings"])
         support.observe("lease_binding_mismatch_refused", reason=receipt["refusal"]["reason"])
 
+    def test_concurrent_first_commands_bind_once(self):
+        """Several first commands at once (shared consumers on a fresh auth source): the marker is
+        created whole and once, and no command finds it half-written (`lease_binding_unreadable`,
+        seen once in the qualification with four shared official-binary consumers)."""
+        self.env.reconfigure(allow_shared_consumers=True)
+        for round_index in range(3):
+            if round_index:
+                self.env.binding().unlink()  # a fresh auth source again (fake drill)
+            procs = [self.env.popen("run", "--role", "dev", "--run-id", "first-%d-%d" % (round_index, i), "--lease",
+                                    "shared", *probe("exit", 0)) for i in range(8)]
+            receipts = [support.last_json(p.communicate(timeout=120)[0]) for p in procs]
+            with self.subTest(round=round_index):
+                self.assertEqual([r["state"] for r in receipts], ["PASS"] * 8, [r.get("refusal") for r in receipts])
+                self.assertEqual(sum(1 for r in receipts if r["lease"]["binding"]["created"]), 1)
+                self.assertEqual(json.loads(self.env.binding().read_text())["lease_path"], str(self.env.lease_path))
+        self.assertEqual([p.name for p in self.env.credential.home.iterdir() if ".tmp-" in p.name], [])
+        support.observe("concurrent_first_binding", rounds=3, consumers=8)
+
+    def test_a_marker_still_being_written_is_awaited_and_an_empty_one_refused(self):
+        """A marker written in place (supervisors before 1.3.0) exists empty for a moment: a reader
+        waits for its content; one that stays empty is refused once the wait is over."""
+        fd = os.open(self.env.lease_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(fd)
+        info = os.stat(self.env.lease_path)
+        record = {"schema": sup.BINDING_SCHEMA, "auth_source_id": "fake", "lease_path": str(self.env.lease_path),
+                  "lease_dev": info.st_dev, "lease_ino": info.st_ino, "bound_at": "2026-10-12T00:00:00.000+00:00"}
+        fd = os.open(self.env.binding(), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)  # created, not yet written
+        proc = self.env.popen("run", "--role", "dev", "--run-id", "late-writer", *probe("exit", 0))
+        time.sleep(0.5)
+        os.write(fd, json.dumps(record).encode())
+        os.close(fd)
+        out, _ = proc.communicate(timeout=60)
+        receipt = support.last_json(out)
+        self.assertEqual((receipt["state"], receipt["lease"]["binding"]["created"]), ("PASS", False))
+        self.env.binding().unlink()
+        fd = os.open(self.env.binding(), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(fd)
+        start = time.monotonic()
+        code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "empty-marker", *probe("exit", 0))
+        self.assertEqual((code, receipt["refusal"]["reason"]), (sup.EXIT_USAGE, "lease_binding_unreadable"))
+        self.assertGreaterEqual(time.monotonic() - start, sup.BINDING_SETTLE_SECONDS)
+        self.assertNotIn("child_started_at", receipt["timings"])
+        support.observe("binding_marker_being_written", awaited=True, empty_refused=True)
+
     def test_deleted_lease_file_cannot_split_the_lock(self):
         ready = self.env.root / "ready-split"
         holder = self.env.popen("run", "--role", "dev", "--run-id", "split-hold",

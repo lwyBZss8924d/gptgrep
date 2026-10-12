@@ -70,6 +70,8 @@ AUTH_FAILURE_CLASSES = ("AUTH_UNAUTHORIZED", "AUTH_NOT_LOGGED_IN", "AUTH_UNEXPEC
                         "AUTH_REFRESH_REJECTED")
 AUTH_FAILURE_RECORD_MAX_BYTES = 4096
 CREDENTIAL_LINK_REPORT_LIMIT = 32
+# How long a binding marker that another first command is still writing is awaited.
+BINDING_SETTLE_SECONDS = 2.0
 
 EXIT_PASS = 0
 EXIT_USAGE = 64
@@ -275,6 +277,19 @@ def write_new_private(path, data):
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     with os.fdopen(fd, "wb") as handle:
         handle.write(data if isinstance(data, bytes) else data.encode())
+
+
+def write_new_private_atomic(path, data):
+    """Create `path` with its whole content at once, or raise FileExistsError: the data
+    goes to a private temporary file next to it, which is then hard-linked into place
+    (link never replaces an existing file). A concurrent reader sees no file or all of it."""
+    path = Path(path)
+    temp = path.with_name("." + path.name + ".tmp-" + str(os.getpid()) + "-" + str(threading.get_ident()))
+    write_new_private(temp, data)
+    try:
+        os.link(temp, path)
+    finally:
+        os.unlink(temp)
 
 
 def write_json_atomic(path, value):
@@ -972,8 +987,24 @@ def probe_lease(cfg):
 
 # --------------------------------------------------------------------------- lease binding
 
-def read_binding(cfg):
-    """The non-secret marker in the canonical auth home that names its one lease file."""
+def read_binding(cfg, settle_seconds=BINDING_SETTLE_SECONDS):
+    """The non-secret marker in the canonical auth home that names its one lease file.
+
+    Several first commands can bind at once. This supervisor creates the marker whole
+    (write_new_private_atomic), but one written in place (supervisors before 1.3.0) is
+    briefly empty or partial: an unreadable marker is read again for `settle_seconds`
+    before it counts as unreadable."""
+    deadline = time.monotonic() + settle_seconds
+    while True:
+        try:
+            return _read_binding_once(cfg)
+        except SupervisorError as exc:
+            if exc.reason != "lease_binding_unreadable" or time.monotonic() >= deadline:
+                raise
+        time.sleep(0.05)
+
+
+def _read_binding_once(cfg):
     try:
         info = os.lstat(cfg.binding_path)
     except FileNotFoundError:
@@ -1017,7 +1048,7 @@ def bind_or_verify(cfg, lease_fd, binding):
         canonical_home_check(cfg)
         record = _binding_record(cfg, lease_fd)
         try:
-            write_new_private(cfg.binding_path, json.dumps(record, indent=2, sort_keys=True) + "\n")
+            write_new_private_atomic(cfg.binding_path, json.dumps(record, indent=2, sort_keys=True) + "\n")
             binding, created = record, True
         except FileExistsError:
             binding = read_binding(cfg)
@@ -3210,7 +3241,7 @@ def command_rebind_lease(cfg, args):
             receipt["archived_binding"] = str(Path(str(cfg.binding_path) + ".replaced-" + utc_stamp()))
             os.rename(cfg.binding_path, receipt["archived_binding"])
         record = _binding_record(cfg, lease.fd)
-        write_new_private(cfg.binding_path, json.dumps(record, indent=2, sort_keys=True) + "\n")
+        write_new_private_atomic(cfg.binding_path, json.dumps(record, indent=2, sort_keys=True) + "\n")
         receipt["binding_after"] = record
         receipt["reason"] = redact(reason, 400)
         ledger(cfg, {"run_id": args.run_id, "decision": "LEASE_REBOUND", "reason": redact(reason, 400),

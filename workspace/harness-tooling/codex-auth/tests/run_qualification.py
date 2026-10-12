@@ -245,7 +245,8 @@ def inner(args):
                          "hard links and symlinks to the credential in run directories (preflight link count, "
                          "post-run and guardian scans)", "account-probe protected outputs",
                          "exit 77 counts only with the auth-failure record",
-                         "real-binary tests refuse without a verified guard"],
+                         "real-binary tests refuse without a verified guard",
+                         "concurrent first commands bind the auth source once"],
                "limitations": ["Fake credentials and loopback fakes only: no real token authority, ChatGPT backend "
                                "or model was contacted; live behaviour remains unqualified.",
                                "Process-tree tracking cannot see a daemon that escapes between samples, closes "
