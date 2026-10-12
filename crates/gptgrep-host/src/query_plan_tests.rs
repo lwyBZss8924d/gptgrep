@@ -211,10 +211,33 @@ pub(crate) async fn mock_jev(plan: Vec<u16>) -> (JevClient, tokio::task::JoinHan
     (client, server)
 }
 
+/// `mock_jev` that holds its last reply until `release`, so whatever the caller
+/// does after its final Decisions call starts no earlier than that instant,
+/// however fast the earlier work ran. The hold must stay below the client's
+/// `gptgrep_jev::REQUEST_TIMEOUT`.
+pub(crate) async fn mock_jev_with_last_reply_at(
+    plan: Vec<u16>,
+    release: tokio::time::Instant,
+) -> (JevClient, tokio::task::JoinHandle<Vec<Value>>) {
+    let (client, server, _) = serve_mock_jev(plan, Some(release)).await;
+    (client, server)
+}
+
 /// `mock_jev` that also reports when the first deliberately hanging (status 0)
 /// request has been read completely, i.e. when that call is provably in flight.
 pub(crate) async fn mock_jev_with_hang_signal(
     plan: Vec<u16>,
+) -> (
+    JevClient,
+    tokio::task::JoinHandle<Vec<Value>>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
+    serve_mock_jev(plan, None).await
+}
+
+async fn serve_mock_jev(
+    plan: Vec<u16>,
+    last_reply_at: Option<tokio::time::Instant>,
 ) -> (
     JevClient,
     tokio::task::JoinHandle<Vec<Value>>,
@@ -234,6 +257,7 @@ pub(crate) async fn mock_jev_with_hang_signal(
     let server = tokio::spawn(async move {
         let mut hung = Some(hung);
         let mut requests = vec![];
+        let last = plan.len().checked_sub(1);
         for (ordinal, status) in plan.into_iter().enumerate() {
             // Only bounds a connection that never arrives. Integrated callers reach
             // their first Decisions call after a full planner turn, which can take
@@ -273,6 +297,11 @@ pub(crate) async fn mock_jev_with_hang_signal(
             }
             if status != 200 {
                 tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+            if Some(ordinal) == last
+                && let Some(release) = last_reply_at
+            {
+                tokio::time::sleep_until(release).await;
             }
             let answers: serde_json::Map<_, _> = request["questions"]
                 .as_object()

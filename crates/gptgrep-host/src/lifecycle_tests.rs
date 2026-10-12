@@ -960,6 +960,21 @@ async fn reader_validation_failures_preserve_completed_planner_and_both_turn_usa
 #[cfg(unix)]
 const INTEGRATED_DEADLINE_SECS: u64 = 30;
 
+/// Original deadline for the integrated run that only a timeout can end. Its
+/// last Decisions reply is held until [`STALLED_READER_WINDOW`] before this
+/// deadline. That leaves the planner turn and the earlier Decisions calls
+/// (under 7 s even in a loaded parallel suite) 15 s and keeps the hold below
+/// the 20 s Decisions request timeout.
+#[cfg(unix)]
+const STALLED_READER_DEADLINE_SECS: u64 = 20;
+
+/// The stalled reader starts with at most this much of the original deadline
+/// left, on any host. Its startup, handshake and both tool calls need well under
+/// that, while a reader deadline refreshed at its start, or set more than 8 s
+/// after its start, would end the stall after the 3 s finalization allowance.
+#[cfg(unix)]
+const STALLED_READER_WINDOW: Duration = Duration::from_secs(5);
+
 #[cfg(unix)]
 fn budget_answer(citation: &str) -> Value {
     json!({"answer":"It uses a ceramic chamber.","citations":[citation],"insufficient_evidence":false})
@@ -1068,8 +1083,18 @@ async fn integrated_budget_failures_keep_identity_usage_and_original_deadline() 
             two_process_mock_with_budget(home.path(), &budget_answer(&citation), Some(ending));
         config.max_tool_calls = 1;
         config.timeout_secs = INTEGRATED_DEADLINE_SECS;
-        let (client, server) = crate::query_plan::tests::mock_jev(vec![200; 4]).await;
         let started = Instant::now();
+        let (client, server) = if ending == "stall" {
+            // The reader starts only after the held last Decisions reply, i.e. with
+            // at most STALLED_READER_WINDOW of the original deadline left.
+            config.timeout_secs = STALLED_READER_DEADLINE_SECS;
+            let release = tokio::time::Instant::from_std(started)
+                + Duration::from_secs(config.timeout_secs)
+                - STALLED_READER_WINDOW;
+            crate::query_plan::tests::mock_jev_with_last_reply_at(vec![200; 4], release).await
+        } else {
+            crate::query_plan::tests::mock_jev(vec![200; 4]).await
+        };
         let error = execute_with_client(
             root.path(),
             "Explain ember storage.",
