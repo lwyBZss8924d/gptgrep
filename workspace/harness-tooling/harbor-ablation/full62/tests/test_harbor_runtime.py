@@ -18,7 +18,7 @@ from harbor.models.task.config import TaskConfig, VerifierEnvironmentMode
 from harbor.models.task.paths import TaskPaths
 from harbor.models.task.verifier_mode import resolve_verifier_environment_definition
 
-from gptgrep_harbor.adapter import Full62Adapter
+from gptgrep_harbor.adapter import MAX_TOOL_CALLS, TOOL_CALL_WARNING_FLOOR, Full62Adapter
 from gptgrep_harbor.agent import PairedNativeAgent
 from gptgrep_harbor.common import MAX_NATIVE_PROMPT_BYTES, MAX_READER_QUESTION_BYTES, PROFILE, canonical, sha
 from gptgrep_harbor.native import JUDGE_OUTPUT_SCHEMA, codex_argv
@@ -134,7 +134,11 @@ class HarborMaterializationTests(unittest.TestCase):
                          [output / name for name in result["trial_order"]["task_names"]])
         self.assertTrue(all(task.source == output.name for task in job.tasks))
         self.assertEqual(job.agents[0].import_path, "gptgrep_harbor.agent:PairedNativeAgent")
-        reader_policies = set()
+        # The fixture's treatment cap (8) is below the parity floor: valid, but warned.
+        self.assertEqual(result["preflight"]["tool_budget"]["treatment_max_tool_calls"], 8)
+        self.assertEqual([warning["code"] for warning in result["preflight"]["warnings"]],
+                         ["treatment_tool_cap_may_bind_before_deadline"])
+        reader_policies, budget_scopes = set(), set()
         for record in result["tasks"]:
             task = output / record["task_name"]
             config = TaskConfig.model_validate(tomllib.loads((task / "task.toml").read_text()))
@@ -150,6 +154,9 @@ class HarborMaterializationTests(unittest.TestCase):
             self.assertNotIn("auth", reader)
             self.assertEqual(reader["budget_scope"]["reader_question_max_bytes"], 8192)
             self.assertEqual(reader["budget_scope"]["tool_calls"], "treatment_enforced_raw_observed_only")
+            self.assertEqual(reader["budget_scope"]["treatment_max_tool_calls"], 8)
+            self.assertEqual(reader["budget_scope"]["raw_tool_call_cap"], "none")
+            budget_scopes.add(canonical(reader["budget_scope"]))
             self.assertIs(reader["native_ptc"], True)
             self.assertEqual(reader["codex_permissions"], "full62_reader")
             self.assertEqual(len(list((task / "environment/corpus").glob("raw-*.txt"))), 34)
@@ -184,6 +191,45 @@ class HarborMaterializationTests(unittest.TestCase):
             self.assertEqual(reader["base_tool_environment"]["provenance"]["path"], BASE_TOOLS_PATH)
             self.assertFalse((task / "tests/corpus").exists())
         self.assertEqual(reader_policies, {model_config(PROFILE, "reader")})
+        self.assertEqual(len(budget_scopes), 1)
+
+    def test_treatment_tool_cap_accepts_adapter_maximum_and_warns_below_parity_floor(self):
+        self.runtime["max_tool_calls"] = MAX_TOOL_CALLS
+        adapter = self.materializer()
+        self.assertEqual(adapter.preflight["tool_budget"],
+                         {"treatment_max_tool_calls": 10000, "raw_tool_call_cap": "none",
+                          "adapter_maximum": 10000, "warning_floor": 64})
+        self.assertEqual(adapter.preflight["warnings"], [])
+        argv = reader_argv({**self.runtime, "source_relative_path": "raw-0.txt"},
+                           {"arm": "gptgrep"}, "generic question")
+        self.assertEqual(argv[argv.index("--max-tool-calls") + 1], "10000")
+        for value, warned in ((TOOL_CALL_WARNING_FLOOR, False), (TOOL_CALL_WARNING_FLOOR - 1, True), (1, True)):
+            self.runtime["max_tool_calls"] = value
+            with self.subTest(max_tool_calls=value):
+                warnings = self.materializer().preflight["warnings"]
+                self.assertEqual(warnings, [{"code": "treatment_tool_cap_may_bind_before_deadline",
+                                             "max_tool_calls": value, "warning_floor": 64}] if warned else [])
+        for value in (0, MAX_TOOL_CALLS + 1, True, 64.0):
+            self.runtime["max_tool_calls"] = value
+            with self.subTest(max_tool_calls=value), self.assertRaisesRegex(ValueError, "integer_range"):
+                self.materializer()
+        self.assertFalse((self.root / "dataset").exists())
+
+    def test_prepare_prints_budget_preflight_before_any_task_is_created(self):
+        from contextlib import redirect_stdout
+        import io
+        from gptgrep_harbor import main as cli
+        stdout, seen = io.StringIO(), []
+        adapter = self.materializer()
+        with patch.object(cli, "Full62Adapter", return_value=adapter), \
+             patch.object(adapter, "run", side_effect=lambda *args, **kwargs: seen.append(stdout.getvalue())), \
+             patch("sys.argv", ["gptgrep-harbor-full62", "prepare", "--manifest", "/synthetic/manifest.json",
+                                "--manifest-sha256", "a" * 64, "--output-dir", str(self.root / "dataset")]), \
+             redirect_stdout(stdout):
+            cli.main()
+        self.assertEqual(json.loads(seen[0]), {"preflight": adapter.preflight})
+        self.assertEqual(json.loads(seen[0])["preflight"]["warnings"][0]["code"],
+                         "treatment_tool_cap_may_bind_before_deadline")
 
     def test_frozen_judge_schema_must_be_strict_structured_output(self):
         del self.judge["response_schema"]["additionalProperties"]

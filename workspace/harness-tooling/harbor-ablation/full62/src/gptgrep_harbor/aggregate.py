@@ -208,6 +208,7 @@ def summarize(export, records, runtime):
                         "qualification_mismatches": runtime.get("qualification_mismatches"),
                         "budget_scope": {"query_deadline": "shared", "instruction_bytes": "shared_local_cap",
                             "tool_calls": "treatment_enforced_raw_observed_only",
+                            "treatment_max_tool_calls": runtime.get("max_tool_calls"), "raw_tool_call_cap": "none",
                             "total_provider_input": "not_enforced_by_raw_cli"}},
             "preregistered_primary": runtime["primary_metric"],
             "accuracy_improvement_logically_supported": comparison["delta_bounds"][0] > 0,

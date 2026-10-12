@@ -15,6 +15,24 @@ from .decisions import (CONTROL_ROOT, FAMILY_ROOT, TRIAL_ROOT, WRITER_LOCK,
 from .trial_order import paired_order
 
 
+# The bare arm has no tool-call cap; the stock CLI only observes native calls.
+# The treatment cap must therefore not bind before the shared query deadline:
+# validation accepts the adapter maximum and warns below the advisory floor.
+MAX_TOOL_CALLS = 10000
+TOOL_CALL_WARNING_FLOOR = 64
+
+
+def tool_budget(value):
+    """Validate the treatment tool cap; return its budget_scope record and warnings."""
+    integer(value, 1, MAX_TOOL_CALLS)
+    warnings = []
+    if value < TOOL_CALL_WARNING_FLOOR:
+        warnings.append({"code": "treatment_tool_cap_may_bind_before_deadline",
+                         "max_tool_calls": value, "warning_floor": TOOL_CALL_WARNING_FLOOR})
+    return {"treatment_max_tool_calls": value, "raw_tool_call_cap": "none",
+            "adapter_maximum": MAX_TOOL_CALLS, "warning_floor": TOOL_CALL_WARNING_FLOOR}, warnings
+
+
 def validate_cohort(cohort):
     require(set(cohort) == {"schema", "source_cohort_sha256", "tasks"} and
             cohort["schema"] == "gptgrep.harbor.cohort.v1", "cohort_schema")
@@ -70,6 +88,9 @@ class Full62Adapter:
         self.runtime = parse(pinned(self.manifest["runtime"]))
         self.judge = parse(pinned(self.manifest["judge_contract"]))
         self.rows = validate_cohort(self.cohort)
+        # Validation output: bounded budget checks and advisory warnings. The
+        # prepare command prints it before creating any task; the export keeps it.
+        self.preflight = {"schema": "gptgrep.harbor.preflight.v1", "warnings": []}
         self._validate_runtime()
 
     def _validate_runtime(self):
@@ -169,7 +190,8 @@ class Full62Adapter:
         integer(runtime["max_asset_bytes"], 1, 2**40)
         for key in ("deadline_seconds", "judge_deadline_seconds"):
             integer(runtime[key], 1, 3600)
-        integer(runtime["max_tool_calls"], 1, 10000)
+        self.preflight["tool_budget"], warnings = tool_budget(runtime["max_tool_calls"])
+        self.preflight["warnings"] += warnings
         integer(runtime["max_input_bytes"], 1024, 1048576)
         # Validate every selected row before run() can create either arm. The
         # broad private row parser is not the product question capacity.
@@ -257,7 +279,8 @@ class Full62Adapter:
         index = {"schema": "gptgrep.harbor.export.v1", "cohort": self.manifest["cohort"],
                  "runtime": self.manifest["runtime"], "judge_contract": self.manifest["judge_contract"],
                  "source_cohort_sha256": self.cohort["source_cohort_sha256"], "tasks": exported,
-                 "expected_pairs": 62, "expected_documents": 34, "runtime_started": False}
+                 "expected_pairs": 62, "expected_documents": 34, "runtime_started": False,
+                 "preflight": self.preflight}
         order = paired_order(exported, self.runtime["trial_order_seed"])
         job = {"job_name": self.runtime["run_id"], "jobs_dir": self.runtime["jobs_dir"],
                "n_attempts": 1, "n_concurrent_trials": 1, "retry": {"max_retries": 0},
@@ -298,6 +321,7 @@ class Full62Adapter:
                   "budget_scope": {"query_deadline": "shared", "instruction_bytes": "shared_local_cap",
                       "reader_question_max_bytes": min(MAX_READER_QUESTION_BYTES, runtime["max_input_bytes"]),
                       "tool_calls": "treatment_enforced_raw_observed_only",
+                      "treatment_max_tool_calls": runtime["max_tool_calls"], "raw_tool_call_cap": "none",
                       "total_provider_input": "not_enforced_by_raw_cli"},
                   **{key: runtime[key] for key in ("platform", "codex_binary", "gptgrep_binary", "codex_home",
                      "jev_model", "reader_mode", "native_ptc", "codex_permissions",

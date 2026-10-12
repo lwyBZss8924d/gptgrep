@@ -168,6 +168,13 @@ class PairedTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.aggregate(export, records, runtime, blobs)
 
+    def test_summary_records_treatment_tool_cap_against_uncapped_bare_arm(self):
+        export, records, runtime, blobs = synthetic_results()
+        runtime["max_tool_calls"] = 10000
+        scope = self.aggregate(export, records, runtime, blobs)["profile"]["budget_scope"]
+        self.assertEqual((scope["treatment_max_tool_calls"], scope["raw_tool_call_cap"]), (10000, "none"))
+        self.assertEqual(scope["tool_calls"], "treatment_enforced_raw_observed_only")
+
     def test_unknown_cost_is_not_free(self):
         export, records, runtime, blobs = synthetic_results()
         result = self.aggregate(export, records, runtime, blobs)
