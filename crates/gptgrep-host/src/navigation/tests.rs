@@ -91,6 +91,8 @@ struct Server {
     task: tokio::task::JoinHandle<()>,
     requests: Arc<Mutex<Vec<Value>>>,
     hashes: Arc<Mutex<Vec<String>>>,
+    /// Fires once the first `Reply::Hang` request has been read completely.
+    hang_signal: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 impl Drop for Server {
     fn drop(&mut self) {
@@ -108,7 +110,9 @@ async fn server(replies: Vec<Reply>, reverse_answers: bool) -> Result<Server> {
     let seen = Arc::clone(&requests);
     let hashes = Arc::new(Mutex::new(vec![]));
     let seen_hashes = Arc::clone(&hashes);
+    let (hung, hang_signal) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
+        let mut hung = Some(hung);
         loop {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut bytes = vec![];
@@ -143,6 +147,9 @@ async fn server(replies: Vec<Reply>, reverse_answers: bool) -> Result<Server> {
             seen_hashes.lock().unwrap().push(hash(&body));
             let reply = replies.get(ordinal).copied().unwrap_or(Reply::Ok);
             if matches!(reply, Reply::Hang) {
+                if let Some(hung) = hung.take() {
+                    let _ = hung.send(());
+                }
                 std::future::pending::<()>().await;
             }
             let mut answers = request["questions"].as_object().unwrap().iter().map(|(id, question)| {
@@ -191,6 +198,7 @@ async fn server(replies: Vec<Reply>, reverse_answers: bool) -> Result<Server> {
         task,
         requests,
         hashes,
+        hang_signal: Some(hang_signal),
     })
 }
 
@@ -329,17 +337,42 @@ async fn navigation_partial_failure_unknown_ids_and_timeout_retain_observed_usag
     let (root, config) = fixture(hints).await?;
     for failure in [Reply::Failure, Reply::UnknownId, Reply::Hang] {
         let accounting = accounting(root.path())?;
-        let server = server(vec![Reply::Ok, failure], false).await?;
-        let deadline = if matches!(failure, Reply::Hang) {
-            Duration::from_millis(500)
+        let mut server = server(vec![Reply::Ok, failure], false).await?;
+        let result = if matches!(failure, Reply::Hang) {
+            // Overlay verification, batch preparation and the first batch run in
+            // real time before this deadline. Its only job is to end the hanging
+            // second batch. The client's own request timers start only when that
+            // batch is sent, so any bound below their timeout fires first.
+            let hang_signal = server.hang_signal.take().unwrap();
+            let navigation = navigate(
+                root.path(),
+                &config,
+                &server.client,
+                &accounting,
+                gptgrep_jev::REQUEST_TIMEOUT * 3 / 4,
+            );
+            tokio::pin!(navigation);
+            tokio::select! {
+                result = &mut navigation => panic!("Ended before the hang: {:?}", result.err()),
+                signal = hang_signal => signal.expect("second batch reached the mock"),
+            }
+            // The second batch is in flight and only the deadline can end it. With
+            // the clock paused, the idle runtime advances directly to that deadline.
+            tokio::time::pause();
+            let result = navigation.await;
+            tokio::time::resume();
+            result
         } else {
-            Duration::from_secs(10)
+            navigate(
+                root.path(),
+                &config,
+                &server.client,
+                &accounting,
+                Duration::from_secs(10),
+            )
+            .await
         };
-        assert!(
-            navigate(root.path(), &config, &server.client, &accounting, deadline)
-                .await
-                .is_err()
-        );
+        assert!(result.is_err());
         let report = accounting.navigation().unwrap();
         assert_eq!(report.status, "failed");
         assert_eq!(report.attempted_calls, 2);
@@ -352,6 +385,16 @@ async fn navigation_partial_failure_unknown_ids_and_timeout_retain_observed_usag
         assert!(!report.hint_scan_complete);
         assert!(report.packet_sha256.is_none());
         assert!(fs::read_to_string(accounting.path())?.contains("navigation-response-0"));
+        if matches!(failure, Reply::Hang) {
+            assert_eq!(
+                report.error_code.as_deref(),
+                Some("host_navigation_timeout")
+            );
+            assert_eq!(
+                report.batches[1].error_code.as_deref(),
+                Some("host_navigation_timeout")
+            );
+        }
     }
     Ok(())
 }

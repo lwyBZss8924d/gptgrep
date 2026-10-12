@@ -207,6 +207,42 @@ async fn host_retrieval_reuses_the_supplied_shared_decisions_context() -> Result
 }
 
 pub(crate) async fn mock_jev(plan: Vec<u16>) -> (JevClient, tokio::task::JoinHandle<Vec<Value>>) {
+    let (client, server, _) = mock_jev_with_hang_signal(plan).await;
+    (client, server)
+}
+
+/// `mock_jev` that holds its last reply until `release`, so whatever the caller
+/// does after its final Decisions call starts no earlier than that instant,
+/// however fast the earlier work ran. The hold must stay below the client's
+/// `gptgrep_jev::REQUEST_TIMEOUT`.
+pub(crate) async fn mock_jev_with_last_reply_at(
+    plan: Vec<u16>,
+    release: tokio::time::Instant,
+) -> (JevClient, tokio::task::JoinHandle<Vec<Value>>) {
+    let (client, server, _) = serve_mock_jev(plan, Some(release)).await;
+    (client, server)
+}
+
+/// `mock_jev` that also reports when the first deliberately hanging (status 0)
+/// request has been read completely, i.e. when that call is provably in flight.
+pub(crate) async fn mock_jev_with_hang_signal(
+    plan: Vec<u16>,
+) -> (
+    JevClient,
+    tokio::task::JoinHandle<Vec<Value>>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
+    serve_mock_jev(plan, None).await
+}
+
+async fn serve_mock_jev(
+    plan: Vec<u16>,
+    last_reply_at: Option<tokio::time::Instant>,
+) -> (
+    JevClient,
+    tokio::task::JoinHandle<Vec<Value>>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client = JevClient::with_endpoint(
         "synthetic-query-plan",
@@ -217,10 +253,16 @@ pub(crate) async fn mock_jev(plan: Vec<u16>) -> (JevClient, tokio::task::JoinHan
         ),
     )
     .unwrap();
+    let (hung, hang_signal) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
+        let mut hung = Some(hung);
         let mut requests = vec![];
+        let last = plan.len().checked_sub(1);
         for (ordinal, status) in plan.into_iter().enumerate() {
-            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+            // Only bounds a connection that never arrives. Integrated callers reach
+            // their first Decisions call after a full planner turn, which can take
+            // seconds on a loaded host, so a larger bound cannot change an outcome.
+            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(60), listener.accept())
                 .await
                 .unwrap()
                 .unwrap();
@@ -248,10 +290,18 @@ pub(crate) async fn mock_jev(plan: Vec<u16>) -> (JevClient, tokio::task::JoinHan
             };
             requests.push(request.clone());
             if status == 0 {
+                if let Some(hung) = hung.take() {
+                    let _ = hung.send(());
+                }
                 std::future::pending::<()>().await;
             }
             if status != 200 {
                 tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+            if Some(ordinal) == last
+                && let Some(release) = last_reply_at
+            {
+                tokio::time::sleep_until(release).await;
             }
             let answers: serde_json::Map<_, _> = request["questions"]
                 .as_object()
@@ -264,7 +314,7 @@ pub(crate) async fn mock_jev(plan: Vec<u16>) -> (JevClient, tokio::task::JoinHan
         }
         requests
     });
-    (client, server)
+    (client, server, hang_signal)
 }
 
 #[tokio::test]
@@ -401,6 +451,29 @@ async fn planned_branch_failure_keeps_partial_accounting_without_issuing_evidenc
     );
 }
 
+/// Publishes the number of validated Decisions replies. The client calls this
+/// synchronously after validation, and the planned route records `after_reply`
+/// before its next await, so a reply seen here is already in the ledger once
+/// the planning future yields.
+struct ValidatedReplies(tokio::sync::watch::Sender<usize>);
+
+impl gptgrep_jev::DecisionObserver for ValidatedReplies {
+    fn send_started(&self, _: &gptgrep_jev::DecisionRequestObservation<'_>) -> Result<()> {
+        Ok(())
+    }
+    fn validated_response(
+        &self,
+        _: &gptgrep_jev::DecisionRequestObservation<'_>,
+        _: &gptgrep_jev::DecisionResponse,
+    ) -> Result<()> {
+        self.0.send_modify(|count| *count += 1);
+        Ok(())
+    }
+    fn failed(&self, _: &gptgrep_jev::DecisionRequestObservation<'_>) -> Result<()> {
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn cancelled_plan_retains_reply_and_marks_unfinished_operations() {
     let root = tempfile::tempdir().unwrap();
@@ -410,14 +483,29 @@ async fn cancelled_plan_retains_reply_and_marks_unfinished_operations() {
     )
     .unwrap();
     gptgrep_core::index(root.path(), 10).await.unwrap();
-    let (client, server) = mock_jev(vec![200, 0]).await;
+    let (client, server, hang_signal) = mock_jev_with_hang_signal(vec![200, 0]).await;
+    let (validated, mut replies) = tokio::sync::watch::channel(0);
+    let client = client.with_decision_observer(std::sync::Arc::new(ValidatedReplies(validated)));
     let (mut evidence, accounting) = configured(root.path(), client, None);
-    let outcome = tokio::time::timeout(
-        Duration::from_millis(150),
-        evidence.bootstrap_planned("stored items", &["copper".into()]),
-    )
-    .await;
-    assert!(outcome.is_err());
+    let alternatives = ["copper".to_owned()];
+    {
+        let planned = evidence.bootstrap_planned("stored items", &alternatives);
+        tokio::pin!(planned);
+        // Cancel exactly when one route reply is validated and the other route's
+        // request is in flight. The mock never answers that request, so the plan
+        // cannot advance further; the bound below only reports a broken fixture.
+        let in_flight = async {
+            hang_signal.await.expect("second route reached the mock");
+            replies.wait_for(|count| *count >= 1).await.unwrap();
+        };
+        let broken_fixture = tokio::time::sleep(Duration::from_secs(60));
+        tokio::select! {
+            outcome = &mut planned => panic!("Plan finished despite a hanging route: {outcome:?}"),
+            () = in_flight => {}
+            () = broken_fixture => panic!("Planned routes never reached the mock"),
+        }
+        // Dropping the pending plan here is the cancellation under test.
+    }
     server.abort();
     let _ = server.await;
     let summary = accounting.summary();

@@ -1377,7 +1377,11 @@ mod tests {
         let anchor = original.ledger_clock_anchor().unwrap();
         let journal = persistent.then(|| fs::read(&path).unwrap());
         let header = persistent.then(|| fs::read(sidecar(&path, ".lock")).unwrap());
-        let cap = Instant::now() + Duration::from_millis(500);
+        // The cap must outlast the admissions below; with a shared ledger each
+        // one is a synced journal replacement (about 0.2 s idle, under 1 s in a
+        // loaded parallel suite on a slow-fsync host). The test then waits for
+        // the cap itself, so a longer cap cannot change any expiry outcome.
+        let cap = Instant::now() + Duration::from_secs(5);
         let view = original.with_deadline(cap).unwrap();
         let later = view.with_deadline(cap + Duration::from_secs(30)).unwrap();
         assert!(Arc::ptr_eq(&original.0, &view.0));
@@ -1394,7 +1398,8 @@ mod tests {
         let mut completed = view.reserve(DIGEST, "synthetic-model").await.unwrap();
         completed.send_started().await.unwrap();
         let mut unsent = view.reserve(DIGEST, "synthetic-model").await.unwrap();
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        tokio::time::sleep_until(tokio::time::Instant::from_std(cap)).await;
+        assert!(Instant::now() >= cap);
         assert!(view.check_deadline().is_err());
         assert!(view.clone().check_deadline().is_err());
         assert!(later.check_deadline().is_err());

@@ -622,12 +622,18 @@ async fn enrich_all_documents_share_one_invocation_deadline_and_source_bound_pla
     )?;
     gptgrep_core::index(directory.path(), 8).await?;
     config.window_bytes = 8;
-    config.timeout_secs = 1;
+    // The invocation deadline also covers planning and every durable ledger
+    // write, so it must not expire during this complete run. It only has to stay
+    // below the per-call host timeout, which makes it the bound every call gets.
+    config.timeout_secs = 60;
+    assert!(config.timeout_secs < config.host.timeout_secs);
     let plan = plan_enrichment(directory.path(), &config)?;
     assert_eq!(plan.documents.len(), 2);
     assert_eq!(plan.binding.source.documents_total, 2);
     let backend = Mock::new(Mode::Empty, &config);
+    let invoked = tokio::time::Instant::now();
     let report = enrich_with(directory.path(), &config, &backend).await?;
+    let returned = tokio::time::Instant::now();
     assert_eq!(report.status, "complete");
     assert_eq!(report.documents_completed, 2);
     assert_eq!(report.windows_completed, plan.unit_count);
@@ -639,6 +645,9 @@ async fn enrich_all_documents_share_one_invocation_deadline_and_source_bound_pla
             .iter()
             .all(|deadline| *deadline == calls.deadlines[0])
     );
+    // The shared bound is the invocation deadline itself, captured once.
+    let timeout = Duration::from_secs(config.timeout_secs);
+    assert!(invoked + timeout <= calls.deadlines[0] && calls.deadlines[0] <= returned + timeout);
     assert_eq!(calls.jev, 0);
     Ok(())
 }
