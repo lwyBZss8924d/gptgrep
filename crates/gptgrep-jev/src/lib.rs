@@ -30,7 +30,7 @@ pub use input::{
 pub(crate) use models::luna_decisions_model;
 pub use models::{
     DEFAULT_MODEL_CANONICAL, LEGACY_MODEL_CANONICAL, MODEL_ALIAS_PREFIX, ModelAlias,
-    is_model_alias, model_accepts_images, response_model_matches,
+    contains_image_part, is_model_alias, model_accepts_images, response_model_matches,
 };
 pub use roles::{
     EvidenceRole, EvidenceRoleCandidate, EvidenceRoleResponse, MAX_ROLE_CANDIDATES,
@@ -353,6 +353,10 @@ impl JevClient {
     /// Validate and serialize once, so a caller can durably reserve the exact
     /// encoded request size and digest before sending it. Oversized requests
     /// fail before network I/O; callers own any explicit splitting policy.
+    /// Raw JSON passes through unchanged for Luna Decisions. Every other
+    /// selector, including each `~` alias, is text-only: an image part anywhere
+    /// in `state` or `questions` (see [`contains_image_part`]) is refused here,
+    /// before any reservation or submission.
     pub fn prepare_decision(&self, state: Value, questions: Value) -> Result<PreparedDecision> {
         self.execution.remaining()?;
         let body = self.request_body(state, &questions)?;
@@ -528,6 +532,11 @@ impl JevClient {
 
     fn request_body(&self, state: Value, questions: &Value) -> Result<Vec<u8>> {
         validation::request(&state, questions)?;
+        ensure!(
+            model_accepts_images(&self.model)
+                || !(contains_image_part(&state) || contains_image_part(questions)),
+            models::IMAGES_REQUIRE_LUNA
+        );
         let body = serde_json::to_vec(&json!({
             "model": self.model,
             "state": state,
@@ -688,6 +697,47 @@ mod tests {
         assert!(rerank_questions("", std::slice::from_ref(&candidate)).is_err());
         assert!(rerank_questions("query", &[candidate.clone(), candidate.clone()]).is_err());
         assert!(rerank_questions("query", &vec![candidate; MAX_QUESTIONS + 1]).is_err());
+    }
+
+    #[test]
+    fn raw_image_parts_are_refused_for_text_only_selectors_and_kept_for_luna() {
+        let state = json!(["Synthetic caption.",
+            {"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}}]);
+        let questions = json!({"q":{"type":"noul","instructions":"Is a mark visible?"}});
+        for model in [
+            "~typesafe/jev-latest",
+            LEGACY_MODEL,
+            LEGACY_MODEL_CANONICAL,
+            "explicit/other",
+        ] {
+            let client = JevClient::new("synthetic-test-key", Some(model)).unwrap();
+            let error = client
+                .request_body(state.clone(), &questions)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, models::IMAGES_REQUIRE_LUNA, "{model}");
+            // An image part inside question instructions is refused the same way.
+            let in_questions = json!({"q":{"type":"noul","instructions":
+                [{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]}});
+            assert!(
+                client
+                    .request_body(json!("Synthetic caption."), &in_questions)
+                    .is_err()
+            );
+            // Literal text that only mentions image parts is still sent.
+            assert!(
+                client
+                    .request_body(json!({"note":"image_url data:image/png"}), &questions)
+                    .is_ok()
+            );
+        }
+        for model in [DEFAULT_MODEL, DEFAULT_MODEL_CANONICAL] {
+            let client = JevClient::new("synthetic-test-key", Some(model)).unwrap();
+            let body: Value =
+                serde_json::from_slice(&client.request_body(state.clone(), &questions).unwrap())
+                    .unwrap();
+            assert_eq!(body["state"], state);
+        }
     }
 
     #[test]

@@ -979,7 +979,8 @@ fn contract() -> Value {
             "rejects":"another author or family, variants such as :free, other aliases, and malformed aliases (before any request)","images":false,
             "accounting":"requested_model and the served model are reported separately"},
         "canonical_builds":{gptgrep_jev::DEFAULT_MODEL:gptgrep_jev::DEFAULT_MODEL_CANONICAL,gptgrep_jev::LEGACY_MODEL:gptgrep_jev::LEGACY_MODEL_CANONICAL},
-        "images":"exact Luna Decisions selector or its canonical build only; aliases and other models reject images before reservation or submission",
+        "images":"exact Luna Decisions selector or its canonical build only; aliases and other models reject typed input.images and raw image parts before reservation or submission",
+        "raw_image_parts":"any object at any depth of a raw state or questions with an image_url or input_image member or type; strings are literal text and never image parts",
         "typed_wire":"flat literal text plus PNG/JPEG image_url data URLs; local source bindings excluded",
         "limits":{"text_envelope_bytes":gptgrep_jev::MAX_REQUEST_BYTES,"body_bytes":gptgrep_jev::MAX_MULTIMODAL_REQUEST_BYTES,
             "images":gptgrep_jev::MAX_IMAGES,"image_file_bytes":gptgrep_jev::MAX_IMAGE_BYTES,"response_bytes":gptgrep_jev::MAX_RESPONSE_BYTES}});
@@ -2668,6 +2669,12 @@ mod query_plan_cli_tests {
             "~typesafe/jev-latest"
         );
         assert_eq!(contract["decisions"]["aliases"]["images"], false);
+        assert!(
+            contract["decisions"]["raw_image_parts"]
+                .as_str()
+                .unwrap()
+                .contains("image_url or input_image member or type")
+        );
         assert_eq!(
             contract["decisions"]["canonical_builds"][gptgrep_jev::LEGACY_MODEL],
             gptgrep_jev::LEGACY_MODEL_CANONICAL

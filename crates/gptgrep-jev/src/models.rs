@@ -15,6 +15,7 @@
 //! equality plus the two pinned canonical mappings.
 
 use anyhow::{Result, ensure};
+use serde_json::Value;
 
 use crate::{DEFAULT_MODEL, LEGACY_MODEL};
 
@@ -23,6 +24,12 @@ pub const MODEL_ALIAS_PREFIX: char = '~';
 const ALIAS_SUFFIX: &str = "-latest";
 const MAX_MODEL_BYTES: usize = 256;
 const MAX_SEGMENT_BYTES: usize = 128;
+/// Fixed refusal for image input sent to a selector other than Luna Decisions.
+pub(crate) const IMAGES_REQUIRE_LUNA: &str =
+    "Decisions images require the Luna Decisions model; no request was prepared or submitted";
+/// Member names and part types that carry image input: the documented flat
+/// Decisions `image_url` part and OpenAI-style `input_image` parts.
+const IMAGE_PART_NAMES: [&str; 2] = ["image_url", "input_image"];
 /// Observed canonical build for the default Luna Decisions selector.
 pub const DEFAULT_MODEL_CANONICAL: &str = "openai/gpt-6-luna-decisions-20261006";
 /// Observed canonical build for the explicit legacy Jev selector.
@@ -129,15 +136,43 @@ pub(crate) fn luna_decisions_model(model: &str) -> bool {
     matches!(model, DEFAULT_MODEL | DEFAULT_MODEL_CANONICAL)
 }
 
-/// Whether typed image evidence may be prepared for this requested selector.
+/// Whether image input may be prepared for this requested selector.
 ///
 /// Only the exact Luna Decisions selector and its pinned canonical build accept
 /// images. Every alias is text-only: an alias may resolve to a later build that
 /// is outside the pinned Luna identity set, so it is never provably Luna before
-/// the paid response. Images for other selectors are rejected before any
-/// reservation or submission.
+/// the paid response. For other selectors, typed images and raw image parts
+/// (see [`contains_image_part`]) are rejected before any reservation or submission.
 pub fn model_accepts_images(model: &str) -> bool {
     luna_decisions_model(model)
+}
+
+/// True when raw request JSON carries an image content part at any depth: an
+/// object with an `image_url` or `input_image` member, or whose `type` names
+/// one of those parts. Strings are literal text and are never treated as image
+/// parts, even when they mention these names or contain a data URL.
+pub fn contains_image_part(value: &Value) -> bool {
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Object(object) => {
+                let image_member = object
+                    .keys()
+                    .any(|key| IMAGE_PART_NAMES.contains(&key.as_str()));
+                let image_type = object
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| IMAGE_PART_NAMES.contains(&kind));
+                if image_member || image_type {
+                    return true;
+                }
+                pending.extend(object.values());
+            }
+            Value::Array(items) => pending.extend(items),
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Validate a requested selector before any client, reservation or request exists.
@@ -306,5 +341,42 @@ mod tests {
         assert!(validate_requested_model("explicit/other").is_ok());
         assert!(validate_requested_model(" ").is_err());
         assert!(validate_requested_model("bad\nmodel").is_err());
+    }
+
+    #[test]
+    fn image_parts_are_found_at_any_depth_and_text_is_never_an_image() {
+        use serde_json::json;
+        let data_url = "data:image/png;base64,iVBORw0KGgo=";
+        for value in [
+            // The documented flat Decisions part, alone and after text.
+            json!([{"type":"image_url","image_url":{"url":data_url}}]),
+            json!(["Synthetic caption.", {"image_url":{"url":data_url},"type":"image_url"}]),
+            // Either signal alone, nested in objects and arrays.
+            json!({"evidence":[{"note":"text"},{"image_url":{"url":"https://example.invalid/a.png"}}]}),
+            json!({"outer":{"inner":[[{"type":"image_url"}]]}}),
+            // OpenAI-style input_image parts.
+            json!([{"type":"input_image","image_url":data_url}]),
+            json!({"part":{"input_image":{"file_id":"synthetic"}}}),
+        ] {
+            assert!(contains_image_part(&value), "{value} carries an image part");
+        }
+        for value in [
+            json!("image_url"),
+            json!(data_url),
+            json!(["Synthetic caption.", data_url, "type image_url"]),
+            json!({"note":"an image_url or input_image is only mentioned here"}),
+            json!({"type":"image","caption":"Figure 1 is described in text"}),
+            json!({"kind":"image_url","url":data_url}),
+            json!({"type":["image_url"]}),
+            json!({"evidence":[{"source":{"source_id":"s","unit_id":"u"},"text":"literal"}]}),
+            json!(null),
+        ] {
+            assert!(!contains_image_part(&value), "{value} is text only");
+        }
+        let mut deep = json!({"type":"image_url"});
+        for _ in 0..512 {
+            deep = json!([deep]);
+        }
+        assert!(contains_image_part(&deep));
     }
 }

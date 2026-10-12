@@ -322,10 +322,7 @@ impl JevClient {
         if crate::luna_decisions_model(&self.model) {
             return self.prepare_flat_input(&input, questions);
         }
-        ensure!(
-            input.images.is_empty(),
-            "Decisions images require the Luna Decisions model; no request was prepared or submitted"
-        );
+        ensure!(input.images.is_empty(), crate::models::IMAGES_REQUIRE_LUNA);
         let state = json!({"evidence": input.text.iter().map(|item| json!({
             "source": item.source, "text": item.text,
             "content_sha256": format!("{:x}", Sha256::digest(item.text.as_bytes()))

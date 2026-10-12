@@ -80,7 +80,12 @@ exact Luna Decisions selector `openai/gpt-6-luna-decisions` and its canonical bu
 
 Legacy `typesafe/jev-1.13`, other exact models and every `~author/family-latest`
 alias are text-only. They keep the `{evidence:[...]}` text object and reject
-images in `prepare_input`, before any reservation or submission. An alias can
+images in `prepare_input`, before any reservation or submission. The raw
+`{state, questions}` route (`prepare_decision`, `decide` and `gptgrep judge` with a
+raw `state`) applies the same rule to these selectors. Any object in `state` or
+`questions` with an `image_url` or `input_image` member or `type` is refused before
+any reservation or submission. Strings are literal text, never image parts. Luna
+receives raw JSON unchanged. An alias can
 resolve to a later build outside the pinned Luna identities, so it is never
 treated as Luna. `prepare_image_qualification` remains the stricter explicit
 wrapper: it also requires the exact alpha endpoint and the bare Luna selector.

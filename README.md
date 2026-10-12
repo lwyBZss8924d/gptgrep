@@ -175,7 +175,8 @@ version starting with a digit. For this alias, `typesafe/jev-1.13` and
 `typesafe/jev-1.13-20260917` are admitted. Another author, another family such as
 `typesafe/jevx-2`, a `:free` variant or another alias is rejected. That rejection
 happens after the call was charged. A malformed alias is rejected before any request.
-Aliases are text-only. The judge output reports `requested_model` separately from
+Aliases are text-only: typed images and raw image parts are refused before any
+request. The judge output reports `requested_model` separately from
 the served `model`. Pin the canonical build when results must stay comparable.
 
 Jev uses OpenRouter's typed **Decisions API**, not chat completions. It supplies
@@ -393,7 +394,11 @@ bytes are admitted as bounded snapshots and sent in order as flat `image_url`
 data URLs. Source bindings and local paths stay out of the provider body. The
 64 KiB control/text envelope, four-image cap, per-image 1 MiB/8 million pixel cap,
 24 million total pixel cap, 8 MiB request cap and 1 MiB response cap remain explicit.
-Legacy Jev and every alias reject typed images before reservation or submission.
+Legacy Jev, other exact models and every alias reject typed images before
+reservation or submission. A raw `{state, questions}` input is held to the same
+rule: for these selectors, any object in `state` or `questions` with an `image_url`
+or `input_image` member or `type` is refused before reservation. Strings stay
+literal text. Luna receives the raw JSON unchanged.
 Refusals, unknown answers, partial bodies and malformed responses do not become
 successful decisions.
 

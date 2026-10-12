@@ -52,8 +52,11 @@ then PNG/JPEG `image_url` data URL objects. Object keys match canonical JSON Val
 encoding and the provider body excludes source metadata. The escaped text/questions
 envelope stays within 64 KiB before image encoding; the complete body stays within
 8 MiB. Explicit legacy or other models retain text-only evidence objects and reject
-images before reservation. Raw `decide` remains the JSON structured-state API and
-does not interpret arbitrary objects as images. `prepare_image_qualification`
+images before reservation. Raw `decide`/`prepare_decision` remains the JSON
+structured-state API. Luna receives it unchanged. Every other selector, including
+each alias, refuses an image part anywhere in `state` or `questions` before
+reservation: an object with an `image_url` or `input_image` member or `type`
+(`contains_image_part`). Strings are literal text and are never image parts. `prepare_image_qualification`
 remains a compatible explicit wrapper around the same codec. Supported syntax and
 observed simple image controls do not establish general image or refusal semantics.
 Unsupported answer types, including refusal/UNKNOWN wrappers, remain failures.

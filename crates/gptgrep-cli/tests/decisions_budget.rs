@@ -384,3 +384,104 @@ fn judge_alias_failures_before_submission_are_diagnosed_without_network() {
     std::thread::sleep(Duration::from_millis(50));
     assert_eq!(proxied.load(Ordering::SeqCst), 0, "no provider egress");
 }
+
+#[test]
+fn judge_raw_state_image_parts_for_text_only_models_fail_before_reservation() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(directory.path()).unwrap();
+    let (proxy, proxied) = counting_proxy();
+    let plan = root.join("plan.json");
+    fs::write(
+        &plan,
+        br#"{"schema":"synthetic-plan","steps":["raw-image"]}"#,
+    )
+    .unwrap();
+    let ledger = root.join("ledger.json");
+    let control = root.join("control.json");
+    let init = gptgrep(
+        &[
+            "decisions-budget",
+            "init",
+            "--run-id",
+            "synthetic-raw-image-run",
+            "--plan-file",
+            plan.to_str().unwrap(),
+            "--deadline-seconds",
+            "600",
+            "--max-submissions",
+            "1",
+            "--ledger",
+            ledger.to_str().unwrap(),
+            "--output",
+            control.to_str().unwrap(),
+        ],
+        None,
+        &proxy,
+        &root,
+    );
+    assert!(init.status.success(), "{init:?}");
+    // The flat wire shape documented for Luna images, sent through the raw route.
+    let data_url = "data:image/png;base64,iVBORw0KGgo=";
+    let request = root.join("raw-image.json");
+    fs::write(
+        &request,
+        json!({"state":["synthetic-private-note",{"type":"image_url","image_url":{"url":data_url}}],
+            "questions":{"q":{"type":"noul","instructions":"Is a mark visible?"}}})
+        .to_string(),
+    )
+    .unwrap();
+    for model in [
+        "~typesafe/jev-latest",
+        "typesafe/jev-1.13",
+        "explicit/other",
+    ] {
+        let judge = gptgrep(
+            &[
+                "--decisions-budget",
+                control.to_str().unwrap(),
+                "judge",
+                "--input",
+                request.to_str().unwrap(),
+                "--model",
+                model,
+                "--json",
+            ],
+            Some(FAKE_KEY),
+            &proxy,
+            &root,
+        );
+        assert_eq!(judge.status.code(), Some(2), "{model}");
+        assert_no_secret(&judge);
+        let error = json_output(&judge);
+        assert_eq!(error["code"], "decisions_judge_failed");
+        assert_eq!(
+            error["error"],
+            "Decisions images require the Luna Decisions model; no request was prepared or submitted"
+        );
+        let report = &error["judge"];
+        assert_eq!(report["stage"], "preparation");
+        assert_eq!(report["requested_model"], model);
+        assert_eq!(report["submission"], "not_submitted");
+        assert_eq!(report["execution"]["logical_reservations"], 0);
+        assert_eq!(report["execution"]["submission_observations"], 0);
+    }
+    let status = json_output(&gptgrep(
+        &[
+            "decisions-budget",
+            "status",
+            "--control",
+            control.to_str().unwrap(),
+            "--json",
+        ],
+        None,
+        &proxy,
+        &root,
+    ));
+    assert_eq!(status["reservations"]["total"], 0);
+    assert_eq!(status["send_started"], 0);
+    assert_eq!(status["submission_observations"], 0);
+    assert_eq!(status["remaining_submissions"], 1);
+    assert_eq!(status["requested_models"], json!({}));
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(proxied.load(Ordering::SeqCst), 0, "no provider egress");
+}
