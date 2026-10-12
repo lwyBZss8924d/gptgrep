@@ -28,6 +28,13 @@ API_ENV = {"OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL", "OPENAI_ORG_ID"
 PASS_ENV = {"PATH", "LANG", "LC_ALL", "TZ", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
             "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy",
             "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"}
+# Trials are credential consumers, never refresh owners. Codex reads this
+# variable on every token refresh; a closed container-local port makes any
+# proactive, 401-recovery or explicit refresh fail before the shared refresh
+# token leaves the process. Loopback is exempted from proxies so the blocked
+# request can never be forwarded (with its body) through an HTTP proxy.
+REFRESH_BLOCKER_URL = "http://127.0.0.1:9/oauth/token"
+LOOPBACK_NO_PROXY = ("127.0.0.1", "localhost", "::1")
 
 
 def native_identity(value):
@@ -221,7 +228,8 @@ def model_config(profile, role):
 
 def auth_compose(auth_file, platform):
     # JSON is a YAML subset. Docker mounts the one file at runtime; COPY never
-    # touches it. A read-only mount delegates refresh to the isolated auth owner.
+    # touches it. Refresh happens only on the host, by the supervised auth owner
+    # before the job; trials keep the read-only mount and the refresh blocker.
     return {"services": {"main": {"platform": platform, "volumes": [{
         "type": "bind", "source": auth_file, "target": CODEX_HOME + "/auth.json",
         "read_only": True, "bind": {"create_host_path": False},
@@ -238,8 +246,25 @@ def native_environment(environ, *, product=False):
     result.update(CODEX_HOME=CODEX_HOME, HOME="/root", TMPDIR=WORK_DIR,
                   TMP=WORK_DIR, TEMP=WORK_DIR, XDG_CACHE_HOME=CODEX_HOME + "/cache",
                   XDG_CONFIG_HOME=CODEX_HOME + "/config", XDG_DATA_HOME=CODEX_HOME + "/data",
-                  XDG_STATE_HOME=CODEX_HOME + "/state", PYTHONDONTWRITEBYTECODE="1")
+                  XDG_STATE_HOME=CODEX_HOME + "/state", PYTHONDONTWRITEBYTECODE="1",
+                  CODEX_REFRESH_TOKEN_URL_OVERRIDE=REFRESH_BLOCKER_URL)
+    no_proxy = loopback_no_proxy(result.get("NO_PROXY"), result.get("no_proxy"))
+    result.update(NO_PROXY=no_proxy, no_proxy=no_proxy)
     return result
+
+
+def loopback_no_proxy(*values):
+    """Merge caller NO_PROXY entries and always exempt loopback."""
+    entries = []
+    for value in values:
+        for entry in (value or "").split(","):
+            entry = entry.strip()
+            if entry and entry not in entries:
+                entries.append(entry)
+    for host in LOOPBACK_NO_PROXY:
+        if host not in entries:
+            entries.append(host)
+    return ",".join(entries)
 
 
 def native_wrapper():

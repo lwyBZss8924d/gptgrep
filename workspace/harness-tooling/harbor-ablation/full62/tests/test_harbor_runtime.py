@@ -27,7 +27,7 @@ from gptgrep_harbor.process import run
 from gptgrep_harbor.product_bundle import PRODUCT_ENTRYPOINT, PRODUCT_PROVENANCE, release_bundle
 from gptgrep_harbor.runtime import (
     BASE_CAPABILITIES, BASE_TOOLS_PATH, CODEX_HOME, CODEX_SOURCE_COMMIT, DECISIONS_BUDGET,
-    base_tools_identity, model_config, native_environment, native_wrapper,
+    base_tools_identity, model_config, native_environment, native_wrapper, REFRESH_BLOCKER_URL,
     validate_asset_path,
 )
 
@@ -347,9 +347,27 @@ class NativePolicyTests(unittest.TestCase):
         self.assertEqual(native["CODEX_HOME"], CODEX_HOME)
         self.assertEqual(native["HTTPS_PROXY"], source["HTTPS_PROXY"])
         self.assertEqual(native_environment(source, product=True)["OPENROUTER_API_KEY"], "synthetic-only")
+        self.assertEqual(native["CODEX_REFRESH_TOKEN_URL_OVERRIDE"], REFRESH_BLOCKER_URL)
         for key in ("CODEX_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL"):
             with self.assertRaisesRegex(ValueError, "api_auth_environment_forbidden"):
                 native_environment({key: "synthetic-only"})
+
+    def test_every_native_child_receives_the_refresh_blocker_and_loopback_no_proxy(self):
+        source = {"PATH": "/usr/bin", "NO_PROXY": "corp.example.invalid", "no_proxy": "lower.example.invalid",
+                  "HTTPS_PROXY": "http://synthetic-proxy:3128",
+                  "CODEX_REFRESH_TOKEN_URL_OVERRIDE": "https://synthetic-elsewhere.invalid/oauth/token"}
+        self.assertEqual(REFRESH_BLOCKER_URL, "http://127.0.0.1:9/oauth/token")
+        for product in (False, True):
+            native = native_environment(source, product=product)
+            self.assertEqual(native["CODEX_REFRESH_TOKEN_URL_OVERRIDE"], REFRESH_BLOCKER_URL)
+            self.assertEqual(native["NO_PROXY"], native["no_proxy"])
+            entries = native["NO_PROXY"].split(",")
+            for entry in ("corp.example.invalid", "lower.example.invalid", "127.0.0.1", "localhost", "::1"):
+                self.assertIn(entry, entries)
+            self.assertEqual(native["HTTPS_PROXY"], source["HTTPS_PROXY"])
+        bare = native_environment({"PATH": "/usr/bin"})
+        self.assertEqual(bare["NO_PROXY"], "127.0.0.1,localhost,::1")
+        self.assertEqual(bare["CODEX_REFRESH_TOKEN_URL_OVERRIDE"], REFRESH_BLOCKER_URL)
 
     def test_product_wrapper_strips_openrouter_and_rejects_legacy_sandbox(self):
         config = {"codex_binary": "/opt/codex", "reader_base_binary": {"path": "/opt/codex"}}
@@ -368,6 +386,7 @@ class NativePolicyTests(unittest.TestCase):
             self.assertNotIn("OPENROUTER_API_KEY", env)
             self.assertNotIn("GPTGREP_DECISIONS_ATTACH_PLAN", env)
             self.assertNotIn("GPTGREP_DECISIONS_ATTACH_PLAN_SHA256", env)
+            self.assertEqual(env["CODEX_REFRESH_TOKEN_URL_OVERRIDE"], REFRESH_BLOCKER_URL)
             execute.reset_mock()
             with patch("sys.argv", ["codex-native", "exec", "--sandbox", "read-only"]):
                 with self.assertRaisesRegex(ValueError, "legacy_sandbox_override_forbidden"):

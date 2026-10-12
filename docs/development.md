@@ -93,7 +93,15 @@ enabled for that ChatGPT account/workspace. `login status` checks authentication
 without printing credentials; model availability and an actual permitted turn
 remain separate checks. See [official Codex authentication](https://learn.chatgpt.com/docs/auth).
 Never put the credential cache in a build context or source commit. Harbor mounts
-the selected cached file at runtime and refreshes it outside consumed trials.
+the selected cached file read-only at runtime. Trials never refresh it: their
+native children point the token endpoint at a closed loopback port.
+
+When several roles share one login, run every consumer through
+[`workspace/harness-tooling/codex-auth`](../workspace/harness-tooling/codex-auth/README.md).
+It provides one lease per login, a per-run `CODEX_HOME` that links to the single
+`auth.json`, an allowlisted environment that blocks consumer refresh, and one
+refresh owner. Its runbook covers the live sequence, failure recovery and the
+re-login procedure.
 
 GPTgrep's native roles request `gpt-6-luna`, reasoning effort `max`, service tier
 `fast`. The guarded protocol normalizes Fast to `priority`; that request does not

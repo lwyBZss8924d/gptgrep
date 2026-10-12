@@ -1,0 +1,54 @@
+{
+  "schema": "gptgrep.codex-auth.config.v1",
+  "_comment": "Portable template. Copy to an ignored local file, replace every /path/to placeholder with a physical absolute path, keep it 0600. The lease path must be shared by every checkout that uses this auth source and live outside all checkouts.",
+  "auth_source_id": "dev",
+  "canonical_auth_home": "/path/to/codex/accounts/dev",
+  "lease_path": "/path/to/codex/locks/dev.lease",
+  "runs_root": "/path/to/runtime/codex-auth-runs",
+  "codex_bin": "/path/to/official-codex/bin/codex",
+  "codex_bin_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "verify_binary_pins": true,
+  "binary_pins": [],
+  "blocker_url": "http://127.0.0.1:9/oauth/token",
+  "blocker_must_be_closed": true,
+  "allow_shared_consumers": false,
+  "lease_wait_seconds": 30,
+  "default_deadline_seconds": 21600,
+  "term_grace_seconds": 10,
+  "sweep_interval_seconds": 0.5,
+  "sweep_settle_seconds": 2,
+  "keeper_poll_seconds": 2,
+  "path_env": "/usr/bin:/bin:/usr/sbin:/sbin",
+  "locale": "en_US.UTF-8",
+  "refresh_policy": {
+    "max_age_seconds": 43200,
+    "pre_run": "never"
+  },
+  "owner": {
+    "rpc_timeout_seconds": 120,
+    "exit_wait_seconds": 30,
+    "term_grace_seconds": 120,
+    "passthrough_env": []
+  },
+  "codex_config": {},
+  "docker": {
+    "bin": "/path/to/docker",
+    "env": {
+      "DOCKER_HOST": "unix:///path/to/docker.sock"
+    },
+    "wait_seconds": 120,
+    "poll_seconds": 2
+  },
+  "roles": {
+    "dev": {},
+    "test": {},
+    "eval-baseline": {},
+    "eval-treatment": {},
+    "ocr": {},
+    "judge": {},
+    "harbor": {
+      "passthrough_env": ["DOCKER_HOST", "DOCKER_CONFIG", "DOCKER_CONTEXT"],
+      "_comment": "OPENROUTER_API_KEY stays blocked until the separate OpenRouter path is approved; then add it here with allow_openrouter=true for the treatment launcher only."
+    }
+  }
+}
