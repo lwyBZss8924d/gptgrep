@@ -1,9 +1,12 @@
 """Finite base-image staging and installed Pillow checks; no Docker execution."""
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import os
 from pathlib import Path
+import shlex
 import tempfile
 import unittest
 import sys
@@ -97,6 +100,13 @@ class CommonBaseImageTests(unittest.TestCase):
         self.assertFalse(result["native_code_mode_host_protocol_executed"])
         self.assertIn("/usr/local/bin/codex-code-mode-host", common)
         self.assertIn("CODE_MODE_HOST_SHA256=", result["build_commands"]["common"])
+        # The derived-image frontdoors pin this BuildKit metadata; it lands beside the context.
+        argv = shlex.split(result["build_commands"]["common"])
+        metadata = output.with_name("context.build-metadata.json")
+        self.assertEqual(argv[argv.index("--metadata-file") + 1], str(metadata))
+        self.assertEqual(argv[-1], str(output))
+        self.assertEqual(result["build_metadata_file"], str(metadata))
+        self.assertFalse(metadata.exists())
         self.assertFalse(result["native_helper_digest_compatibility_verified"])
         self.assertNotIn("auth.json", (output / ".dockerignore").read_text())
         product = self.root / "synthetic-product"
@@ -106,6 +116,36 @@ class CommonBaseImageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "raw_product_binary_unsupported_use_release_bundle"):
             self.prepare(self.config, self.root / "with-product")
         self.assertFalse((self.root / "with-product").exists())
+
+    def test_build_metadata_path_is_fresh_outside_context_and_common_only(self):
+        explicit = self.root / "metadata" / "common.json"
+        explicit.parent.mkdir()
+        result = self.prepare(self.config, self.root / "explicit-context", explicit)
+        argv = shlex.split(result["build_commands"]["common"])
+        self.assertEqual(argv[argv.index("--metadata-file") + 1], str(explicit))
+        self.assertEqual(result["build_metadata_file"], str(explicit))
+        (self.root / "existing.json").write_bytes(b"{}")
+        (self.root / "dangling.json").symlink_to(self.root / "nowhere.json")
+        cases = {"inside-context": lambda output: output / "build-metadata.json",
+                 "existing": lambda output: self.root / "existing.json",
+                 "dangling-link": lambda output: self.root / "dangling.json",
+                 "missing-parent": lambda output: self.root / "absent-dir" / "metadata.json"}
+        for name, metadata in cases.items():
+            output = self.root / name
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "fresh_build_metadata_path"):
+                self.prepare(self.config, output, metadata(output))
+            self.assertFalse(output.exists())
+        (self.root / "occupied.build-metadata.json").write_bytes(b"{}")
+        with self.assertRaisesRegex(ValueError, "fresh_build_metadata_path"):
+            self.prepare(self.config, self.root / "occupied")
+        self.assertFalse((self.root / "occupied").exists())
+        argv = ["prepare.py", "--treatment", "--inputs", str(self.root / "absent.json"),
+                "--output-dir", str(self.root / "treatment"), "--metadata-file", str(explicit)]
+        with patch.object(sys, "argv", argv), contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaises(SystemExit) as raised:
+            self.prepare_module.main()
+        self.assertEqual(raised.exception.code, 2)
+        self.assertFalse((self.root / "treatment").exists())
 
     def test_unresolved_package_or_bad_binary_pin_cannot_create_context(self):
         for field in ("python_image", "uv_image", "debian_snapshot", "poppler_version"):
