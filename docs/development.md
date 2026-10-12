@@ -298,22 +298,33 @@ the approved main comparison.
 export GPTGREP_FULL62_SOURCE="$PWD/workspace/harness-tooling/harbor-ablation/full62"
 export UV_PROJECT_ENVIRONMENT="$GPTGREP_DEV_ROOT/full62-venv"
 uv sync --project "$GPTGREP_FULL62_SOURCE" --frozen
+# Host test extra: the hashed Pillow 12.3.0 lock (an exact sync removes it again).
+uv pip install --python "$UV_PROJECT_ENVIRONMENT/bin/python" --require-hashes \
+  -r "$GPTGREP_FULL62_SOURCE/base-image/requirements.lock"
 uv run --project "$GPTGREP_FULL62_SOURCE" --frozen gptgrep-harbor-full62 --help
 uv run --project "$GPTGREP_FULL62_SOURCE" --frozen python -B -m unittest discover \
   -s "$GPTGREP_FULL62_SOURCE/tests" -v
 ```
 
+`uv.lock` pins only the adapter's runtime dependencies, while the base-image probe
+test imports Pillow 12.3.0 on the host. Install it only from hashed requirements:
+the base image's `requirements.lock` above, or a local extras file in the same
+`pillow==12.3.0 --hash=sha256:...` format that lists the host wheel's hash.
+
 For a real run, follow the adapter's sequence: build and verify the common
 Python/Pillow/Poppler/native-Codex foundation; add the complete Linux GPTgrep plus
-PDFium bundle to the treatment derivative; qualify matching reader permissions
-and account mounts; supply the frozen private cohort and Judge contract; select
-one treatment Decisions mode (an existing shared ledger, per-trial preparation, or
-invocation-bounded contexts under a pinned price and cohort cost cap); prepare
-all 124 tasks; build exact role images; run the generated Harbor job; aggregate
-all paired outcomes. Its `prepare`, `build-local-images` and `aggregate` commands
-require pinned manifests; `prepare` prints its budget preflight before writing tasks. `harbor run -c GENERATED_JOB_JSON` uses the same installed
-adapter environment and a fresh admitted output namespace, with one attempt and
-no automatic retry.
+PDFium bundle to the treatment derivative; build the treatment index inside that
+Linux image at `/data/corpus` with its product binary, from the raw documents only
+and before any question is exposed (a host-built index, or one built at another
+root, is rejected); qualify matching reader permissions and account mounts; supply
+the frozen private cohort and Judge contract; select one treatment Decisions mode
+(an existing shared ledger, per-trial preparation, or invocation-bounded contexts
+under a pinned price and cohort cost cap); prepare all 124 tasks; build exact role
+images; run the generated Harbor job; aggregate all paired outcomes. Its `prepare`,
+`build-local-images` and `aggregate` commands require pinned manifests; `prepare`
+prints its budget preflight before writing tasks. `harbor run -c GENERATED_JOB_JSON`
+uses the same installed adapter environment and a fresh admitted output namespace,
+with one attempt and no automatic retry.
 
 Raw Codex receives only original documents and may extract/render during SEARCH.
 GPTgrep receives the same bytes plus a frozen index built before question access.
