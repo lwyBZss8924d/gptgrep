@@ -96,7 +96,7 @@ impl Fixture {
     }
 }
 
-const SUCCESS: &str = "prompt=sys.stdin.read()\nopen('received.json','w').write(json.dumps({'prompt':prompt,'argv':sys.argv[1:],'env_names':sorted(os.environ)}))\nprint(json.dumps({'type':'thread.started','thread_id':'MOCK-THREAD'}))\nprint(json.dumps({'type':'turn.started'}))\nfor k in ['item.started','item.updated','item.completed']:\n print(json.dumps({'type':k,'item':{'id':'MOCK-ITEM','type':'command_execution','command':'PRIVATE TOOL CONTENT'}}))\nprint(json.dumps({'type':'turn.completed','usage':{'input_tokens':11,'cached_input_tokens':2,'output_tokens':3}}))\nopen('answer.json','w').write(json.dumps({'answer':'Synthetic answer'}))\n";
+const SUCCESS: &str = "prompt=sys.stdin.read()\nopen('received.json','w').write(json.dumps({'prompt':prompt,'argv':sys.argv[1:],'env_names':sorted(os.environ),'refresh_override':os.environ.get('CODEX_REFRESH_TOKEN_URL_OVERRIDE'),'revoke_override':os.environ.get('CODEX_REVOKE_TOKEN_URL_OVERRIDE'),'no_proxy':[os.environ.get('NO_PROXY'),os.environ.get('no_proxy')]}))\nprint(json.dumps({'type':'thread.started','thread_id':'MOCK-THREAD'}))\nprint(json.dumps({'type':'turn.started'}))\nfor k in ['item.started','item.updated','item.completed']:\n print(json.dumps({'type':k,'item':{'id':'MOCK-ITEM','type':'command_execution','command':'PRIVATE TOOL CONTENT'}}))\nprint(json.dumps({'type':'turn.completed','usage':{'input_tokens':11,'cached_input_tokens':2,'output_tokens':3}}))\nopen('answer.json','w').write(json.dumps({'answer':'Synthetic answer'}))\n";
 
 #[test]
 fn check_does_not_launch_or_change_phase() {
@@ -133,6 +133,19 @@ fn direct_stdin_exact_argv_deduplicated_usage_and_null_actuals() {
         f.value["prompt"]["sha256"]
     );
     assert_eq!(captured["argv"].as_array().unwrap().last().unwrap(), "-");
+    // The runner, not the control, pins the refresh/revoke blockers and loopback NO_PROXY.
+    assert_eq!(
+        captured["refresh_override"],
+        "http://127.0.0.1:0/oauth/token"
+    );
+    assert_eq!(
+        captured["revoke_override"],
+        "http://127.0.0.1:0/oauth/revoke"
+    );
+    assert_eq!(
+        captured["no_proxy"],
+        json!(["127.0.0.1,localhost,::1", "127.0.0.1,localhost,::1"])
+    );
     assert!(
         !captured["argv"]
             .as_array()

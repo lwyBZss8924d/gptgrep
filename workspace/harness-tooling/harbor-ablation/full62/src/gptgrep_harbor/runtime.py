@@ -28,6 +28,20 @@ API_ENV = {"OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL", "OPENAI_ORG_ID"
 PASS_ENV = {"PATH", "LANG", "LC_ALL", "TZ", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
             "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy",
             "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"}
+# Trials are credential consumers, never refresh owners. Codex reads these
+# variables on every token refresh or revoke. Port 0 can never have a listener
+# (binding port 0 assigns an ephemeral port), so even a tool process sharing the
+# container's network namespace cannot receive the request: any proactive,
+# 401-recovery or explicit refresh fails before the shared refresh token leaves
+# the process. A fixed low port such as 9 could be bound by such a process.
+# Loopback is exempted from proxies so the blocked request is never forwarded.
+REFRESH_BLOCKER_URL = "http://127.0.0.1:0/oauth/token"
+REVOKE_BLOCKER_URL = "http://127.0.0.1:0/oauth/revoke"
+LOOPBACK_NO_PROXY = ("127.0.0.1", "localhost", "::1")
+# Every trial service carries this label with the runtime run_id, so the host
+# supervisor (codex-auth `run --harbor-job-label`) can see the job's containers
+# and keep the credential lease until they are gone.
+AUTH_JOB_LABEL = "gptgrep.auth-job"
 
 
 def native_identity(value):
@@ -219,10 +233,15 @@ def model_config(profile, role):
     return "\n".join(lines).encode()
 
 
-def auth_compose(auth_file, platform):
+def auth_compose(auth_file, platform, job_id):
     # JSON is a YAML subset. Docker mounts the one file at runtime; COPY never
-    # touches it. A read-only mount delegates refresh to the isolated auth owner.
-    return {"services": {"main": {"platform": platform, "volumes": [{
+    # touches it. Refresh happens only on the host, by the supervised auth owner
+    # before the job; trials keep the read-only mount and the refresh blocker.
+    # Harbor gives each trial its own compose project, so the job-wide label is
+    # the only way to see all of this job's containers from the host.
+    require(isinstance(job_id, str) and 0 < len(job_id) <= 80 and
+            all(c.isalnum() or c == "-" for c in job_id), "auth_job_label")
+    return {"services": {"main": {"platform": platform, "labels": {AUTH_JOB_LABEL: job_id}, "volumes": [{
         "type": "bind", "source": auth_file, "target": CODEX_HOME + "/auth.json",
         "read_only": True, "bind": {"create_host_path": False},
     }]}}}
@@ -238,8 +257,26 @@ def native_environment(environ, *, product=False):
     result.update(CODEX_HOME=CODEX_HOME, HOME="/root", TMPDIR=WORK_DIR,
                   TMP=WORK_DIR, TEMP=WORK_DIR, XDG_CACHE_HOME=CODEX_HOME + "/cache",
                   XDG_CONFIG_HOME=CODEX_HOME + "/config", XDG_DATA_HOME=CODEX_HOME + "/data",
-                  XDG_STATE_HOME=CODEX_HOME + "/state", PYTHONDONTWRITEBYTECODE="1")
+                  XDG_STATE_HOME=CODEX_HOME + "/state", PYTHONDONTWRITEBYTECODE="1",
+                  CODEX_REFRESH_TOKEN_URL_OVERRIDE=REFRESH_BLOCKER_URL,
+                  CODEX_REVOKE_TOKEN_URL_OVERRIDE=REVOKE_BLOCKER_URL)
+    no_proxy = loopback_no_proxy(result.get("NO_PROXY"), result.get("no_proxy"))
+    result.update(NO_PROXY=no_proxy, no_proxy=no_proxy)
     return result
+
+
+def loopback_no_proxy(*values):
+    """Merge caller NO_PROXY entries and always exempt loopback."""
+    entries = []
+    for value in values:
+        for entry in (value or "").split(","):
+            entry = entry.strip()
+            if entry and entry not in entries:
+                entries.append(entry)
+    for host in LOOPBACK_NO_PROXY:
+        if host not in entries:
+            entries.append(host)
+    return ",".join(entries)
 
 
 def native_wrapper():

@@ -1,0 +1,65 @@
+{
+  "schema": "gptgrep.codex-auth.config.v1",
+  "_comment": "Portable template. Copy to an ignored local file, replace every /path/to placeholder with a physical absolute path, keep it 0600. The lease path must be shared by every checkout that uses this auth source and live outside all checkouts; the first managed command binds it in the canonical auth home.",
+  "auth_source_id": "dev",
+  "canonical_auth_home": "/path/to/codex/accounts/dev",
+  "lease_path": "/path/to/codex/locks/dev.lease",
+  "runs_root": "/path/to/runtime/codex-auth-runs",
+  "codex_bin": "/path/to/official-codex/bin/codex",
+  "codex_bin_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "verify_binary_pins": true,
+  "binary_pins": [],
+  "blocker_url": "http://127.0.0.1:0/oauth/token",
+  "blocker_must_be_closed": true,
+  "allow_shared_consumers": false,
+  "lease_wait_seconds": 30,
+  "default_deadline_seconds": 21600,
+  "term_grace_seconds": 10,
+  "sweep_interval_seconds": 0.5,
+  "sweep_settle_seconds": 2,
+  "keeper_poll_seconds": 2,
+  "path_env": "/usr/bin:/bin:/usr/sbin:/sbin",
+  "locale": "en_US.UTF-8",
+  "refresh_policy": {
+    "max_age_seconds": 43200,
+    "pre_run": "never"
+  },
+  "owner": {
+    "rpc_timeout_seconds": 120,
+    "exit_wait_seconds": 30,
+    "term_grace_seconds": 120,
+    "passthrough_env": []
+  },
+  "codex_config": {},
+  "extra_denied_paths": [],
+  "docker": {
+    "bin": "/path/to/docker",
+    "env": {
+      "DOCKER_HOST": "unix:///path/to/docker.sock"
+    },
+    "wait_seconds": 120,
+    "poll_seconds": 2
+  },
+  "roles": {
+    "dev": {
+      "tool_permissions": {"extends": ":workspace", "network_enabled": false, "deny_paths": [], "read_paths": []},
+      "_comment": "Plain Codex consumers (account-probe, codex exec, app-server clients that select no permission profile): tool commands are denied the canonical auth home, the run's auth link, the lease directory, every extra_denied_paths entry and the role's deny_paths; read_paths re-open subpaths of the role's own denies only. A codex command line that selects another sandbox or permission source, or a working or added directory inside a deny, is refused before launch."
+    },
+    "test": {"tool_permissions": {"extends": ":workspace", "network_enabled": false}},
+    "eval-baseline": {
+      "tool_permissions": "consumer-managed",
+      "_comment": "GPTgrep native roles select their own deny-root permission profiles; the supervisor records this as unverified."
+    },
+    "eval-treatment": {"tool_permissions": "consumer-managed"},
+    "ocr": {"tool_permissions": "consumer-managed"},
+    "judge": {"tool_permissions": "consumer-managed"},
+    "harbor": {
+      "tool_permissions": "consumer-managed",
+      "path_env": "/path/to/docker-bin:/usr/bin:/bin:/usr/sbin:/sbin",
+      "passthrough_env": ["DOCKER_HOST", "DOCKER_CONFIG", "DOCKER_CONTEXT"],
+      "stop_scope": "root-first",
+      "term_grace_seconds": 300,
+      "_comment": "Launch the Harbor executable directly (never a wrapper that re-exports the shared CODEX_HOME) with --harbor-job-label gptgrep.auth-job=<full62 runtime run_id>. On cancel or deadline Harbor alone gets SIGTERM and 300 s to remove its containers. OPENROUTER_API_KEY stays blocked until the separate OpenRouter path is approved; then add it here with allow_openrouter=true for the treatment launcher only."
+    }
+  }
+}

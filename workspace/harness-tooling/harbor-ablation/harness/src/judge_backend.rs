@@ -13,6 +13,14 @@ const EVENT_CAP: usize = 65_536;
 const EVENT_COUNT_CAP: usize = 4096;
 const FINAL_CAP: usize = 65_536;
 const RECEIPT_CAP: usize = 65_536;
+// Native Judges are credential consumers: they never refresh or revoke a shared
+// ChatGPT login. Port 0 can never have a listener, so a proactive, 401-recovery
+// or explicit refresh fails before the refresh token leaves the process, and a
+// guarded reload still adopts the refresh owner's rewrite. Loopback bypasses
+// proxies so the blocked request is never forwarded.
+const REFRESH_BLOCKER_URL: &str = "http://127.0.0.1:0/oauth/token";
+const REVOKE_BLOCKER_URL: &str = "http://127.0.0.1:0/oauth/revoke";
+const LOOPBACK_NO_PROXY: &str = "127.0.0.1,localhost,::1";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1032,6 +1040,10 @@ fn execute(a: &Admission, permit: ExecutionPermit) -> Result<Outcome> {
             .env("TMPDIR", &a.control.environment.tmpdir)
             .env("LANG", "C.UTF-8")
             .env("LC_ALL", "C.UTF-8")
+            .env("CODEX_REFRESH_TOKEN_URL_OVERRIDE", REFRESH_BLOCKER_URL)
+            .env("CODEX_REVOKE_TOKEN_URL_OVERRIDE", REVOKE_BLOCKER_URL)
+            .env("NO_PROXY", LOOPBACK_NO_PROXY)
+            .env("no_proxy", LOOPBACK_NO_PROXY)
             .current_dir(staging.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
