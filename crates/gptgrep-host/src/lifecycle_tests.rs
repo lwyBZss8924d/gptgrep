@@ -953,6 +953,13 @@ async fn reader_validation_failures_preserve_completed_planner_and_both_turn_usa
     }
 }
 
+/// Original deadline for integrated budget runs that must reach a stalled
+/// reader. The planner turn, four durably accounted Jev calls and both process
+/// startups take about 1.5 s on an idle host and under 7 s inside a fully
+/// loaded parallel suite, so only the deliberately stalled reader reaches it.
+#[cfg(unix)]
+const INTEGRATED_DEADLINE_SECS: u64 = 30;
+
 #[cfg(unix)]
 fn budget_answer(citation: &str) -> Value {
     json!({"answer":"It uses a ceramic chamber.","citations":[citation],"insufficient_evidence":false})
@@ -1060,7 +1067,7 @@ async fn integrated_budget_failures_keep_identity_usage_and_original_deadline() 
         let mut config =
             two_process_mock_with_budget(home.path(), &budget_answer(&citation), Some(ending));
         config.max_tool_calls = 1;
-        config.timeout_secs = 2;
+        config.timeout_secs = INTEGRATED_DEADLINE_SECS;
         let (client, server) = crate::query_plan::tests::mock_jev(vec![200; 4]).await;
         let started = Instant::now();
         let error = execute_with_client(
@@ -1098,8 +1105,13 @@ async fn integrated_budget_failures_keep_identity_usage_and_original_deadline() 
             );
         }
         if ending == "stall" {
+            // Only the original deadline ends the stalled reader; finalization keeps
+            // the same three-second allowance beyond it (formerly 2 s + 3 s = 5 s).
+            let deadline = Duration::from_secs(config.timeout_secs);
+            assert_eq!(failure.code, "host_model_attempt_timeout");
+            assert!(started.elapsed() >= deadline);
             assert!(
-                started.elapsed() < Duration::from_secs(5),
+                started.elapsed() < deadline + Duration::from_secs(3),
                 "Finalization refreshed the original deadline"
             );
         }
@@ -1115,6 +1127,7 @@ async fn integrated_budget_cancellation_retains_bound_partial_observations() {
     let mut config =
         two_process_mock_with_budget(home.path(), &budget_answer(&citation), Some("stall"));
     config.max_tool_calls = 1;
+    config.timeout_secs = INTEGRATED_DEADLINE_SECS;
     let (client, server) = crate::query_plan::tests::mock_jev(vec![200; 4]).await;
     let mut running = Box::pin(execute_with_client(
         root.path(),
@@ -1123,30 +1136,30 @@ async fn integrated_budget_cancellation_retains_bound_partial_observations() {
         &config,
         Some(client),
     ));
-    let observed = async {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Ok(files) = std::fs::read_dir(root.path().join(".gptgrep/host-attempts")) {
-                    for file in files.flatten() {
-                        let raw = std::fs::read_to_string(file.path()).unwrap();
-                        for line in raw.lines() {
-                            let event: Value = serde_json::from_str(line).unwrap();
-                            if event["model_attempts"][1]["usage"]["total"]["totalTokens"] == 40 {
-                                return file.path();
-                            }
-                        }
-                    }
+    // The attempt ledger is appended synchronously while the invocation is
+    // polled, so checking the newly appended lines after every poll observes the
+    // reader's usage as soon as it is durable. Only a run that never records it
+    // reaches the original deadline and fails below.
+    let attempts = root.path().join(".gptgrep/host-attempts");
+    let mut scanned = std::collections::BTreeMap::<PathBuf, usize>::new();
+    let ledger_path = std::future::poll_fn(|context| {
+        if let std::task::Poll::Ready(result) = running.as_mut().poll(context) {
+            panic!("Expected pending finalization: {result:?}");
+        }
+        for file in std::fs::read_dir(&attempts).into_iter().flatten().flatten() {
+            let raw = std::fs::read_to_string(file.path()).unwrap();
+            let seen = scanned.entry(file.path()).or_default();
+            for line in raw.lines().skip(*seen) {
+                *seen += 1;
+                let event: Value = serde_json::from_str(line).unwrap();
+                if event["model_attempts"][1]["usage"]["total"]["totalTokens"] == 40 {
+                    return std::task::Poll::Ready(file.path());
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        })
-        .await
-        .unwrap()
-    };
-    let ledger_path = tokio::select! {
-        result = &mut running => panic!("Expected pending finalization: {result:?}"),
-        ledger = observed => ledger,
-    };
+        }
+        std::task::Poll::Pending
+    })
+    .await;
     drop(running);
     assert_eq!(server.await.unwrap().len(), 4);
     tokio::time::sleep(Duration::from_millis(200)).await;

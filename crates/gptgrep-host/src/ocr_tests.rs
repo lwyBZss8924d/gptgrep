@@ -937,6 +937,11 @@ async fn intermediate_notification_does_not_renew_original_outer_deadline() {
         json!(true),
     ));
     let capture = Capture::default();
+    // The deadline only has to end the reader that stays pending after the
+    // intermediate notification. With the clock paused, page preparation and the
+    // synchronous handshake cannot consume it on a loaded host; the runtime only
+    // advances to it once the protocol is blocked on that reader.
+    tokio::time::pause();
     let deadline = tokio::time::Instant::now() + Duration::from_millis(20);
     let transport =
         ocr_protocol::TransportBudget::new(fixture.task.budget.transport_bytes as usize);
@@ -956,6 +961,7 @@ async fn intermediate_notification_does_not_renew_original_outer_deadline() {
         ),
     )
     .await;
+    tokio::time::resume();
     let error = crate::ocr::capture_page_outcome(result, &transport)
         .err()
         .unwrap();
