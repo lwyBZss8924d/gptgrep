@@ -175,6 +175,46 @@ class PairedTests(unittest.TestCase):
         self.assertEqual((scope["treatment_max_tool_calls"], scope["raw_tool_call_cap"]), (10000, "none"))
         self.assertEqual(scope["tool_calls"], "treatment_enforced_raw_observed_only")
 
+    def test_abstention_counts_come_from_retained_verdicts_and_operation_records(self):
+        export, records, runtime, blobs = synthetic_results()
+        by_arm = {arm: [record for record, row in zip(records, export["tasks"]) if row["binding"]["arm"] == arm]
+                  for arm in ("gptgrep", "raw_only")}
+
+        def judged(record, verdict):
+            judgment = parse(blobs[record["judgment"]])
+            judgment.update(label=int(verdict["equivalent"]), verdict=verdict,
+                            verdict_sha256=sha(canonical(verdict)))
+            blobs[record["judgment"]] = canonical(judgment)
+
+        for record in by_arm["gptgrep"][:3]:
+            judged(record, {"equivalent": False, "abstained": True, "reason": "synthetic"})
+            operation = parse(blobs[record["operation"]])
+            operation["insufficient_evidence"] = True
+            blobs[record["operation"]] = canonical(operation)
+        for record in by_arm["gptgrep"][3:10] + by_arm["raw_only"][:5]:
+            judged(record, {"equivalent": True, "abstained": False, "reason": "synthetic"})
+        judged(by_arm["raw_only"][5], {"equivalent": True, "abstained": True, "reason": "synthetic"})
+        summary = self.aggregate(export, records, runtime, blobs)
+        self.assertEqual(summary["search"]["gptgrep"]["intentional_abstentions"],
+                         {"product_insufficient_evidence": 3, "judge_abstained": 3,
+                          "judged_abstention_unobserved": 52, "answerability_slices": None})
+        self.assertEqual(summary["search"]["raw_only"]["intentional_abstentions"],
+                         {"product_insufficient_evidence": 0, "judge_abstained": 1,
+                          "judged_abstention_unobserved": 56, "answerability_slices": None})
+        self.assertTrue(any("answerability" in note for note in summary["limitations"]))
+        # A retained verdict must match its digest and its label.
+        for change in ({"abstained": False}, {"equivalent": True}):
+            with self.subTest(change=change):
+                original = blobs[by_arm["gptgrep"][0]["judgment"]]
+                judgment = parse(original)
+                judgment["verdict"].update(change)
+                if "equivalent" in change:
+                    judgment["verdict_sha256"] = sha(canonical(judgment["verdict"]))
+                blobs[by_arm["gptgrep"][0]["judgment"]] = canonical(judgment)
+                with self.assertRaisesRegex(ValueError, "judge_verdict_binding"):
+                    self.aggregate(export, records, runtime, blobs)
+                blobs[by_arm["gptgrep"][0]["judgment"]] = original
+
     def test_unknown_cost_is_not_free(self):
         export, records, runtime, blobs = synthetic_results()
         result = self.aggregate(export, records, runtime, blobs)
@@ -351,12 +391,38 @@ class NativeAccountingTests(unittest.TestCase):
                                          "reason": {"type": "string"}}}
 
     def test_schema_valid_structured_judge_reply_is_parsed(self):
-        reply = canonical({"equivalent": True, "abstained": False, "reason": "synthetic"}).decode()
-        output = self.judge_main(self.events(reply), schema=self.frozen_like_schema)
+        verdict = {"equivalent": True, "abstained": False, "reason": "synthetic"}
+        output = self.judge_main(self.events(canonical(verdict).decode()), schema=self.frozen_like_schema)
         result = output["/logs/verifier/judgment.json"]
         self.assertEqual((result["status"], result["label"]), ("judged", 1))
         self.assertTrue(result["judge_attempts"][0]["output_schema_verified"])
         self.assertEqual(output["/logs/verifier/reward.json"]["answer_equivalence"], 1)
+        # The validated verdict stays reviewable beside its digest.
+        self.assertEqual(result["verdict"], verdict)
+        self.assertEqual(result["verdict_sha256"], sha(canonical(verdict)))
+
+    def test_schema_file_lists_properties_in_the_frozen_required_order(self):
+        # A key-sorted contract file (as the frozen-contract builder writes it)
+        # keeps the upstream generation order only in `required`.
+        sorted_contract = parse(canonical({**self.frozen_like_schema, "properties": {
+            "equivalent": {"type": "boolean", "description": "same answer"},
+            "abstained": {"type": "boolean", "description": "no answer"},
+            "reason": {"type": "string", "description": "short"}}}))
+        self.assertEqual(list(sorted_contract["properties"]), ["abstained", "equivalent", "reason"])
+        data = output_schema_bytes(sorted_contract)
+        written = json.loads(data)
+        self.assertEqual(list(written["properties"]), ["equivalent", "abstained", "reason"])
+        self.assertEqual(list(written), sorted(written))
+        self.assertEqual(list(written["properties"]["equivalent"]), ["description", "type"])
+        self.assertEqual(written, sorted_contract)
+        # Deterministic: a reordered but equal contract yields the same bytes.
+        self.assertEqual(output_schema_bytes(json.loads(data)), data)
+        for broken in ({**sorted_contract, "required": ["equivalent", "abstained", "abstained"]},
+                       {**sorted_contract, "required": ["equivalent", "abstained"]},
+                       {**sorted_contract, "required": [["equivalent"], "abstained", "reason"]}):
+            with self.subTest(required=broken["required"]), \
+                    self.assertRaisesRegex(ValueError, "output_schema_property_order"):
+                output_schema_bytes(broken)
 
     def test_non_json_or_schema_invalid_judge_reply_stays_unknown(self):
         for reply in ("Equivalent: yes", '{"equivalent": true', '{"equivalent": true, "abstained": false}'):
@@ -618,7 +684,9 @@ class MaterializationIsolationTests(unittest.TestCase):
             owner = object.__new__(Full62Adapter)
             owner.runtime = runtime
             owner.judge = {"schema": "gptgrep.harbor.primary-judge.v1", "prompt": "synthetic rubric",
-                           "response_schema": {"type": "object"}}
+                           "response_schema": {"type": "object", "additionalProperties": False,
+                                               "required": ["equivalent"],
+                                               "properties": {"equivalent": {"type": "boolean"}}}}
             row = {"pair_id": "synthetic-pair", "document_id": document["document_id"],
                    "question": "Read the generic number.", "reference": "PRIVATE_SYNTHETIC_REFERENCE_ONLY",
                    "answer_format": "text"}

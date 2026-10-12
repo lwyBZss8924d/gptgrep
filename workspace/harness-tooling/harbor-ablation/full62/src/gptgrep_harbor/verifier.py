@@ -60,8 +60,10 @@ def grade(config, envelope, invoke):
             else:
                 raise ValueError("unsupported_frozen_judge_schema")
         require(type(verdict.get("equivalent")) is bool, "judge_label")
+        # Retain the validated verdict (frozen-schema booleans and strings only;
+        # the native reply is bounded at 1 MiB) so abstentions stay reviewable.
         result.update(label=int(verdict["equivalent"]), status="judged",
-                      verdict_sha256=sha(canonical(verdict)))
+                      verdict_sha256=sha(canonical(verdict)), verdict=verdict)
     except Exception:
         result["judge_error"] = "unavailable_or_invalid_verdict"
     return result

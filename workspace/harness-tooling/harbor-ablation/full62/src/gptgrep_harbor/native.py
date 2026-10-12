@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 
-from .common import MAX_ANSWER, MAX_JSON, MAX_NATIVE_PROMPT_BYTES, PROFILE, canonical, integer, parse, require
+from .common import MAX_ANSWER, MAX_JSON, MAX_NATIVE_PROMPT_BYTES, PROFILE, integer, parse, require
 
 # Materialized from the frozen contract's response_schema into the Judge's
 # private /tests area; judge.json pins these exact bytes.
@@ -11,9 +11,34 @@ JUDGE_OUTPUT_SCHEMA = "/tests/judge-output-schema.json"
 MAX_OUTPUT_SCHEMA_BYTES = 65536
 
 
+def _key_sorted(value):
+    if isinstance(value, dict):
+        return {key: _key_sorted(value[key]) for key in sorted(value)}
+    if isinstance(value, list):
+        return [_key_sorted(item) for item in value]
+    return value
+
+
 def output_schema_bytes(schema):
-    """Exact bytes of the frozen response schema that the native Judge reads."""
-    data = canonical(schema) + b"\n"
+    """Exact bytes of the frozen response schema that the native Judge reads.
+
+    Strict structured output generates keys in `properties` order, and Codex
+    sends the file's key order unchanged. The frozen contract file is key-sorted,
+    so `properties` follows the contract's `required` list, which keeps the
+    frozen judge's order. Every other object is key-sorted, so the verifier can
+    recompute these exact bytes from the contract.
+    """
+    required = schema.get("required") if type(schema) is dict else None
+    properties = schema.get("properties") if type(schema) is dict else None
+    require(type(required) is list and type(properties) is dict and
+            all(isinstance(name, str) for name in required) and
+            len(set(required)) == len(required) and set(required) == set(properties),
+            "output_schema_property_order")
+    ordered = _key_sorted(schema)
+    # Replacing the value keeps the key's sorted position at the top level.
+    ordered["properties"] = {name: _key_sorted(properties[name]) for name in required}
+    data = json.dumps(ordered, separators=(",", ":"), ensure_ascii=False,
+                      allow_nan=False).encode("utf-8") + b"\n"
     require(len(data) <= MAX_OUTPUT_SCHEMA_BYTES, "output_schema_bound")
     return data
 

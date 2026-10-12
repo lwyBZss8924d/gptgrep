@@ -76,6 +76,33 @@ def toml_string(value):
     return json.dumps(value, ensure_ascii=True)
 
 
+def judge_contract(judge):
+    """Validate the frozen primary judge contract; return the Judge's exact schema-file bytes.
+
+    Materialization calls this before creating any task; pre-admission
+    validators can call it directly on the private contract.
+    """
+    require(type(judge) is dict and set(judge) == {"schema", "prompt", "response_schema"} and
+            judge["schema"] == "gptgrep.harbor.primary-judge.v1" and isinstance(judge["prompt"], str),
+            "frozen_judge_contract")
+    fields = [field for _, field, _, _ in string.Formatter().parse(judge["prompt"]) if field]
+    require(set(fields) == {"question", "answer", "answer_format", "response"}, "primary_only_fields")
+    schema = judge["response_schema"]
+    require(type(schema) is dict and schema.get("type") == "object" and
+            type(schema.get("required")) is list and "equivalent" in schema["required"] and
+            type(schema.get("properties")) is dict and
+            schema["properties"].get("equivalent", {}).get("type") == "boolean" and
+            all(type(v) is dict and v.get("type") in ("boolean", "string") for v in schema["properties"].values()),
+            "supported_frozen_schema")
+    # The Judge passes this schema as native strict structured output: every
+    # property is required exactly once and no other key is allowed.
+    required = schema["required"]
+    require(schema.get("additionalProperties") is False and all(isinstance(name, str) for name in required) and
+            len(set(required)) == len(required) and set(required) == set(schema["properties"]),
+            "strict_output_schema")
+    return output_schema_bytes(schema)
+
+
 class Full62Adapter:
     def __init__(self, manifest, manifest_sha256):
         self.manifest_path = Path(manifest).absolute()
@@ -210,20 +237,7 @@ class Full62Adapter:
             value = runtime[key]
             require(isinstance(value, str) and value.startswith("/") and ".." not in Path(value).parts,
                     "sandbox_absolute_path")
-        require(set(self.judge) == {"schema", "prompt", "response_schema"} and
-                self.judge["schema"] == "gptgrep.harbor.primary-judge.v1", "frozen_judge_contract")
-        fields = [field for _, field, _, _ in string.Formatter().parse(self.judge["prompt"]) if field]
-        require(set(fields) == {"question", "answer", "answer_format", "response"}, "primary_only_fields")
-        schema = self.judge["response_schema"]
-        require(schema.get("type") == "object" and "equivalent" in schema.get("required", []) and
-                schema.get("properties", {}).get("equivalent", {}).get("type") == "boolean" and
-                all(v.get("type") in ("boolean", "string") for v in schema["properties"].values()),
-                "supported_frozen_schema")
-        # The Judge passes this schema as native strict structured output: every
-        # property is required and no other key is allowed.
-        require(schema.get("additionalProperties") is False and
-                set(schema["required"]) == set(schema["properties"]), "strict_output_schema")
-        output_schema_bytes(schema)
+        judge_contract(self.judge)
         documents = runtime["documents"]
         require(len(documents) == 34 and len({d["document_id"] for d in documents}) == 34 and
                 {d["document_id"] for d in documents} == {r["document_id"] for r in self.rows}, "document_join")

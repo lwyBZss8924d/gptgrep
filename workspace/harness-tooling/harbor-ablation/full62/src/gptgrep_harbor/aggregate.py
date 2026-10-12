@@ -32,6 +32,31 @@ def decisions_costs(rows, runtime):
             "currency_verified": False, "included_in_query_cost": False}
 
 
+def judge_abstained(judgment, status):
+    """The retained verdict's `abstained` flag for a judged task, or None when it is absent.
+
+    A retained verdict must match its digest. Older judgments without one stay
+    unobserved, never counted as non-abstentions.
+    """
+    if judgment is None or status != "judged" or "verdict" not in judgment:
+        return None
+    verdict = judgment["verdict"]
+    require(type(verdict) is dict and len(verdict) <= 64 and
+            all(isinstance(key, str) and type(value) in (bool, str) for key, value in verdict.items()) and
+            type(verdict.get("equivalent")) is bool and verdict["equivalent"] == bool(judgment["label"]) and
+            judgment.get("verdict_sha256") == sha(canonical(verdict)), "judge_verdict_binding")
+    return verdict["abstained"] if type(verdict.get("abstained")) is bool else None
+
+
+def abstentions(rows):
+    """Per-arm intentional-abstention counts; answerability slices need evaluator metadata."""
+    return {"product_insufficient_evidence": sum(r["insufficient_evidence"] for r in rows),
+            "judge_abstained": sum(r["judge_abstained"] is True for r in rows),
+            "judged_abstention_unobserved": sum(r["status"] == "judged" and r["judge_abstained"] is None
+                                                for r in rows),
+            "answerability_slices": None}
+
+
 def quantile(values, q):
     if not values:
         return None
@@ -145,6 +170,7 @@ def summarize(export, records, runtime):
             require((status == "judged" and type(label) is int and label in (0, 1)) or
                     (status == "operational_failure" and type(label) is int and label == 0) or
                     (status == "judge_unavailable" and label is None), "label_status")
+        abstained = judge_abstained(judgment, status)
         if operation is not None:
             require(operation["schema"] == "gptgrep.harbor.operation.v1", "operation_schema")
             require(operation["deadline_ms"] == runtime["deadline_seconds"] * 1000, "deadline_join")
@@ -176,6 +202,10 @@ def summarize(export, records, runtime):
                             "retrieval_receipts": sum(a["reported_retrieval_cost_receipts"] for a in attempts
                                                       if type(a.get("reported_retrieval_cost_receipts")) is int),
                             "decisions_cost_usd": trial_decisions_cost(attempts),
+                            "judge_abstained": abstained,
+                            # A completed legacy abstention keeps this flag in the private operation record.
+                            "insufficient_evidence": operation is not None and status in ("judged", "judge_unavailable")
+                                                     and operation.get("insufficient_evidence") is True,
                             "final_reader_usage": [a["usage"] for a in attempts if isinstance(a.get("usage"), dict)]})
         if pair in pairs:
             require(binding_equal(pairs[pair]["binding"], binding) and arm not in pairs[pair], "paired_binding")
@@ -213,7 +243,8 @@ def summarize(export, records, runtime):
                         "cost_per_correct_usd": known / correct if cost_complete and correct else None,
                         "outer_attempts_observed": sum(r["attempt_count"] for r in rows),
                         "grounding_unassessed": sum(not r["grounding_available"] for r in rows)}
-        summary[arm].update(final_reader_usage_diagnostic=usage_subtotals,
+        summary[arm].update(intentional_abstentions=abstentions(rows),
+                            final_reader_usage_diagnostic=usage_subtotals,
                             all_model_turn_usage_complete=False,
                             reported_retrieval_cost_known_subtotal=sum(retrieval_costs) if retrieval_costs else None,
                             retrieval_cost_denomination_verified=False,
@@ -244,4 +275,6 @@ def summarize(export, records, runtime):
             "limitations": ["No served-profile proof is inferred from requested CLI flags.",
               "Costs missing native or physical-provider coverage remain unknown.",
               "No full62 result establishes comprehensive INDEX quality.",
+              "Answerable and unanswerable slices need evaluator-side answerability metadata, "
+              "which the cohort projection does not carry; abstention counts are not those slices.",
               "Source preparation and aggregation do not grant release or Goal acceptance."]}

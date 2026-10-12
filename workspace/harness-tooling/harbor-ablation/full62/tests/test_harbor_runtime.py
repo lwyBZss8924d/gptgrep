@@ -18,10 +18,11 @@ from harbor.models.task.config import TaskConfig, VerifierEnvironmentMode
 from harbor.models.task.paths import TaskPaths
 from harbor.models.task.verifier_mode import resolve_verifier_environment_definition
 
+from gptgrep_harbor import adapter as adapter_module, verifier
 from gptgrep_harbor.adapter import MAX_TOOL_CALLS, TOOL_CALL_WARNING_FLOOR, Full62Adapter
 from gptgrep_harbor.agent import PairedNativeAgent
-from gptgrep_harbor.common import MAX_NATIVE_PROMPT_BYTES, MAX_READER_QUESTION_BYTES, PROFILE, canonical, sha
-from gptgrep_harbor.native import JUDGE_OUTPUT_SCHEMA, codex_argv
+from gptgrep_harbor.common import MAX_NATIVE_PROMPT_BYTES, MAX_READER_QUESTION_BYTES, PROFILE, canonical, parse, sha
+from gptgrep_harbor.native import JUDGE_OUTPUT_SCHEMA, codex_argv, output_schema_bytes
 from gptgrep_harbor.reader import reader_argv, product_result, product_accounting
 from gptgrep_harbor.process import run
 from gptgrep_harbor.product_bundle import PRODUCT_ENTRYPOINT, PRODUCT_PROVENANCE, release_bundle
@@ -259,7 +260,37 @@ class HarborMaterializationTests(unittest.TestCase):
         self.judge["response_schema"]["properties"]["reason"] = {"type": "string"}
         with self.assertRaisesRegex(ValueError, "strict_output_schema"):
             self.materializer()
+        # `required` must list every property exactly once: it fixes their order.
+        self.judge["response_schema"]["required"] = ["equivalent", "reason", "reason"]
+        with self.assertRaisesRegex(ValueError, "strict_output_schema"):
+            self.materializer()
         self.assertFalse((self.root / "dataset").exists())
+
+    def test_judge_schema_file_restores_the_frozen_property_order(self):
+        # The frozen-contract builder writes a key-sorted file, so only `required`
+        # keeps the upstream order that strict structured output generates in.
+        self.judge["response_schema"] = parse(canonical({
+            "type": "object", "additionalProperties": False, "required": ["equivalent", "abstained", "reason"],
+            "properties": {"equivalent": {"type": "boolean"}, "abstained": {"type": "boolean"},
+                           "reason": {"type": "string"}}}))
+        self.assertEqual(list(self.judge["response_schema"]["properties"]), ["abstained", "equivalent", "reason"])
+        adapter = self.materializer()
+        self.assertEqual(adapter_module.judge_contract(self.judge),
+                         output_schema_bytes(self.judge["response_schema"]))
+        row = adapter.rows[0]
+        document = next(d for d in self.runtime["documents"] if d["document_id"] == row["document_id"])
+        task = self.root / "single-task"
+        adapter._task(task, Path(adapter_module.__file__).parent, row, document,
+                      {"pair_id": row["pair_id"], "document_id": row["document_id"], "arm": "gptgrep"})
+        schema_file = task / "tests/judge-output-schema.json"
+        self.assertEqual(list(json.loads(schema_file.read_bytes())["properties"]), ["equivalent", "abstained", "reason"])
+        judge = json.loads((task / "tests/judge.json").read_text())
+        self.assertEqual(list(judge["contract"]["response_schema"]["properties"]), ["abstained", "equivalent", "reason"])
+        # The verifier recomputes the same bytes from its key-sorted judge.json.
+        pin = {**judge["output_schema"], "path": str(schema_file)}
+        with patch.object(verifier, "JUDGE_OUTPUT_SCHEMA", str(schema_file)):
+            self.assertEqual(verifier.output_schema({**judge, "output_schema": pin},
+                                                    judge["contract"]["response_schema"]), pin)
 
     def test_shared_native_reader_fields_are_required_before_materialization(self):
         for key, value in (("native_ptc", False), ("native_ptc", None), ("codex_permissions", "other")):
