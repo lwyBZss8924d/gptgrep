@@ -271,6 +271,14 @@ The initial explicit relevance floor is 0.5 of the ordered rubric, an operationa
 selection policy. In hybrid mode exact atomic-token matches remain available via
 the lexical lane and are marked `literal_anchor`; the model score is not rewritten.
 This avoids allowing an uncertain semantic judgment to erase a proven grep match.
+A delivered hit scoring below the requested floor carries `below_threshold: true`.
+When no reranked candidate passes the floor (and none is a literal anchor), the
+search does not return an empty set: it delivers the top three candidates by
+score, each flagged `below_threshold`, counts them in
+`coverage.below_threshold_fallback` (they remain in `filtered_candidates`) and
+adds a warning that they are low-confidence candidates. They never count as
+passing; a host seed reports `filtered_all`. Evidence-role ordering and the rich
+text/multimodal paths keep their existing floor without this fallback.
 No-answer cases, literal queries and natural-language questions are separate evals.
 
 Decisions uses `/api/alpha/decisions`, a 20-second request deadline, no redirects

@@ -470,6 +470,7 @@ fn span(offset: usize) -> Hit {
         score: 1.0,
         confidence: None,
         literal_anchor: true,
+        below_threshold: false,
         source_sha256: digest(b"invented-source"),
         source_fresh: true,
         citation: "invented.txt:L1-L1".into(),

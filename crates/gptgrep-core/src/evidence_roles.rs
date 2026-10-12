@@ -371,6 +371,7 @@ impl EvidenceRoleDiagnostics {
                 .relevance_score
                 .context("evidence role relevance is unavailable")?;
             hit.confidence = candidate.relevance_confidence;
+            hit.below_threshold = hit.score < options.min_score;
             candidate.eligibility = Some(if hit.literal_anchor {
                 CandidateEligibility::OriginalLiteralAnchor
             } else if hit.score >= options.min_score {

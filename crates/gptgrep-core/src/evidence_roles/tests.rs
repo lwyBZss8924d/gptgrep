@@ -24,6 +24,7 @@ fn hit_window(index: usize, text: &str) -> Hit {
         score: 1.,
         confidence: None,
         literal_anchor: false,
+        below_threshold: false,
         source_sha256: digest(b"invented original"),
         source_fresh: true,
         citation: "invented.txt:L1-L1".into(),

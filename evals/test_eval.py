@@ -127,6 +127,13 @@ class EvaluationOracleTests(unittest.TestCase):
         self.assertIsNone(result["recall_at_k"])
         self.assertTrue(result["no_answer_correct"])
 
+    def test_below_threshold_fallback_hits_are_not_scored_as_matches(self):
+        flagged = [{"path": "a", "below_threshold": True}]
+        self.assertTrue(evaluation.quality(flagged, [], False)["no_answer_correct"])
+        result = evaluation.quality(flagged + [{"path": "b"}], [{"path": "a"}], False)
+        self.assertEqual(result["recall_at_k"], 0.0)
+        self.assertFalse(result["passed"])
+
     def test_exact_regex_forbids_extra_matches(self):
         result = evaluation.quality([{"path": "a"}, {"path": "extra"}], [{"path": "a"}], True)
         self.assertFalse(result["passed"])

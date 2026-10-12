@@ -200,6 +200,9 @@ def matches(hit: dict[str, Any], expected: dict[str, Any]) -> bool:
 
 
 def quality(hits: list[dict[str, Any]], relevant: list[dict[str, Any]], exact: bool) -> dict[str, Any]:
+    # Low-confidence fallback hits did not pass the relevance floor; they are
+    # validated as evidence but never scored as retrieved answers.
+    hits = [hit for hit in hits if hit.get("below_threshold") is not True]
     if not relevant:
         return {
             "recall_at_k": None,

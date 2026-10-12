@@ -684,7 +684,11 @@ impl Accounting {
             && matches!(report.mode.as_str(), "hybrid" | "semantic")
         {
             "no_candidates"
-        } else if report.hits.is_empty() && report.coverage.reranked_candidates > 0 {
+        } else if report.coverage.reranked_candidates > 0
+            && (report.hits.is_empty() || report.coverage.below_threshold_fallback > 0)
+        {
+            // No candidate met the relevance floor; any delivered hits are the
+            // flagged low-confidence fallback.
             "filtered_all"
         } else if matches!(report.mode.as_str(), "hybrid" | "semantic") {
             "reranked"
@@ -754,7 +758,12 @@ impl Accounting {
         state.searches[index] = search.clone();
         let current = &mut state.searches[index];
         if current.plan.is_some() && current.status == "awaiting_delivery" {
-            current.status = if current.delivered_hits == 0 {
+            let fallback = current
+                .plan
+                .as_ref()
+                .and_then(|plan| plan.coverage.as_ref())
+                .is_some_and(|coverage| coverage.below_threshold_fallback > 0);
+            current.status = if current.delivered_hits == 0 || fallback {
                 "filtered_all"
             } else {
                 "reranked"

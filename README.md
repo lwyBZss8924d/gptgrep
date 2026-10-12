@@ -199,6 +199,9 @@ hierarchical semantic routing remains an explicit scalability task.
 For an exact single-token query, the hybrid lexical lane retains verified token
 matches even if Jev assigns a low score. Results expose `literal_anchor` and the
 count retained below the floor; their model scores are preserved unchanged.
+If no candidate meets the floor, the top three are still returned as
+low-confidence candidates flagged `below_threshold: true`, with
+`coverage.below_threshold_fallback` and a warning; they never count as passing.
 
 ## Local Codex host
 

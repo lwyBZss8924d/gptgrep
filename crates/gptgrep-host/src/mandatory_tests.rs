@@ -371,6 +371,48 @@ async fn initial_pass_retries_one_transient_status_and_keeps_its_unknown_cost() 
 }
 
 #[tokio::test]
+async fn seed_below_floor_delivers_flagged_low_confidence_candidates() {
+    let root = corpus().await;
+    // Every reranked candidate scores 0 of 3, below the 0.5 relevance floor.
+    let (client, server, _) = mock_jev(vec![(200, 0.0)]).await;
+    let config = HostConfig {
+        document: Some("pipeline-notes.md".into()),
+        ..HostConfig::default()
+    };
+    let mut evidence = Evidence::open(root.path(), None).unwrap();
+    let accounting = Accounting::create(root.path(), &evidence.generation).unwrap();
+    evidence
+        .configure(&config, accounting.clone(), Some(client))
+        .unwrap();
+    evidence
+        .bootstrap("Which transformation removes blank records before assembly?")
+        .await
+        .unwrap();
+    server.await.unwrap();
+    let seed = evidence.initial_payload.as_ref().unwrap();
+    let hits = seed["hits"].as_array().unwrap();
+    assert!(!hits.is_empty() && hits.len() <= 3);
+    assert!(hits.iter().all(|hit| hit["below_threshold"] == true));
+    assert_eq!(
+        seed["coverage"]["below_threshold_fallback"]
+            .as_u64()
+            .unwrap() as usize,
+        hits.len()
+    );
+    assert!(seed["warnings"].as_array().unwrap().iter().any(|warning| {
+        warning
+            .as_str()
+            .unwrap()
+            .contains("low-confidence candidates")
+    }));
+    // Delivered fallback windows are real issued evidence, never a passing status.
+    assert_eq!(evidence.receipts[0].evidence.len(), hits.len());
+    let summary = accounting.summary();
+    assert_eq!(summary.initial_status, "filtered_all");
+    assert_eq!(summary.searches[0].delivered_hits, hits.len());
+}
+
+#[tokio::test]
 async fn partial_rerank_failure_preserves_routing_usage_in_typed_error_and_ledger() {
     let root = corpus().await;
     let (client, server, _) = mock_jev(vec![(200, 3.0), (503, 0.0)]).await;

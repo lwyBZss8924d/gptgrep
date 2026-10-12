@@ -57,6 +57,10 @@ pub struct PlannedCoverage {
     pub reranked_candidates: usize,
     pub filtered_candidates: usize,
     pub retained_literal_anchors: usize,
+    /// Below-floor union candidates delivered as the flagged low-confidence
+    /// fallback because none met the relevance floor (see `Coverage`).
+    #[serde(default)]
+    pub below_threshold_fallback: usize,
     pub stale_files: Vec<String>,
     pub truncated: bool,
 }
@@ -502,6 +506,7 @@ pub async fn search_planned_with_policy_and_observer(
         coverage.reranked_candidates = union.coverage.reranked_candidates;
         coverage.filtered_candidates = union.coverage.filtered_candidates;
         coverage.retained_literal_anchors = union.coverage.retained_literal_anchors;
+        coverage.below_threshold_fallback = union.coverage.below_threshold_fallback;
         if let Err(error) = reranked {
             return Err(operation.fail(error));
         }
@@ -520,6 +525,7 @@ pub async fn search_planned_with_policy_and_observer(
         coverage.reranked_candidates = union.coverage.reranked_candidates;
         coverage.filtered_candidates = union.coverage.filtered_candidates;
         coverage.retained_literal_anchors = union.coverage.retained_literal_anchors;
+        coverage.below_threshold_fallback = union.coverage.below_threshold_fallback;
         coverage.stale_files = union.coverage.stale_files.clone();
         coverage.truncated |= union.coverage.truncated;
         let operations = recorder.events();

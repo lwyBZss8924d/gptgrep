@@ -272,6 +272,13 @@ pub struct Hit {
     pub confidence: Option<f64>,
     /// A verified exact token query match retained by the hybrid lexical lane.
     pub literal_anchor: bool,
+    /// The model relevance score is below the search's `minimum_relevance_score`.
+    /// Such a hit is delivered only as a retained literal anchor or, when no
+    /// reranked candidate met the floor, as one of at most three flagged
+    /// low-confidence fallback candidates; it never passed the floor. Local
+    /// regex/lexical hits apply no floor and are never flagged.
+    #[serde(default)]
+    pub below_threshold: bool,
     pub source_sha256: String,
     pub source_fresh: bool,
     pub citation: String,
@@ -288,6 +295,11 @@ pub struct Coverage {
     pub reranked_candidates: usize,
     pub filtered_candidates: usize,
     pub retained_literal_anchors: usize,
+    /// Below-floor candidates delivered, flagged `below_threshold`, because no
+    /// reranked candidate met the relevance floor (at most three; otherwise 0).
+    /// They are also counted in `filtered_candidates`.
+    #[serde(default)]
+    pub below_threshold_fallback: usize,
     pub stale_files: Vec<String>,
     pub truncated: bool,
     pub semantic_scope_complete: bool,
@@ -1705,6 +1717,7 @@ fn hit_from_bytes(
         score,
         confidence: None,
         literal_anchor: false,
+        below_threshold: false,
         source_sha256: doc.source_sha256.clone(),
         source_fresh: true,
         citation,
@@ -1732,6 +1745,9 @@ fn tokens(query: &str) -> Vec<String> {
         .take(16)
         .collect()
 }
+
+/// Below-floor candidates delivered when no reranked candidate meets the floor.
+const BELOW_THRESHOLD_FALLBACK: usize = 3;
 
 fn lexical_score(text: &str, terms: &[String]) -> f64 {
     if terms.is_empty() {
@@ -2224,7 +2240,11 @@ async fn score_candidates(
     metrics: &mut Metrics,
     started: Instant,
 ) -> Result<()> {
-    let CandidateBatch { hits, coverage, .. } = batch;
+    let CandidateBatch {
+        hits,
+        coverage,
+        warnings,
+    } = batch;
     if !hits.is_empty() {
         let candidates: Vec<_> = hits
             .iter()
@@ -2316,12 +2336,38 @@ async fn score_candidates(
             h.confidence = rank.confidence;
         }
         let before_filter = hits.len();
+        for h in hits.iter_mut() {
+            h.below_threshold = h.score < options.min_score;
+        }
         coverage.retained_literal_anchors = hits
             .iter()
-            .filter(|h| h.literal_anchor && h.score < options.min_score)
+            .filter(|h| h.literal_anchor && h.below_threshold)
             .count();
-        hits.retain(|h| h.literal_anchor || h.score >= options.min_score);
-        coverage.filtered_candidates = before_filter - hits.len();
+        let passing = hits
+            .iter()
+            .filter(|h| h.literal_anchor || !h.below_threshold)
+            .count();
+        coverage.filtered_candidates = before_filter - passing;
+        if passing == 0 {
+            // Never deliver an empty seed when candidates exist: keep the best
+            // few by score, each flagged as below the floor. They never count
+            // as passing, and the reader is told they are low confidence.
+            hits.sort_by(|a, b| {
+                b.score
+                    .total_cmp(&a.score)
+                    .then(a.path.cmp(&b.path))
+                    .then(a.line_start.cmp(&b.line_start))
+            });
+            hits.truncate(BELOW_THRESHOLD_FALLBACK);
+            coverage.below_threshold_fallback = hits.len();
+            warnings.push(format!(
+                "No reranked candidate met the relevance floor {}; delivered the top {} as low-confidence candidates flagged below_threshold=true. They did not pass the floor; verify them before relying on them.",
+                options.min_score,
+                hits.len()
+            ));
+        } else {
+            hits.retain(|h| h.literal_anchor || !h.below_threshold);
+        }
         hits.sort_by(|a, b| {
             b.literal_anchor.cmp(&a.literal_anchor).then_with(|| {
                 b.score
@@ -2996,6 +3042,14 @@ mod tests {
     async fn mock_jev(
         statuses: Vec<u16>,
     ) -> Result<(JevClient, tokio::task::JoinHandle<Vec<Value>>)> {
+        mock_jev_scored(statuses, Arc::new(|_| 3.0)).await
+    }
+
+    /// Like `mock_jev`, with a rubric score (0..3) chosen from each candidate's text.
+    async fn mock_jev_scored(
+        statuses: Vec<u16>,
+        scorer: Arc<dyn Fn(&str) -> f64 + Send + Sync>,
+    ) -> Result<(JevClient, tokio::task::JoinHandle<Vec<Value>>)> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("http://{}/api/alpha/decisions", listener.local_addr()?);
         let client = JevClient::with_endpoint("synthetic-core-test-key", None, &endpoint)?;
@@ -3045,11 +3099,14 @@ mod tests {
                     let answers: serde_json::Map<String, Value> = body["questions"]
                         .as_object()
                         .unwrap()
-                        .keys()
-                        .map(|id| {
+                        .iter()
+                        .map(|(id, question)| {
+                            let text = question["instructions"]["candidate"]["text"]
+                                .as_str()
+                                .unwrap_or_default();
                             (
                                 id.clone(),
-                                json!({"type":"score","score":3.0,"confidence":0.9}),
+                                json!({"type":"score","score":scorer(text),"confidence":0.9}),
                             )
                         })
                         .collect();
@@ -3896,6 +3953,172 @@ mod tests {
                 .backoff(),
             Duration::from_millis(1000)
         );
+    }
+
+    /// One document whose leaf sections carry distinct synthetic markers.
+    async fn floor_corpus() -> Result<tempfile::TempDir> {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("notes.md"),
+            "# Alpha\nmarker-a quartz entry\n# Beta\nmarker-b slate entry\n# Gamma\nmarker-c basalt entry\n# Delta\nmarker-d marble entry\n# Epsilon\nmarker-e chalk entry\n",
+        )?;
+        index(directory.path(), 10).await?;
+        Ok(directory)
+    }
+
+    /// Rubric scores below the 0.5 floor (1.5 of 3), distinct per section.
+    fn below_floor_score(text: &str) -> f64 {
+        [
+            ("marker-a", 0.3),
+            ("marker-b", 1.2),
+            ("marker-c", 0.0),
+            ("marker-d", 0.9),
+            ("marker-e", 0.6),
+        ]
+        .iter()
+        .find(|(marker, _)| text.contains(marker))
+        .map_or(0.0, |(_, score)| *score)
+    }
+
+    #[tokio::test]
+    async fn all_candidates_below_floor_deliver_top_three_flagged_low_confidence() -> Result<()> {
+        let directory = floor_corpus().await?;
+        let (client, server) = mock_jev_scored(vec![200], Arc::new(below_floor_score)).await?;
+        let report = search_with_client(
+            directory.path(),
+            "unrelated survey question",
+            &SearchOptions {
+                mode: "semantic".into(),
+                ..Default::default()
+            },
+            &client,
+        )
+        .await?;
+        assert_eq!(server.await?.len(), 1);
+        assert_eq!(report.coverage.reranked_candidates, 5);
+        // None passed the floor; the best three by score are delivered, flagged.
+        assert_eq!(report.coverage.filtered_candidates, 5);
+        assert_eq!(report.coverage.below_threshold_fallback, 3);
+        assert_eq!(report.minimum_relevance_score, Some(0.5));
+        let delivered: Vec<_> = report.hits.iter().map(|hit| hit.title.as_str()).collect();
+        assert_eq!(delivered, ["Beta", "Delta", "Epsilon"]);
+        assert!(
+            report
+                .hits
+                .windows(2)
+                .all(|pair| pair[0].score > pair[1].score)
+        );
+        assert!(
+            report
+                .hits
+                .iter()
+                .all(|hit| hit.below_threshold && hit.score < 0.5 && !hit.literal_anchor)
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("low-confidence candidates"))
+        );
+        let value = serde_json::to_value(&report)?;
+        assert_eq!(value["hits"][0]["below_threshold"], true);
+        assert_eq!(value["coverage"]["below_threshold_fallback"], 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_passing_candidate_keeps_the_floor_without_fallback() -> Result<()> {
+        let directory = floor_corpus().await?;
+        let (client, server) = mock_jev_scored(
+            vec![200],
+            Arc::new(|text: &str| {
+                if text.contains("marker-c") {
+                    2.4
+                } else {
+                    below_floor_score(text)
+                }
+            }),
+        )
+        .await?;
+        let report = search_with_client(
+            directory.path(),
+            "unrelated survey question",
+            &SearchOptions {
+                mode: "semantic".into(),
+                ..Default::default()
+            },
+            &client,
+        )
+        .await?;
+        server.await?;
+        assert_eq!(report.hits.len(), 1);
+        assert_eq!(report.hits[0].title, "Gamma");
+        assert!(!report.hits[0].below_threshold);
+        assert_eq!(report.coverage.filtered_candidates, 4);
+        assert_eq!(report.coverage.below_threshold_fallback, 0);
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("low-confidence"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_floor_and_literal_anchor_stay_truthful() -> Result<()> {
+        let directory = floor_corpus().await?;
+        // A literal anchor below the floor passes as an anchor: no fallback,
+        // but its score is still flagged as below the floor.
+        let (client, server) = mock_jev_scored(vec![200], Arc::new(below_floor_score)).await?;
+        let anchored = search_with_client(
+            directory.path(),
+            "quartz",
+            &SearchOptions::default(),
+            &client,
+        )
+        .await?;
+        server.await?;
+        assert_eq!(anchored.coverage.below_threshold_fallback, 0);
+        assert_eq!(anchored.coverage.retained_literal_anchors, 1);
+        assert_eq!(anchored.hits.len(), 1);
+        assert!(anchored.hits[0].literal_anchor && anchored.hits[0].below_threshold);
+        // An explicit stricter floor: every candidate scores 2/3, so the
+        // fallback is flagged against the requested floor, never as passing.
+        let (client, server) = mock_jev_scored(vec![200], Arc::new(|_| 2.0)).await?;
+        let strict = search_with_client(
+            directory.path(),
+            "unrelated survey question",
+            &SearchOptions {
+                mode: "semantic".into(),
+                min_score: 0.9,
+                ..Default::default()
+            },
+            &client,
+        )
+        .await?;
+        server.await?;
+        assert_eq!(strict.minimum_relevance_score, Some(0.9));
+        assert_eq!(strict.coverage.below_threshold_fallback, 3);
+        assert!(strict.hits.iter().all(|hit| hit.below_threshold));
+        assert!(
+            strict
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("relevance floor 0.9"))
+        );
+        // Local modes apply no floor and never flag hits.
+        let lexical = search(
+            directory.path(),
+            "quartz",
+            &SearchOptions {
+                mode: "lexical".into(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert!(lexical.hits.iter().all(|hit| !hit.below_threshold));
+        Ok(())
     }
 
     #[tokio::test]
