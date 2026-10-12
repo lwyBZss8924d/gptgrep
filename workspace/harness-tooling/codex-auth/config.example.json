@@ -31,6 +31,7 @@
     "passthrough_env": []
   },
   "codex_config": {},
+  "extra_denied_paths": [],
   "docker": {
     "bin": "/path/to/docker",
     "env": {
@@ -41,8 +42,8 @@
   },
   "roles": {
     "dev": {
-      "tool_permissions": {"extends": ":workspace", "network_enabled": false},
-      "_comment": "Plain Codex consumers (account-probe, codex exec, app-server clients that select no permission profile): tool commands are denied the canonical auth home, the run's auth link and the lease directory."
+      "tool_permissions": {"extends": ":workspace", "network_enabled": false, "deny_paths": [], "read_paths": []},
+      "_comment": "Plain Codex consumers (account-probe, codex exec, app-server clients that select no permission profile): tool commands are denied the canonical auth home, the run's auth link, the lease directory, every extra_denied_paths entry and the role's deny_paths; read_paths re-open subpaths of the role's own denies only. A codex command line that selects another sandbox or permission source, or a working or added directory inside a deny, is refused before launch."
     },
     "test": {"tool_permissions": {"extends": ":workspace", "network_enabled": false}},
     "eval-baseline": {

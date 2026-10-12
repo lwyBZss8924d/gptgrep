@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import subprocess
 import time
+import tomllib
 import unittest
 
 import support
@@ -465,6 +466,45 @@ class CodexIntegrationTests(unittest.TestCase):
         support.observe("i_negative_control_unsupervised", exit_code=proc.returncode, run_link_removed=True,
                         canonical_unchanged=True)
         self.assertEqual(self.authority.requests(), [])
+
+    # -- (l) generated profile with configurable denies and read carve-outs ---------------------
+
+    def test_l_profile_with_extra_denies_and_read_paths_loads_under_strict_config(self):
+        """The official app-server starts with --strict-config on the generated profile with an extra
+        deny, a role deny and read carve-outs, and serves account/read. thread/start and tool commands
+        apply Codex's own sandbox (the fs helper too), which cannot nest in this guard; they are
+        qualified in the unguarded pass."""
+        root = self.env.root
+        for name in ("extra-denied", "role-denied/public"):
+            (root / name).mkdir(parents=True)
+        roles = dict(self.env.values["roles"])
+        roles["paths"] = {"tool_permissions": {
+            "extends": ":workspace", "network_enabled": False, "deny_paths": [str(root / "role-denied")],
+            "read_paths": [str(root / "role-denied" / "public"), str(self.env.credential.home.parent)]}}
+        self.env.reconfigure(roles=roles, extra_denied_paths=[str(root / "extra-denied")])
+        self.env.credential.write(1, time.time() + 3600, in_place=False)
+        code, receipt, rpc, proc = self.consume("strict1", initialize() + [read()], role="paths")
+        self.assertEqual((code, receipt["state"]), (0, "PASS"), proc.stderr[-2000:])
+        self.assertEqual((rpc["results"][0].get("method"), rpc["results"][0].get("ok")), ("initialize", True),
+                         rpc["results"][:1])
+        reads = self.reads(rpc)
+        self.assertTrue(reads and all(r["ok"] and r["account_type"] == "chatgpt" for r in reads), reads)
+        self.assertEqual(rpc["app_server_exit"], 0)
+        run = self.env.run_dir("paths", "strict1")
+        config = tomllib.loads((run / "codex-home" / "config.toml").read_text())
+        self.assertEqual(config["default_permissions"], sup.SUPERVISOR_PERMISSION_PROFILE)
+        filesystem = config["permissions"][sup.SUPERVISOR_PERMISSION_PROFILE]["filesystem"]
+        self.assertEqual(filesystem, {str(self.env.credential.home): "deny",
+                                      str(run / "codex-home" / "auth.json"): "deny",
+                                      str(self.env.lease_path.parent): "deny", str(root / "extra-denied"): "deny",
+                                      str(root / "role-denied"): "deny", str(root / "role-denied" / "public"): "read",
+                                      str(self.env.credential.home.parent): "read"})
+        access = receipt["tool_credential_access"]
+        self.assertEqual(access["read_paths"], roles["paths"]["tool_permissions"]["read_paths"])
+        self.assertEqual(access["denied_paths"][-2:], [str(root / "extra-denied"), str(root / "role-denied")])
+        self.assertEqual(self.authority.requests(), [])
+        support.observe("l_profile_paths_strict_config", strict_config_start_ok=True,
+                        denied=len(access["denied_paths"]), read=len(access["read_paths"]))
 
     # -- (k) staged re-login with the official device flow (CS-1) -------------------------------
 

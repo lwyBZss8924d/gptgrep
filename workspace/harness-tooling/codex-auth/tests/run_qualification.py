@@ -235,7 +235,11 @@ def inner(args):
                          "401 fail-closed and the exit-77 auth contract", "shared/exclusive concurrency",
                          "lifecycle deadline/cancel/unknown, lease guardian (signals, exceptions, killed supervisor)",
                          "CODEX_API_KEY stripping", "leak canaries", "staged re-login (fake and official binary)",
-                         "fake docker label gate"],
+                         "fake docker label gate",
+                         "extra_denied_paths and role deny/read paths (config, generated profile, receipts; "
+                         "enforcement via codex sandbox in the unguarded pass)",
+                         "consumer argv guard against legacy-sandbox and permission-source arguments and "
+                         "project roots inside denied paths"],
                "limitations": ["Fake credentials and loopback fakes only: no real token authority, ChatGPT backend "
                                "or model was contacted; live behaviour remains unqualified.",
                                "Process-tree tracking cannot see a daemon that escapes between samples, closes "

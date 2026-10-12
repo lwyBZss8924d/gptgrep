@@ -264,8 +264,12 @@ class FakeBackend:
                     return self._reply(status, {"error": {"message": "fake %d" % status}})
                 if self.path.split("?")[0].endswith("/accounts/check"):
                     account = self.headers.get("chatgpt-account-id") or "acct-fake-0001"
+                    # Codex requires an https origin here. Port 0 on loopback can never have a
+                    # listener and NO_PROXY covers loopback, so routed backend requests fail at
+                    # connect: no proxy, no DNS. A non-loopback origin made Codex send them
+                    # through HTTP(S)_PROXY.
                     return self._reply(200, {"accounts": [{"id": account,
-                                                           "workspace_backend_origin": "https://fake-backend.invalid",
+                                                           "workspace_backend_origin": "https://127.0.0.1:0",
                                                            "account_routing_override": "NO_CONSTRAINT"}]})
                 return self._reply(404)
 
@@ -389,7 +393,50 @@ class FakeIssuer:
 class ProxyTrap(Trap):
     """A proxy stand-in for runs that cannot use the seatbelt guard: every
     HTTP(S)_PROXY / ALL_PROXY request lands here, is counted and is closed
-    unanswered, so nothing is forwarded to a non-loopback host."""
+    unanswered, so nothing is forwarded to a non-loopback host.
+
+    For diagnosis each connection is recorded with the number of bytes received, how
+    it ended (`eof`: the peer closed; `silent`: nothing arrived for 2 s; `data`) and,
+    when a request line arrived, its method and destination host:port (`CONNECT
+    host:443`, or the authority of an absolute URL). The line is read one byte at a
+    time up to its end; no path, query, header or body is kept."""
+
+    def __init__(self):
+        self.destinations = []
+        super().__init__()
+
+    def _loop(self):
+        while self.running:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            with self.lock:
+                self.count += 1
+            line = b""
+            outcome = "data"
+            try:
+                conn.settimeout(2)
+                while len(line) < 256 and not line.endswith(b"\n"):
+                    byte = conn.recv(1)
+                    if not byte:
+                        outcome = "eof"
+                        break
+                    line += byte
+            except OSError:
+                outcome = "silent"
+            parts = line.decode("latin-1").split()
+            target = parts[1] if len(parts) > 1 else ""
+            host = target.split("://", 1)[1].split("/", 1)[0] if "://" in target else target.split("/", 1)[0]
+            host = host.rsplit("@", 1)[-1]  # never keep userinfo
+            with self.lock:
+                self.destinations.append({"bytes": len(line), "outcome": "data" if line else outcome,
+                                          "method": (parts[0] if parts else "")[:16], "host": host[:128]})
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            conn.close()
 
     @property
     def proxy_url(self):

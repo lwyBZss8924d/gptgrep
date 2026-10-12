@@ -60,10 +60,14 @@ The supervisor refuses group- or world-writable configs. Keys:
 - `relogin.experimental_issuer`: test-only loopback device-code issuer for qualification.
 - `codex_config`: extra allowlisted Codex keys, such as `chatgpt_base_url`, `openai_base_url`
   or `model`. The pinned auth keys and the permission keys cannot be overridden.
+- `extra_denied_paths` (optional): up to 64 absolute, normalized paths that model tool commands
+  are denied in every role whose profile the supervisor generates, on top of the credential paths.
+  Use physical paths (no symlinks). A leading `//` counts as not normalized.
 - `roles.<name>`:
   - `tool_permissions` (**required**; see [Tool commands](#tool-commands-and-the-credential)):
-    `{"extends": ":workspace"|":read-only", "network_enabled": false}` for a generated profile,
-    `"consumer-managed"`, or `"unrestricted"`.
+    `{"extends": ":workspace"|":read-only", "network_enabled": false, "deny_paths": [],
+    "read_paths": []}` for a generated profile, `"consumer-managed"`, or `"unrestricted"`.
+    `deny_paths` and `read_paths` are optional, each up to 64 absolute, normalized paths.
   - `passthrough_env`, `allow_openrouter`, `deadline_seconds` and `codex_config`.
   - `path_env`: Harbor needs the directory that holds `docker`.
   - `stop_scope` (`tree` or `root-first`) and `term_grace_seconds`. With `root-first`, cancel and
@@ -71,6 +75,11 @@ The supervisor refuses group- or world-writable configs. Keys:
     path and remove its containers. Only then is the rest of the tree signalled.
 - `docker.bin`, `docker.env` (`DOCKER_*`), `docker.wait_seconds`, `docker.poll_seconds`: used for
   `--harbor-job-label`.
+
+Supervisors before 1.2.0 ignore unknown top-level keys, so they silently drop
+`extra_denied_paths`, and they refuse role `deny_paths` and `read_paths`. Do not run a config that
+uses these keys with an older supervisor. The config schema stays
+`gptgrep.codex-auth.config.v1`.
 
 ## Commands
 
@@ -97,7 +106,7 @@ run under the supervisor (see [limitations](#limitations-and-unmanaged-entry-poi
 | --- | --- | --- |
 | `PASS` | 0 | Child exited 0, the sweep was clean, the canonical file is unchanged and the link was removed (for `refresh`: refreshed, or skipped as fresh) |
 | `FAILED` | child code (1 to 63), else 1 | Child failed for a non-auth reason; nothing retried |
-| `CONFIG_ERROR` | 64 | Refused before launch (config, pin, lease safety, lease binding, flags) |
+| `CONFIG_ERROR` | 64 | Refused before launch (config, pin, lease safety, lease binding, flags, consumer argv guard) |
 | `RELOGIN_NOT_REQUIRED` | 64 | `relogin` refused: the credential is still usable |
 | `REFRESH_UNAVAILABLE` | 69 | Owner refresh failed transiently (network, 429, 5xx); credential unchanged and usable; retry later |
 | `INTERNAL_ERROR` | 70 | Unexpected supervisor error before launch; only the exception type is reported |
@@ -162,23 +171,123 @@ Model tool commands normally inherit `CODEX_HOME`, so without a permission profi
 credential through the run's link (and, before the supervisor removes it, write to it). Each role
 must state who prevents that:
 
-- `{"extends": ":workspace"|":read-only", "network_enabled": false}`: the supervisor generates
-  `default_permissions = "gptgrep_codex_auth"`. The profile extends the chosen built-in and denies
-  three paths: the canonical auth home, the run's `codex-home/auth.json` and the lease directory
-  (markers and ledger). The official 0.162.1 `command/exec` path was qualified with the official
-  binary: the deny holds through the link, the workspace stays writable, and an `unrestricted`
-  negative control could read the file. This needs `--unguarded-tool-sandbox`: Codex's seatbelt
-  sandbox cannot be applied inside another sandbox, so a consumer that itself runs inside a sandbox
-  cannot use this mode.
+- `{"extends": ":workspace"|":read-only", "network_enabled": false, "deny_paths": [...],
+  "read_paths": [...]}`: the supervisor generates `default_permissions = "gptgrep_codex_auth"`.
+  The profile extends the chosen built-in. Its filesystem table holds:
+  1. `deny` for the canonical auth home, the run's `codex-home/auth.json` and the lease directory
+     (markers and ledger);
+  2. `deny` for every `extra_denied_paths` entry;
+  3. `deny` for the role's `deny_paths`;
+  4. `read` for the role's `read_paths`.
+
+  The official 0.162.1 `command/exec` path was qualified with the official binary: the deny holds
+  through the link, the workspace stays writable, and an `unrestricted` negative control could read
+  the file. This needs `--unguarded-tool-sandbox`: Codex's seatbelt sandbox cannot be applied inside
+  another sandbox, so a consumer that itself runs inside a sandbox cannot use this mode.
 - `"consumer-managed"`: the consumer selects its own permission profile. GPTgrep's native OCR and
   Document roles use deny-root profiles, and Harbor full62 denies `/opt/full62-home`. The
   supervisor cannot verify this; receipts record `verified_by_supervisor=false`.
 - `"unrestricted"`: tool commands can read the credential. Use this only for consumers that run no
   model tools, such as `account-probe`.
 
-A consumer that passes its own `default_permissions` or `permissions.*` on its command line
-overrides the generated profile. Until every consumer chain has been qualified, the ISO-02 and
-SEC acceptance items stay `BLOCKED`.
+Codex 0.162.1 applies the most specific entry, and of two equally specific entries `deny` wins.
+A read path therefore opens a directory below a deny, which is what a carve-out is for. It can
+never reopen a supervisor deny:
+
+- At config load, a read path equal to or inside the canonical auth home, any run's
+  `codex-home/auth.json` or the lease directory is refused (`config_role_read_path_reopens_credential`).
+  The same applies to an `extra_denied_paths` entry (`config_role_read_path_reopens_extra_deny`).
+  A path listed in both `deny_paths` and `read_paths` is refused
+  (`config_role_read_path_equals_deny_path`).
+- Before launch, read paths are checked again against the run's actual denies with symlinks
+  resolved (`role_read_path_resolves_into_denied_path`). Codex resolves read roots again for every
+  sandboxed command, so keep read paths on directories that no other process can replace with a
+  symlink while a run is live.
+
+Receipts and dry runs list every deny in `tool_credential_access.denied_paths` and the carve-outs in
+`tool_credential_access.read_paths`.
+
+### Consumer argv guard
+
+A consumer command line can replace the generated profile. In 0.162.1, a `--sandbox` override
+switches config resolution to the legacy syntax and silently ignores `default_permissions`
+(`core/src/config/mod.rs`, `resolve_permission_config_syntax`), so tool commands would run without
+the credential denies. For a role with a generated profile, the supervisor therefore inspects the
+consumer's argv when its executable is Codex. The executable is resolved as the launch will resolve
+it: a bare name through the role's `PATH`, a relative path against the work directory. It counts as
+Codex in any of these cases:
+
+- it is the pinned binary (the same file, also through a symlink or hard link);
+- its name, or its symlink target's name, is `codex` or starts with `codex-` or `codex.`, in any
+  letter case (release binaries such as `codex-aarch64-apple-darwin`, shims such as `codex.js`);
+- it cannot be resolved (then it cannot launch either).
+
+The run is refused before anything is created (`CONFIG_ERROR`,
+`consumer_argv_overrides_permission_profile`, with the argument as the detail) when the argv, up to
+`--`, contains any of these:
+
+- `--sandbox` or `-s` in any form (`-s VALUE`, `-sVALUE`, `--sandbox=VALUE`);
+- `--dangerously-bypass-approvals-and-sandbox` or its alias `--yolo`;
+- `--approve-for-me` or its alias `--not-so-yolo`, which set `sandbox_mode`;
+- `--full-auto` (not in 0.162.1; refused for other builds);
+- a `-c`/`--config` override whose key starts with one of these:
+  - `sandbox_mode`, `default_permissions`, `permissions` or `sandbox_workspace_write`;
+  - `projects`: project trust loads a repository's `.codex/config.toml` above the generated
+    config, and that layer may set the keys above;
+  - `mcp_servers`: MCP servers run outside the sandbox;
+  - `approvals_reviewer`: a model reviewer could approve permission escalations;
+  - a key the supervisor pins in the generated `config.toml` (`cli_auth_credentials_store`,
+    `forced_login_method`, `notify`, `memories`, `cloud`, `analytics`, `feedback`, `history`,
+    `check_for_update_on_startup`, `log_dir`), `hooks`, `plugins` or `marketplaces` (hooks,
+    notify and plugin servers run outside the sandbox), and `features` itself or a pinned
+    feature (`use_agent_identity`, `secret_auth_storage`, `memories`, `hooks`, `plugins`,
+    `apps`);
+- `--enable` with a pinned feature;
+- `--profile` or `-p`, which layers `$CODEX_HOME/<name>.config.toml`;
+- `--ignore-user-config`, which skips the generated `config.toml`;
+- `--remote`, which runs threads on another app-server under its own config;
+- for `codex sandbox`: `--sandbox-state-json`, `--sandbox-state-readable-root`,
+  `--allow-unix-socket`, and `-P`/`--permission-profile` (alias `--permissions-profile`) naming
+  any profile other than `gptgrep_codex_auth`.
+
+Codex makes the working directory and every added directory writable project roots. Such a root is
+more specific than any deny above it: with `-C` set to a directory below a denied directory, tool
+commands can read and write it (qualified in the unguarded pass). The guard therefore also refuses a
+`-C`/`--cd` or `--add-dir` directory:
+
+- equal to or inside any deny of the profile (`consumer_argv_reopens_denied_path`);
+- inside `runs_root` but outside this run's `{work_dir}`, `{results}`, `{tmp}` and `{home}`, or
+  containing `runs_root` (`consumer_argv_root_overlaps_run_state`). Tool commands could otherwise
+  rewrite a generated `config.toml` or the supervisor's records of this or another run.
+  `--add-dir /` is refused for this reason.
+
+The detail is `FLAG PATH`. Values are resolved as Codex resolves them: a leading `~` or `~/` is the
+run's home, relative values are resolved against the run's work directory, and an added directory
+also against each `-C` directory. Directories outside every deny and outside `runs_root`, or above
+a deny, stay allowed, as do this run's own work, results, tmp and home directories. Keep
+`runs_root` out of `/tmp`: the `:workspace` built-in makes `/tmp` writable without any argument.
+
+Paths are compared in every spelling that names the same file on macOS: letter case and Unicode
+normalization are folded, a leading `//` counts as `/`, and symlinks are resolved. The same rules
+apply to `read_paths`. On a case-sensitive volume this can refuse a path that is in fact different.
+
+Arguments after a positional argument are still inspected, because Codex accepts options there. A
+`codex sandbox` command whose own arguments look like these flags must follow `--`. The receipt
+records the outcome in `tool_credential_access.consumer_argv_guard`: `checked`,
+`not_a_codex_command` or `not_applicable` (no generated profile).
+
+The guard reads only the consumer's own argv. It does not cover:
+
+- non-Codex consumers that launch Codex themselves, such as a GPTgrep binary, Harbor, a shell or an
+  `env` wrapper: their Codex command lines are invisible to the supervisor;
+- app-server and `exec-server` clients, which choose a sandbox, a profile or a working directory
+  per request over JSON-RPC (`thread/start` `sandbox`, `permissions` or `cwd`; `command/exec`
+  `sandboxPolicy`, `permissionProfile` or `cwd`);
+- permission escalations approved by a person or an app-server client, and feature switches such
+  as `--enable` with `request_permissions_tool` or `exec_permission_approvals`.
+
+Such consumers must keep the generated profile themselves. Until every consumer chain has been
+qualified, the ISO-02 and SEC acceptance items stay `BLOCKED`.
 
 ## Limitations and unmanaged entry points
 
@@ -324,7 +433,16 @@ pass needs Codex's own tool sandbox, which cannot nest inside the guard:
 
 - every endpoint is a loopback fake;
 - the blocker is port 0;
-- `HTTP(S)_PROXY`/`ALL_PROXY` point at a loopback trap that must record zero connections.
+- `HTTP(S)_PROXY`/`ALL_PROXY` point at a loopback trap that must record zero connections. A
+  failure reports each connection's request line (method and host only).
+- The fake ChatGPT backend answers `accounts/check` with `workspace_backend_origin =
+  "https://127.0.0.1:0"`: an https origin, as Codex requires, on loopback port 0, where nothing
+  can listen and `NO_PROXY` applies. Codex's routed backend requests therefore fail at connect,
+  with no proxy and no DNS lookup.
+- Earlier rounds advertised `https://fake-backend.invalid`. After a thread and a sandboxed
+  `command/exec`, Codex then intermittently routed a backend request through the proxy trap.
+  One run captured `CONNECT fake-backend.invalid:443`; in others the connection closed before
+  sending any byte.
 
 Covered:
 
@@ -359,6 +477,29 @@ Covered:
   - with the fake CLI: gating, discarding an unverified login, and the clear-before-login model.
 - Tool-command denial through `command/exec` (unguarded pass only), the fake Docker label gate, and
   the guard's self-check.
+- (l) Configurable denies and read carve-outs: config limits, normalization and every reopen
+  refusal, the generated `config.toml` and receipts, and the official app-server starting on the
+  profile with `--strict-config`. In the unguarded pass, `codex sandbox --permission-profile
+  gptgrep_codex_auth` runs as a supervised consumer without any model:
+  - a role deny and an `extra_denied_paths` entry give `Operation not permitted`;
+  - a read carve-out below a denied parent is readable;
+  - the canonical credential stays denied below a read carve-out;
+  - a role without that deny can read the file, while the extra deny still applies to it.
+
+  The app-server starts a thread on the same profile, and its `command/exec` enforces the same
+  denies and carve-out.
+- (m) The consumer argv guard:
+  - every refused form, including pinned keys and `--enable`, before any run directory or lease
+    file exists;
+  - executables found through the role's `PATH`, named `CODEX` or `codex-latest`, or not found;
+  - `-C`/`--add-dir` directories inside a deny (relative, `~/…`, through `-C`, through a symlink,
+    in another letter case, with a leading `//`), and directories inside `runs_root` outside this
+    run's own directories (`~/../codex-home`, another run, `_owner`) or containing it;
+  - allowed command lines: the supervisor's own `-P`, arguments after `--`, roots outside the
+    denies, non-Codex consumers, and roles without a generated profile.
+
+  In the unguarded pass, the official `codex sandbox` with `-C` below a role deny reads and writes
+  there outside the supervisor, and the supervisor refuses the same command line.
 - With `--docker-bin/--docker-host/--docker-image` (unguarded pass): the label gate against plain
   containers on a real Docker engine. Also the read-only bind (`EROFS`), adoption of a host in-place
   save inside a running container, and Linux port-0 refusal.
@@ -407,4 +548,20 @@ Paths are relative to `codex-rs/` at source commit `092d3acd`.
   not the ExceptionsList, and applies `NO_PROXY` first.
 - `app-server` `command/exec`: runs a command under the configured permission profile without a
   model request; `extends = ":workspace"` and `":read-only"` are the extensible built-ins.
+- `protocol/src/permissions.rs`: filesystem entries resolve to the most specific path; of two
+  equally specific entries `deny` beats `write`, and `write` beats `read`.
+  `materialize_project_roots_with_workspace_roots` turns the working directory and every
+  `--add-dir` into concrete `write` entries (`core/src/config/mod.rs` workspace roots; `exec`
+  does not check that an added path is a directory). Observed with the official binary: `codex
+  sandbox -C` set to a directory below a denied directory can read and write it.
+- `core/src/config/mod.rs` `resolve_permission_config_syntax`: a `sandbox_mode` override selects
+  the legacy syntax, and `default_permissions` is then ignored. A `sandbox_mode` set by `-c` in
+  the session flags does the same.
+- `utils/cli/src/shared_options.rs`: `--yolo` is an alias of
+  `--dangerously-bypass-approvals-and-sandbox`; `--approve-for-me` (alias `--not-so-yolo`) adds
+  `sandbox_mode="workspace-write"`; `-p/--profile` layers `$CODEX_HOME/<name>.config.toml`.
+  `exec/src/cli.rs` `--ignore-user-config` skips `$CODEX_HOME/config.toml`. There is no
+  `--full-auto`.
+- `cli/src/debug_sandbox.rs`: `codex sandbox -P NAME` adds `default_permissions=NAME`. With `-P`
+  and without `--include-managed-config` it fetches no cloud config, so it needs no network.
 - The app-server `chatgptAuthTokens` mode is labelled "FOR OPENAI INTERNAL USE ONLY" and is not used.

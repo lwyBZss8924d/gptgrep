@@ -26,6 +26,64 @@ BASE_NAMES = {"CODEX_HOME", "CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED",
               "HOME", "LANG", "LC_ALL", "NO_PROXY", "no_proxy", "PATH", "TMPDIR", "XDG_CACHE_HOME",
               "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"}
 PLATFORM_NAMES = {"__CF_USER_TEXT_ENCODING"}  # injected by macOS at process start, not by the supervisor
+PROFILE = sup.SUPERVISOR_PERMISSION_PROFILE
+# Codex command lines (after the executable) that replace the generated profile, with the refusal detail.
+ARGV_REFUSED = [
+    (["exec", "--sandbox", "workspace-write", "say hi"], "--sandbox"),
+    (["exec", "--sandbox=danger-full-access", "say hi"], "--sandbox"),
+    (["-s", "read-only", "exec", "say hi"], "-s"),
+    (["exec", "-sdanger-full-access", "say hi"], "-s"),
+    (["-hs", "read-only"], "-s"),
+    (["exec", "say hi", "--sandbox", "read-only"], "--sandbox"),
+    (["exec", "--dangerously-bypass-approvals-and-sandbox", "say hi"], "--dangerously-bypass-approvals-and-sandbox"),
+    (["exec", "--yolo", "say hi"], "--yolo"),
+    (["--full-auto", "exec", "say hi"], "--full-auto"),
+    (["exec", "--approve-for-me", "say hi"], "--approve-for-me"),
+    (["exec", "--not-so-yolo", "say hi"], "--not-so-yolo"),
+    (["exec", "-c", 'sandbox_mode="danger-full-access"', "say hi"], "-c sandbox_mode"),
+    (["exec", '-csandbox_mode="danger-full-access"', "say hi"], "-c sandbox_mode"),
+    (["exec", "-c", ' sandbox_mode = "read-only"', "say hi"], "-c sandbox_mode"),
+    (["exec", "-C", "-c", "sandbox_mode=read-only", "say hi"], "-c sandbox_mode"),
+    (['--config=default_permissions=":danger-full-access"', "exec", "say hi"], "--config default_permissions"),
+    (["exec", "--config", "permissions.%s.filesystem={}" % PROFILE, "say hi"], "--config permissions"),
+    (["app-server", "-c", "permissions={}"], "-c permissions"),
+    (["exec", "-c", "sandbox_workspace_write.network_access=true", "say hi"], "-c sandbox_workspace_write"),
+    (["exec", "--profile", "other", "say hi"], "--profile"),
+    (["exec", "-p", "other", "say hi"], "-p"),
+    (["-pother", "exec", "say hi"], "-p"),
+    (["exec", "--ignore-user-config", "say hi"], "--ignore-user-config"),
+    (["sandbox", "--permission-profile", ":danger-full-access", "--", "/bin/cat", "x"], "--permission-profile"),
+    (["sandbox", "--permissions-profile=other", "--", "/bin/true"], "--permissions-profile"),
+    (["sandbox", "-P", "other", "--", "/bin/true"], "-P"),
+    (["sandbox", "--sandbox-state-json", "{}", "--", "/bin/true"], "--sandbox-state-json"),
+    (["sandbox", "--sandbox-state-readable-root", "/", "--", "/bin/true"], "--sandbox-state-readable-root"),
+    (["sandbox", "--allow-unix-socket", "/var/run/docker.sock", "--", "/bin/true"], "--allow-unix-socket"),
+    (["--remote", "ws://127.0.0.1:1", "say hi"], "--remote"),
+    (["exec", "-c", 'projects={"/w"={trust_level="trusted"}}', "say hi"], "-c projects"),
+    (["exec", "-c", 'projects."/w".trust_level="trusted"', "say hi"], "-c projects"),
+    (["exec", "-c", 'mcp_servers.fake.command="/bin/sh"', "say hi"], "-c mcp_servers"),
+    (["exec", "-c", 'approvals_reviewer="auto_review"', "say hi"], "-c approvals_reviewer"),
+    (["exec", "-c", 'cli_auth_credentials_store="keyring"', "say hi"], "-c cli_auth_credentials_store"),
+    (["exec", "-c", 'notify=["/bin/sh", "-c", "true"]', "say hi"], "-c notify"),
+    (["exec", "-c", 'log_dir="/w/elsewhere"', "say hi"], "-c log_dir"),
+    (["exec", "-c", "hooks.fake={}", "say hi"], "-c hooks"),
+    (["exec", "-c", "marketplaces.fake={}", "say hi"], "-c marketplaces"),
+    (["exec", "-c", "features.plugins=true", "say hi"], "-c features.plugins"),
+    (["exec", "-c", "features={plugins=true}", "say hi"], "-c features"),
+    (["exec", "--enable", "hooks", "say hi"], "--enable hooks"),
+    (["--enable=secret_auth_storage", "exec", "say hi"], "--enable secret_auth_storage"),
+]
+ARGV_ALLOWED = [
+    ["exec", "-c", 'model="fake-model"', "-m", "fake-model", "-C", "/w", "-a", "never", "say hi"],
+    ["exec", "-c", "features.fake_feature=true", "--skip-git-repo-check", "--", "--sandbox is prompt text"],
+    ["app-server", "--listen", "stdio://", "--strict-config"],
+    ["sandbox", "--permission-profile", PROFILE, "-C", "/w", "--", "/bin/cat", "-s"],
+    ["sandbox", "--permission-profile=" + PROFILE, "--", "/bin/true"],
+    ["sandbox", "-P" + PROFILE, "--", "/bin/true"],
+    ["-C/w/sandbox-dir", "exec", "say hi"],
+    ["exec", "--enable", "fake_feature", "--disable", "memories", "-c", "features.fake_feature=true", "say hi"],
+    ["--version"],
+]
 
 
 class LayoutEnvTests(unittest.TestCase):
@@ -302,11 +360,13 @@ class LayoutEnvTests(unittest.TestCase):
                                             "/bin/echo")
         self.assertNotIn("default_permissions", tomllib.loads(plan["codex_config_toml"]))
         self.assertEqual(plan["tool_credential_access"],
-                         {"policy": "unrestricted", "tool_commands_can_read_credential": True})
+                         {"policy": "unrestricted", "tool_commands_can_read_credential": True,
+                          "consumer_argv_guard": "not_applicable"})
         code, plan, _ = self.env.supervisor("run", "--role", "harbor", "--run-id", "perm3", "--dry-run", "--",
                                             "/bin/echo")
         self.assertEqual(plan["tool_credential_access"], {"policy": "consumer_managed",
-                                                          "verified_by_supervisor": False})
+                                                          "verified_by_supervisor": False,
+                                                          "consumer_argv_guard": "not_applicable"})
 
     def test_refusals_before_launch_leave_no_auth_link(self):
         listener = support.Trap()
@@ -321,6 +381,346 @@ class LayoutEnvTests(unittest.TestCase):
         os.chmod(self.env.credential.path, 0o600)
         self.assertEqual(support.run_auth_links(self.env), [])
         self.assertTrue(self.env.run_dir("dev", "nolink1").exists() and self.env.run_dir("dev", "nolink2").exists())
+
+
+class ToolPathsAndArgvGuardTests(unittest.TestCase):
+    """(l) extra_denied_paths, role deny/read paths and (m) the consumer argv guard.
+
+    The sandbox itself cannot be applied under the qualification guard; its
+    enforcement is qualified in unguarded_test_tool_sandbox.py."""
+
+    def setUp(self):
+        self.env = Env("paths")
+        self.env.credential.write(1, time.time() + 3600, in_place=False)
+
+    def tools_roles(self, **tool_permissions):
+        roles = dict(self.env.values["roles"])
+        roles["tools"] = {"tool_permissions": dict({"extends": ":workspace", "network_enabled": False},
+                                                   **tool_permissions)}
+        return roles
+
+    def config_with(self, **changes):
+        return sup.Config(dict(self.env.values, schema=sup.CONFIG_SCHEMA, **changes), "inline")
+
+    def refusal(self, **changes):
+        with self.assertRaises(sup.SupervisorError) as ctx:
+            self.config_with(**changes)
+        return ctx.exception.reason, ctx.exception.detail
+
+    def install_fake_codex(self):
+        fake = support.script(self.env.root / "codex", (FIXTURES / "fake_codex.py").read_text())
+        Path(str(fake) + ".json").write_text("{}")
+        self.env.reconfigure(codex_bin=str(fake), codex_bin_sha256=support.sha256_file(fake))
+        return fake
+
+    def test_extra_denied_paths_are_validated_and_deduplicated(self):
+        root = self.env.root
+        cfg = self.config_with(extra_denied_paths=[str(root / "private"), str(root / "private"),
+                                                   str(root / "other")])
+        self.assertEqual(cfg.extra_denied_paths, [str(root / "private"), str(root / "other")])
+        self.assertEqual(self.config_with().extra_denied_paths, [])
+        most = [str(root / ("p%02d" % i)) for i in range(sup.MAX_PROFILE_PATHS)]
+        self.assertEqual(self.config_with(extra_denied_paths=most).extra_denied_paths, most)
+        cases = [("config_extra_denied_paths", str(root / "private")),
+                 ("config_extra_denied_paths", {"path": str(root / "private")}),
+                 ("config_extra_denied_paths", most + [str(root / "one-too-many")]),
+                 ("config_path_not_absolute", ["relative/private"]),
+                 ("config_path_not_absolute", [17]),
+                 ("config_path_not_absolute", [""]),
+                 ("config_path_not_normalized", [str(root / "a") + "/../b"]),
+                 ("config_path_not_normalized", [str(root / "private") + "/"]),
+                 ("config_path_not_normalized", [str(root) + "//private"]),
+                 ("config_path_not_normalized", ["/" + str(root / "private")])]
+        for reason, value in cases:
+            with self.subTest(reason=reason, value=str(value)[-32:]):
+                self.assertEqual(self.refusal(extra_denied_paths=value), (reason, "extra_denied_paths"))
+
+    def test_role_deny_and_read_paths_are_validated(self):
+        root = self.env.root
+        data = str(root / "data")
+        tools = self.config_with(roles=self.tools_roles(deny_paths=[data, data], read_paths=[data + "/public"]))
+        self.assertEqual(tools.role("tools")["tool_permissions"],
+                         {"extends": ":workspace", "network_enabled": False, "deny_paths": [data],
+                          "read_paths": [data + "/public"]})
+        plain = self.config_with(roles=self.tools_roles()).role("tools")["tool_permissions"]
+        self.assertEqual((plain["deny_paths"], plain["read_paths"]), ([], []))
+        most = [str(root / ("p%02d" % i)) for i in range(sup.MAX_PROFILE_PATHS)]
+        self.config_with(roles=self.tools_roles(deny_paths=most, read_paths=[p + "/sub" for p in most]))
+        key = "roles.tools.tool_permissions."
+        cases = [("config_role_tool_permissions_invalid", key + "deny_paths", {"deny_paths": data}),
+                 ("config_role_tool_permissions_invalid", key + "read_paths", {"read_paths": {"x": data}}),
+                 ("config_role_tool_permissions_invalid", key + "deny_paths", {"deny_paths": most + [data]}),
+                 ("config_role_tool_permissions_invalid", key + "read_paths", {"read_paths": most + [data]}),
+                 ("config_path_not_absolute", key + "deny_paths", {"deny_paths": ["data"]}),
+                 ("config_path_not_normalized", key + "read_paths", {"read_paths": [data + "/./public"]}),
+                 ("config_path_not_normalized", key + "read_paths", {"read_paths": ["/" + data]}),
+                 ("config_role_tool_permissions_invalid", "roles.tools", {"write_paths": [data]}),
+                 ("config_role_read_path_equals_deny_path", key + "read_paths:" + data,
+                  {"deny_paths": [data], "read_paths": [data]}),
+                 ("config_role_read_path_equals_deny_path", key + "read_paths:" + data,
+                  {"deny_paths": [data.upper()], "read_paths": [data]})]
+        for reason, detail, change in cases:
+            with self.subTest(reason=reason, change=sorted(change)):
+                self.assertEqual(self.refusal(roles=self.tools_roles(**change)), (reason, detail))
+
+    def test_read_paths_that_reopen_a_supervisor_deny_are_refused_at_config_load(self):
+        root, home, runs = self.env.root, self.env.credential.home, self.env.runs_root
+        extra, accented = str(root / "extra-denied"), str(root / "café")
+        # Other spellings of the same path (macOS volumes ignore case and normalization) count too.
+        cases = [("config_role_read_path_reopens_credential", str(home)),
+                 ("config_role_read_path_reopens_credential", str(self.env.credential.path)),
+                 ("config_role_read_path_reopens_credential", str(home.parent / home.name.upper())),
+                 ("config_role_read_path_reopens_credential", str(home.parent / home.name.upper() / "auth.json")),
+                 ("config_role_read_path_reopens_credential", str(self.env.lease_path.parent)),
+                 ("config_role_read_path_reopens_credential", str(self.env.lease_path)),
+                 ("config_role_read_path_reopens_credential", str(runs / "tools" / "r1" / "codex-home" / "auth.json")),
+                 ("config_role_read_path_reopens_credential", str(runs / "dev" / "r2" / "codex-home" / "auth.json")),
+                 ("config_role_read_path_reopens_credential", str(runs / "dev" / "r2" / "Codex-Home" / "AUTH.json")),
+                 ("config_role_read_path_reopens_extra_deny", extra),
+                 ("config_role_read_path_reopens_extra_deny", extra + "/inside"),
+                 ("config_role_read_path_reopens_extra_deny", extra.upper()),
+                 ("config_role_read_path_reopens_extra_deny", str(root / "café" / "inside"))]
+        for reason, path in cases:
+            with self.subTest(reason=reason, path=path[-40:]):
+                self.assertEqual(self.refusal(extra_denied_paths=[extra, accented],
+                                              roles=self.tools_roles(read_paths=[path])),
+                                 (reason, "roles.tools.tool_permissions.read_paths:" + path))
+        # Accepted: a carve-out below a role deny, and paths that merely contain a supervisor deny
+        # (the more specific deny still applies).
+        reads = [str(root / "data" / "public"), str(home.parent), str(runs / "tools"),
+                 str(runs / "tools" / "r1" / "codex-home")]
+        cfg = self.config_with(extra_denied_paths=[extra],
+                               roles=self.tools_roles(deny_paths=[str(root / "data")], read_paths=reads))
+        self.assertEqual(cfg.role("tools")["tool_permissions"]["read_paths"], reads)
+        # The CLI refuses at config load, for every command, before any lease file exists.
+        self.env.reconfigure(roles=self.tools_roles(read_paths=[str(home)]))
+        for args in (("status",), ("run", "--role", "dev", "--run-id", "load1", "--", "/usr/bin/true")):
+            code, result, _ = self.env.supervisor(*args)
+            self.assertEqual((code, result["state"], result["refusal"]["reason"]),
+                             (sup.EXIT_USAGE, "CONFIG_ERROR", "config_role_read_path_reopens_credential"))
+        self.assertFalse(self.env.lease_path.exists())
+        self.assertFalse(self.env.run_dir("dev", "load1").exists())
+
+    def test_read_path_resolving_into_a_denied_path_is_refused_before_launch(self):
+        alias = self.env.root / "alias"
+        os.symlink(self.env.credential.home, alias)
+        self.env.reconfigure(roles=self.tools_roles(read_paths=[str(alias / "sub")]))
+        self.env.cfg()  # lexically valid, so the config loads
+        for run_id, extra in (("alias1", ()), ("alias2", ("--dry-run",))):
+            code, result, _ = self.env.supervisor("run", "--role", "tools", "--run-id", run_id, *extra, "--",
+                                                  "/usr/bin/true")
+            self.assertEqual((code, result["refusal"]),
+                             (sup.EXIT_USAGE, {"reason": "role_read_path_resolves_into_denied_path",
+                                               "detail": str(alias / "sub")}))
+            self.assertFalse(self.env.run_dir("tools", run_id).exists())
+        self.assertFalse(self.env.lease_path.exists())
+        self.assertEqual(support.run_auth_links(self.env), [])
+
+    def test_generated_profile_composes_supervisor_and_role_denies_with_read_carve_outs(self):
+        root, home = self.env.root, self.env.credential.home
+        data = str(root / "data")
+        reads = [data + "/public", str(home.parent)]
+        # An extra deny that repeats a credential deny is kept once.
+        self.env.reconfigure(extra_denied_paths=[str(root / "extra-denied"), str(home)],
+                             roles=self.tools_roles(deny_paths=[data], read_paths=reads))
+        code, receipt, proc = self.env.supervisor("run", "--role", "tools", "--run-id", "paths1", "--",
+                                                  "/usr/bin/true")
+        self.assertEqual((code, receipt["state"]), (0, "PASS"), proc.stderr)
+        run = self.env.run_dir("tools", "paths1")
+        denied = [str(home), str(run / "codex-home" / "auth.json"), str(self.env.lease_path.parent),
+                  str(root / "extra-denied"), data]
+        config = tomllib.loads((run / "codex-home" / "config.toml").read_text())
+        self.assertEqual(config["default_permissions"], PROFILE)
+        profile = config["permissions"][PROFILE]
+        expected = {path: "deny" for path in denied}
+        expected.update({path: "read" for path in reads})
+        self.assertEqual(list(profile["filesystem"].items()), list(expected.items()))
+        self.assertEqual((profile["extends"], profile["network"]), (":workspace", {"enabled": False}))
+        access = receipt["tool_credential_access"]
+        self.assertEqual((access["policy"], access["denied_paths"], access["read_paths"]),
+                         ("supervisor_profile", denied, reads))
+        self.assertEqual(access["consumer_argv_guard"], "not_a_codex_command")
+        self.assertEqual(json.loads((run / "receipt.json").read_text())["tool_credential_access"], access)
+        code, plan, _ = self.env.supervisor("run", "--role", "tools", "--run-id", "paths2", "--dry-run", "--",
+                                            "/usr/bin/true")
+        self.assertEqual(code, 0)
+        self.assertEqual(plan["tool_credential_access"]["read_paths"], reads)
+        link2 = str(self.env.run_dir("tools", "paths2") / "codex-home" / "auth.json")
+        planned = {(link2 if path == denied[1] else path): mode for path, mode in expected.items()}
+        self.assertEqual(tomllib.loads(plan["codex_config_toml"])["permissions"][PROFILE]["filesystem"], planned)
+        # Roles without a generated profile get no profile, so extra_denied_paths does not apply.
+        for role, policy in (("dev", "unrestricted"), ("harbor", "consumer_managed")):
+            code, plan, _ = self.env.supervisor("run", "--role", role, "--run-id", "paths-" + role, "--dry-run",
+                                                "--", "/usr/bin/true")
+            self.assertEqual((code, plan["tool_credential_access"]["policy"]), (0, policy))
+            self.assertNotIn("permissions", tomllib.loads(plan["codex_config_toml"]))
+            self.assertNotIn("extra-denied", plan["codex_config_toml"])
+        support.observe("profile_paths_generated", denied=len(denied), read=len(reads))
+
+    def test_codex_argv_override_detection(self):
+        for args, detail in ARGV_REFUSED:
+            with self.subTest(args=args):
+                self.assertEqual(sup.codex_profile_override(["/x/codex", *args]), detail)
+        for args in ARGV_ALLOWED:
+            with self.subTest(args=args):
+                self.assertIsNone(sup.codex_profile_override(["/x/codex", *args]))
+
+    def test_consumer_argv_guard_refuses_before_anything_is_created(self):
+        fake = self.install_fake_codex()
+        link = self.env.root / "codex-link"
+        os.symlink(fake, link)
+        (self.env.root / "copy").mkdir()
+        copy = support.script(self.env.root / "copy" / "codex", "raise SystemExit(0)\n")
+        self.env.reconfigure(roles=self.tools_roles())
+        cases = [(str(fake), ["exec", "--sandbox", "danger-full-access", "say hi"], "--sandbox", ()),
+                 (str(link), ["-c", 'sandbox_mode="danger-full-access"', "exec", "say hi"], "-c sandbox_mode", ()),
+                 (str(copy), ["exec", "--profile", "other", "say hi"], "--profile", ()),
+                 (str(fake), ["sandbox", "-P", ":danger-full-access", "-C", "{work_dir}", "--", "/bin/cat", "x"],
+                  "-P", ("--dry-run",))]
+        for index, (executable, args, detail, extra) in enumerate(cases):
+            run_id = "argv%d" % index
+            with self.subTest(detail=detail):
+                code, result, _ = self.env.supervisor("run", "--role", "tools", "--run-id", run_id, *extra, "--",
+                                                      executable, *args)
+                self.assertEqual((code, result["state"], result["refusal"]),
+                                 (sup.EXIT_USAGE, "CONFIG_ERROR",
+                                  {"reason": "consumer_argv_overrides_permission_profile", "detail": detail}))
+                self.assertFalse(self.env.run_dir("tools", run_id).exists())
+        self.assertFalse(self.env.lease_path.exists(), "refused before any lease file or binding exists")
+        self.assertFalse(self.env.binding().exists())
+        support.observe("argv_guard_refusals", cases=len(cases), detector_cases=len(ARGV_REFUSED))
+
+    def test_consumer_argv_guard_refuses_unsafe_project_roots(self):
+        """-C/--cd and --add-dir become writable project roots: more specific than any deny above them,
+        and able to rewrite the run's own config.toml and records."""
+        fake = self.install_fake_codex()
+        root, home = self.env.root, self.env.credential.home
+        data = root / "data"
+        data.mkdir()
+        os.symlink(data, root / "alias")
+        self.env.reconfigure(extra_denied_paths=[str(root / "extra-denied")],
+                             roles=self.tools_roles(deny_paths=[str(data)], read_paths=[str(data / "public")]))
+
+        def run_path(run_id, *parts):
+            return str(self.env.run_dir("tools", run_id).joinpath(*parts))
+
+        def lease_relative(run_id):
+            return os.path.relpath(str(self.env.lease_path.parent / "x"), run_path(run_id, "work"))
+
+        reopen, overlap = "consumer_argv_reopens_denied_path", "consumer_argv_root_overlaps_run_state"
+        upper_home = str(home.parent / home.name.upper())
+        cases = [("root1", ["exec", "-C", str(data / "sub"), "say hi"], reopen, "-C " + str(data / "sub")),
+                 ("root2", ["exec", "--cd=" + str(root / "extra-denied"), "say hi"], reopen,
+                  "--cd " + str(root / "extra-denied")),
+                 ("root3", ["exec", "--add-dir", str(home / "auth.json"), "say hi"], reopen,
+                  "--add-dir " + str(home / "auth.json")),
+                 ("root4", ["exec", "--add-dir", lease_relative("root4"), "say hi"], reopen,
+                  "--add-dir " + str(self.env.lease_path.parent / "x")),
+                 ("root5", ["sandbox", "-P", PROFILE, "-C", str(data / "public"), "--", "/bin/true"], reopen,
+                  "-C " + str(data / "public")),
+                 ("root6", ["exec", "-C", str(root / "open"), "--add-dir", "../data/x", "say hi"], reopen,
+                  "--add-dir " + str(data / "x")),
+                 ("root7", ["exec", "-C", str(root / "alias" / "sub"), "say hi"], reopen,
+                  "-C " + str(root / "alias" / "sub")),
+                 ("root8", ["exec", "--add-dir", run_path("root8", "codex-home", "auth.json"), "say hi"], reopen,
+                  "--add-dir " + run_path("root8", "codex-home", "auth.json")),
+                 ("root9", ["exec", "--add-dir", upper_home + "/auth.json", "say hi"], reopen,
+                  "--add-dir " + upper_home + "/auth.json"),
+                 ("root10", ["exec", "-C", "/" + str(data / "sub"), "say hi"], reopen, "-C /" + str(data / "sub")),
+                 ("root11", ["exec", "-C", "{run_dir}", "say hi"], overlap, "-C " + run_path("root11")),
+                 ("root12", ["exec", "--add-dir", "{codex_home}/skills", "say hi"], overlap,
+                  "--add-dir " + run_path("root12", "codex-home", "skills")),
+                 ("root13", ["exec", "--add-dir", "{log_dir}", "say hi"], overlap,
+                  "--add-dir " + run_path("root13", "state", "logs")),
+                 ("root14", ["exec", "--add-dir", "/", "say hi"], overlap, "--add-dir /"),
+                 ("root15", ["exec", "--add-dir", "~/../codex-home", "say hi"], overlap,
+                  "--add-dir " + run_path("root15", "codex-home")),
+                 ("root16", ["exec", "--add-dir", "~/" + os.path.relpath(str(home / "auth.json"),
+                                                                        run_path("root16", "home")), "say hi"],
+                  reopen, "--add-dir " + str(home / "auth.json")),
+                 ("root17", ["exec", "--add-dir", str(self.env.runs_root / "tools" / "other" / "codex-home"),
+                             "say hi"], overlap,
+                  "--add-dir " + str(self.env.runs_root / "tools" / "other" / "codex-home")),
+                 ("root18", ["exec", "-C", str(self.env.runs_root / "_owner"), "say hi"], overlap,
+                  "-C " + str(self.env.runs_root / "_owner"))]
+        for run_id, args, reason, detail in cases:
+            with self.subTest(detail=detail[-48:]):
+                code, result, _ = self.env.supervisor("run", "--role", "tools", "--run-id", run_id, "--dry-run",
+                                                      "--", str(fake), *args)
+                self.assertEqual((code, result["state"], result["refusal"]),
+                                 (sup.EXIT_USAGE, "CONFIG_ERROR", {"reason": reason, "detail": detail}))
+        code, result, _ = self.env.supervisor("run", "--role", "tools", "--run-id", "root99", "--", str(fake),
+                                              "exec", "--add-dir", str(home / "auth.json"), "say hi")
+        self.assertEqual((code, result["refusal"]["reason"]), (sup.EXIT_USAGE, reopen))
+        self.assertFalse(self.env.run_dir("tools", "root99").exists())
+        self.assertFalse(self.env.lease_path.exists())
+        # Roots outside every deny and the run's own state, or above a deny (the more specific deny
+        # still applies), are allowed.
+        for run_id, args in (("roots-ok1", ["exec", "-C", str(root / "open"), "--add-dir", str(root / "other"), "x"]),
+                             ("roots-ok2", ["exec", "--cd", str(home.parent), "--add-dir", "relative/dir", "x"]),
+                             ("roots-ok3", ["sandbox", "-P", PROFILE, "-C", "{work_dir}", "--", "/bin/true"]),
+                             ("roots-ok4", ["exec", "--add-dir", "{results}", "--add-dir", "{tmp}", "x"]),
+                             ("roots-ok5", ["exec", "--add-dir", "{home}", "--add-dir", "~/notes", "x"])):
+            with self.subTest(run_id=run_id):
+                code, plan, _ = self.env.supervisor("run", "--role", "tools", "--run-id", run_id, "--dry-run", "--",
+                                                    str(fake), *args)
+                self.assertEqual((code, plan["tool_credential_access"]["consumer_argv_guard"]), (0, "checked"))
+        support.observe("argv_guard_root_refusals", cases=len(cases) + 1, allowed=5)
+
+    def test_consumer_argv_guard_resolves_the_executable_like_the_launch(self):
+        """A bare name is looked up in the role's PATH and a name is matched in any case; an executable
+        that cannot be resolved is inspected as Codex."""
+        fake = self.install_fake_codex()
+        bin_dir = self.env.root / "bin"
+        bin_dir.mkdir()
+        os.symlink(fake, bin_dir / "codex-0.162.1")
+        (self.env.root / "upper").mkdir()
+        upper = support.script(self.env.root / "upper" / "CODEX", "raise SystemExit(0)\n")
+        release = support.script(self.env.root / "upper" / "codex-latest", "raise SystemExit(0)\n")
+        roles = self.tools_roles()
+        roles["tools"]["path_env"] = str(bin_dir) + ":/usr/bin:/bin"
+        self.env.reconfigure(roles=roles)
+        refused = [("exe1", ["codex-0.162.1", "exec", "--sandbox", "danger-full-access", "say hi"], "--sandbox"),
+                   ("exe2", [str(upper), "exec", "-p", "other", "say hi"], "-p"),
+                   ("exe3", ["no-such-tool-anywhere", "--yolo"], "--yolo"),
+                   ("exe6", [str(release), "exec", "--ignore-user-config", "say hi"], "--ignore-user-config")]
+        for run_id, argv, detail in refused:
+            with self.subTest(argv=argv[0]):
+                code, result, _ = self.env.supervisor("run", "--role", "tools", "--run-id", run_id, "--dry-run", "--",
+                                                      *argv)
+                self.assertEqual((code, result["refusal"]),
+                                 (sup.EXIT_USAGE, {"reason": "consumer_argv_overrides_permission_profile",
+                                                   "detail": detail}))
+        code, plan, _ = self.env.supervisor("run", "--role", "tools", "--run-id", "exe4", "--dry-run", "--", "echo",
+                                            "--sandbox", "danger-full-access")
+        self.assertEqual((code, plan["tool_credential_access"]["consumer_argv_guard"]), (0, "not_a_codex_command"))
+        code, plan, _ = self.env.supervisor("run", "--role", "tools", "--run-id", "exe5", "--dry-run", "--",
+                                            "codex-0.162.1", "exec", "say hi")
+        self.assertEqual((code, plan["tool_credential_access"]["consumer_argv_guard"]), (0, "checked"))
+
+    def test_consumer_argv_guard_allows_the_supervisor_profile_and_out_of_scope_consumers(self):
+        fake = self.install_fake_codex()
+        self.env.reconfigure(roles=self.tools_roles())
+        code, receipt, proc = self.env.supervisor("run", "--role", "tools", "--run-id", "ok1", "--", str(fake),
+                                                  "-c", 'model="fake-model"', "--version")
+        self.assertEqual((code, receipt["state"], receipt["child_exit_code"]), (0, "PASS", 0), proc.stderr)
+        self.assertEqual(receipt["argv"], [str(fake), "-c", 'model="fake-model"', "--version"])
+        self.assertEqual(receipt["tool_credential_access"]["consumer_argv_guard"], "checked")
+        code, plan, _ = self.env.supervisor("run", "--role", "tools", "--run-id", "ok2", "--dry-run", "--", str(fake),
+                                            "sandbox", "--permission-profile", PROFILE, "-C", "{work_dir}", "--",
+                                            "/bin/cat", "-s")
+        self.assertEqual((code, plan["tool_credential_access"]["consumer_argv_guard"]), (0, "checked"))
+        self.assertEqual(plan["argv"][5], str(self.env.run_dir("tools", "ok2") / "work"))
+        # Out of scope: a program that is not Codex, and roles without a generated profile.
+        code, receipt, _ = self.env.supervisor("run", "--role", "tools", "--run-id", "ok3", "--", "/bin/echo",
+                                               "--sandbox", "danger-full-access")
+        self.assertEqual((code, receipt["tool_credential_access"]["consumer_argv_guard"]),
+                         (0, "not_a_codex_command"))
+        code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "ok4", "--", str(fake),
+                                               "--sandbox", "read-only", "--version")
+        self.assertEqual((code, receipt["state"], receipt["tool_credential_access"]["consumer_argv_guard"]),
+                         (0, "PASS", "not_applicable"))
+        support.observe("argv_guard_allowed", launched=3, detector_cases=len(ARGV_ALLOWED))
 
 
 if __name__ == "__main__":

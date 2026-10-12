@@ -43,6 +43,7 @@ import os
 from pathlib import Path
 import pwd
 import re
+import shutil
 import signal
 import socket
 import stat
@@ -50,9 +51,10 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import urllib.parse
 
-SUPERVISOR_VERSION = "1.1.0"
+SUPERVISOR_VERSION = "1.2.0"
 CONFIG_SCHEMA = "gptgrep.codex-auth.config.v1"
 RUN_SCHEMA = "gptgrep.codex-auth.run.v1"
 LEDGER_SCHEMA = "gptgrep.codex-auth.ledger.v1"
@@ -130,7 +132,48 @@ EXTRA_CODEX_CONFIG_KEYS = frozenset({
 SUPERVISOR_PERMISSION_PROFILE = "gptgrep_codex_auth"
 TOOL_PERMISSION_BASES = (":workspace", ":read-only")
 TOOL_PERMISSION_MODES = ("consumer-managed", "unrestricted")
+TOOL_PERMISSION_KEYS = frozenset({"extends", "network_enabled", "deny_paths", "read_paths"})
+MAX_PROFILE_PATHS = 64
 STOP_SCOPES = ("tree", "root-first")
+# Codex 0.162.1 arguments that replace the generated profile for model tool
+# commands. `--sandbox` and every flag that implies it switch config resolution
+# to the legacy syntax, which silently ignores `default_permissions`
+# (core/src/config/mod.rs resolve_permission_config_syntax). The others disable
+# the sandbox, layer another config file, skip the generated config.toml, run
+# threads on another app-server (`--remote`), or apply a raw sandbox state or
+# extra socket access (`codex sandbox`). `--full-auto` (absent from 0.162.1) is
+# refused for other builds.
+CODEX_PROFILE_OVERRIDE_FLAGS = frozenset({
+    "--sandbox", "-s", "--dangerously-bypass-approvals-and-sandbox", "--yolo", "--full-auto",
+    "--approve-for-me", "--not-so-yolo", "--profile", "-p", "--ignore-user-config", "--remote",
+    "--sandbox-state-json", "--sandbox-state-readable-root", "--allow-unix-socket"})
+CODEX_CONFIG_FLAGS = frozenset({"-c", "--config"})
+# First segment of a -c key. `projects` sets project trust, which loads a
+# repository's .codex/config.toml above the generated one (that layer may set
+# every key here); `mcp_servers` starts servers outside the sandbox;
+# `approvals_reviewer` lets a model approve permission escalations.
+CODEX_PROFILE_CONFIG_KEYS = frozenset({"sandbox_mode", "default_permissions", "permissions",
+                                       "sandbox_workspace_write", "projects", "mcp_servers",
+                                       "approvals_reviewer"})
+# `-P/--permission-profile NAME` equals `-c default_permissions=NAME`; only the
+# supervisor's own profile may be named.
+CODEX_PERMISSION_PROFILE_FLAGS = frozenset({"-P", "--permission-profile", "--permissions-profile"})
+# Keys the supervisor pins in the generated config.toml (auth store, login method,
+# features, telemetry, history, log_dir) and config that runs commands outside the
+# sandbox (hooks, plugins and their marketplaces; notify is pinned). For `features`
+# only the pinned flags (and the whole table) count; `--enable` of a pinned flag too.
+CODEX_PINNED_CONFIG_KEYS = frozenset(set(PINNED_CODEX_CONFIG) - {"features"} |
+                                     {"log_dir", "hooks", "plugins", "marketplaces"})
+CODEX_PINNED_FEATURES = frozenset(PINNED_CODEX_CONFIG["features"])
+# The working directory and every added directory become writable project roots.
+# A root inside a denied path is the more specific entry, so it reopens that path.
+CODEX_WORKSPACE_ROOT_FLAGS = frozenset({"-C", "--cd", "--add-dir"})
+CODEX_INSPECTED_VALUE_FLAGS = (CODEX_CONFIG_FLAGS | CODEX_PERMISSION_PROFILE_FLAGS | CODEX_WORKSPACE_ROOT_FLAGS |
+                               {"--enable"})
+CODEX_BOOLEAN_SHORT_FLAGS = frozenset("hVy")
+# Codex executables: `codex`, release binaries (`codex-aarch64-apple-darwin`) and
+# shims (`codex.js`), in any letter case; not `codex_auth_supervisor.py`.
+CODEX_NAME_RE = re.compile(r"codex([-.].*)?")
 
 # Owner failure classification from Codex 0.162.1 log lines
 # (login/src/auth/manager.rs request_chatgpt_token_refresh and auth();
@@ -279,7 +322,8 @@ def fsync_directory(path):
 def _abs(value, key):
     if not isinstance(value, str) or not value.startswith("/") or "\x00" in value or "\n" in value:
         raise SupervisorError("config_path_not_absolute", detail=key)
-    if os.path.normpath(value) != value or ".." in Path(value).parts:
+    # normpath keeps a leading "//" (POSIX leaves it implementation-defined); refuse it.
+    if os.path.normpath(value) != value or value.startswith("//") or ".." in Path(value).parts:
         raise SupervisorError("config_path_not_normalized", detail=key)
     return Path(value)
 
@@ -345,18 +389,73 @@ def _codex_config_extra(value, key):
     return result
 
 
+def _profile_paths(value, key, reason):
+    """Up to MAX_PROFILE_PATHS absolute, normalized paths for the generated profile."""
+    if not isinstance(value, list) or len(value) > MAX_PROFILE_PATHS:
+        raise SupervisorError(reason, detail=key)
+    return list(dict.fromkeys(str(_abs(item, key)) for item in value))
+
+
 def _tool_permissions(value, key):
     """Required per role: who keeps model tool commands away from the credential."""
     if value is None:
         raise SupervisorError("config_role_tool_permissions_required", detail=key)
     if value in TOOL_PERMISSION_MODES:
         return value
-    if isinstance(value, dict) and set(value) <= {"extends", "network_enabled"}:
+    if isinstance(value, dict) and set(value) <= TOOL_PERMISSION_KEYS:
         extends = value.get("extends", ":workspace")
         network = value.get("network_enabled", False)
         if extends in TOOL_PERMISSION_BASES and isinstance(network, bool):
-            return {"extends": extends, "network_enabled": network}
+            paths = {name: _profile_paths(value.get(name, []), key + ".tool_permissions." + name,
+                                          "config_role_tool_permissions_invalid")
+                     for name in ("deny_paths", "read_paths")}
+            denied = {_path_key(path) for path in paths["deny_paths"]}
+            for path in paths["read_paths"]:
+                if _path_key(path) in denied:
+                    raise SupervisorError("config_role_read_path_equals_deny_path",
+                                          detail=key + ".tool_permissions.read_paths:" + path)
+            return {"extends": extends, "network_enabled": network, **paths}
     raise SupervisorError("config_role_tool_permissions_invalid", detail=key)
+
+
+def _path_key(path):
+    """Comparison form of a path: one leading slash, canonical decomposition and
+    case folding. macOS volumes are normally case- and normalization-insensitive,
+    while Codex matches entries by spelling and then resolves a root's on-disk
+    spelling, so a differently spelled path to the same file must count as the same
+    path. On a case-sensitive volume this over-refuses, which is acceptable."""
+    text = str(path)
+    if text.startswith("//"):
+        text = "/" + text.lstrip("/")
+    return unicodedata.normalize("NFD", unicodedata.normalize("NFD", text).casefold())
+
+
+def _reopens(path, denied, resolve=False):
+    """True when a `read` entry (or a writable root) at `path` would reopen the
+    denied path `denied`: the same path or one inside it (Codex 0.162.1 applies
+    the most specific entry), in any spelling. With `resolve`, symlinks in either
+    path are resolved as well."""
+    paths, denies = {str(path)}, {str(denied)}
+    if resolve:
+        paths.add(os.path.realpath(path))
+        denies.add(os.path.realpath(denied))
+    return any(is_within(_path_key(p), _path_key(d)) for p in paths for d in denies)
+
+
+def _is_run_auth_link(path, runs_root, resolve=False):
+    """True for RUNS_ROOT/<role>/<run-id>/codex-home/auth.json, or a path inside it,
+    for every role and run id and in any spelling (with `resolve`, also once symlinks
+    are resolved)."""
+    paths, roots = {str(path)}, {str(runs_root)}
+    if resolve:
+        paths.add(os.path.realpath(path))
+        roots.add(os.path.realpath(runs_root))
+    for candidate in paths:
+        for root in roots:
+            key, base = _path_key(candidate), _path_key(root)
+            if is_within(key, base) and Path(key).relative_to(base).parts[2:4] == ("codex-home", "auth.json"):
+                return True
+    return False
 
 
 class Config:
@@ -394,6 +493,9 @@ class Config:
             self.binary_pins.append({"name": pin["name"], "path": _abs(pin["path"], "binary_pins"),
                                      "sha256": pin["sha256"]})
         self.verify_binary_pins = raw.get("verify_binary_pins", True) is True
+        # Denied to model tool commands of every role with the generated profile.
+        self.extra_denied_paths = _profile_paths(raw.get("extra_denied_paths", []), "extra_denied_paths",
+                                                 "config_extra_denied_paths")
         self.blocker_url = _loopback_url(raw.get("blocker_url", DEFAULT_BLOCKER_URL), "blocker_url")
         self.revoke_blocker_url = _sibling_url(self.blocker_url, "/oauth/revoke")
         self.blocker_must_be_closed = raw.get("blocker_must_be_closed", True) is True
@@ -492,6 +594,21 @@ class Config:
         # Tool commands are denied the lease directory (markers, ledger); it must not hold run directories.
         if is_within(self.runs_root, self.lease_path.parent):
             raise SupervisorError("config_lease_directory_contains_runs_root")
+        for name, role in self.roles.items():
+            if isinstance(role["tool_permissions"], dict):
+                for path in role["tool_permissions"]["read_paths"]:
+                    self._check_read_path(name, path)
+
+    def _check_read_path(self, role, path):
+        """A role's read carve-out may open a path below one of its own denies, but
+        never the canonical auth home, any run's auth link, the lease directory or
+        an `extra_denied_paths` entry (equal to or inside any of them)."""
+        detail = "roles." + role + ".tool_permissions.read_paths:" + path
+        if _reopens(path, self.canonical_auth_home) or _reopens(path, self.lease_path.parent) \
+                or _is_run_auth_link(path, self.runs_root):
+            raise SupervisorError("config_role_read_path_reopens_credential", detail=detail)
+        if any(_reopens(path, denied) for denied in self.extra_denied_paths):
+            raise SupervisorError("config_role_read_path_reopens_extra_deny", detail=detail)
 
     @classmethod
     def load(cls, path):
@@ -897,9 +1014,10 @@ class Layout:
         values["auth_link"] = str(self.auth_link)
         return values
 
-    def create(self, cfg, extra_codex_config, tool_permissions=None):
+    def create(self, cfg, extra_codex_config, tool_permissions=None, config_text=None):
         """Directories, generated config and marker. The auth link comes later,
-        only once the run holds the lease (link_auth)."""
+        only once the run holds the lease (link_auth). `config_text` is a config
+        already rendered (and checked) for this layout before anything was created."""
         ensure_private_dir(cfg.runs_root, create=True, create_parents=True)
         if os.path.realpath(cfg.runs_root) != str(cfg.runs_root):
             raise SupervisorError("runs_root_not_physical_path")
@@ -914,7 +1032,8 @@ class Layout:
             os.chmod(path, 0o700)
         if is_within(self.codex_home, self.tmp):
             raise SupervisorError("codex_home_under_tmpdir")
-        text = render_codex_config(cfg, self, extra_codex_config, tool_permissions)
+        text = config_text if config_text is not None else render_codex_config(cfg, self, extra_codex_config,
+                                                                                tool_permissions)
         write_new_private(self.codex_home / "config.toml", text)
         fd = os.open(self.marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         os.close(fd)
@@ -1024,17 +1143,36 @@ def render_toml(tree):
 
 
 def permission_denials(cfg, layout):
-    """Paths model tool commands are denied in the supervisor permission profile:
-    the canonical auth home, this run's auth link and the lease directory
-    (lock, markers, ledger)."""
-    return [str(cfg.canonical_auth_home), str(layout.auth_link), str(cfg.lease_path.parent)]
+    """Paths model tool commands are always denied in the supervisor permission
+    profile: the canonical auth home, this run's auth link, the lease directory
+    (lock, markers, ledger) and the configured `extra_denied_paths`."""
+    base = [str(cfg.canonical_auth_home), str(layout.auth_link), str(cfg.lease_path.parent)]
+    return base + [path for path in cfg.extra_denied_paths if path not in base]
+
+
+def profile_filesystem(cfg, layout, tool_permissions):
+    """Filesystem table of the generated profile: the supervisor's denies, the
+    role's denies, then the role's read carve-outs. Codex 0.162.1 applies the most
+    specific entry, so a carve-out can open a path below a role deny. Config load
+    refuses one that reopens a supervisor deny; this re-checks against the run's
+    actual link with symlinks resolved, before anything is written or launched."""
+    denied = permission_denials(cfg, layout)
+    entries = {path: "deny" for path in denied + tool_permissions["deny_paths"]}
+    for path in tool_permissions["read_paths"]:
+        if any(_reopens(path, item, resolve=True) for item in denied) or \
+                _is_run_auth_link(path, cfg.runs_root, resolve=True):
+            raise SupervisorError("role_read_path_resolves_into_denied_path", detail=path)
+        entries[path] = "read"
+    return entries
 
 
 def tool_credential_access(cfg, layout, tool_permissions):
     if isinstance(tool_permissions, dict):
+        filesystem = profile_filesystem(cfg, layout, tool_permissions)
         return {"policy": "supervisor_profile", "profile": SUPERVISOR_PERMISSION_PROFILE,
                 "extends": tool_permissions["extends"], "network_enabled": tool_permissions["network_enabled"],
-                "denied_paths": permission_denials(cfg, layout),
+                "denied_paths": [path for path, access in filesystem.items() if access == "deny"],
+                "read_paths": [path for path, access in filesystem.items() if access == "read"],
                 "applies_to": "tool commands of consumers that do not select another permission profile"}
     if tool_permissions == "consumer-managed":
         return {"policy": "consumer_managed", "verified_by_supervisor": False}
@@ -1053,7 +1191,7 @@ def codex_config_tree(cfg, layout, extra, tool_permissions=None):
         root["default_permissions"] = SUPERVISOR_PERMISSION_PROFILE
         tables["permissions"] = {SUPERVISOR_PERMISSION_PROFILE: {
             "extends": tool_permissions["extends"],
-            "filesystem": {path: "deny" for path in permission_denials(cfg, layout)},
+            "filesystem": profile_filesystem(cfg, layout, tool_permissions),
             "network": {"enabled": bool(tool_permissions["network_enabled"])}}}
     result = dict(sorted(root.items()))
     result.update(tables)
@@ -1134,6 +1272,154 @@ def substitute(argv, layout):
             arg = arg.replace(key, value)
         result.append(arg)
     return result
+
+
+def _is_codex_name(path):
+    return CODEX_NAME_RE.fullmatch(os.path.basename(str(path)).casefold()) is not None
+
+
+def invokes_codex(cfg, executable, path_env, cwd):
+    """The consumer executable is Codex: the configured binary (the same file, also
+    through a symlink or hard link), or a program whose name or symlink target's
+    name is `codex` or starts with `codex-` or `codex.`, in any letter case. It is
+    resolved the way the launch will resolve it: a bare name through the child's
+    PATH, a relative path against the child's working directory. An executable that
+    cannot be resolved is treated as Codex, so it is inspected (it cannot launch)."""
+    if _is_codex_name(executable):
+        return True
+    if "/" in executable:
+        resolved = os.path.normpath(os.path.join(str(cwd), executable))
+    else:
+        resolved = shutil.which(executable, path=path_env)
+        if resolved is None:
+            return True
+    try:
+        info = os.stat(resolved)
+    except OSError:
+        return True
+    if _is_codex_name(os.path.realpath(resolved)):
+        return True
+    try:
+        pinned = os.stat(cfg.codex_bin)
+    except OSError:
+        return False
+    return (info.st_dev, info.st_ino) == (pinned.st_dev, pinned.st_ino)
+
+
+def _codex_options(argv):
+    """(option, value) pairs of a Codex command line, up to `--`. A long option keeps
+    its inline `=value`; a short cluster ends at its first letter that is not a
+    boolean flag, and the rest of the cluster is that option's value. The value of
+    -c/--config, -P/--permission-profile, -C/--cd and --add-dir is the next argument
+    when not inline, unless that argument starts with `-` (clap then reports a
+    missing value); any other argument is inspected on its own."""
+    options = []
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        index += 1
+        if token == "--":
+            break
+        if token.startswith("--"):
+            name, sep, value = token.partition("=")
+            inline = value if sep else None
+        elif token.startswith("-") and len(token) > 1:
+            letters = token[1:]
+            pos = 0
+            while pos < len(letters) - 1 and letters[pos] in CODEX_BOOLEAN_SHORT_FLAGS:
+                pos += 1
+            name, rest = "-" + letters[pos], letters[pos + 1:]
+            inline = (rest[1:] if rest.startswith("=") else rest) if rest else None
+        else:
+            continue
+        if inline is None and name in CODEX_INSPECTED_VALUE_FLAGS and index < len(argv) \
+                and not argv[index].startswith("-"):
+            inline = argv[index]
+            index += 1
+        options.append((name, inline))
+    return options
+
+
+def codex_profile_override(argv):
+    """The first argument of a Codex command line that would replace the generated
+    permission profile or undo a pinned key for model tool commands (a flag name,
+    `-c KEY` or `--enable FEATURE`), or None."""
+    for name, value in _codex_options(argv):
+        if name in CODEX_PROFILE_OVERRIDE_FLAGS:
+            return name
+        if name in CODEX_CONFIG_FLAGS:
+            segments = [part.strip().strip("\"'") for part in (value or "").partition("=")[0].split(".")]
+            key = segments[0]
+            if key in CODEX_PROFILE_CONFIG_KEYS or key in CODEX_PINNED_CONFIG_KEYS:
+                return name + " " + key
+            if key == "features" and (len(segments) == 1 or segments[1] in CODEX_PINNED_FEATURES):
+                return name + " " + ".".join(segments[:2])
+        if name == "--enable" and (value or "").strip() in CODEX_PINNED_FEATURES:
+            return name + " " + value.strip()
+        if name in CODEX_PERMISSION_PROFILE_FLAGS and value != SUPERVISOR_PERMISSION_PROFILE:
+            return name
+    return None
+
+
+def _codex_root_path(base, value, home):
+    """A -C/--add-dir value as Codex resolves it: a leading `~` or `~/` expands to
+    HOME (the run's home), then the value is resolved against `base`."""
+    if value == "~":
+        value = str(home)
+    elif value.startswith("~/"):
+        value = os.path.join(str(home), value[2:].lstrip("/"))
+    return os.path.normpath(os.path.join(str(base), value))
+
+
+def codex_project_root_violation(argv, layout, denied, runs_root):
+    """(reason, `FLAG PATH`) for the first `-C/--cd` or `--add-dir` of a Codex command
+    line that Codex would turn into an unsafe writable project root, or None.
+
+    A project root is more specific than any deny above it, so a root equal to or
+    inside a denied path reopens that path (`consumer_argv_reopens_denied_path`).
+    A root inside the runs root other than this run's work, results, tmp and home
+    directories, or one that contains the runs root, would let tool commands rewrite
+    a generated config.toml or the supervisor's records of this or another run
+    (`consumer_argv_root_overlaps_run_state`). Values are resolved like Codex does:
+    `~` is the run's home, relative values are resolved against the consumer's
+    working directory, and an added directory also against each `-C` directory.
+    Spellings and symlinks are compared as in `_reopens`."""
+    options = _codex_options(argv)
+    cwd, home = layout.work_dir, layout.home
+    own = [layout.work_dir, layout.results, layout.tmp, layout.home]
+    bases = [str(cwd)] + [_codex_root_path(cwd, value, home)
+                          for name, value in options if name in ("-C", "--cd") and value]
+    for name, value in options:
+        if name not in CODEX_WORKSPACE_ROOT_FLAGS or not value:
+            continue
+        paths = [_codex_root_path(base, value, home) for base in (bases if name == "--add-dir" else bases[:1])]
+        for path in paths:
+            if any(_reopens(path, item, resolve=True) for item in denied):
+                return "consumer_argv_reopens_denied_path", name + " " + path
+        for path in paths:
+            overlaps = _reopens(path, runs_root, resolve=True) or _reopens(runs_root, path, resolve=True)
+            if overlaps and not any(_reopens(path, item, resolve=True) for item in own):
+                return "consumer_argv_root_overlaps_run_state", name + " " + path
+    return None
+
+
+def consumer_argv_guard(cfg, layout, spec, argv):
+    """Refuse, before launch, a Codex command line that would replace the generated
+    profile or reopen one of its denies. Only the consumer's own argv is inspected:
+    a program that launches Codex itself (a GPTgrep binary, a shell, a wrapper) is not."""
+    tool_permissions = spec["tool_permissions"]
+    if not isinstance(tool_permissions, dict):
+        return "not_applicable"
+    if not invokes_codex(cfg, argv[0], spec["path_env"] or cfg.path_env, layout.work_dir):
+        return "not_a_codex_command"
+    override = codex_profile_override(argv)
+    if override is not None:
+        raise SupervisorError("consumer_argv_overrides_permission_profile", detail=override)
+    denied = permission_denials(cfg, layout) + tool_permissions["deny_paths"]
+    violation = codex_project_root_violation(argv, layout, denied, cfg.runs_root)
+    if violation is not None:
+        raise SupervisorError(violation[0], detail=violation[1])
+    return "checked"
 
 
 def blocker_probe(cfg):
@@ -2251,22 +2537,26 @@ def command_run(cfg, args):
     layout = Layout(cfg, role, args.run_id)
     extra = spec["codex_config"]
     tool_permissions = spec["tool_permissions"]
+    # The profile and the argv are checked, and the config rendered once, before any
+    # directory, lease or link exists.
+    access = tool_credential_access(cfg, layout, tool_permissions)
+    access["consumer_argv_guard"] = consumer_argv_guard(cfg, layout, spec, substitute(args.command, layout))
+    config_text = render_codex_config(cfg, layout, extra, tool_permissions)
     if args.dry_run:
         env, passed = build_consumer_env(cfg, role, layout, dict(os.environ))
         return {"schema": RUN_SCHEMA, "operation": "run", "dry_run": True, "role": role, "run_id": args.run_id,
                 "lease_mode": mode, "deadline_seconds": deadline, "layout": layout.describe(),
                 "argv": substitute(args.command, layout), "env_keys": sorted(env), "passthrough_env": passed,
-                "codex_config_toml": render_codex_config(cfg, layout, extra, tool_permissions),
-                "tool_credential_access": tool_credential_access(cfg, layout, tool_permissions),
+                "codex_config_toml": config_text, "tool_credential_access": access,
                 "pre_refresh": pre_refresh, "blocker_url": cfg.blocker_url,
                 "binary_pins": cfg.pins_summary()}, EXIT_PASS
-    layout.create(cfg, extra, tool_permissions)
+    layout.create(cfg, extra, tool_permissions, config_text=config_text)
     receipt = _base_receipt(cfg, "run", layout, mode)
     receipt.update({"deadline_seconds": deadline, "harbor_job_label": args.harbor_job_label,
                     "live_request_attempted": {"yes": True, "no": False}.get(args.live_request_attempted),
                     "live_request_attempted_source": "caller", "pre_refresh": pre_refresh,
                     "caller_fields": dict(args.manifest_field or []),
-                    "tool_credential_access": tool_credential_access(cfg, layout, tool_permissions)})
+                    "tool_credential_access": access})
     layout.event("created")
     lease = Lease(cfg)
     signals = Signals().install()
