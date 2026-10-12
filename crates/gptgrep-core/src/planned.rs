@@ -377,7 +377,7 @@ pub async fn search_planned_with_policy_and_observer(
         let mut seen = HashSet::from([original_question.trim()]);
         for query in alternate_queries {
             ensure!(
-                !query.trim().is_empty() && query.len() <= 1024 && !tokens(query).is_empty(),
+                !query.trim().is_empty() && query.len() <= 1024 && !query_tokens(query).is_empty(),
                 "alternate queries must contain 1..1024 UTF-8 bytes and a word"
             );
             ensure!(

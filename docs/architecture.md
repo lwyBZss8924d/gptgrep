@@ -242,7 +242,15 @@ The default context is zero, matching grep; callers request more with `-C`.
 
 **Lexical** finds query-token matches using the same index, groups evidence by
 tree node, and orders it by term coverage. This score is a local lexical measure,
-not an embedding distance or calibrated semantic probability.
+not an embedding distance or calibrated semantic probability. Lexical and hybrid
+queries use at most 16 terms: lowercase alphanumeric tokens, deduplicated, after
+dropping a small fixed English function-word list and ASCII-letter tokens shorter
+than three characters (tokens with digits and non-ASCII tokens are kept; a query
+of only dropped tokens keeps them). When more than 16 remain, the first 64 are
+ranked by document frequency in the scoped index, rarer first, terms absent from
+the scope last and ties in question order, using the same verified
+case-insensitive matching as search. The selection is deterministic for a
+snapshot and scope.
 
 **Hybrid** retains lexical candidates and adds a separate semantic tree lane.
 Jev first judges bounded document descriptions containing paths, headings and

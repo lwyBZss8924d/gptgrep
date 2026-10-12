@@ -10,7 +10,7 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
-use regex::Regex;
+use regex::{Regex, RegexSet};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tgrep_core::builder::{self, BuildOptions};
@@ -652,6 +652,90 @@ impl IndexSession {
             }
         }
         Ok(result)
+    }
+}
+
+impl IndexSession {
+    /// Count, for each literal term, the indexed documents whose verified text
+    /// contains it, using the lexical lane's case-insensitive matcher. A
+    /// document scope restricts the count to that one indexed file.
+    ///
+    /// Candidates come from each term's trigram plan, plus the conservative
+    /// BOM files that search also verifies. Each candidate file is read and
+    /// checked against its digest once for all terms. The count describes the
+    /// immutable indexed snapshot; original-source freshness is not consulted.
+    pub fn document_frequencies(
+        &self,
+        terms: &[String],
+        document: Option<&Path>,
+    ) -> Result<Vec<usize>> {
+        self.validate()?;
+        let document = document.map(normalized_document_path).transpose()?;
+        if let Some(document) = document {
+            ensure!(
+                self.manifest.files.contains_key(document),
+                "unknown indexed document: {document}"
+            );
+        }
+        let bom_files: Vec<&str> = self
+            .manifest
+            .files
+            .iter()
+            .filter(|(_, version)| version.has_bom)
+            .map(|(rel, _)| rel.as_str())
+            .collect();
+        let mut patterns = Vec::with_capacity(terms.len());
+        let mut candidates: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+        for (index, term) in terms.iter().enumerate() {
+            let source = format!("(?i:{})", regex::escape(term));
+            let plan = query::build_query_plan(&source, false).map_err(anyhow::Error::msg)?;
+            let ids = if plan.is_match_all() {
+                self.reader.all_file_ids()
+            } else {
+                query::execute_plan_with_masks(&plan, &|tri| {
+                    self.reader.lookup_trigram_with_masks(tri)
+                })
+            };
+            for id in ids {
+                let rel = self
+                    .reader
+                    .file_path(id)
+                    .context("index returned an unknown file ID")?;
+                candidates.entry(rel).or_default().push(index);
+            }
+            for rel in &bom_files {
+                candidates.entry(rel).or_default().push(index);
+            }
+            patterns.push(source);
+        }
+        let set = RegexSet::new(&patterns).context("invalid term pattern")?;
+        let mut frequencies = vec![0; terms.len()];
+        for (rel, mut indexes) in candidates {
+            if document.is_some_and(|document| document != rel) {
+                continue;
+            }
+            let version = self
+                .manifest
+                .files
+                .get(rel)
+                .context("candidate missing from manifest")?;
+            let data = read_owned_file(&self.root, rel)?;
+            ensure!(
+                data.len() as u64 == version.bytes && sha256(&data) == version.sha256,
+                "normalized snapshot file changed after indexing: {rel}"
+            );
+            let text = std::str::from_utf8(&data)
+                .with_context(|| format!("normalized snapshot is not UTF-8: {rel}"))?;
+            let matched = set.matches(text);
+            indexes.sort_unstable();
+            indexes.dedup();
+            for index in indexes {
+                if matched.matched(index) {
+                    frequencies[index] += 1;
+                }
+            }
+        }
+        Ok(frequencies)
     }
 }
 

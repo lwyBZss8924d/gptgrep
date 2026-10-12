@@ -1736,14 +1736,86 @@ fn node_at(doc: &Document, line: usize) -> Option<&TreeNode> {
         })
 }
 
-fn tokens(query: &str) -> Vec<String> {
+/// Maximum lexical query terms used by one lexical/hybrid search.
+const MAX_LEXICAL_TERMS: usize = 16;
+/// Candidate terms ranked by scoped document frequency, in first-occurrence
+/// order; later candidates are not considered. Bounds the frequency pass.
+const MAX_RANKED_LEXICAL_TERMS: usize = 64;
+/// A small fixed list of English function words. Each has at least three
+/// letters; shorter ASCII-letter tokens are dropped by length instead.
+const LEXICAL_STOPWORDS: &[&str] = &[
+    "about", "above", "across", "after", "against", "all", "also", "although", "among", "and",
+    "any", "are", "because", "been", "before", "being", "below", "between", "both", "but", "can",
+    "could", "did", "does", "doing", "done", "during", "each", "either", "else", "every", "for",
+    "from", "had", "has", "have", "having", "her", "here", "hers", "him", "his", "how", "into",
+    "its", "itself", "may", "might", "mine", "must", "neither", "nor", "not", "off", "onto", "our",
+    "ours", "out", "over", "per", "shall", "she", "should", "some", "such", "than", "that", "the",
+    "their", "theirs", "them", "then", "there", "these", "they", "this", "those", "though",
+    "through", "too", "toward", "towards", "under", "upon", "very", "via", "was", "were", "what",
+    "when", "where", "whether", "which", "while", "who", "whom", "whose", "why", "will", "with",
+    "within", "without", "would", "yet", "you", "your", "yours",
+];
+
+/// Lowercase alphanumeric/underscore tokens, deduplicated in first-occurrence order.
+fn query_tokens(query: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     query
         .split(|c: char| !c.is_alphanumeric() && c != '_')
         .map(str::to_lowercase)
         .filter(|s| !s.is_empty() && seen.insert(s.clone()))
-        .take(16)
         .collect()
+}
+
+/// Candidate lexical terms before the 16-term cap. Fixed English function
+/// words and ASCII-letter tokens shorter than three characters are dropped;
+/// tokens containing a digit and non-ASCII tokens (for example CJK words) are
+/// kept. A query made only of dropped tokens keeps all of its tokens.
+fn candidate_terms(query: &str) -> Vec<String> {
+    let tokens = query_tokens(query);
+    let kept: Vec<String> = tokens
+        .iter()
+        .filter(|token| {
+            token.chars().any(|c| c.is_ascii_digit())
+                || !token.is_ascii()
+                || (token.chars().count() >= 3 && !LEXICAL_STOPWORDS.contains(&token.as_str()))
+        })
+        .cloned()
+        .collect();
+    if kept.is_empty() { tokens } else { kept }
+}
+
+/// Order candidate terms for the cap: lower document frequency in the scoped
+/// index first, terms absent from the scope last, ties by first occurrence.
+/// `frequencies` is parallel to `terms`. Deterministic for a fixed snapshot.
+fn rank_terms(terms: Vec<String>, frequencies: &[usize]) -> Vec<String> {
+    let mut ranked: Vec<(usize, String)> = terms.into_iter().enumerate().collect();
+    ranked.sort_by_key(|(index, _)| {
+        let frequency = frequencies[*index];
+        (frequency == 0, frequency, *index)
+    });
+    ranked
+        .into_iter()
+        .take(MAX_LEXICAL_TERMS)
+        .map(|(_, term)| term)
+        .collect()
+}
+
+/// Seed lexical terms for one search scope. At most 16 terms are kept; when
+/// more candidates remain, the rarest in the scoped index are kept.
+fn lexical_terms(
+    snapshot: &Snapshot,
+    query: &str,
+    indexed_document: Option<&Path>,
+) -> Result<Vec<String>> {
+    let mut terms = candidate_terms(query);
+    if terms.len() <= MAX_LEXICAL_TERMS {
+        return Ok(terms);
+    }
+    terms.truncate(MAX_RANKED_LEXICAL_TERMS);
+    let frequencies = snapshot
+        .index_session()?
+        .document_frequencies(&terms, indexed_document)?;
+    Ok(rank_terms(terms, &frequencies))
 }
 
 /// Below-floor candidates delivered when no reranked candidate meets the floor.
@@ -1956,7 +2028,11 @@ async fn collect_candidate_view(
     let mut freshness = HashMap::new();
     let mut texts = HashMap::new();
     let mut hits = Vec::new();
-    let terms = tokens(query);
+    let terms = if options.mode == "regex" || options.mode == "semantic" {
+        Vec::new()
+    } else {
+        lexical_terms(snapshot, query, indexed_document.as_deref())?
+    };
     if options.mode != "semantic" {
         let pattern = if options.mode == "regex" {
             query.to_owned()
@@ -4211,6 +4287,107 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn candidate_terms_drop_function_words_and_short_ascii_tokens() {
+        assert_eq!(
+            candidate_terms("What is the role of a Q3 2019 report in 杭州, per the report?"),
+            ["role", "q3", "2019", "report", "杭州"]
+        );
+        // Tokens with digits are kept at any length; other short ASCII tokens drop.
+        assert_eq!(candidate_terms("Is 7 of 12 ok"), ["7", "12"]);
+        // A query of only dropped tokens keeps its tokens.
+        assert_eq!(candidate_terms("is it on"), ["is", "it", "on"]);
+        assert_eq!(
+            candidate_terms("Ledger LEDGER ledger_2"),
+            ["ledger", "ledger_2"]
+        );
+    }
+
+    #[test]
+    fn rarer_terms_rank_first_absent_last_and_ties_keep_question_order() {
+        let terms: Vec<String> = (0..20).map(|i| format!("term{i:02}")).collect();
+        let mut frequencies = vec![5; 20];
+        frequencies[17] = 1;
+        frequencies[19] = 1;
+        frequencies[3] = 0;
+        frequencies[2] = 2;
+        let ranked = rank_terms(terms, &frequencies);
+        assert_eq!(ranked.len(), MAX_LEXICAL_TERMS);
+        assert_eq!(ranked[..3], ["term17", "term19", "term02"]);
+        // Equal frequencies keep first occurrence; the absent term sorts last.
+        assert_eq!(ranked[3..6], ["term00", "term01", "term04"]);
+        assert!(!ranked.contains(&"term03".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn long_question_keeps_distinctive_terms_after_position_sixteen() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let common = [
+            "ledger", "archive", "record", "entry", "update", "review", "status", "note", "budget",
+            "office", "region", "quarter", "metric", "policy", "summary", "filler",
+        ];
+        for index in 0..4 {
+            fs::write(
+                directory.path().join(format!("common-{index}.txt")),
+                format!("{}\nroutine page {index}\n", common.join(" ")),
+            )?;
+        }
+        fs::write(
+            directory.path().join("rare.txt"),
+            format!("{}\nThe zirconium flask holds quinoa.\n", common.join(" ")),
+        )?;
+        index(directory.path(), 10).await?;
+        // Sixteen shared terms come first; the distinctive ones follow them.
+        let question = format!(
+            "Which of the {} lines also mention zirconium and quinoa?",
+            common.join(" ")
+        );
+        let snapshot = Snapshot::open(directory.path())?;
+        let selected = lexical_terms(&snapshot, &question, None)?;
+        assert_eq!(selected.len(), MAX_LEXICAL_TERMS);
+        assert_eq!(selected[..2], ["zirconium", "quinoa"]);
+        // Equal document frequencies keep question order; the last two drop.
+        assert_eq!(selected[2..], common[..14]);
+        // Deterministic across runs and fresh snapshots.
+        assert_eq!(selected, lexical_terms(&snapshot, &question, None)?);
+        assert_eq!(
+            selected,
+            lexical_terms(&Snapshot::open(directory.path())?, &question, None)?
+        );
+        // Previously the first sixteen tokens filled the cap and no lexical
+        // candidate reached the distinctive line.
+        let report = search(
+            directory.path(),
+            &question,
+            &SearchOptions {
+                mode: "lexical".into(),
+                limit: 1,
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(report.hits[0].path, "rare.txt");
+        assert!(report.hits[0].text.contains("zirconium"));
+        // Scoped frequencies use only the selected document.
+        let scoped = lexical_terms(
+            &snapshot,
+            &question,
+            Some(Path::new(&format!(
+                "{}.txt",
+                snapshot
+                    .manifest
+                    .documents
+                    .iter()
+                    .find(|document| document.path == "common-0.txt")
+                    .unwrap()
+                    .id
+            ))),
+        )?;
+        // Absent distinctive terms sort last within one common document.
+        assert_eq!(scoped[..], common[..]);
+        Ok(())
+    }
+
+    #[test]
     fn unicode_boundaries() {
         assert_eq!(truncate("文档abc", 4), ("文", true));
     }
@@ -4223,7 +4400,7 @@ mod tests {
     #[test]
     fn lexical_is_not_semantic() {
         assert_eq!(
-            lexical_score("car speed", &tokens("automobile velocity")),
+            lexical_score("car speed", &candidate_terms("automobile velocity")),
             0.0
         );
     }
