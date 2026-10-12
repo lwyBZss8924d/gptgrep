@@ -38,6 +38,14 @@ def main(argv):
                 item = sup.classify_response(step["method"], message)
                 if step["method"] == "thread/start":
                     item["thread_started"] = bool((message.get("result") or {}).get("thread"))
+                if step["method"] == "command/exec" and "result" in message:
+                    # Booleans and sizes only: a tool command's output is never recorded.
+                    out = (message["result"] or {}).get("stdout") or ""
+                    err = (message["result"] or {}).get("stderr") or ""
+                    item.update(exit_code=(message["result"] or {}).get("exitCode"), stdout_bytes=len(out),
+                                stdout_has_fake_token="FAKE-" in out, stdout_has_marker="MARKER-OK" in out,
+                                stderr_denied="not permitted" in err.lower() or "denied" in err.lower(),
+                                label=step.get("label"))
                 item["at"] = time.time()
                 results.append(item)
             elif op == "notify":

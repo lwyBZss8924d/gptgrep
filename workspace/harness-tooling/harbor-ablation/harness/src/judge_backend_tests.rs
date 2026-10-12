@@ -6,7 +6,10 @@ use serde_json::json;
 const MOCK: &str = r#"
 import json, os, sys, time
 mode = sys.argv[1]
-assert set(os.environ) <= {'PATH','HOME','CODEX_HOME','TMPDIR','LANG','LC_ALL','LC_CTYPE','__CF_USER_TEXT_ENCODING'}
+assert set(os.environ) <= {'PATH','HOME','CODEX_HOME','TMPDIR','LANG','LC_ALL','LC_CTYPE','__CF_USER_TEXT_ENCODING','CODEX_REFRESH_TOKEN_URL_OVERRIDE','CODEX_REVOKE_TOKEN_URL_OVERRIDE','NO_PROXY','no_proxy'}
+assert os.environ['CODEX_REFRESH_TOKEN_URL_OVERRIDE'] == 'http://127.0.0.1:0/oauth/token'
+assert os.environ['CODEX_REVOKE_TOKEN_URL_OVERRIDE'] == 'http://127.0.0.1:0/oauth/revoke'
+assert os.environ['NO_PROXY'] == os.environ['no_proxy'] == '127.0.0.1,localhost,::1'
 prompt = sys.stdin.buffer.read()
 assert prompt
 if mode == 'hang':

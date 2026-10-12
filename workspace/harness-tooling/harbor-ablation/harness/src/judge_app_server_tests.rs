@@ -1033,8 +1033,11 @@ fn expired_original_deadline_and_unsent_response_fail_before_any_write() -> Resu
 }
 
 const MOCK: &str = r#"
-import json,sys,time
+import json,os,sys,time
 mode=sys.argv[1]
+assert os.environ['CODEX_REFRESH_TOKEN_URL_OVERRIDE']=='http://127.0.0.1:0/oauth/token'
+assert os.environ['CODEX_REVOKE_TOKEN_URL_OVERRIDE']=='http://127.0.0.1:0/oauth/revoke'
+assert os.environ['NO_PROXY']==os.environ['no_proxy']=='127.0.0.1,localhost,::1'
 def send(x):
     sys.stdout.write(json.dumps(x,separators=(',',':'))+'\n');sys.stdout.flush()
 def read():

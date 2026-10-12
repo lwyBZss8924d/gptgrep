@@ -22,7 +22,7 @@ CANARY_ENV = {
     "DOCKER_HOST": "unix:///fake/docker.sock", "BASH_ENV": "/FAKE-CANARY-startup",
 }
 BASE_NAMES = {"CODEX_HOME", "CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED", "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
-              "CODEX_SQLITE_HOME", "GPTGREP_AUTH_LEASE_FD", "GPTGREP_AUTH_RUN_ID", "GPTGREP_AUTH_SOURCE_ID",
+              "CODEX_REVOKE_TOKEN_URL_OVERRIDE", "CODEX_SQLITE_HOME", "GPTGREP_AUTH_LEASE_FD", "GPTGREP_AUTH_RUN_ID", "GPTGREP_AUTH_SOURCE_ID",
               "HOME", "LANG", "LC_ALL", "NO_PROXY", "no_proxy", "PATH", "TMPDIR", "XDG_CACHE_HOME",
               "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"}
 PLATFORM_NAMES = {"__CF_USER_TEXT_ENCODING"}  # injected by macOS at process start, not by the supervisor
@@ -57,9 +57,12 @@ class LayoutEnvTests(unittest.TestCase):
             self.assertTrue(stat.S_ISDIR(info.st_mode))
             self.assertEqual(stat.S_IMODE(info.st_mode), 0o700, name)
         link = run / "codex-home" / "auth.json"
-        self.assertTrue(link.is_symlink())
-        self.assertEqual(os.readlink(link), str(self.env.credential.path))
-        self.assertTrue(os.path.isabs(os.readlink(link)))
+        # The link exists only while the run holds the lease (CS-3): it was an absolute
+        # link to the canonical file during the run and is gone afterwards.
+        self.assertEqual(report["auth_link"], {"is_symlink": True, "target": str(self.env.credential.path)})
+        self.assertTrue(os.path.isabs(report["auth_link"]["target"]))
+        self.assertFalse(os.path.lexists(link))
+        self.assertTrue(receipt["auth_link_final"]["released"])
         config = tomllib.loads((run / "codex-home" / "config.toml").read_text())
         self.assertEqual(config["cli_auth_credentials_store"], "file")
         self.assertEqual(config["forced_login_method"], "chatgpt")
@@ -92,6 +95,8 @@ class LayoutEnvTests(unittest.TestCase):
         self.assertEqual(names, BASE_NAMES)
         self.assertFalse(report["canary_value_present"])
         self.assertEqual(report["values"]["CODEX_REFRESH_TOKEN_URL_OVERRIDE"], sup.DEFAULT_BLOCKER_URL)
+        self.assertEqual(report["values"]["CODEX_REVOKE_TOKEN_URL_OVERRIDE"], "http://127.0.0.1:0/oauth/revoke")
+        self.assertEqual(sup.DEFAULT_BLOCKER_URL, "http://127.0.0.1:0/oauth/token")
         for key in ("NO_PROXY", "no_proxy"):
             self.assertEqual(set(report["values"][key].split(",")), {"127.0.0.1", "localhost", "::1"})
         self.assertEqual(report["values"]["CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED"], "1")
@@ -113,25 +118,38 @@ class LayoutEnvTests(unittest.TestCase):
 
     def test_config_rejects_forbidden_passthrough_and_unknown_codex_keys(self):
         cases = [
-            {"roles": {"dev": {"passthrough_env": ["CODEX_API_KEY"]}}},
-            {"roles": {"dev": {"passthrough_env": ["OPENAI_API_KEY"]}}},
-            {"roles": {"dev": {"passthrough_env": ["OPENROUTER_API_KEY"]}}},
-            {"roles": {"dev": {"passthrough_env": ["CODEX_HOME"]}}},
-            {"roles": {"dev": {"passthrough_env": ["RUST_LOG"]}}},
-            {"roles": {"dev": {"passthrough_env": ["OP_SESSION_abc"]}}},
+            {"roles": {"dev": {"passthrough_env": ["CODEX_API_KEY"], "tool_permissions": "unrestricted"}}},
+            {"roles": {"dev": {"passthrough_env": ["OPENAI_API_KEY"], "tool_permissions": "unrestricted"}}},
+            {"roles": {"dev": {"passthrough_env": ["OPENROUTER_API_KEY"], "tool_permissions": "unrestricted"}}},
+            {"roles": {"dev": {"passthrough_env": ["CODEX_HOME"], "tool_permissions": "unrestricted"}}},
+            {"roles": {"dev": {"passthrough_env": ["RUST_LOG"], "tool_permissions": "unrestricted"}}},
+            {"roles": {"dev": {"passthrough_env": ["OP_SESSION_abc"], "tool_permissions": "unrestricted"}}},
             {"codex_config": {"cli_auth_credentials_store": "keyring"}},
             {"codex_config": {"model_providers": "x"}},
             {"blocker_url": "http://192.0.2.10:9/oauth/token"},
             {"owner": {"refresh_token_url_override": "https://example.invalid/oauth/token"}},
             {"runs_root": str(self.env.credential.home / "runs")},
             {"expected_user": "nobody-fake-user-name"},
-            {"roles": {"dev": {"path_env": "relative/bin"}}},
+            {"roles": {"dev": {"path_env": "relative/bin", "tool_permissions": "unrestricted"}}},
+            {"roles": {"dev": {}}},
+            {"roles": {"dev": {"tool_permissions": "none"}}},
+            {"roles": {"dev": {"tool_permissions": {"extends": ":danger-full-access"}}}},
+            {"roles": {"dev": {"tool_permissions": {"extends": ":workspace", "filesystem": {}}}}},
+            {"roles": {"dev": {"tool_permissions": "unrestricted", "stop_scope": "group"}}},
+            {"relogin": {"experimental_issuer": "https://auth.example.invalid"}},
+            {"blocker_url": "http://127.0.0.1:99999/oauth/token"},
+            {"runs_root": str(self.env.lease_path.parent / "runs")},
+            {"codex_config": {"default_permissions": "x"}},
         ]
+        reasons = []
         for change in cases:
             values = dict(self.env.values, **change)
             with self.subTest(change=sorted(change)):
-                with self.assertRaises(sup.SupervisorError):
+                with self.assertRaises(sup.SupervisorError) as ctx:
                     sup.Config(dict(values, schema=sup.CONFIG_SCHEMA), "inline")
+                reasons.append(ctx.exception.reason)
+        self.assertEqual(reasons.count("config_role_tool_permissions_required"), 1, reasons)
+        self.assertIn("config_lease_directory_contains_runs_root", reasons)
 
     def test_expected_effective_user_and_portable_example_config(self):
         import pwd
@@ -141,6 +159,10 @@ class LayoutEnvTests(unittest.TestCase):
         cfg = sup.Config(example, "example")
         self.assertFalse(cfg.allow_shared_consumers)
         self.assertEqual(cfg.blocker_url, sup.DEFAULT_BLOCKER_URL)
+        harbor = cfg.role("harbor")
+        self.assertEqual((harbor["stop_scope"], harbor["tool_permissions"]), ("root-first", "consumer-managed"))
+        self.assertGreaterEqual(harbor["term_grace_seconds"], 120)
+        self.assertIn("/path/to/docker-bin", harbor["path_env"].split(":"))
         text = (support.TOOL_DIR / "config.example.json").read_text()
         self.assertNotIn(str(Path.home()), text, "portable example carries no machine paths")
 
@@ -258,6 +280,47 @@ class LayoutEnvTests(unittest.TestCase):
             self.assertFalse(ready.exists())
         finally:
             listener.stop()
+
+    def test_supervisor_permission_profile_denies_credential_paths_to_tool_commands(self):
+        roles = dict(self.env.values["roles"])
+        roles["tools"] = {"tool_permissions": {"extends": ":workspace", "network_enabled": False}}
+        self.env.reconfigure(roles=roles)
+        code, plan, _ = self.env.supervisor("run", "--role", "tools", "--run-id", "perm1", "--dry-run", "--",
+                                            "/bin/echo")
+        self.assertEqual(code, 0)
+        config = tomllib.loads(plan["codex_config_toml"])
+        run = self.env.run_dir("tools", "perm1")
+        self.assertEqual(config["default_permissions"], sup.SUPERVISOR_PERMISSION_PROFILE)
+        profile = config["permissions"][sup.SUPERVISOR_PERMISSION_PROFILE]
+        self.assertEqual(profile["extends"], ":workspace")
+        self.assertIs(profile["network"]["enabled"], False)
+        self.assertEqual(profile["filesystem"], {str(self.env.credential.home): "deny",
+                                                 str(run / "codex-home" / "auth.json"): "deny",
+                                                 str(self.env.lease_path.parent): "deny"})
+        self.assertEqual(plan["tool_credential_access"]["policy"], "supervisor_profile")
+        code, plan, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "perm2", "--dry-run", "--",
+                                            "/bin/echo")
+        self.assertNotIn("default_permissions", tomllib.loads(plan["codex_config_toml"]))
+        self.assertEqual(plan["tool_credential_access"],
+                         {"policy": "unrestricted", "tool_commands_can_read_credential": True})
+        code, plan, _ = self.env.supervisor("run", "--role", "harbor", "--run-id", "perm3", "--dry-run", "--",
+                                            "/bin/echo")
+        self.assertEqual(plan["tool_credential_access"], {"policy": "consumer_managed",
+                                                          "verified_by_supervisor": False})
+
+    def test_refusals_before_launch_leave_no_auth_link(self):
+        listener = support.Trap()
+        try:
+            self.env.reconfigure(blocker_url=listener.url, blocker_must_be_closed=True)
+            self.env.supervisor("run", "--role", "dev", "--run-id", "nolink1", "--", PY, "-c", "pass")
+        finally:
+            listener.stop()
+        self.env.reconfigure(blocker_url=sup.DEFAULT_BLOCKER_URL)
+        os.chmod(self.env.credential.path, 0o644)
+        self.env.supervisor("run", "--role", "dev", "--run-id", "nolink2", "--", PY, "-c", "pass")
+        os.chmod(self.env.credential.path, 0o600)
+        self.assertEqual(support.run_auth_links(self.env), [])
+        self.assertTrue(self.env.run_dir("dev", "nolink1").exists() and self.env.run_dir("dev", "nolink2").exists())
 
 
 if __name__ == "__main__":

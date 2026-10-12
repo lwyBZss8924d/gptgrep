@@ -2,14 +2,22 @@
 
 Behaviour comes from `<this file>.json` (the supervisor passes an allowlisted
 environment, so no mode variable can be inherited):
-  {"app_server": "normal" | "no_write" | "slow_term" | "stuck",
-   "login_exit": 0, "status_exit": 0, "login_sleep": 0.0}
+  {"app_server": "normal" | "no_write" | "slow_term" | "stuck" | "permanent_fail" | "transient_fail" | "slow_refresh",
+   "login_exit": 0, "status_exit": "auto" | int, "login_sleep": 0.0,
+   "refresh_delay": 0.0, "started": PATH, "finished": PATH}
 
 app-server: newline JSON-RPC on stdin/stdout. account/read with refreshToken
 rewrites $CODEX_HOME/auth.json IN PLACE through the run's symlink (like the
-official FileAuthStorage::save) unless mode is no_write.
-login --device-auth: prints a fake device code to the terminal, then replaces
-$CODEX_HOME/auth.json (unlink + create, like logout-then-login).
+official FileAuthStorage::save) unless the mode is no_write or *_fail. The
+*_fail modes print the official 0.162.1 log line shapes to stderr
+(codex_login / account_processor targets) and, for permanent_fail, return a
+null account like the official app-server after a permanent refresh failure.
+slow_refresh touches `started`, sleeps `refresh_delay`, rewrites, touches `finished`.
+login --device-auth: like the official CLI, first revokes and deletes an
+existing $CODEX_HOME/auth.json (clear_existing_auth_before_login; recorded as
+"cleared_existing_auth"), then prints a fake device code, then, on success,
+creates a new auth.json.
+login status: "auto" exits 0 when $CODEX_HOME/auth.json exists and is non-empty.
 Every invocation appends argv and environment NAMES to $CODEX_SQLITE_HOME/fake-codex-record.jsonl.
 """
 import json
@@ -22,14 +30,23 @@ SELF = os.path.realpath(sys.argv[0])
 with open(SELF + ".json") as handle:
     SETTINGS = json.load(handle)
 
+PERMANENT_LINE = ('\x1b[2m2026-10-12T00:00:00.000000Z\x1b[0m \x1b[31mERROR\x1b[0m codex_login::auth::manager: '
+                  'Failed to refresh token status=401 Unauthorized detail=TokenErrorDetail { error_code: '
+                  'Some("refresh_token_reused"), error_message: Some("fake"), .. }')
+TRANSIENT_LINE = ('2026-10-12T00:00:00.000000Z  WARN codex_app_server::request_processors::account_processor: '
+                  'failed to refresh token while getting account: error sending request for url '
+                  '(http://127.0.0.1:1/oauth/token)')
 
-def record(kind):
+
+def record(kind, **extra):
     path = os.path.join(os.environ.get("CODEX_SQLITE_HOME", "/nonexistent"), "fake-codex-record.jsonl")
     try:
         with open(path, "a") as handle:
-            handle.write(json.dumps({"kind": kind, "argv": sys.argv[1:], "env_names": sorted(os.environ),
-                                     "codex_home": os.environ.get("CODEX_HOME"),
-                                     "refresh_override": os.environ.get("CODEX_REFRESH_TOKEN_URL_OVERRIDE")}) + "\n")
+            handle.write(json.dumps(dict(extra, kind=kind, argv=sys.argv[1:], env_names=sorted(os.environ),
+                                         codex_home=os.environ.get("CODEX_HOME"),
+                                         refresh_override=os.environ.get("CODEX_REFRESH_TOKEN_URL_OVERRIDE"),
+                                         revoke_override=os.environ.get("CODEX_REVOKE_TOKEN_URL_OVERRIDE"),
+                                         rust_log=os.environ.get("RUST_LOG"))) + "\n")
     except OSError:
         pass
 
@@ -37,6 +54,11 @@ def record(kind):
 def send(message):
     sys.stdout.write(json.dumps(message) + "\n")
     sys.stdout.flush()
+
+
+def touch(path):
+    if path:
+        open(path, "w").close()
 
 
 def rewrite_in_place(generation):
@@ -68,14 +90,28 @@ def app_server():
         method = message.get("method")
         if "id" not in message:
             continue
+        account = {"type": "chatgpt", "email": "fake@example.invalid", "planType": "plus"}
         if method == "initialize":
             send({"id": message["id"], "result": {"userAgent": "fake", "codexHome": os.environ.get("CODEX_HOME")}})
         elif method == "account/read":
-            if (message.get("params") or {}).get("refreshToken") and mode != "no_write":
+            refresh = (message.get("params") or {}).get("refreshToken")
+            if refresh and mode == "permanent_fail":
+                sys.stderr.write(PERMANENT_LINE + "\n")
+                sys.stderr.flush()
+            elif refresh and mode == "transient_fail":
+                sys.stderr.write(TRANSIENT_LINE + "\n")
+                sys.stderr.flush()
+            elif refresh and mode not in ("no_write",):
+                if mode == "slow_refresh":
+                    touch(SETTINGS.get("started"))
+                    time.sleep(float(SETTINGS.get("refresh_delay", 0)))
                 generation += 1
                 rewrite_in_place(generation)
-            send({"id": message["id"], "result": {"account": {"type": "chatgpt", "email": "fake@example.invalid",
-                                                              "planType": "plus"}, "requiresOpenaiAuth": True}})
+                if mode == "slow_refresh":
+                    touch(SETTINGS.get("finished"))
+            if mode == "permanent_fail":
+                account = None
+            send({"id": message["id"], "result": {"account": account, "requiresOpenaiAuth": True}})
         else:
             send({"id": message["id"], "error": {"code": -32601, "message": "fake: unsupported"}})
     if mode in ("slow_term", "stuck"):
@@ -86,21 +122,27 @@ def app_server():
 
 def login():
     args = sys.argv[1:]
-    record("login" if "--device-auth" in args else "status")
+    path = os.path.join(os.environ["CODEX_HOME"], "auth.json")
     if "--device-auth" in args:
+        cleared = os.path.lexists(path)
+        if cleared:
+            os.unlink(path)  # the official CLI revokes the refresh token, then deletes the file
+        record("login", cleared_existing_auth=cleared)
         print("FAKE-DEVICE-CODE-7Q2W-9ZXC (synthetic; visit the official device page)", flush=True)
         time.sleep(float(SETTINGS.get("login_sleep", 0)))
         code = int(SETTINGS.get("login_exit", 0))
         if code == 0:
-            path = os.path.join(os.environ["CODEX_HOME"], "auth.json")
-            if os.path.lexists(path):
-                os.unlink(path)
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             os.write(fd, b'{"auth_mode": "chatgpt", "tokens": {"refresh_token": "FAKE-RELOGIN-RT"}}')
             os.close(fd)
         return code
-    print("Logged in using ChatGPT (fake)", flush=True)
-    return int(SETTINGS.get("status_exit", 0))
+    record("status")
+    status = SETTINGS.get("status_exit", "auto")
+    if status == "auto":
+        ok = os.path.exists(path) and os.path.getsize(path) > 0
+        print("Logged in using ChatGPT (fake)" if ok else "Not logged in (fake)", file=sys.stderr, flush=True)
+        return 0 if ok else 1
+    return int(status)
 
 
 def main():

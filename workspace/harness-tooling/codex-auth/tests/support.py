@@ -162,7 +162,21 @@ class _Recorder:
 
 
 class FakeAuthority:
-    """Loopback OAuth token endpoint implementing the refresh grant."""
+    """Loopback OAuth token endpoint implementing the refresh grant.
+
+    Failure modes return the authority's documented error shapes; the official
+    client classifies 401 and the refresh_token_* / invalid_grant codes as
+    permanent and other statuses as transient."""
+
+    FAILURES = {
+        "reused": (401, {"error": {"code": "refresh_token_reused", "message": "fake"}}),
+        "expired": (401, {"error": {"code": "refresh_token_expired", "message": "fake"}}),
+        "invalidated": (401, {"error": {"code": "refresh_token_invalidated", "message": "fake"}}),
+        "invalid_grant": (400, {"error": "invalid_grant", "error_description": "fake"}),
+        "unknown_401": (401, {"error": {"code": "fake_unknown_code", "message": "fake"}}),
+        "server_error": (500, {"error": {"message": "fake upstream"}}),
+        "rate_limited": (429, {"error": {"message": "fake rate limit"}}),
+    }
 
     def __init__(self, credential, mode="ok", lifetime=3600):
         self.credential = credential
@@ -185,9 +199,10 @@ class FakeAuthority:
                     grant = {}
                 outer.recorder.add(kind="token", path=self.path, grant_type=grant.get("grant_type"),
                                    refresh_token=grant.get("refresh_token"))
-                if outer.mode == "reused":
-                    data = json.dumps({"error": {"code": "refresh_token_reused", "message": "fake"}}).encode()
-                    self.send_response(401)
+                if outer.mode in FakeAuthority.FAILURES:
+                    status, body = FakeAuthority.FAILURES[outer.mode]
+                    data = json.dumps(body).encode()
+                    self.send_response(status)
                 else:
                     outer.generation += 1
                     tokens = outer.credential.token_set(outer.generation, time.time() + outer.lifetime)
@@ -244,6 +259,9 @@ class FakeBackend:
                 self._record("GET")
                 if outer.mode == "unauthorized":
                     return self._reply(401, {"error": {"code": "token_expired", "message": "fake 401"}})
+                if outer.mode in ("rate_limited", "server_error"):
+                    status = 429 if outer.mode == "rate_limited" else 500
+                    return self._reply(status, {"error": {"message": "fake %d" % status}})
                 if self.path.split("?")[0].endswith("/accounts/check"):
                     account = self.headers.get("chatgpt-account-id") or "acct-fake-0001"
                     return self._reply(200, {"accounts": [{"id": account,
@@ -312,6 +330,72 @@ class Trap:
             pass
 
 
+class FakeIssuer:
+    """Loopback device-code issuer (`codex login --device-auth --experimental_issuer`).
+
+    mode "approve": the code is approved on the second poll and the exchange
+    returns a fresh fake token set (generation 900); "decline": the poll fails.
+    Records request paths only, including any /oauth/revoke attempt."""
+
+    def __init__(self, credential, mode="approve"):
+        self.credential = credential
+        self.mode = mode
+        self.recorder = _Recorder()
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def _reply(self, status, payload):
+                data = json.dumps(payload).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                path = self.path.split("?")[0]
+                outer.recorder.add(kind="issuer", path=path)
+                if path.endswith("/deviceauth/usercode"):
+                    return self._reply(200, {"device_auth_id": "fake-device-id", "user_code": "FAKE-CODE-1234",
+                                             "interval": "1"})
+                if path.endswith("/deviceauth/token"):
+                    if outer.mode == "decline":
+                        return self._reply(400, {"error": "access_denied"})
+                    if len(outer.recorder.where(kind="issuer", path=path)) < 2:
+                        return self._reply(403, {"error": "authorization_pending"})
+                    return self._reply(200, {"authorization_code": "fake-auth-code", "code_challenge": "fake",
+                                             "code_verifier": "fake"})
+                if path.endswith("/oauth/token"):
+                    tokens = outer.credential.token_set(900, time.time() + 3600)
+                    return self._reply(200, {k: tokens[k] for k in ("id_token", "access_token", "refresh_token")})
+                return self._reply(404, {"error": "not_found"})
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", next_port()), Handler)
+        self.url = "http://127.0.0.1:%d" % self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def paths(self):
+        return [e["path"] for e in self.recorder.where(kind="issuer")]
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class ProxyTrap(Trap):
+    """A proxy stand-in for runs that cannot use the seatbelt guard: every
+    HTTP(S)_PROXY / ALL_PROXY request lands here, is counted and is closed
+    unanswered, so nothing is forwarded to a non-loopback host."""
+
+    @property
+    def proxy_url(self):
+        return "http://127.0.0.1:%d" % self.port
+
+
 def write_config(path, values):
     path = Path(path)
     data = {"schema": sup.CONFIG_SCHEMA}
@@ -340,9 +424,14 @@ class Env:
                   "lease_path": str(self.lease_path), "runs_root": str(self.runs_root),
                   "codex_bin": "/usr/bin/false", "lease_wait_seconds": 0, "term_grace_seconds": 2,
                   "sweep_interval_seconds": 0.2, "sweep_settle_seconds": 1, "keeper_poll_seconds": 0.5,
-                  "roles": {"dev": {}, "test": {},
-                            "harbor": {"passthrough_env": ["DOCKER_HOST", "DOCKER_CONFIG"]},
-                            "judge": {"passthrough_env": ["OPENROUTER_API_KEY"], "allow_openrouter": True}}}
+                  # Tool commands are unrestricted by default here: under the qualification's
+                  # seatbelt guard Codex cannot apply its own nested sandbox.
+                  "roles": {"dev": {"tool_permissions": "unrestricted"},
+                            "test": {"tool_permissions": "unrestricted"},
+                            "harbor": {"passthrough_env": ["DOCKER_HOST", "DOCKER_CONFIG"],
+                                       "tool_permissions": "consumer-managed"},
+                            "judge": {"passthrough_env": ["OPENROUTER_API_KEY"], "allow_openrouter": True,
+                                      "tool_permissions": "unrestricted"}}}
         values.update(config)
         self.values = values
         self.config_path = write_config(self.root / "config.json", values)
@@ -389,6 +478,28 @@ class Env:
 
     def sidecar(self, role, run_id):
         return Path(str(self.lease_path) + ".holders") / ("%s--%s.json" % (role, run_id))
+
+    def auth_block_marker(self):
+        return Path(str(self.lease_path) + ".auth-blocked")
+
+    def binding(self):
+        return self.credential.home / sup.BINDING_NAME
+
+    def receipt(self, role, run_id):
+        path = self.run_dir(role, run_id) / "receipt.json"
+        return json.loads(path.read_text()) if path.exists() else None
+
+    def events(self, role, run_id):
+        path = self.run_dir(role, run_id) / "state" / "supervisor-events.jsonl"
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+    def has_event(self, role, run_id, name):
+        return any(e.get("event") == name for e in self.events(role, run_id))
+
+    def lease_probe(self):
+        return sup.probe_lease(self.cfg())
 
 
 def observe(name, **values):
@@ -470,5 +581,24 @@ def scan_for_leaks(roots, needles, skip=(), counter=None):
 
 def lease_side_files(env):
     base = str(env.lease_path)
-    return [Path(base + ".ledger.jsonl"), Path(base + ".holders"), Path(base + ".quarantine")] + \
-        list(Path(env.lease_path.parent).glob(env.lease_path.name + ".quarantine.cleared-*"))
+    return [Path(base + ".ledger.jsonl"), Path(base + ".holders"), Path(base + ".quarantine"),
+            Path(base + ".auth-blocked")] + \
+        list(Path(env.lease_path.parent).glob(env.lease_path.name + ".quarantine.cleared-*")) + \
+        list(Path(env.lease_path.parent).glob(env.lease_path.name + ".auth-blocked.cleared-*"))
+
+
+def run_auth_links(env):
+    """Run homes whose auth.json still exists (a live link or anything else)."""
+    if not env.runs_root.exists():
+        return []
+    return sorted(str(p) for p in env.runs_root.glob("*/*/codex-home/auth.json") if os.path.lexists(p))
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True

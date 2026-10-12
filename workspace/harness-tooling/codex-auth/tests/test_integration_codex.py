@@ -3,12 +3,15 @@
 Skipped unless GPTGREP_AUTH_TEST_CODEX_BIN names the official 0.162.1 CLI.
 Every endpoint is a loopback fake: CODEX_REFRESH_TOKEN_URL_OVERRIDE (owner ->
 fake authority, consumers -> blocker/trap), chatgpt_base_url and
-openai_base_url (-> fake backend). The runner additionally wraps the whole
-suite in a seatbelt profile allowing only its reserved loopback ports.
+openai_base_url (-> fake backend), the device-code issuer (-> fake issuer). The
+runner additionally wraps the whole suite in a seatbelt profile allowing only
+its reserved loopback ports.
 
-(c) owner refresh via symlink; (d) consumer cannot refresh; (e) consumer adopts
-an owner write; (f) 401 fails closed; (g) concurrency; (i) CODEX_API_KEY never
-reaches consumers; (j) leak canaries (checked after every test).
+(c) owner refresh via symlink and owner failure classes; (d) consumer cannot
+refresh (port-0 blocker); (e) consumer adopts an owner write; (f) 401 fails
+closed and the account-probe auth contract; (g) concurrency; (i) CODEX_API_KEY
+never reaches consumers; (j) leak canaries (checked after every test);
+(k) staged re-login with the official device flow.
 """
 import json
 import os
@@ -48,35 +51,44 @@ def thread_start(cwd):
             "timeout": 60}
 
 
+LINK_OK = {"present": True, "symlink": True, "target_matches": True, "home_physical": True}
+
+
 @unittest.skipUnless(support.CODEX_BIN, "set GPTGREP_AUTH_TEST_CODEX_BIN to the official codex 0.162.1 binary")
 class CodexIntegrationTests(unittest.TestCase):
     def setUp(self):
-        self.env = Env("codex")
-        self.authority = support.FakeAuthority(self.env.credential)
+        self.extra_stops = []
+        self.make_world("codex")
+
+    def make_world(self, name, authority_mode="ok", owner_url=None, **config):
+        self.env = Env(name)
+        self.authority = support.FakeAuthority(self.env.credential, mode=authority_mode)
         self.backend = support.FakeBackend()
         self.trap = support.Trap()
-        self.env.reconfigure(
-            codex_bin=support.CODEX_BIN, codex_bin_sha256=codex_pin(),
-            codex_config={"chatgpt_base_url": self.backend.chatgpt_base_url,
-                          "openai_base_url": self.backend.openai_base_url},
-            owner={"refresh_token_url_override": self.authority.url, "rpc_timeout_seconds": 60,
-                   "exit_wait_seconds": 30, "term_grace_seconds": 60},
-            blocker_url=self.trap.url, blocker_must_be_closed=False)
+        values = dict(codex_bin=support.CODEX_BIN, codex_bin_sha256=codex_pin(),
+                      codex_config={"chatgpt_base_url": self.backend.chatgpt_base_url,
+                                    "openai_base_url": self.backend.openai_base_url},
+                      owner={"refresh_token_url_override": owner_url or self.authority.url,
+                             "rpc_timeout_seconds": 60, "exit_wait_seconds": 30, "term_grace_seconds": 60},
+                      blocker_url=self.trap.url, blocker_must_be_closed=False)
+        values.update(config)
+        self.env.reconfigure(**values)
+        support.assert_fake_path(self.env.credential.home)
 
     def tearDown(self):
         try:
             scanned = []
-            needles = sorted(self.env.credential.canaries()) + ["FAKE-CANARY"]
+            needles = sorted(self.env.credential.canaries()) + ["FAKE-CANARY", "FAKE-CODE-1234"]
             hits = support.scan_for_leaks([self.env.runs_root, *support.lease_side_files(self.env)], needles,
                                           skip=[self.env.credential.home], counter=scanned)
             support.observe("leak_scan", test=self.id().split(".")[-1], files_scanned=len(scanned),
                             canaries=len(needles), hits=len(hits))
             self.assertTrue(scanned, "leak scan must not be vacuous")
             self.assertEqual(hits, [], "fake credential canaries leaked into supervisor/run files")
+            self.assertEqual(support.run_auth_links(self.env), [], "no run keeps a link to the credential")
         finally:
-            self.authority.stop()
-            self.backend.stop()
-            self.trap.stop()
+            for stop in [self.authority.stop, self.backend.stop, self.trap.stop] + self.extra_stops:
+                stop()
 
     # -- helpers -----------------------------------------------------------------------------
 
@@ -89,6 +101,15 @@ class CodexIntegrationTests(unittest.TestCase):
             return self.env.popen(*args, env=env)
         code, receipt, proc = self.env.supervisor(*args, env=env)
         return code, receipt, self.rpc(role, run_id), proc
+
+    def account_probe(self, run_id, role="dev"):
+        return self.env.supervisor(
+            "run", "--role", role, "--run-id", run_id, "--live-request-attempted", "no", "--deadline-seconds", "120",
+            "--", PY, "-I", "-B", str(support.SUPERVISOR), "account-probe", "--codex-bin", support.CODEX_BIN,
+            "--out", "{results}/account-probe.json", "--stderr-log", "{log_dir}/account-probe.stderr.log")
+
+    def probe_result(self, run_id, role="dev"):
+        return json.loads((self.env.run_dir(role, run_id) / "results" / "account-probe.json").read_text())
 
     def rpc(self, role, run_id):
         path = self.env.run_dir(role, run_id) / "results" / "rpc.json"
@@ -121,9 +142,8 @@ class CodexIntegrationTests(unittest.TestCase):
         self.assertTrue(after["regular"])
         self.assertEqual(after["mode"], 0o600)
         self.assertNotEqual((after["mtime_ns"], after["size"]), (before["mtime_ns"], before["size"]))
-        link = self.env.run_dir("_owner", "own1") / "codex-home" / "auth.json"
-        self.assertTrue(link.is_symlink())
-        self.assertEqual(os.readlink(link), str(self.env.credential.path))
+        self.assertEqual(receipt["auth_link_after"], LINK_OK, "the write went through the run's symlink")
+        self.assertTrue(receipt["auth_link_final"]["released"])
         self.assertEqual(receipt["owner"]["rpc"][2]["account_type"], "chatgpt")
         self.assertEqual(receipt["owner"]["stop"], "stdin_closed")
         entry = self.env.ledger()[-1]
@@ -146,8 +166,69 @@ class CodexIntegrationTests(unittest.TestCase):
         count = len(self.authority.requests())
         # Startup proactive refresh (exp <= now+5min) plus the explicit refreshToken=true.
         self.assertIn(count, (1, 2))
+        tokens = [r["refresh_token"] for r in self.authority.requests()]
+        self.assertEqual(len(set(tokens)), len(tokens), "the owner never presents a refresh token twice")
         self.assertEqual(self.env.credential.meta()["ino"], before["ino"])
         support.observe("c_owner_expiring_token", authority_requests=count)
+
+    def test_c_owner_failure_classes_from_the_official_log(self):
+        """Permanent authority answers quarantine; transport, 429 and 5xx do not (F4)."""
+        self.authority.stop()
+        self.backend.stop()
+        self.trap.stop()
+        cases = [("reused", "REFRESH_TOKEN_REUSED", "permanent"), ("expired", "REFRESH_TOKEN_EXPIRED", "permanent"),
+                 ("invalidated", "REFRESH_TOKEN_REVOKED", "permanent"), ("invalid_grant", None, "permanent"),
+                 ("unknown_401", "REFRESH_REJECTED", "permanent"),
+                 ("server_error", "AUTHORITY_SERVER_ERROR", "transient"),
+                 ("rate_limited", "RATE_LIMITED", "transient"), ("closed", "TRANSPORT", "transient")]
+        observed = {}
+        first = True
+        for mode, expected_class, kind in cases:
+            for lifetime in (3600, 120):
+                with self.subTest(mode=mode, lifetime=lifetime):
+                    if not first:
+                        self.tearDown_world()  # the last world stays for tearDown's leak scan
+                    first = False
+                    owner_url = None
+                    if mode == "closed":
+                        port = support.next_port()
+                        owner_url = "http://127.0.0.1:%d/oauth/token" % port
+                    self.make_world("cls-%s-%d" % (mode, lifetime), authority_mode=mode if mode != "closed" else "ok",
+                                    owner_url=owner_url)
+                    self.env.credential.write(1, time.time() + lifetime, in_place=False)
+                    before = self.env.credential.meta()
+                    code, receipt, proc = self.env.supervisor("refresh", "--run-id", "own-cls", "--force")
+                    refresh = receipt["refresh"]
+                    observed["%s/%d" % (mode, lifetime)] = [receipt["state"], refresh.get("owner_log_failure_class"),
+                                                            refresh.get("owner_log_failure_kind")]
+                    self.assertEqual(self.env.credential.meta(), before, "a failed refresh never writes")
+                    self.assertEqual(refresh.get("owner_log_failure_kind"), kind, proc.stderr[-1500:])
+                    if expected_class:
+                        self.assertEqual(refresh.get("owner_log_failure_class"), expected_class)
+                    else:
+                        self.assertIn(refresh.get("owner_log_failure_class"), ("INVALID_GRANT", "REFRESH_REJECTED"))
+                    if kind == "permanent":
+                        self.assertEqual((code, receipt["state"]), (sup.EXIT_BLOCKED_AUTH, "BLOCKED_AUTH"))
+                        marker = json.loads(self.env.quarantine_marker().read_text())
+                        self.assertEqual(marker["details"]["failure_kind"], "permanent")
+                    else:
+                        self.assertEqual((code, receipt["state"]), (sup.EXIT_UNAVAILABLE, "REFRESH_UNAVAILABLE"))
+                        self.assertFalse(self.env.quarantine_marker().exists())
+                        self.assertTrue(refresh["account_chatgpt"])
+                    if lifetime == 3600 and mode != "closed":
+                        self.assertGreaterEqual(len(self.authority.requests()), 1)
+        support.observe("c_owner_failure_classes", cases=observed)
+
+    def tearDown_world(self):
+        scanned = []
+        hits = support.scan_for_leaks([self.env.runs_root, *support.lease_side_files(self.env)],
+                                      sorted(self.env.credential.canaries()), skip=[self.env.credential.home],
+                                      counter=scanned)
+        self.authority.stop()
+        self.backend.stop()
+        self.trap.stop()
+        self.assertTrue(scanned, "leak scan must not be vacuous")
+        self.assertEqual(hits, [])
 
     # -- (d) consumers cannot refresh -----------------------------------------------------------
 
@@ -165,35 +246,38 @@ class CodexIntegrationTests(unittest.TestCase):
         self.assertTrue(all(r["ok"] and r["account_type"] == "chatgpt" for r in reads), reads)
         starts = [r for r in rpc["results"] if r.get("method") == "thread/start"]
         self.assertTrue(starts and starts[0]["ok"] and starts[0]["thread_started"], starts)
-        self.assertEqual(receipt["auth_link_after"], {"present": True, "symlink": True, "target_matches": True})
+        self.assertEqual(receipt["auth_link_after"], LINK_OK)
         self.assertIn("CODEX_REFRESH_TOKEN_URL_OVERRIDE", receipt["env_keys"])
+        self.assertIn("CODEX_REVOKE_TOKEN_URL_OVERRIDE", receipt["env_keys"])
         support.observe("d_consumer_blocked", authority_requests=0, blocked_attempts_at_trap=self.trap.count,
                         canonical_unchanged=True, thread_start_ok=True)
 
-    def test_d_production_closed_port_blocker(self):
+    def test_d_production_port_zero_blocker(self):
+        """The default blocker is port 0: no process can listen there, and the refresh fails transiently."""
         self.env.reconfigure(blocker_url=sup.DEFAULT_BLOCKER_URL, blocker_must_be_closed=True)
         self.env.credential.write(1, time.time() + 120, in_place=False)
         before = self.env.credential.meta()
         code, receipt, rpc, proc = self.consume("blk2", initialize() + [read(True), read()])
-        self.assertEqual((code, receipt["state"], receipt["blocker_probe"]), (0, "PASS", "closed"),
-                         proc.stderr[-2000:])
+        self.assertEqual((code, receipt["state"]), (0, "PASS"), proc.stderr[-2000:])
+        # EPERM under the seatbelt guard (it cannot express port 0); EADDRNOTAVAIL without it.
+        self.assertIn(receipt["blocker_probe"], ("closed", "blocked"))
         self.assertEqual(self.authority.requests(), [])
         self.assertEqual(self.env.credential.meta(), before)
-        self.assertTrue(all(r["ok"] for r in self.reads(rpc)))
-        support.observe("d_closed_port_blocker", authority_requests=0, blocker_probe=receipt["blocker_probe"],
+        self.assertTrue(all(r["ok"] and r["account_type"] == "chatgpt" for r in self.reads(rpc)))
+        log = (self.env.run_dir("dev", "blk2") / "state" / "logs" / "app-server.stderr.log").read_text()
+        self.assertNotIn("panicked", log)
+        support.observe("d_port_zero_blocker", authority_requests=0, blocker_probe=receipt["blocker_probe"],
                         canonical_unchanged=True)
 
     def test_d_account_probe_rehearses_first_live_step(self):
         """The runbook's first live step, against fakes: consumer, blocker, no refresh, no model call."""
         self.env.credential.write(1, time.time() + 120, in_place=False)
         before = self.env.credential.meta()
-        code, receipt, proc = self.env.supervisor(
-            "run", "--role", "dev", "--run-id", "probe1", "--live-request-attempted", "no", "--deadline-seconds", "120",
-            "--", PY, "-I", "-B", str(support.SUPERVISOR), "account-probe", "--codex-bin", support.CODEX_BIN,
-            "--out", "{results}/account-probe.json", "--stderr-log", "{log_dir}/account-probe.stderr.log")
+        code, receipt, proc = self.account_probe("probe1")
         self.assertEqual((code, receipt["state"]), (0, "PASS"), proc.stderr[-2000:])
-        result = json.loads((self.env.run_dir("dev", "probe1") / "results" / "account-probe.json").read_text())
+        result = self.probe_result("probe1")
         self.assertTrue(result["account_ok"])
+        self.assertEqual(result["outcome"], "OK")
         self.assertFalse(result["refresh_requested"])
         self.assertEqual(self.authority.requests(), [])
         self.assertEqual(self.env.credential.meta(), before)
@@ -253,7 +337,7 @@ class CodexIntegrationTests(unittest.TestCase):
                                          "fake drill: simulated owner write")
         self.assertEqual(code, 0)
 
-    # -- (f) 401 fails closed -----------------------------------------------------------------
+    # -- (f) 401 fails closed; the consumer auth-failure contract --------------------------------
 
     def test_f_unauthorized_without_owner_refresh_fails_closed(self):
         self.backend.mode = "unauthorized"
@@ -269,6 +353,39 @@ class CodexIntegrationTests(unittest.TestCase):
         self.assertEqual(self.env.credential.meta(), before)
         support.observe("f_401_fail_closed", authority_requests=0, blocked_attempts=self.trap.count,
                         error_message=result.get("error_message"), canonical_unchanged=True)
+
+    def test_f_account_probe_auth_failure_is_blocked_auth_and_blocks_next_consumer(self):
+        self.backend.mode = "unauthorized"
+        self.env.credential.write(1, time.time() + 3600, in_place=False)
+        code, receipt, proc = self.account_probe("p401")
+        self.assertEqual((code, receipt["state"], receipt["child_exit_code"]),
+                         (sup.EXIT_BLOCKED_AUTH, "BLOCKED_AUTH", sup.EXIT_BLOCKED_AUTH), proc.stderr[-1500:])
+        self.assertEqual(self.probe_result("p401")["outcome"], "AUTH_UNAUTHORIZED")
+        self.assertTrue(self.env.auth_block_marker().exists())
+        self.assertFalse(self.env.quarantine_marker().exists())
+        self.backend.mode = "ok"
+        code, receipt, _ = self.account_probe("p401-next")
+        self.assertEqual((code, receipt["refusal"]["reason"]), (sup.EXIT_BLOCKED_AUTH,
+                                                                "auth_blocked_pending_owner_refresh"))
+        code, owner, _ = self.env.supervisor("refresh", "--run-id", "p401-own")
+        self.assertEqual((code, owner["refresh"]["decision"]), (0, "REFRESHED"))
+        self.assertFalse(self.env.auth_block_marker().exists())
+        code, receipt, _ = self.account_probe("p401-after")
+        self.assertEqual((code, receipt["state"]), (0, "PASS"))
+        support.observe("f_probe_auth_contract", first="BLOCKED_AUTH", next_refused=True, after_owner_refresh="PASS")
+
+    def test_f_account_probe_service_failures_are_not_auth_failures(self):
+        self.env.credential.write(1, time.time() + 3600, in_place=False)
+        observed = {}
+        for mode in ("server_error", "rate_limited"):
+            self.backend.mode = mode
+            code, receipt, proc = self.account_probe("psvc-" + mode)
+            observed[mode] = [receipt["state"], receipt["child_exit_code"]]
+            self.assertEqual((receipt["state"], receipt["child_exit_code"]), ("FAILED", sup.EXIT_UNAVAILABLE),
+                             proc.stderr[-1500:])
+            self.assertEqual(self.probe_result("psvc-" + mode)["outcome"], "SERVICE_UNAVAILABLE")
+            self.assertFalse(self.env.auth_block_marker().exists(), "rate limits and 5xx never block auth")
+        support.observe("f_probe_service_failures", cases=observed)
 
     # -- (g) concurrency ----------------------------------------------------------------------
 
@@ -322,7 +439,7 @@ class CodexIntegrationTests(unittest.TestCase):
         self.assertEqual(receipt["sweep"]["survivor_pids"], [])
         self.assertNotIn("CODEX_API_KEY", receipt["env_keys"])
         self.assertNotIn("OPENAI_API_KEY", receipt["env_keys"])
-        self.assertEqual(receipt["auth_link_after"], {"present": True, "symlink": True, "target_matches": True})
+        self.assertEqual(receipt["auth_link_after"], LINK_OK)
         self.assertEqual(self.env.credential.meta(), before)
         stderr = (self.env.run_dir("dev", "api1") / "state" / "logs" / "child.stderr.log").read_text()
         self.assertNotIn("Logging out", stderr)
@@ -336,6 +453,7 @@ class CodexIntegrationTests(unittest.TestCase):
         cfg = self.env.cfg()
         layout = sup.Layout(cfg, "dev", "api-neg")
         layout.create(cfg, {})
+        layout.link_auth(cfg)
         env, _ = sup.build_consumer_env(cfg, "dev", layout, {})
         env["CODEX_API_KEY"] = "FAKE-CANARY-negative-control"
         proc = subprocess.run([support.CODEX_BIN, "exec", "--skip-git-repo-check", "--ephemeral", "synthetic"],
@@ -347,6 +465,53 @@ class CodexIntegrationTests(unittest.TestCase):
         support.observe("i_negative_control_unsupervised", exit_code=proc.returncode, run_link_removed=True,
                         canonical_unchanged=True)
         self.assertEqual(self.authority.requests(), [])
+
+    # -- (k) staged re-login with the official device flow (CS-1) -------------------------------
+
+    def _relogin_world(self, mode):
+        issuer = support.FakeIssuer(self.env.credential, mode)
+        self.extra_stops.append(issuer.stop)
+        self.env.reconfigure(relogin={"experimental_issuer": issuer.url})
+        self.env.credential.write(1, time.time() + 3600, in_place=False)
+        sup.write_quarantine(self.env.cfg(), "AUTH_REFRESH_FAILED", "fake-owner", {
+            "operation": "refresh", "owner_log_failure_class": "REFRESH_TOKEN_REUSED", "failure_kind": "permanent"})
+        return issuer
+
+    def test_k_declined_official_device_login_never_revokes_or_deletes(self):
+        issuer = self._relogin_world("decline")
+        before = self.env.credential.meta()
+        code, receipt, proc = self.env.supervisor("relogin", "--run-id", "rl-decline", "--confirm-relogin")
+        self.assertEqual((code, receipt["state"], receipt["login_exit_code"]),
+                         (sup.EXIT_BLOCKED_AUTH, "BLOCKED_AUTH", 1), proc.stderr[-1500:])
+        self.assertEqual(self.env.credential.meta(), before, "the existing login was neither deleted nor replaced")
+        self.assertNotIn("/oauth/revoke", issuer.paths())
+        self.assertIn("/api/accounts/deviceauth/usercode", issuer.paths())
+        self.assertFalse(receipt["installed"])
+        self.assertFalse(os.path.lexists(self.env.run_dir("_relogin", "rl-decline") / "codex-home" / "auth.json"))
+        self.assertIn("FAKE-CODE-1234", proc.stdout, "the code reached the terminal, not a file")
+        support.observe("k_relogin_declined_official", canonical_unchanged=True, revoke_requests=0,
+                        issuer_paths=issuer.paths())
+
+    def test_k_approved_official_device_login_is_installed_atomically_and_adopted(self):
+        issuer = self._relogin_world("approve")
+        before = self.env.credential.meta()
+        code, receipt, proc = self.env.supervisor("relogin", "--run-id", "rl-approve", "--confirm-relogin")
+        self.assertEqual((code, receipt["state"], receipt["installed"]), (0, "PASS", True), proc.stderr[-1500:])
+        after = self.env.credential.meta()
+        self.assertNotEqual(after["ino"], before["ino"])
+        self.assertEqual((after["mode"], after["regular"]), (0o600, True))
+        self.assertNotIn("/oauth/revoke", issuer.paths())
+        self.assertEqual(self.authority.requests(), [])
+        code, _, _ = self.env.supervisor("clear-quarantine", "--run-id", "rl-clear", "--confirm", "--reason",
+                                         "fake drill: re-login completed")
+        self.assertEqual(code, 0)
+        since = time.time()
+        code, receipt, rpc, _ = self.consume("after-relogin", initialize() + [read()])
+        self.assertEqual(code, 0)
+        bearers = self.bearers_since(since)
+        self.assertTrue(bearers and all(b == self.label(900) for b in bearers), bearers)
+        support.observe("k_relogin_approved_official", inode_changed=True, revoke_requests=0,
+                        consumer_uses_new_login=True)
 
 
 if __name__ == "__main__":

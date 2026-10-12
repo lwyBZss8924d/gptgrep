@@ -1,29 +1,37 @@
 # codex-auth: shared ChatGPT credential supervisor
 
 `codex_auth_supervisor.py` lets several local Codex consumers share one persistent ChatGPT login cache
-(the *canonical auth home*) without copying it, without letting consumers refresh it, and without
-sharing any other Codex state. It is a single Python 3.12+ standard-library file. It never opens,
-reads, hashes or decodes the credential: every check uses `lstat` metadata.
+(the *canonical auth home*) without copying it, without letting consumers refresh or revoke it, and
+without sharing any other Codex state. It is a single Python 3.12+ standard-library file. It never
+opens, reads, hashes or decodes the credential: every check uses `lstat` metadata.
 
 Status: implemented and qualified against fake credentials and loopback fakes (see
 [Qualification](#qualification)). Live behaviour against a real login is not established by this
-document. Follow the [live runbook](#live-runbook) and record its results separately.
+document. Follow the [live runbook](#live-runbook) and record its results separately. The
+[limitations](#limitations-and-unmanaged-entry-points) are part of the contract: the related
+acceptance items stay `BLOCKED` until each is qualified.
 
 ## What it enforces
 
 | Control | Mechanism |
 | --- | --- |
 | One serial group per auth source | `flock` on `lease_path`, a file outside every checkout. The parent directory must be 0700 and owned by the caller. The file must be 0600, opened with `O_NOFOLLOW`, never a symlink and never hardlinked. Exclusive by default. Shared mode exists only with `allow_shared_consumers=true`. The wait is bounded and ends in `AUTH_BUSY` (75). |
-| Whole-lifecycle lease | The lease descriptor is passed to the child (`pass_fds`) and is never `LOCK_UN`ed, so descendants that keep it keep the lease. The supervisor tracks the process tree throughout the run. After the child exits it sweeps for survivors before releasing: pid tree, process group and session, `lsof` holders of a per-run marker descriptor, and processes with files or cwd under the run directory. Survivors give `UNKNOWN` (76). A detached lease keeper then holds the lease until they, and any labelled Harbor containers, are gone. |
-| Per-run isolation | `RUNS_ROOT/<role>/<run-id>/{codex-home,state,state/logs,home,tmp,work,results}`, all 0700. Run ids are never reused. `codex-home/auth.json` is an absolute symlink to the canonical file. `codex-home/config.toml` is generated. The canonical `config.toml`, skills and state are never copied. |
+| Lease bound to the auth source | The first managed command writes a non-secret marker, `.gptgrep-codex-auth-binding.json`, into the canonical auth home. It records the lease path and the lock file's device and inode. Later commands refuse another lease path (`lease_binding_mismatch`), and refuse a deleted or recreated lock file (`lease_file_missing`, `lease_file_replaced`), which would otherwise split the lock. `rebind-lease` repairs the binding after human review, and only while no holder is alive. |
+| Whole-lifecycle lease | The lease descriptor is passed to the child (`pass_fds`) and is never `LOCK_UN`ed, so descendants that keep it keep the lease. Before anything that can use the credential is launched, a **lease guardian** process inherits the descriptor too. The supervisor tracks the process tree throughout the run. After the child exits it sweeps for survivors: pid tree, process group and session, `lsof` holders of a per-run marker descriptor, and processes with files or cwd under the run directory. Only a clean sweep releases the guardian. Survivors, an inconclusive sweep, a signal or any error after launch give `UNKNOWN` (76), and the guardian then holds the lease until the processes and any labelled Harbor containers are gone. If the supervisor itself is killed, the guardian takes over the same way and writes the receipt. Before it releases, it re-checks the canonical credential (a change quarantines) and removes the run's auth link. |
+| Signals | `SIGINT`, `SIGTERM` and `SIGHUP` are recorded, never fatal, for the whole command. During a run a signal cancels the child. After the child exits, a further signal only stops the waiting (sweep settle, Harbor container wait): the run ends `UNKNOWN` and the guardian keeps the lease. During an owner refresh the signal is honoured after the in-flight refresh and its in-place save complete, so the refresh is always judged and recorded. |
+| Per-run isolation | `RUNS_ROOT/<role>/<run-id>/{codex-home,state,state/logs,home,tmp,work,results}`, all 0700. Run ids are never reused. `codex-home/config.toml` is generated. The canonical `config.toml`, skills and state are never copied. |
+| Auth link lifetime | `codex-home/auth.json`, an absolute symlink to the canonical file, is created only after the quarantine check, the lease and the blocker and canonical preflights. It is removed on every exit path once the sweep is clean; after `UNKNOWN`, the guardian removes it at release. Refusals (`AUTH_BUSY`, `QUARANTINED`, `BLOCKED_AUTH`, configuration errors) never create it. The `_relogin` and `_maintenance` layouts never have one. A link a consumer *replaced* with a regular file or a different symlink (a per-run login or copy) is `RUN_AUTH_LINK_REPLACED`: the run is `QUARANTINED` and the file is left for review, not deleted. |
 | Pinned Codex config | `cli_auth_credentials_store="file"`, `forced_login_method="chatgpt"`, `features.use_agent_identity=false`, `features.{secret_auth_storage,memories,hooks,plugins,apps}=false`, `memories.{generate_memories,use_memories}=false`, `cloud.skills.enabled=false`, `notify=[]`, `analytics/feedback` off, `history.persistence="none"`, `check_for_update_on_startup=false`, `log_dir=<run>/state/logs`. Every key is checked against the 0.162.1 schema; the qualification starts app-servers with `--strict-config`. |
-| Allowlisted environment | The child environment is built from scratch: fixed `PATH`, `LANG`/`LC_ALL`, per-run `HOME`, `TMPDIR` and `XDG_*`, `CODEX_HOME`, `CODEX_SQLITE_HOME`, `CODEX_REFRESH_TOKEN_URL_OVERRIDE=<blocker>`, `CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED=1`, loopback `NO_PROXY`/`no_proxy`, `GPTGREP_AUTH_RUN_ID` and `GPTGREP_AUTH_SOURCE_ID`, plus any names a role lists. `OPENAI_API_KEY`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN` and `OP_SERVICE_ACCOUNT_TOKEN` can never pass. `OPENROUTER_API_KEY` passes only for roles with `allow_openrouter=true`. |
-| Consumers cannot refresh | Codex reads `CODEX_REFRESH_TOKEN_URL_OVERRIDE` on every refresh. The default blocker `http://127.0.0.1:9/oauth/token` is a closed port, and every run first checks that nothing listens there. Proactive refresh (token within 5 minutes of expiry), 401 recovery step 2, and explicit `account/read {refreshToken:true}` all fail transiently, and the token is never sent anywhere. A guarded reload still adopts an owner's rewrite. |
+| Allowlisted environment | The child environment is built from scratch: fixed `PATH` (or the role's `path_env`), `LANG`/`LC_ALL`, per-run `HOME`, `TMPDIR` and `XDG_*`, `CODEX_HOME`, `CODEX_SQLITE_HOME`, `CODEX_REFRESH_TOKEN_URL_OVERRIDE` and `CODEX_REVOKE_TOKEN_URL_OVERRIDE` (the blocker), `CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED=1`, loopback `NO_PROXY`/`no_proxy`, `GPTGREP_AUTH_RUN_ID` and `GPTGREP_AUTH_SOURCE_ID`, plus any names a role lists. `OPENAI_API_KEY`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN` and `OP_SERVICE_ACCOUNT_TOKEN` can never pass. `OPENROUTER_API_KEY` passes only for roles with `allow_openrouter=true`. |
+| Consumers cannot refresh or revoke | Codex reads both override variables on every call. The default blocker is `http://127.0.0.1:0/oauth/token` (revoke: `/oauth/revoke` on the same address). **Port 0 can never have a listener**: binding port 0 assigns an ephemeral port, and a connect to it fails before a byte is sent (`EADDRNOTAVAIL` on macOS, `ECONNREFUSED` on Linux). A fixed low port such as 9 is not safe, because any local process, a consumer's own tool commands included, can bind it on macOS and would receive the refresh token. Proactive refresh (token within 5 minutes of expiry), 401 recovery step 2, and explicit `account/read {refreshToken:true}` all fail transiently. A guarded reload still adopts an owner's rewrite. For a configured non-zero blocker port, the port is probed at launch, every 2 seconds while the child runs, and after it exits. A listener stops the child and gives `QUARANTINED` (`BLOCKER_LISTENER_APPEARED`), because the token may have been harvested. |
 | Proxy safety | reqwest/hyper-util read the macOS system HTTP(S) proxy but **ignore its ExceptionsList**, while honouring `NO_PROXY`. Without the loopback `NO_PROXY`, a request to the blocker (body included) can be relayed through a local or remote proxy. The supervisor always sets it. |
-| Single refresh owner | `refresh` holds the **exclusive** lease, so no consumer is alive during Codex's non-atomic in-place save. It drives the official `codex app-server --listen stdio:// --strict-config` in its own per-run home without the blocker: `initialize`, `initialized`, `account/read {refreshToken:true}`, then `account/read {}`, which must report a `chatgpt` account. Success requires the canonical `mtime_ns`/`size` to change while the inode, regular-file type, mode 0600 and the run's symlink stay intact. Otherwise the result is `AUTH_REFRESH_FAILED`, and a quarantine marker blocks every `run`/`refresh` until a human clears it. |
-| Owner stop | Close stdin and wait. If the owner is still running, SIGTERM its group with a long grace. SIGKILL is sent only after the grace, and is then recorded as `OWNER_SIGKILLED_AFTER_GRACE` with a quarantine, because the save may have been torn. |
-| Canonical integrity | Every run records canonical metadata before and after. Any change during a consumer run is `CANONICAL_CHANGED_BY_CONSUMER`: state `QUARANTINED` (78) plus the quarantine marker. |
-| Non-secret records | `manifest.json`, `receipt.json` and `state/supervisor-events.jsonl` in the run directory. Lease sidecars hold only pid, host id, process start time, run id, role, operation, mode and acquired/released times. The owner ledger `<lease_path>.ledger.jsonl` and the quarantine marker `<lease_path>.quarantine` hold no secrets. Child stdout/stderr go to `state/logs/` and are never parsed into receipts. |
+| Single refresh owner | `refresh` holds the **exclusive** lease, so no consumer is alive during Codex's non-atomic in-place save. It drives the official `codex app-server --listen stdio:// --strict-config` in its own per-run home without the consumer blocker: `initialize`, `initialized`, `account/read {refreshToken:true}`, then `account/read {}`, which must report a `chatgpt` account. Success (`REFRESHED`) requires the canonical `mtime_ns`/`size` to change while the inode, regular-file type, mode 0600 and the run's symlink stay intact. |
+| Owner failure classes | The owner runs with `RUST_LOG=error,codex_login=warn,codex_app_server=warn`, because by default the app-server logs only errors and hides transient refresh failures. Its log is classified by the 0.162.1 error codes and messages. **Permanent** (`REFRESH_TOKEN_REUSED`, `_EXPIRED`, `_REVOKED`, `INVALID_GRANT`, `ACCOUNT_MISMATCH`, `REFRESH_REJECTED` for any other 401) gives `BLOCKED_AUTH` (77) and a quarantine whose details carry `failure_kind=permanent`. **Transient** (`TRANSPORT`, `RATE_LIMITED`, `AUTHORITY_SERVER_ERROR`) with an unchanged credential that still reads as a chatgpt account gives `REFRESH_UNAVAILABLE` (69): no quarantine, retry later. An unclassified failure is `BLOCKED_AUTH` with a quarantine, but is never treated as permanent. |
+| Owner stop | Close stdin and wait. If the owner is still running, SIGTERM its group with a long grace. SIGKILL is sent only after the grace, and is then recorded as `OWNER_SIGKILLED_AFTER_GRACE` with a quarantine, because the save may have been torn. If the supervisor is killed during a refresh, the guardian waits for the owner and quarantines any credential change it could not judge (`OWNER_REFRESH_UNRECORDED`, ledger `OWNER_INTERRUPTED`). |
+| Consumer auth failures | Consumers report an explicit auth failure (unauthorized, not logged in, refresh rejected) by **exiting 77**. The run is then `BLOCKED_AUTH`, and an auth-block marker refuses new consumer runs until an owner refresh succeeds (it forces the refresh even when the file is fresh), a re-login succeeds, or a human runs `clear-quarantine --auth-block`. Network, rate-limit and server failures must use other codes and never block. `account-probe` implements the contract: 0 OK, 77 auth failure, 69 service unavailable. |
+| Canonical integrity | Every run records canonical metadata before and after, and the guardian re-checks it before a late release. Any change during or after a consumer run is `CANONICAL_CHANGED_BY_CONSUMER` or `CANONICAL_CHANGED_AFTER_SUPERVISOR`: state `QUARANTINED` (78) plus the quarantine marker. |
+| Re-login | Only for an unusable credential, in an empty staging home, installed by an atomic rename after success. See [Re-login](#re-login-maintenance). |
+| Non-secret records | `manifest.json`, `receipt.json` and `state/supervisor-events.jsonl` in the run directory, plus `state/lease-guardian-*.json`. Lease sidecars hold only pid, guardian pid, host id, process start time, run id, role, operation, mode and acquired/released times. The owner ledger `<lease_path>.ledger.jsonl`, the quarantine marker `<lease_path>.quarantine`, the auth-block marker `<lease_path>.auth-blocked` and the binding marker hold no secrets. Child stdout/stderr go to `state/logs/` and are never parsed into receipts. |
 
 ## Configuration
 
@@ -31,24 +39,38 @@ Copy `config.example.json` to an ignored local file, fill in physical absolute p
 The supervisor refuses group- or world-writable configs. Keys:
 
 - `canonical_auth_home`: directory holding the one `auth.json`. It must be 0700, owned by you, a
-  physical path, and contain a 0600 regular file.
+  physical path, and contain a 0600 regular file. The first managed command adds the non-secret
+  lease binding file next to `auth.json`.
 - `lease_path`: the single lock identity for this auth source. Every checkout and worktree using
-  the same login must point at the same file. Its sidecars, ledger and quarantine marker live next to it.
-- `runs_root`: where per-run directories are created. It must not overlap the auth home.
+  the same login must point at the same file; the binding refuses any other. Its sidecars, ledger
+  and markers live next to it. Its directory must not contain `runs_root`.
+- `runs_root`: where per-run directories are created. It must not overlap the auth home. A re-login
+  installs the new login by `rename` from a run directory, so it must be on the same filesystem as
+  the auth home.
 - `codex_bin` and `codex_bin_sha256`: the official CLI and its pin. The pin is mandatory for
   `refresh` and `relogin`, and verified on every run. `binary_pins` records more pins.
 - `expected_user` (optional): refuse unless the effective user has this name.
-- `blocker_url` (loopback only) and `blocker_must_be_closed`.
+- `blocker_url` (loopback only; keep the default port 0) and `blocker_must_be_closed`.
 - `allow_shared_consumers`: Phase 2 only (see below). Default `false`.
 - `refresh_policy.max_age_seconds` (default 43200) and `refresh_policy.pre_run`
-  (`never`, `if-stale` or `always`).
+  (`never`, `if-stale` or `always`). With `if-stale`, a shared consumer upgrades to the exclusive
+  lease only when a refresh is actually due.
 - `owner.*`: RPC timeout, exit wait, SIGTERM grace, `passthrough_env`, and the test-only
   `refresh_token_url_override` (loopback only).
+- `relogin.experimental_issuer`: test-only loopback device-code issuer for qualification.
 - `codex_config`: extra allowlisted Codex keys, such as `chatgpt_base_url`, `openai_base_url`
-  or `model`. The pinned auth keys cannot be overridden.
-- `roles.<name>`: `passthrough_env`, `allow_openrouter`, `deadline_seconds`, `codex_config`
-  and `path_env`.
-- `docker.bin`, `docker.env` (`DOCKER_*`), `docker.wait_seconds`: used for `--harbor-job-label`.
+  or `model`. The pinned auth keys and the permission keys cannot be overridden.
+- `roles.<name>`:
+  - `tool_permissions` (**required**; see [Tool commands](#tool-commands-and-the-credential)):
+    `{"extends": ":workspace"|":read-only", "network_enabled": false}` for a generated profile,
+    `"consumer-managed"`, or `"unrestricted"`.
+  - `passthrough_env`, `allow_openrouter`, `deadline_seconds` and `codex_config`.
+  - `path_env`: Harbor needs the directory that holds `docker`.
+  - `stop_scope` (`tree` or `root-first`) and `term_grace_seconds`. With `root-first`, cancel and
+    deadline send SIGTERM to the root alone and wait its grace, so Harbor can run its own cancel
+    path and remove its containers. Only then is the rest of the tree signalled.
+- `docker.bin`, `docker.env` (`DOCKER_*`), `docker.wait_seconds`, `docker.poll_seconds`: used for
+  `--harbor-job-label`.
 
 ## Commands
 
@@ -60,28 +82,32 @@ codex_auth_supervisor.py --config CFG run --role R --run-id ID [--lease exclusiv
     [--manifest-field KEY=VALUE]... [--stdin null|inherit] [--dry-run] -- CMD...
 codex_auth_supervisor.py --config CFG refresh --run-id ID [--force] [--wait-seconds N]
 codex_auth_supervisor.py --config CFG relogin --run-id ID --confirm-relogin
-codex_auth_supervisor.py --config CFG clear-quarantine --run-id ID --confirm --reason TEXT
+codex_auth_supervisor.py --config CFG clear-quarantine --run-id ID --confirm [--auth-block] --reason TEXT
+codex_auth_supervisor.py --config CFG rebind-lease --run-id ID --confirm --reason TEXT
 codex_auth_supervisor.py account-probe --codex-bin BIN --out FILE   # inside `run` only
 ```
 
 `CMD` may use the placeholders `{codex_home} {state_dir} {log_dir} {work_dir} {home} {tmp}
-{results} {run_dir}`. The child's `PATH` is fixed, so pass absolute executables. For GPTgrep, pass
-`--codex-bin <official binary> --codex-home {codex_home} --codex-state-dir {state_dir}` explicitly.
-Do not use a wrapper that re-exports a shared `CODEX_HOME`.
+{results} {run_dir}`. The child's `PATH` is fixed, so pass absolute executables. Do not use a wrapper
+that re-exports a shared `CODEX_HOME`. For GPTgrep the intended shape is `--codex-bin <official
+binary> --codex-home {codex_home} --codex-state-dir {state_dir}`; it is designed but has not been
+run under the supervisor (see [limitations](#limitations-and-unmanaged-entry-points)).
 
 | State | Exit | Meaning |
 | --- | --- | --- |
-| `PASS` | 0 | Child exited 0, the sweep was clean and the canonical file is unchanged (for `refresh`: refreshed, or skipped as fresh) |
-| `FAILED` | child code (1 to 63), else 1 | Child failed; nothing retried |
-| `CONFIG_ERROR` | 64 | Refused before launch (config, pin, lease safety, flags) |
-| `INTERNAL_ERROR` | 70 | Unexpected supervisor error; only the exception type is reported |
+| `PASS` | 0 | Child exited 0, the sweep was clean, the canonical file is unchanged and the link was removed (for `refresh`: refreshed, or skipped as fresh) |
+| `FAILED` | child code (1 to 63), else 1 | Child failed for a non-auth reason; nothing retried |
+| `CONFIG_ERROR` | 64 | Refused before launch (config, pin, lease safety, lease binding, flags) |
+| `RELOGIN_NOT_REQUIRED` | 64 | `relogin` refused: the credential is still usable |
+| `REFRESH_UNAVAILABLE` | 69 | Owner refresh failed transiently (network, 429, 5xx); credential unchanged and usable; retry later |
+| `INTERNAL_ERROR` | 70 | Unexpected supervisor error before launch; only the exception type is reported |
 | `RUN_ALREADY_EXISTS` | 73 | Run id reused; choose a new id |
 | `AUTH_BUSY` | 75 | Lease not acquired within the wait bound |
-| `UNKNOWN` | 76 | Processes or containers outlived the child, or the sweep was inconclusive. The lease is retained by the keeper. Never retried automatically |
-| `BLOCKED_AUTH` | 77 | Canonical preflight failed, `AUTH_REFRESH_FAILED`, the blocker port has a listener, or re-login failed |
+| `UNKNOWN` | 76 | Processes or containers outlived the child, the Harbor label never matched, the sweep was inconclusive, a signal interrupted the post-run waits, or an error followed the launch. The guardian keeps the lease. Never retried automatically |
+| `BLOCKED_AUTH` | 77 | Canonical preflight failed, a permanent or unclassified owner refresh failure, the blocker port has a listener at launch, a consumer exited 77, an auth block is pending, or re-login failed or was declined |
 | `QUARANTINED` | 78 | The quarantine marker exists, or this run created it |
-| `TIMEOUT` | 124 | Deadline: SIGTERM to the group, grace, then SIGKILL (consumers only) |
-| `CANCELLED` | 130 | SIGINT/SIGTERM/SIGHUP forwarded to the child's group |
+| `TIMEOUT` | 124 | Deadline: SIGTERM (root-first or tree), grace, then SIGKILL (consumers only) |
+| `CANCELLED` | 130 | SIGINT/SIGTERM/SIGHUP during the run, forwarded per the role's `stop_scope` |
 
 ## Concurrency phases
 
@@ -103,17 +129,92 @@ The owner cannot see token expiry, because the credential is never decoded. Choo
 
 A consumer whose access token expires mid-run fails closed with an auth error. It does not refresh.
 If the token is within five minutes of expiry when the owner starts, Codex refreshes once at startup
-and once for the explicit request. Both writes are the owner's and both are recorded.
+and once for the explicit request, presenting each rotated token once. Both writes are the owner's
+and both are recorded.
+
+## Harbor
+
+- full62 stamps the label `gptgrep.auth-job=<runtime run_id>` on every trial service it generates
+  (reader and judge compose files). Harbor gives each trial its own compose project, so that label
+  is the only job-wide handle.
+- Launch the Harbor executable directly under `run --role harbor --harbor-job-label
+  gptgrep.auth-job=<run_id>`. Never launch through a local wrapper that
+  re-exports the canonical `CODEX_HOME`.
+- The supervisor polls the label while Harbor runs and requires at least one matching container
+  before it accepts "cleared". A label that never matched gives `UNKNOWN`, so a wrong label cannot
+  release the lease early. After Harbor exits, the supervisor waits for the label to clear. The
+  guardian keeps watching it after an `UNKNOWN` result, even when the first check was clear.
+- The `harbor` role uses `stop_scope=root-first` with a long `term_grace_seconds`. Harbor turns
+  SIGTERM into its own cancel path, which removes the trial containers.
+- **Qualified with a real Docker engine, not with Harbor:** the optional container pass ran plain
+  containers from a local image with `--network none`, a fake credential and the full62 mount. It
+  showed four things: the label gate holds the lease until the container is gone (and the guardian
+  keeps it when the container outlives the wait); the read-only single-file bind refuses writes
+  (`EROFS`); a host in-place save is visible inside a running container on OrbStack; and Linux
+  refuses a connect to port 0.
+- **Not yet qualified:** a real Harbor trial under the supervisor, and the Linux Codex binary's
+  refresh, 401 and guarded-reload behaviour inside a trial container. Keep Harbor shared-login runs
+  `BLOCKED` until one minimal non-live Harbor trial with fake auth and `network: none` passes.
+
+## Tool commands and the credential
+
+Model tool commands normally inherit `CODEX_HOME`, so without a permission profile they can read the
+credential through the run's link (and, before the supervisor removes it, write to it). Each role
+must state who prevents that:
+
+- `{"extends": ":workspace"|":read-only", "network_enabled": false}`: the supervisor generates
+  `default_permissions = "gptgrep_codex_auth"`. The profile extends the chosen built-in and denies
+  three paths: the canonical auth home, the run's `codex-home/auth.json` and the lease directory
+  (markers and ledger). The official 0.162.1 `command/exec` path was qualified with the official
+  binary: the deny holds through the link, the workspace stays writable, and an `unrestricted`
+  negative control could read the file. This needs `--unguarded-tool-sandbox`: Codex's seatbelt
+  sandbox cannot be applied inside another sandbox, so a consumer that itself runs inside a sandbox
+  cannot use this mode.
+- `"consumer-managed"`: the consumer selects its own permission profile. GPTgrep's native OCR and
+  Document roles use deny-root profiles, and Harbor full62 denies `/opt/full62-home`. The
+  supervisor cannot verify this; receipts record `verified_by_supervisor=false`.
+- `"unrestricted"`: tool commands can read the credential. Use this only for consumers that run no
+  model tools, such as `account-probe`.
+
+A consumer that passes its own `default_permissions` or `permissions.*` on its command line
+overrides the generated profile. Until every consumer chain has been qualified, the ISO-02 and
+SEC acceptance items stay `BLOCKED`.
+
+## Limitations and unmanaged entry points
+
+The lease covers only processes the supervisor launches. These entry points use the canonical
+`CODEX_HOME` with no lease and must not be used with the shared login. Treat them as `BLOCKED` for
+shared-login use until each is routed through `run`:
+
+- Local workstation wrappers outside this repository that force or export the canonical
+  `CODEX_HOME`, or do not unset `CODEX_API_KEY`.
+- Local metadata front doors that keep their own lock file.
+- The harbor-ablation Rust harness (`judge_app_server`, `judge_backend`, `codex_agent`) sets the
+  refresh and revoke blockers and loopback `NO_PROXY` in its children. It takes no lease. Use it with
+  the shared login only under `run`.
+- Scripts with built-in concurrency (system eval, PageIndex) and OCR's two app-servers need
+  in-job concurrency 1 under the exclusive lease.
+- No GPTgrep product, OCR, Document or Judge call chain, and no Harbor trial (only plain containers
+  from a local image), has been run under the supervisor yet. CRED-11 and CTR-05 stay open.
+- The owner attributes every canonical change made while it holds the exclusive lease to itself. An
+  unmanaged writer active at the same time cannot be told apart.
+- Process tracking cannot see a daemon that escapes between samples, closes inherited descriptors
+  and leaves the run directory.
 
 ## Live runbook
 
 Run each step only within the authorization and budget that apply to it. Keep the device code out of
 files. Record receipts under your private evidence location.
 
-1. **Preflight, no network.** Run `status`. Confirm that the lease probe reports `free` and that there
-   is no quarantine, that canonical preflight is `ok`, and that `canonical_age_seconds` is present.
-   Then run `run --dry-run ... -- CMD` and review the argv, the environment key names and the
-   generated `config.toml`. Confirm no unmanaged consumer is running against the same cache.
+1. **Preflight, no network.** Run `status`. Check all of these:
+   - the lease probe reports `free`, and the binding, if present, matches your config;
+   - there is no quarantine and no auth block;
+   - the canonical preflight is `ok`;
+   - the blocker probe is `closed`.
+
+   Then run `run --dry-run ... -- CMD` and review the argv, the environment key names, the
+   generated `config.toml` and `tool_credential_access`. Confirm that no
+   [unmanaged entry point](#limitations-and-unmanaged-entry-points) is running against the same cache.
 2. **First live step: consumer probe with the blocker, no refresh, no model request.**
    ```text
    codex_auth_supervisor.py --config CFG run --role dev --run-id live-probe-001 \
@@ -123,89 +224,151 @@ files. Record receipts under your private evidence location.
      --stderr-log {log_dir}/account-probe.stderr.log
    ```
    This calls `account/read` with `refreshToken=false` through the real backend. It sends no
-   model request and can never refresh. Expect `PASS`, `account_ok=true` and
-   `canonical_changed=false`. If the token is near expiry, the blocked refresh attempts appear only
-   in the app-server log. An auth error here means "needs an owner refresh"; it never means
-   "re-login".
+   model request and can never refresh.
+
+   Expect `PASS`, `outcome=OK` and `canonical_changed=false`. `BLOCKED_AUTH` (`AUTH_*`) means
+   "needs an owner refresh" and sets the auth block; it never means "re-login". A child exit of 69
+   (`SERVICE_UNAVAILABLE`) is a network, rate-limit or server problem and blocks nothing.
 3. **Owner refresh, by policy only.** Run `refresh --run-id live-own-001` without `--force`. If
-   the canonical file is younger than `max_age_seconds`, the result is `SKIPPED_FRESH` and nothing
-   is contacted. Use `--force` only when step 2 showed an expired token or a policy decision
-   requires it. Expect `REFRESHED`, `inode_preserved=true`, `integrity_ok=true` and a ledger entry.
-4. **Bounded consumer runs.** Repeat step 2's shape with the real command, a new run id, an explicit
-   deadline and `--harbor-job-label` for Harbor jobs. One unit at a time in Phase 1.
-5. **Afterwards.** Check `status`: no unreleased holders and no quarantine. Then archive the
-   receipts.
+   the canonical file is younger than `max_age_seconds` and no auth block is pending, the result is
+   `SKIPPED_FRESH` and nothing is contacted. Use `--force` only when a policy decision requires it.
+   Expect `REFRESHED`, `inode_preserved=true`, `integrity_ok=true` and a ledger entry.
+4. **Bounded consumer runs.** Repeat step 2's shape with the real command, a new run id and an
+   explicit deadline. For Harbor jobs, also pass `--harbor-job-label`. One unit at a time in Phase 1.
+5. **Afterwards.** Check `status`: no unreleased holders, no quarantine and no auth block.
+   - Archive only `receipt.json`, `manifest.json` and `results/` from each run directory, never the
+     whole directory.
+   - A finished run has no `codex-home/auth.json`. A file found there after a `QUARANTINED`
+     `RUN_AUTH_LINK_REPLACED` run is a credential: remove it after review, and do not archive it.
 
 ## Failure recovery
 
-- `AUTH_BUSY`: another managed run holds the lease. Use `status` to find it (holder records). Wait;
-  do not delete the lock file. The kernel releases it when the last holder exits.
-- `UNKNOWN`: inspect `receipt.json` → `sweep` and `docker`. Verify that the listed pids and
-  containers belong to this run before stopping them. The keeper releases the lease once they are
-  gone. It works from a config snapshot taken when it started, so later config edits cannot
-  release the lease early. Never rerun automatically: check for duplicate side effects or
-  charges first.
-- `QUARANTINED` / `CANONICAL_CHANGED_BY_CONSUMER`: a consumer, or something outside the supervisor,
-  wrote the credential. Find the writer: an unmanaged entry point, a missing blocker, or a tool
-  bypassing the run home. After review, run `clear-quarantine --confirm --reason "..."`. The marker
-  is archived, not deleted.
-- `BLOCKED_AUTH` / `AUTH_REFRESH_FAILED`: the owner could not refresh. See
-  `refresh.owner_log_failure_class` (for example `REFRESH_TOKEN_REUSED` or
-  `REFRESH_TOKEN_EXPIRED`). Do not loop. A transport failure may be retried once, after the
-  network is fixed and the quarantine is cleared. A permanent class needs a re-login.
-- `OWNER_SIGKILLED_AFTER_GRACE`: the in-place save may be torn. Run `status`; canonical preflight
-  must still pass. If `auth.json` is empty or invalid, re-login. Never restore an old copy.
-- Consumer 401 or "unauthorized" during a run: stop the unit. Run the owner refresh (step 3), then
-  repeat with a new run id. Never add an API key or switch accounts.
+- `AUTH_BUSY`: another managed run or a guardian holds the lease. Use `status` to find it (holder
+  records, including `guardian_pid`). Wait; do not delete the lock file. Deleting it is refused
+  afterwards (`lease_file_missing`) until `rebind-lease` is run with no live holders.
+- `UNKNOWN`: inspect `receipt.json` → `sweep` and `docker`, and `state/lease-guardian-*.json`.
+  - Verify that the listed pids and containers belong to this run before stopping them.
+  - The guardian releases the lease once they are gone. It works from a config snapshot taken when
+    it started, so later config edits cannot release the lease early.
+  - Never rerun automatically: check for duplicate side effects or charges first.
+- `QUARANTINED`: something changed the credential, replaced a run's link, listened on the blocker,
+  or an owner was interrupted or killed. Find the cause, such as an unmanaged entry point, a
+  missing blocker, a tool bypassing the run home or a harvester. After review, run
+  `clear-quarantine --confirm --reason "..."`. The marker is archived, not deleted.
+- `BLOCKED_AUTH` after `refresh`: read `refresh.owner_log_failure_class` and
+  `owner_log_failure_kind`. Do not loop.
+  - A **permanent** class means the refresh token is dead: re-login (below).
+  - An unclassified failure needs investigation; it does not allow a re-login on its own.
+- `REFRESH_UNAVAILABLE`: a transient failure (network, 429, 5xx). The credential is unchanged.
+  Retry later, after the network is fixed.
+- `BLOCKED_AUTH` from a consumer (exit 77 or a pending auth block): run the owner refresh, then repeat
+  with a new run id. Never add an API key or switch accounts.
+- `OWNER_SIGKILLED_AFTER_GRACE` / `OWNER_REFRESH_UNRECORDED`: the in-place save may be torn, or
+  nobody judged the write. Run `status`; the canonical preflight must still pass. If the credential
+  is empty or no longer loads, the re-login gate allows a re-login. Never restore an old copy.
 
 ## Re-login (maintenance)
+
+The official `codex login --device-auth` first **revokes the refresh token in the `auth.json` of the
+`CODEX_HOME` it runs in and deletes that file**, before it shows a code (`clear_existing_auth_before_login`
+in 0.162.1). Run directly against the canonical home, a declined or expired code would destroy the
+only shared login. The supervisor therefore:
+
+1. Allows a re-login only when the credential is unusable. Any one of these is enough:
+   - the canonical `auth.json` is missing or empty;
+   - a quarantine records a permanent owner failure;
+   - the pinned official `login status`, run in a separate linked home, reports not logged in.
+
+   Otherwise it ends `RELOGIN_NOT_REQUIRED`.
+2. Runs the pinned `codex -c cli_auth_credentials_store="file" -c forced_login_method="chatgpt" -c
+   log_dir=<run>/state/logs login --device-auth` with `CODEX_HOME` set to the run's empty
+   `codex-home` (a staging home on the auth home's filesystem). Both the refresh and revoke
+   endpoints point at the blocker. Nothing is revoked or deleted. Terminal I/O is passed through
+   and never captured, and a notice explaining this is printed first.
+3. Runs `login status` against the staging home. Only when both succeed does it rename the staged
+   `auth.json` over the canonical file. Per-run symlinks follow the path. A staged login that cannot
+   be verified is discarded.
+
+Procedure:
 
 1. Stop every consumer, then run `status`: no holders, lease `free`.
 2. Tell the user this re-logs in the existing ChatGPT login for this auth source, and get explicit
    confirmation for this one action.
-3. Run `relogin --run-id relogin-001 --confirm-relogin` in an interactive terminal. It takes the
-   exclusive lease and runs the pinned official
-   `codex -c cli_auth_credentials_store="file" -c forced_login_method="chatgpt" -c log_dir=<run>/state/logs login --device-auth`
-   with `CODEX_HOME` set to the canonical home. Terminal I/O is passed through and never captured.
+3. Run `relogin --run-id relogin-001 --confirm-relogin` in an interactive terminal.
 4. Give the device code and the official page only in the user's private conversation. The user
-   approves it personally. Then `login status` runs, and only exit codes are recorded.
-5. Login replaces `auth.json` (logout first, so the inode changes); per-run symlinks follow the path.
-   Clear any quarantine with a reason. Resume work with new run ids.
-6. If the code expires or the user declines, the state stays `BLOCKED_AUTH`. A new code is a new,
-   explicitly confirmed attempt. Never retry on a timer.
+   approves it personally. Only exit codes are recorded.
+5. After `PASS`, a pending auth block is cleared. Clear any quarantine with a reason, then resume
+   with new run ids.
+6. If the code expires or the user declines, the state stays `BLOCKED_AUTH` and the existing login
+   is untouched. A new code is a new, explicitly confirmed attempt. Never retry on a timer.
 
 ## Qualification
 
 ```text
 python3 -I -B tests/run_qualification.py --results-dir /path/to/results \
-    [--codex-bin /path/to/official/codex --codex-sha256 <pin>]
+    [--codex-bin /path/to/official/codex --codex-sha256 <pin>] [--unguarded-tool-sandbox \
+    [--docker-bin /path/to/docker --docker-host unix:///path/to/docker.sock --docker-image <local image>]]
 ```
 
 The runner writes `<results>/<UTC>/` containing `logs/unittest.log`, `summary.json` (counts,
-per-test outcomes, non-secret observations), `runner-meta.json` and `sandbox.sb`. On macOS it
-re-executes under `sandbox-exec`. Outbound network is allowed only to its reserved loopback ports
-and the closed port 9, so system proxies, DNS and every real endpoint are unreachable. Any access
-under the real `~/.gptgrep` and `~/.codex` is denied. Tests that run a real Codex binary refuse to
-run without this guard. All credentials are unsigned fake JWTs under the run's own temporary
-directory.
+per-test outcomes, non-secret observations), `runner-meta.json` and `sandbox.sb`.
+
+- On macOS it re-executes under `sandbox-exec`. Outbound network is allowed only to its reserved
+  loopback ports and port 9, so system proxies, DNS and every real endpoint are unreachable.
+- Any access under the real `~/.gptgrep` and `~/.codex` is denied.
+- Tests that run a real Codex binary refuse to run without this guard.
+- All credentials are unsigned fake JWTs under the run's own temporary directory.
+
+`--unguarded-tool-sandbox` (official binary only) adds one more pass for `unguarded_test_*.py`. That
+pass needs Codex's own tool sandbox, which cannot nest inside the guard:
+
+- every endpoint is a loopback fake;
+- the blocker is port 0;
+- `HTTP(S)_PROXY`/`ALL_PROXY` point at a loopback trap that must record zero connections.
 
 Covered:
 
-- (a) Lease semantics.
-- (b) Layout and environment.
+- (a) Lease semantics, the lease binding, and deleting the lock file while it is held.
+- (b) Layout and environment; the auth-link lifetime on every exit path; a replaced link.
 - (c) Owner refresh through the symlink with a fake authority: in place, inode kept, one request.
-- (d) Consumers with expiring tokens never reach the authority.
+  Owner failure classes from the official log: reused, expired, revoked, `invalid_grant`, other
+  401, 5xx, 429 and connection refused, each with valid and near-expiry tokens.
+- (d) Consumers with expiring tokens never reach the authority. The port-0 blocker, guarded and
+  unguarded.
 - (e) Consumers adopt the owner's write, both at startup and through the guarded reload of a
   running app-server.
-- (f) A 401 fails closed.
-- (g) Four shared consumers, then the owner waits for exclusive.
-- (h) SIGTERM grace and SIGKILL anomaly, `UNKNOWN` with the keeper, deadline and cancel.
+- (f) A 401 fails closed. The exit-77 contract blocks the next consumer until an owner refresh;
+  5xx and 429 do not block.
+- (g) Four shared consumers, then the owner waits for exclusive. A shared `if-stale` consumer
+  overlaps while the file is fresh.
+- (h) Lifecycle:
+  - SIGTERM grace and the SIGKILL anomaly; deadline and cancel; a root-first stop;
+  - SIGINT/SIGTERM during the sweep and during the Harbor container wait;
+  - a killed supervisor, after the child exits and during an owner refresh;
+  - the post-launch exception path;
+  - the guardian's canonical re-check and its continued label watch;
+  - the guardian does not adopt a reused root pid;
+  - a listener appearing on the blocker port.
 - (i) `CODEX_API_KEY` stripped. The unsupervised negative control shows `codex exec` would log out,
   and that this only unlinks the run's symlink.
-- (j) Leak canaries in every supervisor- and Codex-written run file.
-- Fake re-login, the fake Docker label sweep, and the guard's self-check.
+- (j) Leak canaries in every supervisor- and Codex-written run file, after every official-binary
+  test.
+- (k) Staged re-login with the official device flow against a fake issuer:
+  - decline: no revoke and no change;
+  - approve: installed by rename, and a consumer uses the new login;
+  - with the fake CLI: gating, discarding an unverified login, and the clear-before-login model.
+- Tool-command denial through `command/exec` (unguarded pass only), the fake Docker label gate, and
+  the guard's self-check.
+- With `--docker-bin/--docker-host/--docker-image` (unguarded pass): the label gate against plain
+  containers on a real Docker engine. Also the read-only bind (`EROFS`), adoption of a host in-place
+  save inside a running container, and Linux port-0 refusal.
 
-Not covered: any real login, token authority, ChatGPT backend or model, and real Harbor containers.
+`--docker-bin`, `--docker-host` and `--docker-image` name a local image with `python3`, which is
+never pulled.
+
+Not covered: any real login, token authority, ChatGPT backend or model; Harbor trials and the
+Linux Codex binary inside a container; GPTgrep product, OCR, Document and Judge chains under the
+supervisor.
 
 ## Verified Codex 0.162.1 behaviour this design depends on
 
@@ -216,16 +379,25 @@ Paths are relative to `codex-rs/` at source commit `092d3acd`.
   only a symlink.
 - `login/src/auth/manager.rs`:
   - The refresh window is 5 minutes, with an 8-day `last_refresh` fallback.
-  - `CODEX_REFRESH_TOKEN_URL_OVERRIDE` is read on each call.
+  - `CODEX_REFRESH_TOKEN_URL_OVERRIDE` and `CODEX_REVOKE_TOKEN_URL_OVERRIDE` are read on each
+    call; without the latter, the revoke endpoint is derived from the former.
   - `auth()` refreshes proactively and keeps the token on failure.
   - `refresh_token()` does a guarded reload, then contacts the authority.
   - `UnauthorizedRecovery` step 2 calls `refresh_token_from_authority` without comparing the file.
   - Each manager has an in-process `Semaphore(1)` and no cross-process lock.
-- `app-server/src/request_processors/account_processor.rs`: `account/read {refreshToken:true}`
-  calls `refresh_token()` and discards the outcome.
+  - `request_chatgpt_token_refresh` logs `Failed to refresh token status=… detail=TokenErrorDetail
+    { error_code … }` at ERROR. It classifies 401, `invalid_grant` and the `refresh_token_*` codes
+    as permanent and other statuses as transient.
+- `app-server/src/request_processors/account_processor.rs`:
+  - `account/read {refreshToken:true}` calls `refresh_token()` and discards the outcome.
+  - It logs transient failures only at WARN.
+  - After a permanent failure the account reads as `null`.
 - `app-server/src/request_processors/account_processor/workspace_routing.rs`: `account/read`
-  queries `<chatgpt_base_url>/…/accounts/check` and routes model traffic to the returned workspace
-  origin.
+  queries `<chatgpt_base_url>/…/accounts/check`. A 401 surfaces as `workspace routing discovery
+  unauthorized (401)`; 429, 5xx and connection errors surface as `workspace routing discovery
+  failed`.
+- `cli/src/login.rs` `run_login_with_device_code`: `clear_existing_auth_before_login` →
+  `logout_with_revoke` revokes and deletes the current `auth.json` before the user code is requested.
 - `login/src/auth/manager.rs` `enforce_login_restrictions`: with `forced_login_method="chatgpt"`
   and a visible `CODEX_API_KEY`, `codex exec` logs out and deletes `CODEX_HOME/auth.json`.
 - `arg0/src/lib.rs`: every invocation writes `CODEX_HOME/tmp/arg0` and refuses a `CODEX_HOME`
@@ -233,4 +405,6 @@ Paths are relative to `codex-rs/` at source commit `092d3acd`.
 - `http-client/src/outbound_proxy.rs`: the default `ReqwestDefault` policy (`respect_system_proxy`
   is off) uses hyper-util's system matcher. On macOS that matcher reads the HTTP/HTTPS proxy but
   not the ExceptionsList, and applies `NO_PROXY` first.
+- `app-server` `command/exec`: runs a command under the configured permission profile without a
+  model request; `extends = ":workspace"` and `":read-only"` are the extensible built-ins.
 - The app-server `chatgptAuthTokens` mode is labelled "FOR OPENAI INTERNAL USE ONLY" and is not used.

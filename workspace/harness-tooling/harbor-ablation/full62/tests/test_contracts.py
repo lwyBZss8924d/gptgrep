@@ -387,7 +387,7 @@ class MaterializationIsolationTests(unittest.TestCase):
                            "provenance": {"path": "/synthetic/base-tools.json", "bytes": 1, "sha256": "f" * 64}},
                        "codex_binary": "/opt/codex", "gptgrep_binary": "/opt/gptgrep", "codex_home": "/opt/full62-home",
                        "native_ptc": True, "codex_permissions": "full62_reader",
-                       "platform": "linux/amd64",
+                       "platform": "linux/amd64", "run_id": "synthetic-full62",
                        "native_cli": {"version": "0.162.1", "release_tag": "rust-v0.162.1", "source_commit": "a" * 40},
                        "auth": {"method": "chatgpt_device_file", "reader_file": "/synthetic/reader/auth.json",
                                 "judge_file": "/synthetic/judge/auth.json"},
@@ -407,6 +407,9 @@ class MaterializationIsolationTests(unittest.TestCase):
             destination = root / "generated-raw-task"
             owner._task(destination, Path(adapter_module.__file__).parent, row, document, binding)
             self.assertFalse((destination / "environment/corpus/.gptgrep/index.bin").exists())
+            for directory in ("environment", "tests"):
+                compose = json.loads((destination / directory / "docker-compose.yaml").read_text())
+                self.assertEqual(compose["services"]["main"]["labels"], {"gptgrep.auth-job": "synthetic-full62"})
             self.assertEqual((destination / "environment/corpus/arbitrary-document.txt").read_bytes(), raw.read_bytes())
             reader = (destination / "environment/reader.json").read_text()
             self.assertNotIn(row["reference"], reader)

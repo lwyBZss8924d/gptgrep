@@ -19,6 +19,14 @@ type Result<T> = std::result::Result<T, &'static str>;
 // These bound metadata work, independently of page count and retained file bytes.
 const MAX_GENERATION_FILES: usize = 4096;
 const MAX_CAPABILITY_BYTES: usize = 1_048_576;
+// The native agent is a credential consumer and never refreshes or revokes a
+// shared ChatGPT login. These are set by the runner itself (the control's
+// environment allowlist cannot carry or override them). Port 0 can never have a
+// listener, so a refresh fails before the refresh token leaves the process;
+// loopback bypasses proxies so the blocked request is never forwarded.
+const REFRESH_BLOCKER_URL: &str = "http://127.0.0.1:0/oauth/token";
+const REVOKE_BLOCKER_URL: &str = "http://127.0.0.1:0/oauth/revoke";
+const LOOPBACK_NO_PROXY: &str = "127.0.0.1,localhost,::1";
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 extern "C" fn interrupt(_: libc::c_int) {
     INTERRUPTED.store(true, Ordering::Relaxed);
@@ -1399,6 +1407,10 @@ fn execute(admitted: Admitted) -> Result<Value> {
         .current_dir(&control.cwd)
         .env_clear()
         .envs(&control.environment)
+        .env("CODEX_REFRESH_TOKEN_URL_OVERRIDE", REFRESH_BLOCKER_URL)
+        .env("CODEX_REVOKE_TOKEN_URL_OVERRIDE", REVOKE_BLOCKER_URL)
+        .env("NO_PROXY", LOOPBACK_NO_PROXY)
+        .env("no_proxy", LOOPBACK_NO_PROXY)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

@@ -1056,6 +1056,7 @@ dependencies = [
  "gptgrep-pageindex",
  "image",
  "liteparse",
+ "png 0.18.1",
  "serde",
  "serde_json",
  "sha2",

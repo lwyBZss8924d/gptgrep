@@ -28,6 +28,7 @@ from gptgrep_harbor.product_bundle import PRODUCT_ENTRYPOINT, PRODUCT_PROVENANCE
 from gptgrep_harbor.runtime import (
     BASE_CAPABILITIES, BASE_TOOLS_PATH, CODEX_HOME, CODEX_SOURCE_COMMIT, DECISIONS_BUDGET,
     base_tools_identity, model_config, native_environment, native_wrapper, REFRESH_BLOCKER_URL,
+    REVOKE_BLOCKER_URL, AUTH_JOB_LABEL, auth_compose,
     validate_asset_path,
 )
 
@@ -162,6 +163,8 @@ class HarborMaterializationTests(unittest.TestCase):
                 self.assertEqual(mounts[0]["target"], CODEX_HOME + "/auth.json")
                 self.assertTrue(mounts[0]["read_only"])
                 self.assertFalse(mounts[0]["bind"]["create_host_path"])
+                # Every trial service carries the job-wide label the host supervisor waits on.
+                self.assertEqual(compose["services"]["main"]["labels"], {AUTH_JOB_LABEL: self.runtime["run_id"]})
                 self.assertFalse((task / directory / "auth.json").exists())
                 self.assertNotIn("COPY .", (task / directory / "Dockerfile").read_text())
             self.assertEqual(len(json.loads((task / "environment/docker-compose.yaml").read_text())["services"]["main"]["volumes"]), 3 if treatment else 1)
@@ -356,10 +359,13 @@ class NativePolicyTests(unittest.TestCase):
         source = {"PATH": "/usr/bin", "NO_PROXY": "corp.example.invalid", "no_proxy": "lower.example.invalid",
                   "HTTPS_PROXY": "http://synthetic-proxy:3128",
                   "CODEX_REFRESH_TOKEN_URL_OVERRIDE": "https://synthetic-elsewhere.invalid/oauth/token"}
-        self.assertEqual(REFRESH_BLOCKER_URL, "http://127.0.0.1:9/oauth/token")
+        # Port 0: no process in the container (tool commands share its network namespace) can listen there.
+        self.assertEqual(REFRESH_BLOCKER_URL, "http://127.0.0.1:0/oauth/token")
+        self.assertEqual(REVOKE_BLOCKER_URL, "http://127.0.0.1:0/oauth/revoke")
         for product in (False, True):
             native = native_environment(source, product=product)
             self.assertEqual(native["CODEX_REFRESH_TOKEN_URL_OVERRIDE"], REFRESH_BLOCKER_URL)
+            self.assertEqual(native["CODEX_REVOKE_TOKEN_URL_OVERRIDE"], REVOKE_BLOCKER_URL)
             self.assertEqual(native["NO_PROXY"], native["no_proxy"])
             entries = native["NO_PROXY"].split(",")
             for entry in ("corp.example.invalid", "lower.example.invalid", "127.0.0.1", "localhost", "::1"):
@@ -368,6 +374,13 @@ class NativePolicyTests(unittest.TestCase):
         bare = native_environment({"PATH": "/usr/bin"})
         self.assertEqual(bare["NO_PROXY"], "127.0.0.1,localhost,::1")
         self.assertEqual(bare["CODEX_REFRESH_TOKEN_URL_OVERRIDE"], REFRESH_BLOCKER_URL)
+
+    def test_auth_compose_labels_every_trial_with_the_job_id(self):
+        compose = auth_compose("/synthetic/accounts/dev/auth.json", "linux/amd64", "synthetic-full62")
+        self.assertEqual(compose["services"]["main"]["labels"], {"gptgrep.auth-job": "synthetic-full62"})
+        for bad in ("", "x" * 81, "has space", "label=x", None):
+            with self.assertRaisesRegex(ValueError, "auth_job_label"):
+                auth_compose("/synthetic/accounts/dev/auth.json", "linux/amd64", bad)
 
     def test_product_wrapper_strips_openrouter_and_rejects_legacy_sandbox(self):
         config = {"codex_binary": "/opt/codex", "reader_base_binary": {"path": "/opt/codex"}}

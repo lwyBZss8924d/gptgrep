@@ -94,14 +94,19 @@ without printing credentials; model availability and an actual permitted turn
 remain separate checks. See [official Codex authentication](https://learn.chatgpt.com/docs/auth).
 Never put the credential cache in a build context or source commit. Harbor mounts
 the selected cached file read-only at runtime. Trials never refresh it: their
-native children point the token endpoint at a closed loopback port.
+native children point the token and revoke endpoints at loopback port 0, where
+no process can listen.
 
 When several roles share one login, run every consumer through
 [`workspace/harness-tooling/codex-auth`](../workspace/harness-tooling/codex-auth/README.md).
-It provides one lease per login, a per-run `CODEX_HOME` that links to the single
-`auth.json`, an allowlisted environment that blocks consumer refresh, and one
-refresh owner. Its runbook covers the live sequence, failure recovery and the
-re-login procedure.
+It provides one lease per login, a lease guardian, and a per-run `CODEX_HOME`
+that links to the single `auth.json` only while the run holds the lease. It also
+provides an allowlisted environment that blocks consumer refresh and revoke, one
+refresh owner, and a re-login that never touches the existing login until a new
+one succeeds. Entry points that are not yet routed through it (local workstation
+wrappers, the harbor-ablation Rust harness run on its
+own) are listed in its README as unmanaged and stay blocked for shared-login use.
+Its runbook covers the live sequence, failure recovery and the re-login procedure.
 
 GPTgrep's native roles request `gpt-6-luna`, reasoning effort `max`, service tier
 `fast`. The guarded protocol normalizes Fast to `priority`; that request does not

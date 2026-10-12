@@ -353,7 +353,7 @@ class Full62Adapter:
                                            ("tests", "judge", "judge_file")):
             profile = PROFILE if role == "reader" else runtime["judge_profile"]
             put(task / directory / "config.toml", model_config(profile, role))
-            compose = auth_compose(runtime["auth"][auth_key], runtime["platform"])
+            compose = auth_compose(runtime["auth"][auth_key], runtime["platform"], runtime["run_id"])
             if role == "reader" and arm == "gptgrep":
                 mounts = ([(preparation["controls_directory"], CONTROL_ROOT, True),
                            (preparation["financial_family_directory"], FAMILY_ROOT, False),

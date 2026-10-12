@@ -2,6 +2,7 @@
 
 usage: python3 -I -B tests/run_qualification.py --results-dir DIR
            [--codex-bin PATH --codex-sha256 HEX] [--pattern 'test_*.py']
+           [--unguarded-tool-sandbox [--docker-bin PATH --docker-host URL --docker-image IMAGE]]
 
 Outer process: creates DIR/<UTC-stamp>/, reserves loopback ports and, on macOS,
 re-executes itself under `sandbox-exec` with a profile that
@@ -10,6 +11,15 @@ re-executes itself under `sandbox-exec` with a profile that
   * denies any file access below the user's real ~/.gptgrep and ~/.codex.
 Inner process: runs unittest discovery and writes logs plus summary.json.
 Integration tests that execute a real Codex binary refuse to run unguarded.
+
+--unguarded-tool-sandbox (explicit, official binary only) adds a second pass
+for unguarded_test_*.py. Codex's own tool sandbox cannot be applied inside the
+seatbelt guard, so that pass runs without it; every endpoint is a loopback fake,
+the refresh/revoke blocker is port 0, and HTTP(S)/ALL proxies point at a
+loopback trap whose connection count must stay 0. With --docker-bin,
+--docker-host and --docker-image (a local image with python3, never pulled) the
+same pass runs the minimal non-live container checks: `--network none`, fake
+credential, a label unique to the test.
 """
 import argparse
 import datetime
@@ -113,13 +123,43 @@ def outer(args):
         argv = inner
     (out / "runner-meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n")
     proc = subprocess.run(argv, env=env, cwd=str(out / "tmp"))
+    code = proc.returncode
+    unguarded = None
+    if args.unguarded_tool_sandbox:
+        if not args.codex_bin:
+            print(json.dumps({"error": "unguarded_tool_sandbox_requires_official_codex_bin"}))
+            return 2
+        # Separate fake world, no seatbelt: see the module docstring.
+        env_unguarded = dict(env, GPTGREP_AUTH_TEST_SANDBOX="proxy-trap",
+                             GPTGREP_AUTH_TEST_ROOT=str(out / "tmp" / "root-unguarded"))
+        if args.docker_image:
+            if not (args.docker_bin and args.docker_host):
+                print(json.dumps({"error": "docker_image_requires_docker_bin_and_host"}))
+                return 2
+            env_unguarded.update(GPTGREP_AUTH_TEST_DOCKER_BIN=args.docker_bin,
+                                 GPTGREP_AUTH_TEST_DOCKER_HOST=args.docker_host,
+                                 GPTGREP_AUTH_TEST_DOCKER_IMAGE=args.docker_image)
+            meta["docker"] = {"bin": args.docker_bin, "image": args.docker_image, "network": "none",
+                              "pull": "never"}
+        (out / "tmp" / "root-unguarded").mkdir(mode=0o700)
+        second = subprocess.run([sys.executable, "-I", "-B", str(Path(__file__).resolve()), "--inner", "--out",
+                                 str(out), "--pattern", "unguarded_test_*.py", "--summary-name",
+                                 "summary-unguarded.json", "--log-name", "unguarded.log"],
+                                env=env_unguarded, cwd=str(out / "tmp"))
+        code = code or second.returncode
+        path = out / "summary-unguarded.json"
+        unguarded = json.loads(path.read_text()) if path.exists() else {"error": "no_summary"}
     summary_path = out / "summary.json"
     if summary_path.exists():
         summary = json.loads(summary_path.read_text())
         summary["runner"] = meta
+        if unguarded is not None:
+            summary["unguarded_tool_sandbox"] = {"guard": "proxy-trap", "counts": unguarded.get("counts"),
+                                                 "tests": unguarded.get("tests")}
         summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
-        print(json.dumps({"summary": str(summary_path), "counts": summary["counts"]}))
-    return proc.returncode
+        print(json.dumps({"summary": str(summary_path), "counts": summary["counts"],
+                          "unguarded_counts": (unguarded or {}).get("counts")}))
+    return code
 
 
 class Collector(unittest.TextTestResult):
@@ -179,7 +219,7 @@ def inner(args):
     started = datetime.datetime.now(datetime.timezone.utc).isoformat()
     loader = unittest.TestLoader()
     suite = loader.discover(str(HERE), pattern=args.pattern, top_level_dir=str(HERE))
-    with open(out / "logs" / "unittest.log", "w") as log:
+    with open(out / "logs" / args.log_name, "w") as log:
         runner = unittest.TextTestRunner(stream=log, verbosity=2, resultclass=Collector)
         result = runner.run(suite)
     counts = {"total": result.testsRun, "passed": sum(1 for r in result.records if r["outcome"] == "passed"),
@@ -187,21 +227,25 @@ def inner(args):
     summary = {"schema": "gptgrep.codex-auth.qualification.v1", "started_at": started,
                "finished_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                "counts": counts, "tests": result.records, "codex_version": codex_version(),
-               "guard": os.environ.get("GPTGREP_AUTH_TEST_SANDBOX", "none"),
+               "guard": os.environ.get("GPTGREP_AUTH_TEST_SANDBOX", "none"), "pattern": args.pattern,
                "fake_credentials_only": True,
-               "scope": ["lease semantics", "layout/env allowlist", "owner refresh (fake and official binary)",
-                         "consumer refresh blocker", "guarded-reload adoption", "401 fail-closed",
-                         "shared/exclusive concurrency", "lifecycle deadline/cancel/unknown/keeper",
-                         "CODEX_API_KEY stripping", "leak canaries", "fake re-login", "fake docker label sweep"],
+               "scope": ["lease semantics and binding", "layout/env allowlist and auth-link lifetime",
+                         "owner refresh and failure classes (fake and official binary)",
+                         "consumer refresh blocker (port 0) and re-probe", "guarded-reload adoption",
+                         "401 fail-closed and the exit-77 auth contract", "shared/exclusive concurrency",
+                         "lifecycle deadline/cancel/unknown, lease guardian (signals, exceptions, killed supervisor)",
+                         "CODEX_API_KEY stripping", "leak canaries", "staged re-login (fake and official binary)",
+                         "fake docker label gate"],
                "limitations": ["Fake credentials and loopback fakes only: no real token authority, ChatGPT backend "
                                "or model was contacted; live behaviour remains unqualified.",
                                "Process-tree tracking cannot see a daemon that escapes between samples, closes "
                                "inherited descriptors and leaves the run directory.",
-                               "Harbor containers were simulated with a fake docker CLI."]}
+                               "Harbor containers were simulated with a fake docker CLI.",
+                               "No GPTgrep product, OCR, Document or Judge call chain ran under the supervisor."]}
     observations = out / "observations.jsonl"
     if observations.exists():
         summary["observations"] = [json.loads(line) for line in observations.read_text().splitlines() if line]
-    (out / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    (out / args.summary_name).write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     return 0 if result.wasSuccessful() else 1
 
 
@@ -212,8 +256,14 @@ def main():
     parser.add_argument("--codex-sha256")
     parser.add_argument("--pattern", default="test_*.py")
     parser.add_argument("--ports", type=int, default=32)
+    parser.add_argument("--unguarded-tool-sandbox", action="store_true")
+    parser.add_argument("--docker-bin")
+    parser.add_argument("--docker-host")
+    parser.add_argument("--docker-image")
     parser.add_argument("--inner", action="store_true")
     parser.add_argument("--out")
+    parser.add_argument("--summary-name", default="summary.json")
+    parser.add_argument("--log-name", default="unittest.log")
     args = parser.parse_args()
     if args.inner:
         return inner(args)
