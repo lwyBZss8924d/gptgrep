@@ -95,7 +95,9 @@ def bundle_fixture(root, *, change=None, omit=None, extra=None, member_change=No
     metadata.write_bytes((json.dumps(release, sort_keys=True, indent=2) + "\n").encode())
     content["RELEASE.json"] = metadata.read_bytes()
     sums = {**release["files"], "RELEASE.json": sha(content["RELEASE.json"])}
-    content["SHA256SUMS"] = "".join(value + "  " + name + "\n" for name, value in sorted(sums.items())).encode()
+    # Same line order as the packager's sorted pathlib walk (by "/"-separated parts).
+    content["SHA256SUMS"] = "".join(sums[name] + "  " + name + "\n" for name in
+                                    sorted(sums, key=lambda name: PurePosixPath(name).parts)).encode()
     if omit:
         del content[omit]
     top = "gptgrep-" + release["version"] + "-" + target

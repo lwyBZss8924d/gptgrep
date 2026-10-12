@@ -47,6 +47,17 @@ def _elf(header, machine):
             struct.unpack("<H", header[18:20])[0] == machine, "bundle_linux_elf")
 
 
+def release_checksums(expected):
+    """Render SHA256SUMS exactly as scripts/package_release.py writes it.
+
+    The packager lists files in sorted pathlib order, which compares "/"-separated
+    parts: skills/gptgrep/SKILL.md precedes skills/gptgrep-document/SKILL.md even
+    though "-" sorts before "/" in a plain string sort.
+    """
+    return "".join(value + "  " + name + "\n" for name, value in
+                   sorted(expected.items(), key=lambda item: PurePosixPath(item[0]).parts)).encode()
+
+
 def _bounded_tar(archive):
     chunks, total = [], 0
     with gzip.GzipFile(fileobj=io.BytesIO(archive), mode="rb") as source:
@@ -109,8 +120,7 @@ def release_bundle(bundle, platform, destination=None):
     integer(licenses["packages"], 1, 4096)
     top = "gptgrep-" + release["version"] + "-" + release["target"]
     expected = {**files, "RELEASE.json": sha(metadata)}
-    sums = "".join(value + "  " + name + "\n" for name, value in sorted(expected.items())).encode()
-    expected["SHA256SUMS"] = sha(sums)
+    expected["SHA256SUMS"] = sha(release_checksums(expected))
     rows, members, names, directory_names, total = {}, {}, set(), set(), 0
     tar_bytes = _bounded_tar(archive)
     with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:") as tar:

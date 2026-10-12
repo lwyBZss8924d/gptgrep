@@ -21,7 +21,7 @@ class ProductBundleTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name).resolve()
 
-    def runtime_bundle(self, root, change=None):
+    def packager(self):
         repo = Path(__file__).resolve().parents[5]
         scripts = repo / "scripts"
         spec = importlib.util.spec_from_file_location("package_release_runtime_fixture", scripts / "package_release.py")
@@ -31,6 +31,10 @@ class ProductBundleTests(unittest.TestCase):
             spec.loader.exec_module(module)
         finally:
             sys.path.pop(0)
+        return module, repo
+
+    def runtime_bundle(self, root, change=None):
+        module, repo = self.packager()
 
         def attach(release, files):
             copied = root / "runtime-copy"
@@ -50,6 +54,58 @@ class ProductBundleTests(unittest.TestCase):
         self.assertTrue(product.RUNTIME_FILES <= result["files"].keys())
         for name in product.RUNTIME_FILES:
             self.assertEqual((dest / name).read_bytes(), (self.root / "runtime-copy" / name).read_bytes())
+
+    def test_packager_checksum_walk_and_archive_writer_are_accepted(self):
+        """The packager's own SHA256SUMS walk and archive writer over the runtime skill paths."""
+        module, repo = self.packager()
+        target = "x86_64-unknown-linux-gnu"
+        bundle = self.root / "staging" / ("gptgrep-1.2.3-synthetic-" + target)
+        bundle.mkdir(parents=True)
+        elf = bytearray(64)
+        elf[:6] = b"\x7fELF\x02\x01"
+        elf[18:20] = (62).to_bytes(2, "little")
+        authored = {"gptgrep": module.LAUNCHER.encode(), "gptgrep.bin": bytes(elf),
+                    "lib/libpdfium.so": bytes(elf), "LICENSE": b"authored license fixture",
+                    "THIRD_PARTY.md": b"authored notice fixture",
+                    "third-party/rust/inventory.json": canonical({
+                        "schema_version": "gptgrep.licenses.v1", "target": target, "complete": True,
+                        "missing_license_files": [], "packages": [{}]})}
+        for name, data in authored.items():
+            path = bundle / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            path.chmod(0o755 if name in ("gptgrep", "gptgrep.bin") else 0o644)
+        runtime = module.copy_runtime_assets(repo, bundle)
+        # Mirrors scripts/package_release.py: manifest, RELEASE.json, then the sorted walk.
+        files = {item.relative_to(bundle).as_posix(): module.sha256(item)
+                 for item in sorted(bundle.rglob("*")) if item.is_file()}
+        release = {"schema_version": "gptgrep.release.v1", "version": "1.2.3-synthetic", "target": target,
+                   "source_revision": None, "source_dirty": True,
+                   "binary": {"file": "gptgrep.bin", "sha256": files["gptgrep.bin"]},
+                   "pdfium": {"library": "lib/libpdfium.so", "library_sha256": files["lib/libpdfium.so"]},
+                   "rust_licenses": {"complete": True, "packages": 1, "inventory": "third-party/rust/inventory.json"},
+                   "native_runtime_package": {"root": ".", **runtime}, "files": files}
+        encoded = json.dumps(release, indent=2, sort_keys=True) + "\n"
+        (bundle / "RELEASE.json").write_text(encoded, encoding="utf-8")
+        checksums = [f"{module.sha256(item)}  {item.relative_to(bundle).as_posix()}"
+                     for item in sorted(bundle.rglob("*")) if item.is_file()]
+        (bundle / "SHA256SUMS").write_text("\n".join(checksums) + "\n", encoding="utf-8")
+        listed = [line.split("  ", 1)[1] for line in checksums]
+        # Pathlib order differs from a plain string sort for these real runtime paths.
+        self.assertLess(listed.index("skills/gptgrep/SKILL.md"), listed.index("skills/gptgrep-document/SKILL.md"))
+        self.assertNotEqual(listed, sorted(listed))
+        for item in [bundle, *bundle.rglob("*")]:
+            if item.is_dir():
+                item.chmod(0o755)
+        archive = self.root / "packaged.tar.gz"
+        module.archive_bundle(bundle, archive)
+        sidecar = self.root / "packaged.release.json"
+        sidecar.write_text(encoded, encoding="utf-8")
+        dest = self.root / "installed"
+        result = product.release_bundle({"archive": pin(archive), "release_metadata": pin(sidecar)},
+                                        "linux/amd64", dest)
+        self.assertEqual((dest / "SHA256SUMS").read_bytes(), (bundle / "SHA256SUMS").read_bytes())
+        self.assertEqual(result["files"]["SHA256SUMS"]["sha256"], module.sha256(bundle / "SHA256SUMS"))
 
     def test_runtime_declarations_cannot_detach_from_pinned_bundle_files(self):
         variants = {
