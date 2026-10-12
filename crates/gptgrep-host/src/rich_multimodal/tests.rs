@@ -1042,6 +1042,30 @@ async fn native_ptc_keeps_actual_render_delivery_as_the_only_image_citation_auth
 }
 
 #[tokio::test]
+async fn native_ptc_multimodal_reader_keeps_its_own_abstention_rule() -> Result<()> {
+    let (_temp, mut evidence, _png, id) = fixture(11).await?;
+    let (_outcome, frames) = drive(&mut evidence, id, Mode::PtcImage).await?;
+    let start = frames
+        .iter()
+        .find(|frame| frame["method"] == "thread/start")
+        .context("thread/start")?;
+    let instructions = start["params"]["baseInstructions"]
+        .as_str()
+        .context("base instructions")?;
+    // The rich reader carries no retrieval answer rules, so the shared native
+    // closing sentence keeps the unchanged abstention rule and refers to none.
+    assert!(!instructions.contains("Answer rules:"));
+    assert!(!instructions.contains("answer rules above"));
+    assert!(instructions.ends_with(
+        "Return insufficient_evidence=true when the available evidence cannot support the answer."
+    ));
+    assert!(instructions.contains(
+        "A substantive answer requires delivered citations; otherwise mark insufficient_evidence=true."
+    ));
+    Ok(())
+}
+
+#[tokio::test]
 async fn native_ptc_does_not_allow_native_image_ids_or_wrong_source_quotes() -> Result<()> {
     for mode in [Mode::PtcUnissued, Mode::PtcWrongQuote] {
         let (_temp, mut evidence, _png, id) = fixture(11).await?;

@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 from pathlib import Path
 import tempfile
 import unittest
@@ -251,7 +252,7 @@ class NativeAccountingTests(unittest.TestCase):
                   "native_cli": {}, "native_config_sha256": "e" * 64, "deadline_seconds": 20,
                   "base_tool_environment": {},
                   "permitted_tools": [], "generic_capabilities": [], "qualification_mismatches": [],
-                  "budget_scope": {}}
+                  "budget_scope": {}, "reader_mode": "legacy_text"}
         outputs = {}
         with patch.object(reader, "read", side_effect=[canonical(config), b"synthetic question"]), \
              patch.object(reader, "check_config"), patch.object(reader, "copy_asset"), \
@@ -266,6 +267,10 @@ class NativeAccountingTests(unittest.TestCase):
         self.assertEqual(argv[-2:], ["--", "-"])
         self.assertNotIn("synthetic question", argv)
         self.assertTrue(child.call_args.kwargs["input_bytes"].endswith(b"synthetic question"))
+        # A legacy_text run gives the raw-only arm the reader's generic answer rules.
+        self.assertIn(reader.READER_ANSWER_RULES.encode(), child.call_args.kwargs["input_bytes"])
+        self.assertEqual(outputs["/logs/agent/operational.json"]["shared_answer_rules_sha256"],
+                         sha(reader.READER_ANSWER_RULES.encode()))
         self.assertLess(child.call_args.kwargs["timeout"], config["deadline_seconds"])
         return outputs
 
@@ -453,6 +458,28 @@ class NativeDirectToolPolicyTests(unittest.TestCase):
         self.assertEqual(config["permissions"]["full62_judge"]["filesystem"]["/data"], "deny")
         self.assertNotIn("/tmp/full62-work",
                          config["permissions"]["full62_judge"]["filesystem"])
+
+
+
+class SharedAnswerRuleTests(unittest.TestCase):
+    def test_legacy_text_raw_prompt_carries_the_reader_answer_rules_verbatim(self):
+        # The constant must stay byte-identical to the product reader's rules.
+        protocol = Path(__file__).resolve().parents[5] / "crates/gptgrep-host/src/protocol.rs"
+        match = re.search(r'pub\(crate\) const READER_ANSWER_RULES: &str = "((?:[^"\\]|\\.)*)";',
+                          protocol.read_text(encoding="utf-8"))
+        self.assertIsNotNone(match)
+        self.assertEqual(json.loads('"' + match.group(1) + '"'), reader.READER_ANSWER_RULES)
+        config = {"raw_document": "/data/corpus/generic.txt"}
+        legacy = reader.raw_prompt({**config, "reader_mode": "legacy_text"}, "Generic question?").decode()
+        rich = reader.raw_prompt({**config, "reader_mode": "rich_multimodal"}, "Generic question?").decode()
+        self.assertEqual(legacy.count(reader.READER_ANSWER_RULES), 1)
+        self.assertTrue(legacy.endswith("Question:\nGeneric question?"))
+        # The rich_multimodal reader has no answer rules, so neither arm gets them.
+        self.assertNotIn("Answer rules:", rich)
+        self.assertEqual(legacy.replace(reader.READER_ANSWER_RULES + " ", ""), rich)
+        self.assertIsNone(reader.shared_answer_rules({"reader_mode": "rich_multimodal"}))
+        with self.assertRaisesRegex(ValueError, "explicit_reader_mode"):
+            reader.raw_prompt(config, "Generic question?")
 
 
 if __name__ == "__main__":

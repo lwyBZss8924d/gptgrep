@@ -361,13 +361,17 @@ initial retrieval. Empty or stale scopes do not establish successful reranking.
 Summary and retrieval use actual source evidence; model-produced citations must
 resolve to evidence issued during that run and remain fresh at completion.
 The retrieval reader's instructions (restricted and native) add two generic
-answer rules: lead with the direct answer in the form the question asks for and
-commit to an answer that the delivered evidence supports, reserving
-`insufficient_evidence` for when no reading is supported; and, when the question
-depends on a specific passage, resolve the in-text references it relies on
-(footnote or endnote markers, citation numbers, see-table or see-section
-pointers) by reading the referenced note or section before answering. Every
-evidence and citation rule is unchanged.
+answer rules: lead with the direct answer in the form the question asks for, and
+commit to it, citing it, when the evidence read answers the question as asked;
+and, when the question depends on a specific passage, resolve the in-text
+references it relies on (footnote or endnote markers, citation numbers, see-table
+or see-section pointers) by reading the referenced note or section before
+answering. The rules say when to commit, never when to stop abstaining: every
+evidence, citation and abstention rule is unchanged, including
+`insufficient_evidence: true` when evidence is missing or cannot support the
+answer. Rich text and multimodal readers do not receive these rules. In the
+full62 paired comparison, the raw-only arm of a `legacy_text` run receives the
+same rule text.
 
 `HostConfig.native_ptc` (default false) and `--native-ptc` select native
 execution for the final retrieval reader. An existing named permission profile

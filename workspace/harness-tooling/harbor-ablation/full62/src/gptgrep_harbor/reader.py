@@ -42,11 +42,33 @@ def reader_argv(config, binding, question):
     return codex_argv(config["codex_binary"])
 
 
+# Generic answer rules, byte-identical to READER_ANSWER_RULES in
+# crates/gptgrep-host/src/protocol.rs. The legacy_text GPTgrep reader receives
+# them in its base instructions, so the raw-only arm of a legacy_text run
+# receives the same text: answer strategy is matched between the arms and is
+# not credited to retrieval. The rich_multimodal reader has no such rules, so
+# neither arm receives them in that mode.
+READER_ANSWER_RULES = (
+    "Answer rules: Lead with the direct answer in the form the question asks for. "
+    "When the evidence you have read answers the question as asked, commit to that "
+    "answer and cite it rather than hedging. When the question depends on a specific "
+    "passage, resolve the in-text references it relies on before answering by reading "
+    "the referenced note or section, for example footnote or endnote markers, citation "
+    "numbers, and see Table or see Section pointers.")
+
+
+def shared_answer_rules(config):
+    """The answer rules both arms receive for the run's reader mode, if any."""
+    require(config.get("reader_mode") in ("rich_multimodal", "legacy_text"), "explicit_reader_mode")
+    return READER_ANSWER_RULES if config["reader_mode"] == "legacy_text" else None
+
+
 def raw_prompt(config, question):
+    rules = shared_answer_rules(config)
     return prompt_bytes("Answer the question using only the protocol-scoped raw document at "
               + config["raw_document"] + ". You may inspect that document with native tools. "
               "Do not use external search. Give the complete answer and source locations "
-              "when available. Question:\n" + question)
+              "when available. " + (rules + " " if rules else "") + "Question:\n" + question)
 
 
 def product_accounting(report):
@@ -191,6 +213,9 @@ def main():
                 version["stdout"].strip() == ("codex-cli " + CODEX_VERSION).encode(), "native_version_mismatch")
         operation["observed_native_version"] = version["stdout"].decode().strip()
         argv = reader_argv(config, binding, question)
+        # Both arms record the same shared answer rules, or none, for the run.
+        rules = shared_answer_rules(config)
+        operation["shared_answer_rules_sha256"] = sha(rules.encode()) if rules else None
         if binding["arm"] == "gptgrep" and config.get("decisions_preparation") is not None:
             writer = acquire_writer()
             env, operation["decisions_preparation"] = prepare_decisions(
