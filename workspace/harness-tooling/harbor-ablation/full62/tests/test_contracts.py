@@ -712,10 +712,12 @@ class NativeDirectToolPolicyTests(unittest.TestCase):
         import tomllib
         from gptgrep_harbor.runtime import model_config
         config = tomllib.loads(model_config(PROFILE, "reader").decode())
+        # Native code, shell, image and sub-agent tools stay on; host-side
+        # connector, plugin and tool-suggestion features are off for both arms.
         self.assertEqual(config["features"], {
             "shell_tool": True, "view_image": True, "unified_exec": True,
-            "multi_agent": True, "plugins": True, "apps": True,
-            "tool_suggest": True, "code_mode": {"enabled": True}, "code_mode_host": {"enabled": True}})
+            "multi_agent": True, "plugins": False, "apps": False,
+            "tool_suggest": False, "code_mode": {"enabled": True}, "code_mode_host": {"enabled": True}})
         self.assertEqual(config["web_search"], "disabled")
         self.assertEqual(config["default_permissions"], "full62_reader")
         self.assertEqual(config["model"], PROFILE["model"])
@@ -737,6 +739,9 @@ class NativeDirectToolPolicyTests(unittest.TestCase):
                          {"enabled": False, "direct_only_tool_namespaces": []})
         self.assertFalse(config["features"]["shell_tool"])
         self.assertFalse(config["features"]["view_image"])
+        # Codex enables these by default; the Judge disables them explicitly.
+        for feature in ("apps", "plugins", "tool_suggest"):
+            self.assertIs(config["features"][feature], False)
         self.assertEqual(config["default_permissions"], "full62_judge")
         self.assertEqual(config["web_search"], "disabled")
         self.assertFalse(config["permissions"]["full62_judge"]["network"]["enabled"])

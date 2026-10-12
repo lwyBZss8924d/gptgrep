@@ -180,6 +180,9 @@ class Full62Adapter:
         require(approval.get("named_permissions_qualified") is True and
                 approval.get("reader_effective_permissions_equal") is True and
                 approval.get("native_cli") == runtime["native_cli"], "native_permissions_admission")
+        # Runtime-only fact: the qualified readers and Judge expose no connector,
+        # plugin, MCP or hosted web-search tool. Configuration alone cannot show it.
+        require(approval.get("reader_external_tools_excluded") is True, "external_tools_admission")
         reader_pin = runtime["reader_base_binary"]
         require(set(reader_pin) == {"path", "bytes", "sha256"} and
                 reader_pin["path"] == runtime["codex_binary"], "same_search_reader_binary")

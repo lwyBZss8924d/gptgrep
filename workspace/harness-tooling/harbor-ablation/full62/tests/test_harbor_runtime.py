@@ -101,6 +101,8 @@ class HarborMaterializationTests(unittest.TestCase):
             "prompt": "Question:{question}\nReference:{answer}\nFormat:{answer_format}\nResponse:{response}",
             "response_schema": {"type": "object", "additionalProperties": False, "required": ["equivalent"],
                                 "properties": {"equivalent": {"type": "boolean"}}}}
+        # The synthetic admission attests the runtime-only external-tool qualification.
+        self.external_tools_excluded = True
 
     def materializer(self):
         cohort = write_pin(self.root / "cohort.json", self.cohort)
@@ -112,6 +114,7 @@ class HarborMaterializationTests(unittest.TestCase):
             "native_cli_contract_qualified": True, "reader_base_binary": self.runtime["reader_base_binary"],
             "bare_image_excludes_gptgrep_and_indexes": True, "raw_only_index_provenance_verified": True,
             "named_permissions_qualified": True, "reader_effective_permissions_equal": True,
+            "reader_external_tools_excluded": self.external_tools_excluded,
             "native_cli": self.runtime["native_cli"],
             "assets_sha256": sha(canonical(self.runtime["documents"] + self.runtime["index_files"])),
             "judge_sha256": judge["sha256"]}
@@ -301,6 +304,15 @@ class HarborMaterializationTests(unittest.TestCase):
             self.runtime[key] = original
         self.assertFalse((self.root / "dataset").exists())
 
+    def test_external_tool_exclusion_needs_runtime_qualification(self):
+        # Disabled config features are requests; only the runtime review can
+        # attest that no connector, plugin, MCP or web-search tool is exposed.
+        for value in (False, None):
+            self.external_tools_excluded = value
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "external_tools_admission"):
+                self.materializer()
+        self.assertFalse((self.root / "dataset").exists())
+
     def test_shared_base_and_pillow_identity_are_required(self):
         self.runtime["images"]["judge"] = "synthetic/other@sha256:" + "a" * 64
         with self.assertRaisesRegex(ValueError, "shared_raw_judge_base"):
@@ -452,13 +464,14 @@ class NativePolicyTests(unittest.TestCase):
         self.assertEqual(config["web_search"], "disabled")
         self.assertEqual(config["features"], {
             "shell_tool": True, "view_image": True, "unified_exec": True,
-            "multi_agent": True, "plugins": True, "apps": True,
-            "tool_suggest": True, "code_mode": {"enabled": True}, "code_mode_host": {"enabled": True}})
+            "multi_agent": True, "plugins": False, "apps": False,
+            "tool_suggest": False, "code_mode": {"enabled": True}, "code_mode_host": {"enabled": True}})
         judge = tomllib.loads(model_config(PROFILE, "judge").decode())
         self.assertEqual(judge["web_search"], "disabled")
         self.assertFalse(judge["permissions"]["full62_judge"]["network"]["enabled"])
         self.assertEqual(judge["features"], {
             "shell_tool": False, "view_image": False, "code_mode_only": False, "code_mode_prewarm": False,
+            "apps": False, "plugins": False, "tool_suggest": False,
             "code_mode": {"enabled": False, "direct_only_tool_namespaces": []},
             "code_mode_host": {"enabled": False, "disable_in_process_fallback": True}})
 

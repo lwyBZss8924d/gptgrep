@@ -42,6 +42,8 @@ LOOPBACK_NO_PROXY = ("127.0.0.1", "localhost", "::1")
 # supervisor (codex-auth `run --harbor-job-label`) can see the job's containers
 # and keep the credential lease until they are gone.
 AUTH_JOB_LABEL = "gptgrep.auth-job"
+# Codex 0.162.1 enables these by default; every role disables them explicitly.
+EXTERNAL_TOOL_FEATURES = ("apps", "plugins", "tool_suggest")
 
 
 def native_identity(value):
@@ -205,22 +207,30 @@ def model_config(profile, role):
         "service_tier": profile["service_tier"], "model_provider": "openai",
         "cli_auth_credentials_store": "file", "forced_login_method": "chatgpt",
         "approval_policy": "never", "default_permissions": name,
-        # No reader or Judge has external access: no hosted web search here and
-        # no model-tool network below. GPTgrep's Decisions requests come from its
-        # host process, outside this Codex tool sandbox.
+        # No reader or Judge has external access: no hosted web search here, no
+        # connector or plugin tools and no model-tool network below. GPTgrep's
+        # Decisions requests come from its host process, outside this Codex
+        # tool sandbox.
         "web_search": "disabled",
     }
     lines = [key + " = " + json.dumps(value) for key, value in settings.items()]
     enabled = "true" if role == "reader" else "false"
     lines += ["", "[features]", "shell_tool = " + enabled, "view_image = " + enabled]
     if role == "reader":
-        lines += [feature + " = true" for feature in (
-            "unified_exec", "multi_agent", "plugins", "apps", "tool_suggest")]
+        lines += [feature + " = true" for feature in ("unified_exec", "multi_agent")]
+    else:
+        lines += ["code_mode_only = false", "code_mode_prewarm = false"]
+    # Host-side external tools stay off for every role. With ChatGPT auth,
+    # `apps` registers the account's Codex Apps connector server and `plugins`
+    # loads account cloud plugins and their MCP servers; `tool_suggest` offers
+    # to install more. Their traffic leaves from the Codex process itself, so
+    # the network policy below does not govern it.
+    lines += [feature + " = false" for feature in EXTERNAL_TOOL_FEATURES]
+    if role == "reader":
         lines += ["", "[features.code_mode]", "enabled = true",
                   "", "[features.code_mode_host]", "enabled = true"]
     else:
-        lines += ["code_mode_only = false", "code_mode_prewarm = false",
-                  "", "[features.code_mode]", "enabled = false",
+        lines += ["", "[features.code_mode]", "enabled = false",
                   "direct_only_tool_namespaces = []",
                   "", "[features.code_mode_host]", "enabled = false",
                   "disable_in_process_fallback = true"]
