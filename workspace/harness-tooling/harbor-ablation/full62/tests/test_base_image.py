@@ -95,6 +95,13 @@ class CommonBaseImageTests(unittest.TestCase):
         self.assertIn("--require-hashes", common)
         self.assertIn('"poppler-utils=$POPPLER_VERSION"', common)
         self.assertIn("/usr/local/bin/codex-resources/bwrap", common)
+        # The build-time codex probes must not leave CODEX_HOME state (tmp/arg0) in the image,
+        # and the binary mode must be set at COPY time so the 294 MB layer is not copied up twice.
+        self.assertIn("COPY --chmod=0755 codex /usr/local/bin/codex", common)
+        self.assertNotIn("chmod 755 /usr/local/bin/codex", common)
+        self.assertIn("export CODEX_HOME=/tmp/full62-build-codex-home", common)
+        self.assertIn('rm -rf "$CODEX_HOME"', common)
+        self.assertIn("test ! -e /root/.codex", common)
         self.assertEqual(result["native_sandbox_helper"], self.helper_record)
         self.assertEqual(result["native_code_mode_host"], self.host_record)
         self.assertFalse(result["native_code_mode_host_protocol_executed"])

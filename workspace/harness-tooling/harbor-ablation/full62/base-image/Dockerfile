@@ -14,7 +14,7 @@ ARG TARGETPLATFORM
 ENV PYTHONDONTWRITEBYTECODE=1 UV_PYTHON_DOWNLOADS=never
 COPY --from=uv /uv /usr/local/bin/uv
 COPY requirements.lock probe.py /usr/local/share/full62-base/
-COPY codex /usr/local/bin/codex
+COPY --chmod=0755 codex /usr/local/bin/codex
 COPY --chmod=0555 codex-code-mode-host /usr/local/bin/codex-code-mode-host
 COPY host-provenance.json host.sigstore /usr/local/share/full62-code-mode-host/
 COPY --chmod=0555 bwrap /usr/local/bin/codex-resources/bwrap
@@ -36,13 +36,16 @@ RUN test -n "$DEBIAN_SNAPSHOT" && test -n "$POPPLER_VERSION" && test -n "$CODEX_
     && printf '%s  %s\n' "$CODE_MODE_HOST_SHA256" /usr/local/bin/codex-code-mode-host | sha256sum --check - \
     && test -n "$BWRAP_SHA256" \
     && printf '%s  %s\n' "$BWRAP_SHA256" /usr/local/bin/codex-resources/bwrap | sha256sum --check - \
-    && chmod 755 /usr/local/bin/codex \
+    && export CODEX_HOME=/tmp/full62-build-codex-home \
+    && mkdir -m 0700 "$CODEX_HOME" \
     && test "$(codex --version)" = 'codex-cli 0.162.1' \
     && python3 /usr/local/share/full62-base/probe.py \
       --python-image "$PYTHON_IMAGE" --uv-image "$UV_IMAGE" \
       --debian-snapshot "$DEBIAN_SNAPSHOT" --poppler-version "$POPPLER_VERSION" \
       --platform "$TARGETPLATFORM" \
-      > /usr/local/share/full62-base/provenance.json
+      > /usr/local/share/full62-base/provenance.json \
+    && rm -rf "$CODEX_HOME" \
+    && test ! -e /root/.codex
 WORKDIR /tmp
 
 # Only this final target has the current product binary. No corpus/index is built in.
