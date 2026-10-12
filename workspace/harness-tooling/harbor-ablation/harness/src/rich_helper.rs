@@ -474,6 +474,16 @@ fn attempt_projection(attempt: &RichTextAttempt, expected_model: &str) -> Result
         "actual_provider_requests":null
     }))
 }
+/// Validated product calls a completed pass makes: document routing then evidence
+/// reranking, or reranking alone when the product selects the only routing
+/// candidate without a routing call (`coverage.routing_status`).
+fn expected_product_calls(report: &RichTextSearchReport) -> usize {
+    if report.coverage.routing_status == "skipped_single_document" {
+        1
+    } else {
+        2
+    }
+}
 fn accounting(
     bound: &Bound,
     started: Instant,
@@ -520,13 +530,18 @@ fn accounting(
     // This is deliberately distinct from the unmodified product status flag and
     // from physical/provider accounting. Concurrent unrelated ledger activity
     // makes attribution incomplete rather than being silently counted as ours.
+    let expected = report.map(expected_product_calls);
     let logical_accounting_complete = status == "completed"
-        && rows.len() == 2
-        && report.is_some_and(|r| r.logical_calls_attempted == 2 && r.validated_responses == 2)
-        && logical_reservations == Some(2)
-        && send_starts == Some(2)
-        && submission_observations == Some(2)
-        && terminal_submissions == Some(2)
+        && expected.is_some_and(|expected| {
+            rows.len() == expected
+                && report.is_some_and(|r| {
+                    r.logical_calls_attempted == expected && r.validated_responses == expected
+                })
+                && logical_reservations == Some(expected)
+                && send_starts == Some(expected)
+                && submission_observations == u64::try_from(expected).ok()
+                && terminal_submissions == Some(expected)
+        })
         && original_context_unchanged
         && input_tokens.is_some()
         && output_tokens.is_some()
@@ -541,10 +556,10 @@ fn accounting(
         "requested_model":MODEL,"expected_actual_model":bound.config.expected_actual_model,
         "original_clock_anchor_sha256":bound.config.context.original_clock_anchor_sha256,
         "retrieval_wall_ms":started.elapsed().as_millis(),"timing_scope":"all_helper_execution_including_admission_and_preparation_is_retrieval",
-        "excluded_as_indexing":false,"max_product_calls":2,
+        "excluded_as_indexing":false,"max_product_calls":2,"expected_product_calls":expected,
         "execution_before":before,"execution_after":after,"validated_observations":rows,
         "helper_logical_accounting_complete":logical_accounting_complete,
-        "helper_accounting_scope":"two_validated_logical_calls_and_exact_shared_context_deltas_not_physical_requests_or_money_settlement",
+        "helper_accounting_scope":"every_expected_validated_logical_call_and_exact_shared_context_deltas_not_physical_requests_or_money_settlement",
         "logical_reservations_delta":logical_reservations,"send_start_observations_delta":send_starts,
         "submission_observations_delta":submission_observations,"terminal_submissions_delta":terminal_submissions,
         "observed_validated_input_tokens_sum":input_tokens,"observed_validated_output_tokens_sum":output_tokens,
@@ -622,7 +637,9 @@ where
         value["failed_stage"] = json!(stage);
         ensure!(report.logical_calls_attempted <= 2 && report.validated_responses <= 2, "rich_helper_product_call_invariant");
         if status == "completed" {
-            ensure!(report.logical_calls_attempted == 2 && rows.len() == 2, "rich_helper_required_two_stages");
+            // Routing then reranking, or reranking alone for one routing candidate.
+            let expected = expected_product_calls(&report);
+            ensure!(report.logical_calls_attempted == expected && rows.len() == expected, "rich_helper_required_stages");
             // Keep the product's exact hits, order, threshold and coverage; no new citations.
             let evidence = json!({"schema_version":"gptgrep.harbor.rich_helper_evidence.v1","status":"completed","generation":report.generation,"query_sha256":bound.config.query.sha256,"query_options_sha256":report.query_options_sha256,"hits":report.hits,"coverage":report.coverage,"citation_status":report.citation_status,"model_exposure_is_not_reader_delivery":true});
             finalization_hook(&context, FinalizationPoint::BeforeEvidence)?;

@@ -470,9 +470,12 @@ umasks remains unqualified. The parser retains its frozen admission budgets.
 controlled pipeline pilot. It calls the existing v2
 `prepare_rich_text_search` plan and executes document routing plus evidence
 reranking with exactly `openai/gpt-6-luna-decisions`, without retry or fallback.
-Successful retrieval requires both calls; failure may stop before either call or
-after one. A shared pool can exhaust between stages, so this is not an atomic
-two-credit reservation.
+Successful retrieval requires both calls, except that a generation scope with a
+single routing candidate is selected without a routing call
+(`product.coverage.routing_status` is `skipped_single_document`) and then requires
+only the reranking call; `expected_product_calls` records which applies. Failure
+may stop before either call or after one. A shared pool can exhaust between
+stages, so this is not an atomic two-credit reservation.
 
 Run the helper after sealing a generation built from raw documents and projecting
 the current task's query, before the treatment reader starts. Count all helper
@@ -513,8 +516,9 @@ The product's `accounting_complete` flag means every nonzero attempted logical
 call returned a validated response; it does not require search success or optional
 usage. An observer failure after a validated response can therefore retain true,
 while zero-attempt or partially validated failures remain false. The separate
-`helper_logical_accounting_complete` requires two validated observations, checked
-available token/cost fields, and exactly two reservations, send starts, submission
+`helper_logical_accounting_complete` requires one validated observation per
+expected product call (two, or one when routing was skipped), checked available
+token/cost fields, and exactly that many reservations, send starts, submission
 observations and terminal results in the unchanged original context. Concurrent
 unrelated ledger changes invalidate that attribution; failed response usage,
 physical requests and billed cost remain outside this completeness claim.
