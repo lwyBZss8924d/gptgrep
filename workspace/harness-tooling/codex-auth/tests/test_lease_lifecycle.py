@@ -104,7 +104,7 @@ class LeaseTests(unittest.TestCase):
         on every descriptor it has, and on a fresh one of the lock file, leaves the lease held."""
         ready, report = self.env.root / "ready-unlock", self.env.root / "unlock-report.json"
         holder = self.env.popen("run", "--role", "dev", "--run-id", "unlock1",
-                                *probe("unlock-lease", self.env.lease_path, 6, ready, report))
+                                *probe("unlock-lease", self.env.lease_path, 10, ready, report))
         self.assertTrue(support.wait_for(ready.exists, 60), "the consumer started")
         self.assertEqual(json.loads(report.read_text()), {"inherited_lease_descriptors": 0, "unlock_attempts": 1})
         self.assertEqual(self.env.lease_probe(), "held_exclusive")
@@ -428,8 +428,9 @@ class LifecycleTests(unittest.TestCase):
         """L2: a survivor links the credential after the supervisor's own scan; the guardian scans again
         before it releases the lease, removes the link and quarantines."""
         pidfile = self.env.root / "late-linker.pid"
+        # The survivor links 8 s after it starts: well after the supervisor's own scan (about 3 s).
         code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "gl1",
-                                               *probe("escaped", pidfile, 4, "hard-link", "late.json"))
+                                               *probe("escaped", pidfile, 8, "hard-link", "late.json"))
         self.assertEqual((code, receipt["state"]), (sup.EXIT_UNKNOWN, "UNKNOWN"))
         self.assertEqual(receipt["credential_links"]["found"], 0)
         self.assertTrue(support.wait_for(lambda: self.env.lease_probe() == "free", 60, 0.2))
