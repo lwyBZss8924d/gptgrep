@@ -268,6 +268,92 @@ pub(crate) async fn mock_jev(plan: Vec<u16>) -> (JevClient, tokio::task::JoinHan
     (client, server)
 }
 
+/// A planned seed whose union rerank receives a transient status, under the
+/// same bounded retry the production host client uses.
+async fn planned_retry_bootstrap(
+    statuses: Vec<u16>,
+) -> (Result<()>, Accounting, Vec<Value>, tempfile::TempDir) {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("ledger.md"),
+        "# Copper ledger\nCOPPER_OTTER stores 83 blue beads.\nThe copper archive is invented.\n",
+    )
+    .unwrap();
+    gptgrep_core::index(root.path(), 10).await.unwrap();
+    // One scoped document: the union rerank and its retry are the only calls.
+    let (client, server) = mock_jev(statuses).await;
+    let client = client.with_transient_retry(gptgrep_jev::TransientRetry::with_jitter(|| 0.0));
+    let (mut evidence, accounting) = configured(root.path(), client, Some("ledger.md"));
+    let question = "Which items are stored in the copper archive?";
+    accounting
+        .bind_workflow(question, evidence.document_scope())
+        .unwrap();
+    let result = evidence
+        .bootstrap_planned(question, &["COPPER_OTTER".into()])
+        .await;
+    let requests = server.await.unwrap();
+    (result, accounting, requests, root)
+}
+
+#[tokio::test]
+async fn planned_bootstrap_accounts_a_successful_bounded_retry() {
+    let (result, accounting, requests, _root) = planned_retry_bootstrap(vec![502, 200]).await;
+    result.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0], requests[1],
+        "the retry repeats the identical rerank"
+    );
+    let summary = accounting.summary();
+    assert_eq!(summary.initial_status, "reranked");
+    assert_eq!((summary.attempted_calls, summary.requests), (2, 1));
+    assert_eq!(summary.unobserved_attempts, 1);
+    // The validated reply keeps its reported cost; the failed attempt stays unknown.
+    assert_eq!(summary.usage.len(), 1);
+    assert_eq!(summary.usage[0]["cost"], json!(0.001));
+    assert!(!summary.accounting_complete);
+    let search = &summary.searches[0];
+    assert_eq!(search.metrics.jev_retried_attempts.len(), 1);
+    assert_eq!(
+        search.metrics.jev_retried_attempts[0].attempt.http_status,
+        Some(502)
+    );
+    let union = &search.plan.as_ref().unwrap().operations["union.rerank"];
+    assert_eq!(
+        (
+            union.metrics.jev_calls_attempted,
+            union.metrics.jev_requests
+        ),
+        (2, 1)
+    );
+    let ledger = std::fs::read_to_string(accounting.path()).unwrap();
+    assert!(ledger.contains("\"event\":\"before_retry\""));
+}
+
+#[tokio::test]
+async fn planned_bootstrap_keeps_both_attempts_when_the_retry_also_fails() {
+    let (result, accounting, requests, _root) = planned_retry_bootstrap(vec![502, 503]).await;
+    assert!(result.is_err());
+    assert_eq!(requests.len(), 2);
+    let summary = accounting.summary();
+    assert_eq!(summary.initial_status, "failed");
+    assert_eq!((summary.attempted_calls, summary.requests), (2, 0));
+    assert!(summary.usage.is_empty());
+    assert!(!summary.accounting_complete);
+    let search = &summary.searches[0];
+    assert_eq!(search.status, "failed");
+    assert_eq!(search.metrics.jev_retried_attempts.len(), 1);
+    let union = &search.plan.as_ref().unwrap().operations["union.rerank"];
+    assert_eq!(union.event, "failed");
+    assert_eq!(
+        (
+            union.metrics.jev_calls_attempted,
+            union.metrics.jev_retried_attempts.len()
+        ),
+        (2, 1)
+    );
+}
+
 #[tokio::test]
 async fn planned_bootstrap_accounts_disjoint_stages_and_issues_only_delivered_spans() {
     let root = tempfile::tempdir().unwrap();

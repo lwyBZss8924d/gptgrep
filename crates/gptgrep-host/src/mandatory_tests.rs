@@ -537,6 +537,64 @@ async fn cancellation_retains_prior_reply_and_unobserved_attempt() {
 }
 
 #[tokio::test]
+async fn cancellation_during_a_bounded_retry_keeps_every_submission_in_the_ledger() {
+    let root = corpus().await;
+    // Unscoped: routing replies, the rerank gets HTTP 502, its retry hangs.
+    let (client, server, received) = mock_jev(vec![(200, 3.0), (502, 0.0), (0, 0.0)]).await;
+    let client = client.with_transient_retry(gptgrep_jev::TransientRetry::with_jitter(|| 0.0));
+    let root_path = root.path().to_owned();
+    let home = tempfile::tempdir().unwrap();
+    let config = HostConfig {
+        codex_home: home.path().to_owned(),
+        ..HostConfig::default()
+    };
+    let task = tokio::spawn(async move {
+        execute_with_client(
+            &root_path,
+            "Describe the transformation.",
+            None,
+            &config,
+            Some(client),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while received.load(Ordering::SeqCst) < 3 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    server.abort();
+    let path = std::fs::read_dir(root.path().join(".gptgrep/host-attempts"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let events = ledger_events(&path);
+    assert!(events.iter().any(|event| event["event"] == "before_retry"));
+    let last = events.last().unwrap();
+    assert_eq!(last["event"], "interrupted");
+    // Three submissions: one validated reply and two with unknown cost.
+    assert_eq!(last["requests"], 1);
+    assert_eq!(last["attempted_calls"], 3);
+    assert_eq!(last["unobserved_attempts"], 2);
+    assert_eq!(last["accounting_complete"], false);
+    let retried = events
+        .iter()
+        .rev()
+        .find_map(|event| event["search"]["metrics"]["jev_retried_attempts"].as_array())
+        .unwrap();
+    assert_eq!(retried.len(), 1);
+    assert_eq!(retried[0]["stage"], "evidence_reranking");
+    assert_eq!(retried[0]["http_status"], 502);
+    assert!(retried[0]["reported_usage"].is_null());
+}
+
+#[tokio::test]
 async fn all_stale_candidates_are_fatal_without_claiming_reranking() {
     let root = corpus().await;
     std::fs::remove_file(root.path().join("pipeline-notes.md")).unwrap();

@@ -1112,3 +1112,92 @@ async fn before_call_observer_failure_counts_admission_without_claiming_a_provid
     assert!(!failure.accounting_complete);
     Ok(())
 }
+
+#[tokio::test]
+async fn bounded_retry_of_the_union_rerank_keeps_both_attempts_in_operation_receipts() -> Result<()>
+{
+    // One scoped document: views skip routing, so the union rerank and its
+    // bounded retry are the only Decisions submissions.
+    let (directory, generation, _) = fixture("notes.txt", "\n", false).await?;
+    for (statuses, succeeds) in [(vec![502, 200], true), (vec![502, 503], false)] {
+        let (client, server) = crate::tests::mock_jev(statuses).await?;
+        let client = client.with_transient_retry(gptgrep_jev::TransientRetry::with_jitter(|| 0.0));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let result = search_planned_with_client_and_observer(
+            directory.path(),
+            "cobalt",
+            &[],
+            &options("notes.txt"),
+            &generation,
+            &client,
+            &event_sink(events.clone()),
+        )
+        .await;
+        assert_eq!(server.await?.len(), 2);
+        let events = events.lock().unwrap().clone();
+        let union: Vec<_> = events
+            .iter()
+            .filter(|event| event.operation_id == "union.rerank")
+            .collect();
+        // The retry is a durable operation receipt before it is sent.
+        let retry = union
+            .iter()
+            .find(|event| event.event == "before_retry")
+            .unwrap();
+        assert_eq!(
+            (
+                retry.metrics.jev_calls_attempted,
+                retry.metrics.jev_requests,
+                retry.metrics.jev_retried_attempts.len()
+            ),
+            (2, 0, 1)
+        );
+        let last = union.last().unwrap();
+        assert!(!last.accounting_complete);
+        if succeeds {
+            let report = result?;
+            assert_eq!(last.event, "finished");
+            assert_eq!(
+                (
+                    report.metrics.jev_calls_attempted,
+                    report.metrics.jev_requests
+                ),
+                (2, 1)
+            );
+            assert_eq!(report.metrics.jev_usage.len(), 1);
+            assert_eq!(report.metrics.jev_retried_attempts.len(), 1);
+            assert_eq!(
+                report.metrics.jev_retried_attempts[0].stage,
+                "evidence_reranking"
+            );
+            assert!(!report.hits.is_empty());
+        } else {
+            let error = result.unwrap_err();
+            let failure = error.downcast_ref::<PlannedSearchError>().unwrap();
+            // The failed receipt keeps the retried attempt, not the pre-call snapshot.
+            assert_eq!(last.event, "failed");
+            assert_eq!(
+                (
+                    last.metrics.jev_calls_attempted,
+                    last.metrics.jev_retried_attempts.len()
+                ),
+                (2, 1)
+            );
+            assert_eq!(
+                (
+                    failure.metrics.jev_calls_attempted,
+                    failure.metrics.jev_requests
+                ),
+                (2, 0)
+            );
+            assert_eq!(failure.metrics.jev_retried_attempts.len(), 1);
+            assert_eq!(
+                failure.metrics.jev_retried_attempts[0].attempt.http_status,
+                Some(502)
+            );
+            assert!(failure.cause.contains("attempt 2: HTTP 503"));
+            assert!(failure.metrics.jev_usage.is_empty());
+        }
+    }
+    Ok(())
+}

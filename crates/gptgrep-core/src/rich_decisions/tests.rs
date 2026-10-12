@@ -1029,3 +1029,34 @@ async fn saved_text_change_after_rerank_rejects_results_and_keeps_both_receipts(
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn retry_enabled_client_still_submits_each_rich_request_once() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    publish_two(&root, &["An entirely distinct source statement.\n"])?;
+    let reader = RichGenerationReader::open(&root)?;
+    let execution = context(4)?;
+    // Routing replies; the rerank receives HTTP 500, a transient status.
+    let (endpoint, server) = mock(2, Arc::new(|_| Ok(())), true).await?;
+    let client = client(&endpoint, execution.clone())?
+        .with_transient_retry(gptgrep_jev::TransientRetry::with_jitter(|| 0.0));
+    let prepared = prepare_rich_text_search(
+        reader,
+        client,
+        "maturity mechanism",
+        &RichTextSearchOptions::default(),
+    )?;
+    // The attempt receipts count one submission per call, so the policy is removed.
+    assert!(prepared.client.transient_retry().is_none());
+    let Err(error) = prepared.execute().await else {
+        panic!("the transient rerank status is a required-stage failure");
+    };
+    assert_eq!(server.await??.len(), 2);
+    // No bounded retry: the receipts and the shared context agree.
+    assert_eq!(execution.snapshot()?.logical_reservations, 2);
+    assert_eq!(error.report.logical_calls_attempted, 2);
+    assert_eq!(error.report.validated_responses, 1);
+    assert!(!error.report.accounting_complete);
+    Ok(())
+}

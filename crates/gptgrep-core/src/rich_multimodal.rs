@@ -582,7 +582,9 @@ fn prepare_batch(
 
 /// Prepare actual route bodies, complete union bounds and whole output capacity
 /// before any submission. The client supplies its same finite original context.
-/// Calls read no credentials and initialize no ledger or run anchor.
+/// Calls read no credentials and initialize no ledger or run anchor. Each
+/// prepared request is submitted exactly once: an attached bounded transient
+/// retry is removed, because these attempt receipts count one submission per call.
 pub fn prepare_rich_multimodal_search(
     reader: RichGenerationReader,
     client: JevClient,
@@ -590,6 +592,7 @@ pub fn prepare_rich_multimodal_search(
     options: &RichMultimodalSearchOptions,
 ) -> Result<PreparedRichMultimodalSearch> {
     let started = Instant::now();
+    let client = client.without_transient_retry();
     ensure!(
         !query.trim().is_empty() && query.len() <= 8192,
         "rich_multimodal_invalid_query"

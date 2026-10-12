@@ -326,8 +326,10 @@ pub struct JevRetriedAttempt {
 pub struct Metrics {
     pub elapsed_ms: u128,
     /// Logical Jev call attempts, including a pre-call observer that may stop
-    /// before network I/O, and each bounded transient retry submission. Never a
-    /// claim of physical provider requests.
+    /// before network I/O. An admitted bounded transient retry counts as its own
+    /// attempt from its `before_retry` receipt, before its backoff and send, so
+    /// it too may stop before network I/O. Never a claim of physical provider
+    /// requests.
     pub jev_calls_attempted: usize,
     /// Successful validated Jev responses observed by this search.
     pub jev_requests: usize,
@@ -372,6 +374,87 @@ fn retried_attempts_of(error: &anyhow::Error) -> &[DecisionRetriedAttempt] {
     error
         .downcast_ref::<DecisionFailure>()
         .map_or(&[], |failure| &failure.diagnostic().prior_attempts)
+}
+
+/// Submit one logical relevance call for `stage`. When the client's bounded
+/// transient retry is admitted, the retry is counted as its own logical attempt
+/// and its failed predecessor is recorded in `metrics` before the retry's
+/// backoff, reservation and send, and a `before_retry` progress receipt makes
+/// both durable first; a failed receipt stops the retry. A failure returns a
+/// typed [`JevSearchError`] whose metrics include every attempt.
+#[allow(clippy::too_many_arguments)]
+async fn rerank_call(
+    client: &JevClient,
+    query: &str,
+    candidates: &[Candidate],
+    stage: &str,
+    observer: Option<&JevSearchObserver<'_>>,
+    metrics: &mut Metrics,
+    coverage: &Coverage,
+    options: &SearchOptions,
+    generation: &str,
+    started: Instant,
+) -> Result<RerankResponse> {
+    let base = metrics.clone();
+    let noticed = std::sync::Mutex::new(None::<Metrics>);
+    let notice = |failed: &DecisionRetriedAttempt| -> Result<()> {
+        let mut retried = base.clone();
+        record_retried_attempts(
+            &mut retried,
+            stage,
+            client.requested_model(),
+            std::slice::from_ref(failed),
+        );
+        *noticed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(retried.clone());
+        observe_jev(
+            observer,
+            stage,
+            "before_retry",
+            &retried,
+            coverage,
+            options,
+            generation,
+            started,
+            None,
+        )
+    };
+    let result = client
+        .rerank_with_retry_notice(query, candidates, &notice)
+        .await;
+    let noticed = noticed
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match noticed {
+        Some(retried) => *metrics = retried,
+        // Defensive: a retry reported without its notice is still counted.
+        None => {
+            let attempts = match &result {
+                Ok(ranked) => ranked.retried_attempts.as_slice(),
+                Err(error) => retried_attempts_of(error),
+            };
+            record_retried_attempts(metrics, stage, client.requested_model(), attempts);
+        }
+    }
+    result.map_err(|error| {
+        if error.is::<JevSearchError>() {
+            // The `before_retry` receipt failed; its typed error already
+            // carries these metrics and a fixed cause.
+            error
+        } else {
+            jev_search_error(
+                stage,
+                error,
+                metrics,
+                coverage,
+                options.document.as_deref(),
+                Some(generation),
+                started,
+            )
+            .into()
+        }
+    })
 }
 
 /// The default retrieval client: one bounded retry of transient provider
@@ -462,14 +545,16 @@ impl std::fmt::Display for JevSearchError {
 
 impl std::error::Error for JevSearchError {}
 
-/// Nonterminal metadata receipt emitted before a logical call attempt and after
-/// each validated reply. A caller can persist these before the next await so
-/// cancellation does not discard already observed usage. No source text, request
-/// payload, credential or raw provider body is included.
+/// Nonterminal metadata receipt emitted before a logical call attempt, before
+/// an admitted bounded transient retry, and after each validated reply. A caller
+/// can persist these before the next await so cancellation does not discard
+/// already observed usage or an attempt that may have been sent. No source text,
+/// request payload, credential or raw provider body is included.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JevSearchProgress {
     pub stage: String,
-    /// `before_call` or `after_reply`.
+    /// `before_call`, `before_retry` (the retry already counts as an attempt
+    /// and its failed predecessor is in `jev_retried_attempts`) or `after_reply`.
     pub event: String,
     pub metrics: Metrics,
     pub coverage: Coverage,
@@ -566,11 +651,18 @@ fn observe_jev(
     };
     observer(&progress).map_err(|error| {
         let mut failure = jev_search_error(stage, error, metrics, coverage, options.document.as_deref(), Some(generation), started);
-        failure.cause = if event == "before_call" {
-            "Jev progress observer failed before the call; no provider call was started".into()
-        } else {
-            "Jev progress observer failed after a validated reply; no further provider call was started".into()
-        };
+        failure.cause = match event {
+            "before_call" => {
+                "Jev progress observer failed before the call; no provider call was started"
+            }
+            "before_retry" => {
+                "Jev progress observer failed before the bounded retry; the retry was not sent"
+            }
+            _ => {
+                "Jev progress observer failed after a validated reply; no further provider call was started"
+            }
+        }
+        .into();
         anyhow::Error::new(failure)
     })
 }
@@ -2239,33 +2331,19 @@ async fn collect_candidate_view(
                 started,
                 None,
             )?;
-            let ranked = match client.rerank(query, &routing).await {
-                Ok(ranked) => ranked,
-                Err(error) => {
-                    record_retried_attempts(
-                        metrics,
-                        "document_routing",
-                        client.requested_model(),
-                        retried_attempts_of(&error),
-                    );
-                    return Err(jev_search_error(
-                        "document_routing",
-                        error,
-                        metrics,
-                        &coverage,
-                        options.document.as_deref(),
-                        Some(&snapshot.manifest.generation),
-                        started,
-                    )
-                    .into());
-                }
-            };
-            record_retried_attempts(
-                metrics,
+            let ranked = rerank_call(
+                client,
+                query,
+                &routing,
                 "document_routing",
-                client.requested_model(),
-                &ranked.retried_attempts,
-            );
+                observer,
+                metrics,
+                &coverage,
+                options,
+                &snapshot.manifest.generation,
+                started,
+            )
+            .await?;
             metrics.jev_requests += 1;
             metrics.jev_models.push(ranked.model.clone());
             metrics.jev_usage.push(ranked.usage.clone());
@@ -2349,33 +2427,19 @@ async fn score_candidates(
             started,
             None,
         )?;
-        let ranked = match client.rerank(query, &candidates).await {
-            Ok(ranked) => ranked,
-            Err(error) => {
-                record_retried_attempts(
-                    metrics,
-                    "evidence_reranking",
-                    client.requested_model(),
-                    retried_attempts_of(&error),
-                );
-                return Err(jev_search_error(
-                    "evidence_reranking",
-                    error,
-                    metrics,
-                    coverage,
-                    options.document.as_deref(),
-                    Some(&snapshot.manifest.generation),
-                    started,
-                )
-                .into());
-            }
-        };
-        record_retried_attempts(
-            metrics,
+        let ranked = rerank_call(
+            client,
+            query,
+            &candidates,
             "evidence_reranking",
-            client.requested_model(),
-            &ranked.retried_attempts,
-        );
+            observer,
+            metrics,
+            coverage,
+            options,
+            &snapshot.manifest.generation,
+            started,
+        )
+        .await?;
         metrics.jev_requests += 1;
         metrics.jev_models.push(ranked.model.clone());
         metrics.jev_usage.push(ranked.usage.clone());
@@ -3115,7 +3179,7 @@ mod tests {
         Ok(())
     }
 
-    async fn mock_jev(
+    pub(crate) async fn mock_jev(
         statuses: Vec<u16>,
     ) -> Result<(JevClient, tokio::task::JoinHandle<Vec<Value>>)> {
         mock_jev_scored(statuses, Arc::new(|_| 3.0)).await
@@ -3949,6 +4013,25 @@ mod tests {
         );
         assert!(!report.hits.is_empty());
         let events = events.lock().unwrap();
+        let routing: Vec<_> = events
+            .iter()
+            .filter(|event| event.stage == "document_routing")
+            .map(|event| event.event.as_str())
+            .collect();
+        assert_eq!(routing, ["before_call", "before_retry", "after_reply"]);
+        // The retry is counted, with its failed predecessor, before it is sent.
+        let retry = events
+            .iter()
+            .find(|event| event.event == "before_retry")
+            .unwrap();
+        assert_eq!(
+            (
+                retry.metrics.jev_calls_attempted,
+                retry.metrics.jev_requests,
+                retry.metrics.jev_retried_attempts.len()
+            ),
+            (2, 0, 1)
+        );
         let routed = events
             .iter()
             .find(|event| event.stage == "document_routing" && event.event == "after_reply")
@@ -3961,6 +4044,126 @@ mod tests {
             ),
             (2, 1)
         );
+        Ok(())
+    }
+
+    /// One document, so the rerank is the only logical call.
+    async fn one_document_corpus() -> Result<tempfile::TempDir> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("only.txt"), "needle only evidence")?;
+        index(directory.path(), 10).await?;
+        Ok(directory)
+    }
+
+    #[tokio::test]
+    async fn admitted_retry_is_recorded_before_it_is_sent_and_survives_cancellation() -> Result<()>
+    {
+        let directory = one_document_corpus().await?;
+        // The rerank gets HTTP 502, then its admitted retry hangs in flight.
+        let (client, server) = mock_jev(vec![502, 0]).await?;
+        let context = gptgrep_jev::ExecutionContext::new(
+            "synthetic-retry-cancellation",
+            &"c".repeat(64),
+            std::time::SystemTime::now() + Duration::from_secs(60),
+            4,
+        )?;
+        let client = client
+            .with_execution_context(context.clone())
+            .with_transient_retry(TransientRetry::with_jitter(|| 0.0));
+        let events: Arc<Mutex<Vec<JevSearchProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = events.clone();
+        let observer = move |progress: &JevSearchProgress| {
+            recorded.lock().unwrap().push(progress.clone());
+            Ok(())
+        };
+        let options = SearchOptions::default();
+        let mut search = Box::pin(search_with_client_and_observer(
+            directory.path(),
+            "needle",
+            &options,
+            &client,
+            &observer,
+        ));
+        // Drive the search until the retry has been sent, then cancel it.
+        let started = tokio::time::Instant::now();
+        while context.snapshot()?.send_start_observations < 2 {
+            tokio::select! {
+                _ = &mut search => panic!("a hanging retry cannot complete"),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "retry never sent"
+            );
+        }
+        drop(search);
+        server.abort();
+        let snapshot = context.snapshot()?;
+        assert_eq!(snapshot.logical_reservations, 2);
+        let events = events.lock().unwrap();
+        let last = events.last().unwrap();
+        assert_eq!(
+            (last.stage.as_str(), last.event.as_str()),
+            ("evidence_reranking", "before_retry")
+        );
+        // Both submissions are on record although the logical call never returned.
+        assert_eq!(
+            (last.metrics.jev_calls_attempted, last.metrics.jev_requests),
+            (2, 0)
+        );
+        assert_eq!(last.metrics.jev_requested_models.len(), 2);
+        assert!(last.metrics.jev_usage.is_empty());
+        let retried = &last.metrics.jev_retried_attempts;
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0].stage, "evidence_reranking");
+        assert_eq!(retried[0].attempt.http_status, Some(502));
+        assert!(retried[0].attempt.reported_usage.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refused_before_retry_receipt_stops_the_retry_and_keeps_its_attempt() -> Result<()> {
+        let directory = one_document_corpus().await?;
+        let (client, server) = mock_jev(vec![502]).await?;
+        let client = client.with_transient_retry(TransientRetry::with_jitter(|| 0.0));
+        let observer = |progress: &JevSearchProgress| {
+            anyhow::ensure!(progress.event != "before_retry", "synthetic-ledger-refusal");
+            Ok(())
+        };
+        let error = search_with_client_and_observer(
+            directory.path(),
+            "needle",
+            &SearchOptions::default(),
+            &client,
+            &observer,
+        )
+        .await
+        .unwrap_err();
+        // No retry is sent when its receipt cannot be recorded.
+        assert_eq!(server.await?.len(), 1);
+        let failure = error
+            .downcast_ref::<JevSearchError>()
+            .context("missing typed Jev error")?;
+        assert_eq!(failure.stage, "evidence_reranking");
+        assert_eq!(
+            failure.cause,
+            "Jev progress observer failed before the bounded retry; the retry was not sent"
+        );
+        // The stopped retry stays a logical attempt; no usage is invented.
+        assert_eq!(
+            (
+                failure.metrics.jev_calls_attempted,
+                failure.metrics.jev_requests
+            ),
+            (2, 0)
+        );
+        assert!(failure.metrics.jev_usage.is_empty());
+        assert_eq!(failure.metrics.jev_retried_attempts.len(), 1);
+        assert_eq!(
+            failure.metrics.jev_retried_attempts[0].attempt.http_status,
+            Some(502)
+        );
+        assert!(!format!("{error:#}").contains("synthetic-ledger-refusal"));
         Ok(())
     }
 

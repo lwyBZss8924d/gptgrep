@@ -20,6 +20,11 @@ pub enum DecisionFailureKind {
     /// The bounded transient retry submission was not admitted or was stopped
     /// before its HTTP send; any reservation it took remains charged.
     RetryAdmission,
+    /// The bounded transient retry submission was sent, then a local step
+    /// failed: its terminal ledger record, a caller observer, or local response
+    /// handling. The provider may have completed and billed it. A validated
+    /// response's usage is kept in `reported_usage`; otherwise usage is unknown.
+    RetryPostSend,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -260,6 +265,25 @@ impl DecisionFailure {
         )
     }
 
+    /// The bounded retry submission was sent, then a local step failed. When its
+    /// response had already been validated, that response's usage and identity
+    /// are kept; otherwise its usage is unknown. The local error text is not kept.
+    pub(crate) fn retry_post_send(
+        validated: Option<(FailedResponseUsage, FailedResponseMetadata)>,
+    ) -> Self {
+        let mut failure = Self::new(
+            DecisionFailureKind::RetryPostSend,
+            "Jev bounded retry was sent, then a local accounting or observer step failed; the provider may have completed it",
+            None,
+            None,
+        );
+        if let Some((usage, metadata)) = validated {
+            failure.diagnostic.reported_usage = Some(usage);
+            failure.diagnostic.response_metadata = Some(metadata);
+        }
+        failure
+    }
+
     /// Attach the failed earlier submissions that the bounded retry repeated.
     pub(crate) fn with_prior_attempts(mut self, prior: Vec<DecisionRetriedAttempt>) -> Self {
         self.diagnostic.prior_attempts = prior;
@@ -435,6 +459,13 @@ impl DecisionFailure {
             ),
             DecisionFailureKind::RetryAdmission => f.write_str(
                 "not admitted or sent, any reserved retry submission remains charged",
+            ),
+            DecisionFailureKind::RetryPostSend => f.write_str(
+                if diagnostic.reported_usage.is_some() {
+                    "sent and validated, then a local accounting or observer step failed, its reported usage is retained"
+                } else {
+                    "sent, then a local accounting or observer step failed, the provider may have completed it and its usage is unknown"
+                },
             ),
         }
     }

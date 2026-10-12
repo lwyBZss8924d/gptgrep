@@ -301,9 +301,19 @@ skipped when no submission remains. Timeouts, connection or mid-body errors, par
 and validation failures and other statuses are never retried. Both attempts are
 reported: the failed one keeps its HTTP status in `jev_retried_attempts` and counts
 in `jev_calls_attempted` without a usage entry, so its unknown cost keeps accounting
-incomplete. Judge, enrichment support calls (their own explicit retry plan),
-navigation scans, evidence-role decisions, rich/multimodal and batch submissions
-remain single-submission. Text requests
+incomplete. The retry counts as an attempt once admitted: a `before_retry`
+progress receipt that already records the failed attempt is emitted before the
+backoff, reservation and send, so cancelling the search during the retry cannot
+drop either submission from the host ledger, and a receipt that cannot be recorded
+stops the retry unsent. Planned query-view operations accept one such retry per
+logical call, and a failed operation receipt keeps the retried attempt. An error
+after the retry was sent (for example a failed local ledger record) is kind
+`retry_post_send` and keeps a validated reply's reported usage; only a retry
+stopped before its send is `retry_admission`. Judge, enrichment support calls
+(their own explicit retry plan), navigation scans, evidence-role decisions,
+rich/multimodal searches, explicit rerank pools and batch submissions remain
+single-submission; the rich paths remove any retry policy attached to a
+caller-supplied client. Text requests
 and the escaped text/questions envelope retain a 64 KiB limit. Typed Luna image
 requests have an 8 MiB complete-body limit, with at most four PNG/JPEG images,
 1 MiB of compressed bytes and 8 million pixels per image, and 24 million pixels

@@ -477,11 +477,22 @@ impl Accounting {
             ),
             "host_jev_plan_operation_invalid"
         );
+        // One logical call per operation; an admitted bounded transient retry
+        // adds exactly one attempt, recorded with its failed predecessor.
+        let retried = event.metrics.jev_retried_attempts.len();
         ensure!(
             matches!(
                 event.event.as_str(),
-                "admitted" | "before_call" | "after_reply" | "finished" | "failed" | "interrupted"
-            ) && event.metrics.jev_calls_attempted <= 1
+                "admitted"
+                    | "before_call"
+                    | "before_retry"
+                    | "after_reply"
+                    | "finished"
+                    | "failed"
+                    | "interrupted"
+            ) && retried <= 1
+                && event.metrics.jev_calls_attempted <= 1 + retried
+                && event.metrics.jev_requests <= 1
                 && event.metrics.jev_requests <= event.metrics.jev_calls_attempted,
             "host_jev_plan_event_invalid"
         );
@@ -498,7 +509,8 @@ impl Accounting {
             ensure!(
                 prior.query_sha256 == event.query_sha256
                     && prior.metrics.jev_calls_attempted <= event.metrics.jev_calls_attempted
-                    && prior.metrics.jev_requests <= event.metrics.jev_requests,
+                    && prior.metrics.jev_requests <= event.metrics.jev_requests
+                    && prior.metrics.jev_retried_attempts.len() <= retried,
                 "host_jev_plan_event_regressed"
             );
         }
@@ -709,6 +721,7 @@ impl Accounting {
             .0
             .lock()
             .map_err(|_| anyhow!("host_jev_ledger_unavailable"))?;
+        let elapsed_ms = state.search_started[index].elapsed().as_millis();
         let search = &mut state.searches[index];
         search.status = "failed".into();
         search.accounting_complete = false;
@@ -726,10 +739,31 @@ impl Accounting {
             search.stage = error.stage.clone();
             search.document_scope = error.document_scope.clone();
             search.generation = error.generation.clone();
-            search
+            let plan = search
                 .plan
-                .get_or_insert_with(PlannedSearchTelemetry::default)
-                .coverage = Some(error.coverage.clone());
+                .get_or_insert_with(PlannedSearchTelemetry::default);
+            plan.coverage = Some(error.coverage.clone());
+            // The core retains each operation's latest observation, including one
+            // whose durable receipt was refused or never written. Keep the larger
+            // view of every operation so no attempt or validated usage is lost.
+            for operation in &error.operations {
+                let newer = plan
+                    .operations
+                    .get(&operation.operation_id)
+                    .is_none_or(|prior| {
+                        prior.metrics.jev_calls_attempted <= operation.metrics.jev_calls_attempted
+                            && prior.metrics.jev_requests <= operation.metrics.jev_requests
+                            && prior.metrics.jev_retried_attempts.len()
+                                <= operation.metrics.jev_retried_attempts.len()
+                    });
+                if newer {
+                    let mut operation = operation.clone();
+                    operation.evidence_roles = None;
+                    plan.operations
+                        .insert(operation.operation_id.clone(), operation);
+                }
+            }
+            search.metrics = plan_metrics(&plan.operations, elapsed_ms);
         }
         if let Some(diagnostics) = search
             .plan

@@ -71,7 +71,9 @@ pub struct PlannedCoverage {
 pub struct PlannedSearchEvent {
     /// q0.route, q1.route, q2.route, or union.rerank.
     pub operation_id: String,
-    /// admitted, before_call, after_reply, finished, failed, or interrupted.
+    /// admitted, before_call, before_retry, after_reply, finished, failed, or
+    /// interrupted. One operation makes one logical call; an admitted bounded
+    /// transient retry adds one attempt and one `jev_retried_attempts` entry.
     pub event: String,
     pub query_sha256: String,
     pub original_question_sha256: String,
@@ -236,6 +238,16 @@ impl<'a, 'b> Operation<'a, 'b> {
         event.event = "failed".into();
         event.accounting_complete = false;
         event.cause = Some(sanitized_cause(&error));
+        // A typed Jev failure carries this operation's final metrics, including
+        // a bounded retry's failed attempt. Adopt them unless that would regress.
+        if let Some(failure) = error.downcast_ref::<JevSearchError>()
+            && failure.metrics.jev_calls_attempted >= event.metrics.jev_calls_attempted
+            && failure.metrics.jev_requests >= event.metrics.jev_requests
+            && failure.metrics.jev_retried_attempts.len()
+                >= event.metrics.jev_retried_attempts.len()
+        {
+            event.metrics = failure.metrics.clone();
+        }
         // If persistence itself failed, retain the observed slot in the typed
         // error and let the caller report its ledger failure separately.
         let _ = self.emit(event);

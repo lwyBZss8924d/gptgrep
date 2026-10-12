@@ -172,7 +172,10 @@ pub struct DecisionResponse {
 /// leaves the wait plus [`RETRY_MIN_ATTEMPT_TIME`]; that deadline is never renewed.
 /// Each attempt is a separate reservation in the client's execution context, and
 /// no retry is made when that context has no submission left. The failed attempt
-/// is reported in `retried_attempts` or the final failure's `prior_attempts`.
+/// is reported in `retried_attempts` or the final failure's `prior_attempts`; a
+/// caller that must durably count the retry before it can be sent passes a
+/// [`RetryNotice`] (see [`JevClient::submit_rerank_with_retry_notice`]). An error
+/// after the retry's HTTP send is kind `retry_post_send`, never `retry_admission`.
 #[derive(Clone)]
 pub struct TransientRetry {
     jitter: Arc<dyn Fn() -> f64 + Send + Sync>,
@@ -225,6 +228,40 @@ fn random_unit() -> f64 {
             .as_nanos(),
     );
     (hasher.finish() >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Write-ahead callback for the bounded transient retry of one logical request.
+///
+/// It receives the failed submission after the retry was admitted and before
+/// the retry's backoff, reservation and HTTP send, so a caller can durably count
+/// the retry before it can be sent. Returning an error stops the retry: that
+/// error is returned unchanged and nothing further is sent. It is never called
+/// when no retry is admitted.
+pub type RetryNotice<'a> = dyn Fn(&DecisionRetriedAttempt) -> Result<()> + Send + Sync + 'a;
+
+/// How far one submission progressed, to label a failure after its HTTP send.
+#[derive(Default)]
+struct SendProgress {
+    /// The HTTP send started, so the provider may have completed the request.
+    sent: bool,
+    /// Usage and identity of a validated response, kept if a later local
+    /// accounting or observer step fails.
+    validated: Option<(FailedResponseUsage, FailedResponseMetadata)>,
+}
+
+/// Bounded usage and identity of a validated response; no answer content.
+fn validated_observation(
+    response: &DecisionResponse,
+) -> (FailedResponseUsage, FailedResponseMetadata) {
+    let identity = json!({
+        "model": response.model,
+        "id": response.id,
+        "provider": response.provider,
+    });
+    (
+        FailedResponseUsage::from_response(&json!({"usage": response.usage})),
+        FailedResponseMetadata::from_response(&identity),
+    )
 }
 
 /// A single numeric (delta-seconds) `Retry-After`; absent, repeated, HTTP-date
@@ -511,7 +548,7 @@ impl JevClient {
     /// Send the prepared request and validate the typed response. It is sent
     /// once, or at most twice under an attached [`TransientRetry`].
     pub async fn submit_prepared(&self, prepared: PreparedDecision) -> Result<DecisionResponse> {
-        self.submit_prepared_with(prepared, self.retry.as_ref())
+        self.submit_prepared_with(prepared, self.retry.as_ref(), None)
             .await
     }
 
@@ -520,13 +557,14 @@ impl JevClient {
         &self,
         prepared: PreparedDecision,
     ) -> Result<DecisionResponse> {
-        self.submit_prepared_with(prepared, None).await
+        self.submit_prepared_with(prepared, None, None).await
     }
 
     async fn submit_prepared_with(
         &self,
         prepared: PreparedDecision,
         retry: Option<&TransientRetry>,
+        notice: Option<&RetryNotice<'_>>,
     ) -> Result<DecisionResponse> {
         ensure!(
             prepared.requested_model == self.model
@@ -534,7 +572,7 @@ impl JevClient {
                 && Arc::ptr_eq(&prepared.identity, &self.identity),
             "Prepared Jev decision belongs to a different client, model or endpoint"
         );
-        self.decide_body(prepared.body, &prepared.questions, retry)
+        self.decide_body(prepared.body, &prepared.questions, retry, notice)
             .await
     }
 
@@ -543,6 +581,7 @@ impl JevClient {
         body: Vec<u8>,
         questions: &Value,
         retry: Option<&TransientRetry>,
+        notice: Option<&RetryNotice<'_>>,
     ) -> Result<DecisionResponse> {
         // Capture before sampling: suspension while checking the original/local
         // clocks must shorten this request, never renew its remaining lifetime.
@@ -559,6 +598,8 @@ impl JevClient {
         };
         let mut observer_started = false;
         let mut prior: Vec<DecisionRetriedAttempt> = Vec::new();
+        // How far the retry submission got, to label a later local failure.
+        let mut retry_progress = SendProgress::default();
         let submitted = async {
             // Only a retrying client keeps a second copy of the exact bytes.
             let (first_body, retry_body) = if retry.is_some() {
@@ -574,6 +615,7 @@ impl JevClient {
                     &observation,
                     deadline,
                     &mut observer_started,
+                    &mut SendProgress::default(),
                 )
                 .await
             {
@@ -606,6 +648,12 @@ impl JevClient {
             {
                 observer.failed(&observation)?;
             }
+            // Write-ahead: the caller records the admitted retry before its
+            // backoff, reservation and send. A refusal stops the retry and is
+            // returned unchanged; nothing further is sent.
+            if let Some(notice) = notice {
+                notice(&failed)?;
+            }
             prior.push(failed);
             tokio::time::sleep(wait).await;
             let mut response = self
@@ -616,6 +664,7 @@ impl JevClient {
                     &observation,
                     deadline,
                     &mut observer_started,
+                    &mut retry_progress,
                 )
                 .await?;
             response.retried_attempts = prior.clone();
@@ -633,11 +682,17 @@ impl JevClient {
         }
         match result {
             Err(error) if !prior.is_empty() => {
-                // A failure after the retry keeps the earlier attempt. An
-                // admission error of the retry is reduced to a fixed kind.
-                let failure = error
-                    .downcast::<DecisionFailure>()
-                    .unwrap_or_else(|_| DecisionFailure::retry_admission());
+                // A failure after the retry keeps the earlier attempt. Any other
+                // error of the retry is reduced to a fixed kind: before its HTTP
+                // send it was not admitted; after the send the provider may have
+                // completed it, and a validated response keeps its usage.
+                let failure = match error.downcast::<DecisionFailure>() {
+                    Ok(failure) => failure,
+                    Err(_) if retry_progress.sent => {
+                        DecisionFailure::retry_post_send(retry_progress.validated.take())
+                    }
+                    Err(_) => DecisionFailure::retry_admission(),
+                };
                 Err(failure.with_prior_attempts(prior).into())
             }
             result => result,
@@ -679,6 +734,7 @@ impl JevClient {
     }
 
     /// One reserved, admitted and validated submission of the exact body.
+    #[allow(clippy::too_many_arguments)]
     async fn submit_once(
         &self,
         body: Vec<u8>,
@@ -687,6 +743,7 @@ impl JevClient {
         observation: &DecisionRequestObservation<'_>,
         deadline: tokio::time::Instant,
         observer_started: &mut bool,
+        progress: &mut SendProgress,
     ) -> Result<DecisionResponse> {
         self.execution.observe_submission().await?;
         let mut reservation = self.execution.reserve(digest, &self.model).await?;
@@ -707,6 +764,8 @@ impl JevClient {
                 "Jev request deadline expired during send admission; reservation remains charged"
             );
         }
+        // From here the provider may receive and complete the request.
+        progress.sent = true;
         let mut response = self
             .http
             .post(self.endpoint.clone())
@@ -745,6 +804,9 @@ impl JevClient {
                     error
                 }
             });
+        if let Ok(response) = &result {
+            progress.validated = Some(validated_observation(response));
+        }
         reservation.terminal().await?;
         if let (Some(observer), Ok(response)) = (&self.observer, &result) {
             observer.validated_response(observation, response)?;
@@ -767,7 +829,28 @@ impl JevClient {
     /// Submit one exact prepared relevance request without fallback. It is
     /// sent once, or at most twice under an attached [`TransientRetry`].
     pub async fn submit_rerank(&self, prepared: PreparedRerank) -> Result<RerankResponse> {
-        let result = self.submit_prepared(prepared.request).await?;
+        self.submit_rerank_with(prepared, None).await
+    }
+
+    /// [`Self::submit_rerank`] with a write-ahead [`RetryNotice`] that runs
+    /// after an attached [`TransientRetry`] admits the retry and before the
+    /// retry is reserved or sent. Without an attached policy it is never called.
+    pub async fn submit_rerank_with_retry_notice(
+        &self,
+        prepared: PreparedRerank,
+        notice: &RetryNotice<'_>,
+    ) -> Result<RerankResponse> {
+        self.submit_rerank_with(prepared, Some(notice)).await
+    }
+
+    async fn submit_rerank_with(
+        &self,
+        prepared: PreparedRerank,
+        notice: Option<&RetryNotice<'_>>,
+    ) -> Result<RerankResponse> {
+        let result = self
+            .submit_prepared_with(prepared.request, self.retry.as_ref(), notice)
+            .await?;
         let mut rankings = Vec::with_capacity(prepared.ids.len());
         for (index, id) in prepared.ids.into_iter().enumerate() {
             let Some(DecisionAnswer::Score {
@@ -802,6 +885,18 @@ impl JevClient {
     /// One bounded request; callers own shortlisting and additional batching.
     pub async fn rerank(&self, query: &str, candidates: &[Candidate]) -> Result<RerankResponse> {
         self.submit_rerank(self.prepare_rerank(query, candidates)?)
+            .await
+    }
+
+    /// [`Self::rerank`] with a write-ahead [`RetryNotice`] for the bounded
+    /// transient retry (see [`Self::submit_rerank_with_retry_notice`]).
+    pub async fn rerank_with_retry_notice(
+        &self,
+        query: &str,
+        candidates: &[Candidate],
+        notice: &RetryNotice<'_>,
+    ) -> Result<RerankResponse> {
+        self.submit_rerank_with(self.prepare_rerank(query, candidates)?, Some(notice))
             .await
     }
 
@@ -1094,6 +1189,7 @@ mod tests {
             DecisionFailureKind::ResponseSchema,
             DecisionFailureKind::ResponseValidation,
             DecisionFailureKind::RetryAdmission,
+            DecisionFailureKind::RetryPostSend,
         ] {
             let failure = DecisionFailure::new(kind, "synthetic", Some(502), None);
             assert!(
@@ -1119,6 +1215,30 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[test]
+    fn post_send_retry_failure_without_a_validated_reply_keeps_usage_unknown() {
+        let prior = vec![DecisionRetriedAttempt {
+            attempt: 1,
+            kind: DecisionFailureKind::HttpStatus,
+            http_status: Some(502),
+            reported_usage: None,
+            retry_wait_ms: 250,
+            retry_after_ms: None,
+        }];
+        let failure = DecisionFailure::retry_post_send(None).with_prior_attempts(prior);
+        let diagnostic = failure.diagnostic();
+        assert_eq!(diagnostic.kind, DecisionFailureKind::RetryPostSend);
+        assert!(diagnostic.reported_usage.is_none());
+        assert!(diagnostic.response_metadata.is_none());
+        let rendered = failure.to_string();
+        assert!(
+            rendered.contains("attempt 2: sent, then a local accounting or observer step failed"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("usage is unknown"), "{rendered}");
+        assert!(!rendered.contains("not admitted"), "{rendered}");
     }
 
     #[test]

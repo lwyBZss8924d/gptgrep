@@ -985,7 +985,7 @@ fn contract() -> Value {
         "typed_wire":"flat literal text plus PNG/JPEG image_url data URLs; local source bindings excluded",
         "limits":{"text_envelope_bytes":gptgrep_jev::MAX_REQUEST_BYTES,"body_bytes":gptgrep_jev::MAX_MULTIMODAL_REQUEST_BYTES,
             "images":gptgrep_jev::MAX_IMAGES,"image_file_bytes":gptgrep_jev::MAX_IMAGE_BYTES,"response_bytes":gptgrep_jev::MAX_RESPONSE_BYTES},
-        "transient_retry":{"applies_to":"search hybrid/semantic document routing and evidence reranking, including ask/summarize initial and reader searches",
+        "transient_retry":{"applies_to":"search hybrid/semantic document routing and evidence reranking, including ask/summarize initial and reader searches and planned query-view routes and union rerank",
             "max_retries":1,"statuses":gptgrep_jev::TRANSIENT_RETRY_STATUSES,"request":"identical prepared bytes",
             "backoff_ms":[gptgrep_jev::RETRY_BACKOFF_MIN.as_millis() as u64,gptgrep_jev::RETRY_BACKOFF_MAX.as_millis() as u64],
             "retry_after":"numeric delta-seconds honoured when longer than the backoff; other forms ignored",
@@ -993,7 +993,9 @@ fn contract() -> Value {
             "budget":"each attempt is a separate reservation in the same execution context; no retry without a remaining submission",
             "never":"timeouts, deadlines, connection or mid-body errors, size/JSON/validation failures, other statuses",
             "accounting":"metrics.jev_retried_attempts keeps each failed attempt's HTTP status with null usage; it counts in jev_calls_attempted, has no jev_usage entry and leaves accounting incomplete",
-            "single_submission":["judge","enrich support calls (own --support-retries plan)","navigation scans","evidence-role decisions","rich/multimodal search and ask","batch"]}});
+            "receipts":"an admitted retry is counted, with its failed attempt, in a before_retry progress receipt before its backoff and send; if that receipt cannot be recorded the retry is not sent",
+            "failure_kinds":{"retry_admission":"the retry stopped before its HTTP send","retry_post_send":"a local step failed after the retry was sent; a validated reply's reported usage is kept"},
+            "single_submission":["judge","enrich support calls (own --support-retries plan)","navigation scans","evidence-role decisions","rich/multimodal search and ask","explicit rerank pools","batch"]}});
     contract["commands"]["judge"]["output"] = json!({
         "success":"validated Decisions response JSON; model is the served build, requested_model is the selector sent",
         "failure":{"code":judge::JUDGE_FAILURE_CODE,"field":"judge","schema":judge::JUDGE_FAILURE_SCHEMA,
@@ -2737,6 +2739,8 @@ mod query_plan_cli_tests {
         assert_eq!(retry["max_retries"], 1);
         assert_eq!(retry["statuses"], json!([429, 500, 502, 503, 504]));
         assert_eq!(retry["backoff_ms"], json!([250, 1000]));
+        assert!(retry["receipts"].as_str().unwrap().contains("before_retry"));
+        assert!(retry["failure_kinds"]["retry_post_send"].is_string());
         assert!(llms().contains("metrics.jev_retried_attempts"));
     }
 

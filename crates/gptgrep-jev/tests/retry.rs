@@ -454,6 +454,7 @@ async fn invalid_success_body_is_never_retried() {
 struct Recorded {
     events: Mutex<Vec<&'static str>>,
     reject_second_send: bool,
+    reject_validated: bool,
 }
 
 impl DecisionObserver for Recorded {
@@ -473,6 +474,7 @@ impl DecisionObserver for Recorded {
         _: &DecisionResponse,
     ) -> Result<()> {
         self.events.lock().unwrap().push("validated");
+        anyhow::ensure!(!self.reject_validated, "synthetic-observer-refusal");
         Ok(())
     }
     fn failed(&self, _: &DecisionRequestObservation<'_>) -> Result<()> {
@@ -526,6 +528,129 @@ async fn refused_retry_admission_keeps_the_first_attempt_and_its_charge() {
     let snapshot = context.snapshot().unwrap();
     assert_eq!(snapshot.logical_reservations, 2);
     assert_eq!(snapshot.send_start_observations, 2);
+}
+
+#[tokio::test]
+async fn local_failure_after_the_retry_was_sent_is_not_reported_as_unsent() {
+    // The retry reaches the provider and validates; a local step then fails.
+    let (endpoint, server) = serve(vec![reply("502 Bad Gateway", ""), success()]).await;
+    let observer = Arc::new(Recorded {
+        reject_validated: true,
+        ..Recorded::default()
+    });
+    let context = context(Duration::from_secs(30), 5);
+    let client = retrying(&endpoint, &context).with_decision_observer(observer.clone());
+    let error = decide(&client).await.unwrap_err();
+    let diagnostic = failure(&error).diagnostic();
+    assert_eq!(diagnostic.kind, DecisionFailureKind::RetryPostSend);
+    assert_eq!(diagnostic.prior_attempts.len(), 1);
+    assert_eq!(diagnostic.prior_attempts[0].http_status, Some(502));
+    // The validated retry's reported usage and identity are kept, not dropped.
+    let usage = diagnostic.reported_usage.as_ref().unwrap();
+    assert_eq!(usage.cost.value, Some(0.0002));
+    assert_eq!(usage.input_tokens.value, Some(7));
+    let metadata = diagnostic.response_metadata.as_ref().unwrap();
+    assert_eq!(metadata.id.value.as_deref(), Some("synthetic-final"));
+    let rendered = error.to_string();
+    assert!(rendered.contains("attempt 1: HTTP 502"), "{rendered}");
+    assert!(
+        rendered.contains("attempt 2: sent and validated"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("not admitted or sent"), "{rendered}");
+    assert!(!rendered.contains("synthetic-observer-refusal"));
+    assert_eq!(
+        serde_json::to_value(diagnostic).unwrap()["kind"],
+        "retry_post_send"
+    );
+    let served = server.await.unwrap();
+    assert_eq!((served.bodies.len(), served.unexpected), (2, 0));
+    let snapshot = context.snapshot().unwrap();
+    assert_eq!(snapshot.logical_reservations, 2);
+    assert_eq!(snapshot.terminal_submissions, 2);
+}
+
+#[tokio::test]
+async fn retry_notice_runs_after_admission_and_before_the_retry_is_reserved() {
+    let body = json!({"model":"openai/gpt-6-luna-decisions-20261006",
+        "answers":{"candidate_0":{"type":"score","score":3.0}},
+        "usage":{"input_tokens":9,"output_tokens":1,"cost":0.0003}})
+    .to_string();
+    let (endpoint, server) = serve(vec![
+        reply("503 Service Unavailable", ""),
+        reply("200 OK", body),
+    ])
+    .await;
+    let context = context(Duration::from_secs(30), 5);
+    let client = retrying(&endpoint, &context);
+    let noticed = Mutex::new(Vec::new());
+    let notice = |failed: &gptgrep_jev::DecisionRetriedAttempt| -> Result<()> {
+        // Only the failed first submission is reserved when the notice runs.
+        let reserved = context.snapshot().unwrap().logical_reservations;
+        noticed
+            .lock()
+            .unwrap()
+            .push((failed.attempt, failed.http_status, reserved));
+        Ok(())
+    };
+    let candidates = [Candidate {
+        id: "synthetic".into(),
+        text: "synthetic evidence".into(),
+    }];
+    let ranked = client
+        .rerank_with_retry_notice("synthetic query", &candidates, &notice)
+        .await
+        .unwrap();
+    assert_eq!(*noticed.lock().unwrap(), [(1, Some(503), 1)]);
+    assert_eq!(ranked.retried_attempts.len(), 1);
+    assert_eq!(server.await.unwrap().bodies.len(), 2);
+    assert_eq!(context.snapshot().unwrap().logical_reservations, 2);
+    // Without an admitted retry the notice is never called.
+    let (endpoint, server) = serve(vec![reply("400 Bad Request", "")]).await;
+    let context = self::context(Duration::from_secs(30), 5);
+    let client = retrying(&endpoint, &context);
+    let calls = Mutex::new(0);
+    let counting = |_: &gptgrep_jev::DecisionRetriedAttempt| -> Result<()> {
+        *calls.lock().unwrap() += 1;
+        Ok(())
+    };
+    assert!(
+        client
+            .rerank_with_retry_notice("synthetic query", &candidates, &counting)
+            .await
+            .is_err()
+    );
+    assert_eq!(*calls.lock().unwrap(), 0);
+    assert_eq!(server.await.unwrap().bodies.len(), 1);
+}
+
+#[tokio::test]
+async fn refused_retry_notice_stops_the_retry_before_any_reservation() {
+    let (endpoint, server) = serve(vec![reply("502 Bad Gateway", "")]).await;
+    let context = context(Duration::from_secs(30), 5);
+    let client = retrying(&endpoint, &context);
+    let refuse = |_: &gptgrep_jev::DecisionRetriedAttempt| -> Result<()> {
+        anyhow::bail!("synthetic-notice-refusal")
+    };
+    let error = client
+        .rerank_with_retry_notice(
+            "synthetic query",
+            &[Candidate {
+                id: "synthetic".into(),
+                text: "synthetic evidence".into(),
+            }],
+            &refuse,
+        )
+        .await
+        .unwrap_err();
+    // The caller's own error is returned unchanged; nothing further is sent.
+    assert_eq!(error.to_string(), "synthetic-notice-refusal");
+    assert!(error.downcast_ref::<DecisionFailure>().is_none());
+    let served = server.await.unwrap();
+    assert_eq!((served.bodies.len(), served.unexpected), (1, 0));
+    let snapshot = context.snapshot().unwrap();
+    assert_eq!(snapshot.logical_reservations, 1);
+    assert_eq!(snapshot.terminal_submissions, 1);
 }
 
 #[test]

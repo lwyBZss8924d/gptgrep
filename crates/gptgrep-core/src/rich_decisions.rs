@@ -296,6 +296,8 @@ fn validate_pool(
 
 /// Prepares all actual text/request/output bounds before the first paid admission.
 /// The caller supplies its bound context/client; this function reads no credentials.
+/// Each prepared request is submitted exactly once: an attached bounded transient
+/// retry is removed, because these attempt receipts count one submission per call.
 pub fn prepare_rich_text_search(
     reader: RichGenerationReader,
     client: JevClient,
@@ -303,6 +305,7 @@ pub fn prepare_rich_text_search(
     options: &RichTextSearchOptions,
 ) -> Result<PreparedRichTextSearch> {
     let started = Instant::now();
+    let client = client.without_transient_retry();
     ensure!(
         !query.trim().is_empty() && query.len() <= 8192,
         "rich_decisions_invalid_query"
