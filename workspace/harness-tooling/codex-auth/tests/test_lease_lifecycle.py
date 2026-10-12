@@ -99,7 +99,24 @@ class LeaseTests(unittest.TestCase):
         self.assertIsNotNone(sidecar["released_at"])
         self.assertTrue(self.env.lease_path.exists(), "lock file is never deleted")
 
-    def test_descendant_keeping_lease_fd_retains_lease_until_it_exits(self):
+    def test_consumer_cannot_release_the_lease(self):
+        """L1: a consumer (and so a model tool command) inherits no lease descriptor. flock(LOCK_UN)
+        on every descriptor it has, and on a fresh one of the lock file, leaves the lease held."""
+        ready, report = self.env.root / "ready-unlock", self.env.root / "unlock-report.json"
+        holder = self.env.popen("run", "--role", "dev", "--run-id", "unlock1",
+                                *probe("unlock-lease", self.env.lease_path, 6, ready, report))
+        self.assertTrue(support.wait_for(ready.exists, 60), "the consumer started")
+        self.assertEqual(json.loads(report.read_text()), {"inherited_lease_descriptors": 0, "unlock_attempts": 1})
+        self.assertEqual(self.env.lease_probe(), "held_exclusive")
+        code, receipt, _ = self.env.supervisor("run", "--role", "test", "--run-id", "unlock-busy", "--wait-seconds",
+                                               "0", *probe("exit", 0))
+        self.assertEqual((code, receipt["state"]), (sup.EXIT_AUTH_BUSY, "AUTH_BUSY"))
+        out, _ = holder.communicate(timeout=60)
+        self.assertEqual(support.last_json(out)["state"], "PASS")
+        self.assertTrue(self.next_ok("unlock-after"))
+        support.observe("consumer_cannot_release_lease", inherited_lease_descriptors=0, second_consumer="AUTH_BUSY")
+
+    def test_surviving_descendant_keeps_the_lease_through_the_guardian(self):
         code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "orph1", *probe("survivor", 15, "keep"))
         self.assertEqual(code, sup.EXIT_UNKNOWN)
         self.assertEqual(receipt["state"], "UNKNOWN")
@@ -326,6 +343,103 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(support.run_auth_links(self.env), [])
         self.assertFalse(os.path.lexists(self.env.run_dir("_maintenance", "lk-maint") / "codex-home" / "auth.json"))
         support.observe("auth_link_lifetime", live_links_after_runs=0)
+
+    # -- credential links below the run directory (L2) --------------------------------------
+
+    def clear(self, run_id):
+        code, _, _ = self.env.supervisor("clear-quarantine", "--run-id", run_id, "--confirm", "--reason",
+                                         "fake drill reviewed")
+        self.assertEqual(code, 0)
+
+    def test_links_to_the_credential_in_results_are_removed_and_quarantined(self):
+        """L2: a hard link or a symlink (to the file, to the run's link or to the auth home) that a
+        consumer leaves in results/ would put the credential into an archive of results/."""
+        before = self.env.credential.meta()
+        cases = [("ln-hard", "hard", "hardlink"), ("ln-sym", "sym-canonical", "symlink"),
+                 ("ln-runlink", "sym-run-link", "symlink"), ("ln-home", "sym-home", "symlink")]
+        for run_id, kind, found in cases:
+            with self.subTest(kind=kind):
+                code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", run_id,
+                                                       *probe("link-credential", kind, "copy.json"))
+                self.assertEqual((code, receipt["state"], receipt["child_exit_code"]),
+                                 (sup.EXIT_QUARANTINED, "QUARANTINED", 0))
+                self.assertIn("CREDENTIAL_LINK_IN_RUN_DIR", [a["code"] for a in receipt["anomalies"]])
+                self.assertNotIn("CANONICAL_HARDLINKED", [a["code"] for a in receipt["anomalies"]])
+                links = receipt["credential_links"]
+                self.assertEqual((links["found"], links["removed"], links["canonical_nlink_after"]), (1, 1, 1))
+                self.assertEqual(links["links"], [{"kind": found, "removed": True, "path": "results/copy.json"}])
+                self.assertFalse(os.path.lexists(self.env.run_dir("dev", run_id) / "results" / "copy.json"))
+                self.assertEqual(json.loads(self.env.quarantine_marker().read_text())["reason"],
+                                 "CREDENTIAL_LINK_IN_RUN_DIR")
+                self.assertEqual(self.env.credential.meta(), before, "only the extra link was removed")
+                self.assertEqual(os.lstat(self.env.credential.path).st_nlink, 1)
+                self.clear(run_id + "-clear")
+        code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "ln-none", *probe("exit", 0))
+        self.assertEqual((code, receipt["credential_links"]["found"]), (0, 0))
+        support.observe("credential_links_removed", cases=len(cases), quarantined=True)
+
+    def test_extra_hard_link_outside_the_run_quarantines_after_the_run_and_at_preflight(self):
+        """L2: an extra link outside every run directory cannot be located by the supervisor: the run
+        that made it, and every later preflight, quarantine (st_nlink); nothing is removed."""
+        outside = self.env.root / "outside-copy.json"
+        code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "lo1",
+                                               *probe("link-credential", "hard-outside", outside))
+        self.assertEqual((code, receipt["state"]), (sup.EXIT_QUARANTINED, "QUARANTINED"))
+        self.assertIn("CANONICAL_HARDLINKED", [a["code"] for a in receipt["anomalies"]])
+        self.assertEqual((receipt["credential_links"]["found"], receipt["credential_links"]["canonical_nlink_after"]),
+                         (0, 2))
+        self.assertTrue(outside.exists(), "a link outside the run directory is never removed")
+        self.clear("lo1-clear")
+        code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "lo2", *probe("exit", 0))
+        self.assertEqual((code, receipt["state"], receipt["refusal"]),
+                         (sup.EXIT_QUARANTINED, "QUARANTINED", {"reason": "canonical_auth_hardlinked",
+                                                                 "detail": "nlink=2"}))
+        self.assertNotIn("child_started_at", receipt["timings"])
+        self.assertEqual(receipt["quarantine"]["reason"], "CANONICAL_HARDLINKED")
+        marker = json.loads(self.env.quarantine_marker().read_text())
+        self.assertEqual((marker["reason"], marker["details"]["phase"]), ("CANONICAL_HARDLINKED", "preflight"))
+        self.assertEqual(support.run_auth_links(self.env), [])
+        _, status, _ = self.env.supervisor("status")
+        self.assertEqual(status["canonical"]["preflight"], "canonical_auth_hardlinked")
+        outside.unlink()  # the operator removes the reviewed extra link
+        self.clear("lo2-clear")
+        code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "lo3", *probe("exit", 0))
+        self.assertEqual((code, receipt["state"]), (0, "PASS"))
+        support.observe("credential_hardlink_outside_run", preflight="canonical_auth_hardlinked")
+
+    def test_a_link_that_is_the_only_copy_of_the_original_credential_is_kept(self):
+        """L2: when the consumer replaced the canonical path, the link in results may be the only copy of
+        the original credential: it is reported and kept for review, never removed."""
+        original = self.env.credential.meta()
+        code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "lk-only",
+                                               *probe("move-canonical-keep", "orig.json"))
+        self.assertEqual((code, receipt["state"]), (sup.EXIT_QUARANTINED, "QUARANTINED"))
+        codes = [a["code"] for a in receipt["anomalies"]]
+        self.assertIn("CANONICAL_CHANGED_BY_CONSUMER", codes)
+        self.assertIn("CREDENTIAL_LINK_IN_RUN_DIR", codes)
+        links = receipt["credential_links"]
+        self.assertEqual(links["links"], [{"kind": "hardlink", "removed": False, "path": "results/orig.json",
+                                           "kept": "canonical_path_keeps_no_other_link"}])
+        kept = self.env.run_dir("dev", "lk-only") / "results" / "orig.json"
+        self.assertEqual(os.lstat(kept).st_ino, original["ino"])
+        support.observe("credential_only_copy_kept", kept=True)
+
+    def test_guardian_removes_a_credential_link_made_by_a_survivor(self):
+        """L2: a survivor links the credential after the supervisor's own scan; the guardian scans again
+        before it releases the lease, removes the link and quarantines."""
+        pidfile = self.env.root / "late-linker.pid"
+        code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "gl1",
+                                               *probe("escaped", pidfile, 4, "hard-link", "late.json"))
+        self.assertEqual((code, receipt["state"]), (sup.EXIT_UNKNOWN, "UNKNOWN"))
+        self.assertEqual(receipt["credential_links"]["found"], 0)
+        self.assertTrue(support.wait_for(lambda: self.env.lease_probe() == "free", 60, 0.2))
+        result = json.loads((self.env.run_dir("dev", "gl1") / "state" / "lease-guardian-result.json").read_text())
+        self.assertEqual((result["credential_links"]["found"], result["credential_links"]["removed"]), (1, 1))
+        self.assertEqual(result["credential_link_quarantine"]["reason"], "CREDENTIAL_LINK_IN_RUN_DIR")
+        self.assertFalse(os.path.lexists(self.env.run_dir("dev", "gl1") / "results" / "late.json"))
+        self.assertEqual(os.lstat(self.env.credential.path).st_nlink, 1)
+        self.assertEqual(json.loads(self.env.quarantine_marker().read_text())["reason"], "CREDENTIAL_LINK_IN_RUN_DIR")
+        support.observe("guardian_credential_link_rescan", removed=1)
 
     def test_replaced_link_is_quarantined_and_left_for_review(self):
         code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "rl1", *probe("replace-link"))

@@ -44,6 +44,22 @@ class NetworkGuardTests(unittest.TestCase):
             self.assertEqual(connect_errno("127.0.0.1", port), 0)
         self.assertEqual(connect_errno("127.0.0.1", 9), errno.ECONNREFUSED)
 
+    def test_the_guard_is_verified_not_only_declared(self):
+        """L4: real-binary tests accept the guard only when a loopback connect outside the reserved
+        ports is actually denied."""
+        self.assertTrue(support.seatbelt_active())
+        self.assertIsNone(support.real_binary_refusal())
+
+    def test_real_binary_tests_refuse_to_run_without_the_guard(self):
+        """L4 (README, Qualification): without the guard or the explicit unguarded opt-in, the official
+        binary tests fail in setUpClass (never a silent skip) and no Codex binary is started."""
+        proc, ran = support.run_integration_module_child(None)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("refusing to run a real Codex binary without the qualification guard", proc.stderr)
+        self.assertIn("Ran 0 tests", proc.stderr)
+        self.assertFalse(ran.exists(), "no Codex binary was started")
+        support.observe("real_binary_tests_refuse_unguarded", exit_code=proc.returncode, binary_started=False)
+
     def test_real_credential_roots_are_unreachable(self):
         for root in support.real_credential_roots():
             with self.subTest(root=root.name):

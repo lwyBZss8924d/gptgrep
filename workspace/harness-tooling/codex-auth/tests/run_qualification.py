@@ -239,7 +239,13 @@ def inner(args):
                          "extra_denied_paths and role deny/read paths (config, generated profile, receipts; "
                          "enforcement via codex sandbox in the unguarded pass)",
                          "consumer argv guard against legacy-sandbox and permission-source arguments and "
-                         "project roots inside denied paths"],
+                         "project roots inside denied paths; the run's own directories as roots below a deny "
+                         "that contains runs_root (production Judge shape)",
+                         "no lease descriptor inherited by consumers or their tool commands",
+                         "hard links and symlinks to the credential in run directories (preflight link count, "
+                         "post-run and guardian scans)", "account-probe protected outputs",
+                         "exit 77 counts only with the auth-failure record",
+                         "real-binary tests refuse without a verified guard"],
                "limitations": ["Fake credentials and loopback fakes only: no real token authority, ChatGPT backend "
                                "or model was contacted; live behaviour remains unqualified.",
                                "Process-tree tracking cannot see a daemon that escapes between samples, closes "

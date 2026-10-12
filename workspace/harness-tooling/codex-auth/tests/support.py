@@ -51,6 +51,70 @@ def real_credential_roots():
     return [home / ".gptgrep", home / ".codex"]
 
 
+def seatbelt_active():
+    """True when this process cannot connect to a loopback port that the runner did not
+    reserve, as under run_qualification.py's seatbelt guard (EPERM). Only loopback is
+    touched: the probe connects to a listener of its own on an ephemeral port."""
+    reserved = set(_RESERVED) | {9}
+    held = []
+    try:
+        for _ in range(16):
+            server = socket.socket()
+            held.append(server)
+            server.bind(("127.0.0.1", 0))
+            port = server.getsockname()[1]
+            if port in reserved:
+                continue
+            server.listen(1)
+            with socket.socket() as client:
+                client.settimeout(5)
+                try:
+                    client.connect(("127.0.0.1", port))
+                except PermissionError:
+                    return True
+                except OSError:
+                    return False
+            return False
+        return False
+    finally:
+        for sock in held:
+            sock.close()
+
+
+def real_binary_refusal():
+    """None when a test may run a real Codex binary in this process, else why it must refuse
+    (README, Qualification). Allowed under run_qualification.py's seatbelt guard, verified by
+    a denied loopback connect, or in its explicit unguarded pass (--unguarded-tool-sandbox,
+    which sets GPTGREP_AUTH_TEST_SANDBOX=proxy-trap and routes every proxy to a trap)."""
+    if SANDBOX == "seatbelt":
+        if seatbelt_active():
+            return None
+        return ("refusing to run a real Codex binary: GPTGREP_AUTH_TEST_SANDBOX=seatbelt, but outbound "
+                "connections are not denied, so no guard is active")
+    if SANDBOX == "proxy-trap":
+        return None
+    return ("refusing to run a real Codex binary without the qualification guard: use run_qualification.py "
+            "(seatbelt) or its explicit --unguarded-tool-sandbox pass")
+
+
+def run_integration_module_child(sandbox_claim):
+    """Run test_integration_codex in a child process with GPTGREP_AUTH_TEST_SANDBOX set to
+    `sandbox_claim` (None: unset) and a stand-in "Codex" that only records that it ran.
+    Returns (completed process, path of the record the stand-in would create)."""
+    root = test_root() / ("guard-claim-" + secrets.token_hex(4))
+    root.mkdir(mode=0o700)
+    stand_in = script(root / "codex", "import os, sys\nopen(os.path.realpath(sys.argv[0]) + '.ran', 'w').close()\n")
+    env = {"PATH": "/usr/bin:/bin", "LANG": "en_US.UTF-8", "HOME": str(root), "TMPDIR": str(root),
+           "GPTGREP_AUTH_TEST_ROOT": str(root), "GPTGREP_AUTH_TEST_CODEX_BIN": str(stand_in),
+           "GPTGREP_AUTH_TEST_PORTS": ",".join(map(str, _RESERVED))}
+    if sandbox_claim:
+        env["GPTGREP_AUTH_TEST_SANDBOX"] = sandbox_claim
+    proc = subprocess.run([PY, "-I", "-B", "-m", "unittest", "discover", "-s", str(HERE), "-p",
+                           "test_integration_codex.py", "-t", str(HERE)], capture_output=True, text=True, env=env,
+                          cwd=str(root), timeout=300)
+    return proc, Path(str(stand_in) + ".ran")
+
+
 def assert_fake_path(path):
     """Every fake credential path must be outside the real credential roots."""
     resolved = Path(os.path.realpath(path))

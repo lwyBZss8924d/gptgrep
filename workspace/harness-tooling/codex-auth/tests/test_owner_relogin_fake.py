@@ -219,11 +219,15 @@ class OwnerFakeTests(FakeCodexMixin, unittest.TestCase):
 
     def test_consumer_auth_failure_blocks_new_consumers_until_owner_refresh(self):
         self.install_fake_codex(app_server="normal")
-        code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "af1", *probe("exit", 77))
+        code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "af1",
+                                               *probe("auth-fail", "AUTH_UNAUTHORIZED"))
         self.assertEqual((code, receipt["state"]), (sup.EXIT_BLOCKED_AUTH, "BLOCKED_AUTH"))
         self.assertTrue(receipt["auth_block"]["created"])
+        self.assertEqual(receipt["auth_failure_record"],
+                         {"present": True, "valid": True, "failure_class": "AUTH_UNAUTHORIZED"})
         marker = json.loads(self.env.auth_block_marker().read_text())
         self.assertEqual(marker["reason"], "CONSUMER_REPORTED_AUTH_FAILURE")
+        self.assertEqual(marker["details"]["auth_failure_class"], "AUTH_UNAUTHORIZED")
         ready = self.env.root / "ready-af2"
         code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "af2", *probe("hold", 0, ready))
         self.assertEqual((code, receipt["refusal"]["reason"]), (sup.EXIT_BLOCKED_AUTH,
@@ -246,8 +250,49 @@ class OwnerFakeTests(FakeCodexMixin, unittest.TestCase):
         self.assertEqual((code, receipt["state"]), (1, "FAILED"))
         self.assertFalse(self.env.auth_block_marker().exists())
 
+    def test_exit_77_alone_is_not_an_auth_failure(self):
+        """L5: exit 77 is also sysexits EX_NOPERM. Without the auth-failure record it is FAILED, records
+        an anomaly and blocks nobody."""
+        code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "np1", *probe("exit", 77))
+        self.assertEqual((code, receipt["state"], receipt["child_exit_code"]), (1, "FAILED", 77))
+        self.assertIn("CONSUMER_EXIT_77_WITHOUT_AUTH_FAILURE_RECORD", [a["code"] for a in receipt["anomalies"]])
+        self.assertEqual(receipt["auth_failure_record"], {"present": False, "valid": False})
+        self.assertNotIn("auth_block", receipt)
+        self.assertFalse(self.env.auth_block_marker().exists())
+        code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "np2", *probe("exit", 0))
+        self.assertEqual((code, receipt["state"]), (0, "PASS"), "the next consumer is not blocked")
+        support.observe("exit_77_without_record", state="FAILED", blocked=False)
+
+    def test_unrecognised_auth_failure_records_do_not_block(self):
+        """L5: only this uid's private, single-link regular file with the schema and a known class counts,
+        and only together with exit 77."""
+        valid = json.dumps({"schema": sup.AUTH_FAILURE_SCHEMA, "class": "AUTH_UNAUTHORIZED"})
+        elsewhere = self.env.root / "record-elsewhere.json"
+        elsewhere.write_text(valid)
+        cases = [("ar1", probe("auth-record", json.dumps({"schema": sup.AUTH_FAILURE_SCHEMA, "class": "EX_NOPERM"}),
+                               77), "schema_or_class"),
+                 ("ar2", probe("auth-record", json.dumps({"schema": "other", "class": "AUTH_UNAUTHORIZED"}), 77),
+                  "schema_or_class"),
+                 ("ar3", probe("auth-record", "not json", 77), "invalid_json"),
+                 ("ar4", probe("auth-record", valid + " " * sup.AUTH_FAILURE_RECORD_MAX_BYTES, 77),
+                  "unsafe_file"),
+                 ("ar5", probe("auth-record-symlink", elsewhere, 77), "unsafe_file")]
+        for run_id, args, rejected in cases:
+            with self.subTest(run_id=run_id):
+                code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", run_id, *args)
+                self.assertEqual((code, receipt["state"]), (1, "FAILED"))
+                self.assertEqual(receipt["auth_failure_record"], {"present": True, "valid": False,
+                                                                  "rejected": rejected})
+                self.assertFalse(self.env.auth_block_marker().exists())
+        # A valid record without exit 77 is not read at all.
+        code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "ar6", *probe("auth-record", valid, 0))
+        self.assertEqual((code, receipt["state"]), (0, "PASS"))
+        self.assertNotIn("auth_failure_record", receipt)
+        self.assertFalse(self.env.auth_block_marker().exists())
+        support.observe("auth_failure_records_rejected", cases=len(cases) + 1)
+
     def test_auth_block_can_be_cleared_by_a_human(self):
-        self.env.supervisor("run", "--role", "dev", "--run-id", "ab1", *probe("exit", 77))
+        self.env.supervisor("run", "--role", "dev", "--run-id", "ab1", *probe("auth-fail", "AUTH_NOT_LOGGED_IN"))
         self.assertTrue(self.env.auth_block_marker().exists())
         code, receipt, _ = self.env.supervisor("clear-quarantine", "--auth-block", "--run-id", "ab-clear", "--confirm",
                                                "--reason", "fake drill: consumer misreported")

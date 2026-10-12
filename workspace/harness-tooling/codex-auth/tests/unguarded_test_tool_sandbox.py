@@ -30,6 +30,23 @@ from support import PY, FIXTURES, TOOL_DIR, Env, sup
 
 RPC = str(FIXTURES / "rpc_client.py")
 PROXY_NAMES = ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy"]
+# A sandboxed tool command looking for descriptors of the lease file (given by device and inode:
+# the lease directory is denied to tool commands) and releasing each with flock(LOCK_UN).
+LEASE_FD_PROBE = """import fcntl, os, sys, time
+dev, ino = int(sys.argv[1]), int(sys.argv[2])
+found = 0
+for fd in range(256):
+    try:
+        info = os.fstat(fd)
+    except OSError:
+        continue
+    if (info.st_dev, info.st_ino) == (dev, ino):
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        found += 1
+print("LEASE_FDS=%d" % found, flush=True)
+open(sys.argv[3], "w").close()
+time.sleep(float(sys.argv[4]))
+"""
 
 
 def cat(path, label):
@@ -249,6 +266,66 @@ class ToolSandboxTests(unittest.TestCase):
                         write_below_exit=write_below.returncode, read_from_work_exit=read_from_work.returncode,
                         supervised_refusal=result["refusal"]["reason"])
 
+    def test_own_work_directory_stays_a_root_below_a_deny_that_contains_the_runs_root(self):
+        """H1 with the official binary: a role deny that contains the runs root (the fake world root,
+        as `/Users` does on the host). The supervised `codex sandbox -C {work_dir}` passes the argv guard;
+        its tool command writes in the work directory, while a sibling below the deny and the
+        credential stay denied."""
+        root = self.env.root
+        sibling = root / "open" / "control.txt"
+        sibling.parent.mkdir()
+        sibling.write_text("MARKER-SIBLING\n")
+        roles = dict(self.env.values["roles"])
+        roles["judge"] = {"tool_permissions": {"extends": ":workspace", "network_enabled": False,
+                                               "deny_paths": [str(root)]}, "passthrough_env": PROXY_NAMES}
+        self.env.reconfigure(roles=roles)
+        self.assertTrue(sup.is_within(self.env.runs_root, root))
+        env = self.env.parent_env(**{name: self.proxy.proxy_url for name in PROXY_NAMES})
+        script = ("echo WORK-OK > '{work_dir}/own.txt'; echo write=$?; cat '{work_dir}/own.txt'; "
+                  "cat '%s' > /dev/null 2>&1; echo sibling=$?; cat '%s' > /dev/null 2>&1; echo credential=$?"
+                  % (sibling, self.env.credential.path))
+        code, receipt, proc = self.env.supervisor(
+            "run", "--role", "judge", "--run-id", "h1-real", "--", support.CODEX_BIN, "sandbox",
+            "--permission-profile", sup.SUPERVISOR_PERMISSION_PROFILE, "-C", "{work_dir}", "--", "/bin/sh", "-c",
+            script, env=env)
+        self.assertEqual((code, receipt["state"], receipt["tool_credential_access"]["consumer_argv_guard"]),
+                         (0, "PASS", "checked"), proc.stderr[-1500:])
+        out = (self.env.run_dir("judge", "h1-real") / "state" / "logs" / "child.stdout.log").read_text().split()
+        self.assertEqual([item for item in out if "=" in item or item == "WORK-OK"],
+                         ["write=0", "WORK-OK", "sibling=1", "credential=1"])
+        self.assertEqual(self.env.credential.meta()["mode"], 0o600)
+        support.observe("own_work_dir_below_ancestor_deny_official", write=0, sibling_denied=True,
+                        credential_denied=True, proxy_trap_connections=self.proxy.count)
+
+    def test_tool_commands_inherit_no_lease_descriptor(self):
+        """L1 with the official binary: a sandboxed tool command finds no descriptor of the lease file,
+        so flock(LOCK_UN) cannot release the run's lease; a second consumer stays AUTH_BUSY."""
+        env = self.env.parent_env(**{name: self.proxy.proxy_url for name in PROXY_NAMES})
+        code, _receipt, proc = self.env.supervisor("run", "--role", "tools", "--run-id", "lfd-init", "--",
+                                                   "/usr/bin/true", env=env)
+        self.assertEqual(code, 0, proc.stderr[-1500:])
+        lease = os.stat(self.env.lease_path)
+        probe = self.env.root / "lease_fd_probe.py"
+        probe.write_text(LEASE_FD_PROBE)
+        run = self.env.run_dir("tools", "lfd1")
+        holder = self.env.popen("run", "--role", "tools", "--run-id", "lfd1", "--", support.CODEX_BIN, "sandbox",
+                                "--permission-profile", sup.SUPERVISOR_PERMISSION_PROFILE, "-C", "{work_dir}", "--",
+                                PY, "-I", "-B", str(probe), str(lease.st_dev), str(lease.st_ino),
+                                "{work_dir}/ready", "8", env=env)
+        try:
+            self.assertTrue(support.wait_for((run / "work" / "ready").exists, 120), "the tool command ran")
+            self.assertEqual(self.env.lease_probe(), "held_exclusive")
+            code, busy, _ = self.env.supervisor("run", "--role", "tools", "--run-id", "lfd-busy", "--wait-seconds",
+                                                "0", "--", "/usr/bin/true", env=env)
+            self.assertEqual((code, busy["state"]), (sup.EXIT_AUTH_BUSY, "AUTH_BUSY"))
+        finally:
+            out, err = holder.communicate(timeout=180)
+        receipt = support.last_json(out)
+        self.assertEqual((receipt["state"], receipt["child_exit_code"]), ("PASS", 0), err[-1500:])
+        self.assertIn("LEASE_FDS=0", (run / "state" / "logs" / "child.stdout.log").read_text())
+        support.observe("tool_command_lease_descriptors_official", lease_fds=0, second_consumer="AUTH_BUSY",
+                        proxy_trap_connections=self.proxy.count)
+
     def test_app_server_starts_a_thread_and_enforces_role_paths_through_command_exec(self):
         """(l) The same profile through the official app-server (--strict-config): a thread starts
         (AGENTS.md is loaded through Codex's fs sandbox helper under the profile), and command/exec
@@ -277,6 +354,21 @@ class ToolSandboxTests(unittest.TestCase):
         support.observe("app_server_profile_paths", thread_started=True, proxy_trap_connections=self.proxy.count,
                         **{label: by_label[label]["exit_code"]
                            for label in ("role_deny", "extra_deny", "carve_out", "canonical")})
+
+
+@unittest.skipUnless(support.SANDBOX == "proxy-trap",
+                     "runs only in run_qualification.py's explicit --unguarded-tool-sandbox pass")
+class GuardClaimTests(unittest.TestCase):
+    def test_a_declared_seatbelt_guard_must_be_active(self):
+        """L4: outside the seatbelt, a process that merely claims the guard cannot run the real-binary
+        tests: they fail in setUpClass and no Codex binary is started."""
+        self.assertFalse(support.seatbelt_active(), "this pass runs without the seatbelt guard")
+        proc, ran = support.run_integration_module_child("seatbelt")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("outbound connections are not denied", proc.stderr)
+        self.assertIn("Ran 0 tests", proc.stderr)
+        self.assertFalse(ran.exists(), "no Codex binary was started")
+        support.observe("declared_guard_verified", exit_code=proc.returncode, binary_started=False)
 
 
 if __name__ == "__main__":

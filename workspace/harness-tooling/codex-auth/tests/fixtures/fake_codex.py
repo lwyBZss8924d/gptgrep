@@ -18,6 +18,8 @@ existing $CODEX_HOME/auth.json (clear_existing_auth_before_login; recorded as
 "cleared_existing_auth"), then prints a fake device code, then, on success,
 creates a new auth.json.
 login status: "auto" exits 0 when $CODEX_HOME/auth.json exists and is non-empty.
+exec: reads the prompt from stdin when the last argument is "-", writes a fake
+verdict to the `-o` path and exits 0 (no model; the Judge argv shape only).
 Every invocation appends argv and environment NAMES to $CODEX_SQLITE_HOME/fake-codex-record.jsonl.
 """
 import json
@@ -145,12 +147,24 @@ def login():
     return int(status)
 
 
+def exec_():
+    args = sys.argv[1:]
+    prompt = sys.stdin.read() if args and args[-1] == "-" else ""
+    record("exec", stdin_bytes=len(prompt))
+    if "-o" in args:
+        with open(args[args.index("-o") + 1], "w") as handle:
+            json.dump({"verdict": "fake", "stdin_bytes": len(prompt)}, handle)
+    return 0
+
+
 def main():
     args = sys.argv[1:]
     if "app-server" in args:
         return app_server()
     if "login" in args:
         return login()
+    if "exec" in args:
+        return exec_()
     if "--version" in args:
         print("codex-cli 0.0.0-fake")
         return 0

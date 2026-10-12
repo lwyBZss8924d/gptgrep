@@ -57,6 +57,14 @@ LINK_OK = {"present": True, "symlink": True, "target_matches": True, "home_physi
 
 @unittest.skipUnless(support.CODEX_BIN, "set GPTGREP_AUTH_TEST_CODEX_BIN to the official codex 0.162.1 binary")
 class CodexIntegrationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # A real binary runs only under the runner's verified guard or its explicit unguarded pass.
+        # Refuse loudly (an error, not a skip) so an unguarded run can never pass silently.
+        refusal = support.real_binary_refusal()
+        if refusal:
+            raise RuntimeError(refusal)
+
     def setUp(self):
         self.extra_stops = []
         self.make_world("codex")
@@ -362,6 +370,10 @@ class CodexIntegrationTests(unittest.TestCase):
         self.assertEqual((code, receipt["state"], receipt["child_exit_code"]),
                          (sup.EXIT_BLOCKED_AUTH, "BLOCKED_AUTH", sup.EXIT_BLOCKED_AUTH), proc.stderr[-1500:])
         self.assertEqual(self.probe_result("p401")["outcome"], "AUTH_UNAUTHORIZED")
+        # L5: exit 77 counts only with the probe's auth-failure record.
+        self.assertTrue(self.probe_result("p401")["auth_failure_record_written"])
+        self.assertEqual(receipt["auth_failure_record"],
+                         {"present": True, "valid": True, "failure_class": "AUTH_UNAUTHORIZED"})
         self.assertTrue(self.env.auth_block_marker().exists())
         self.assertFalse(self.env.quarantine_marker().exists())
         self.backend.mode = "ok"

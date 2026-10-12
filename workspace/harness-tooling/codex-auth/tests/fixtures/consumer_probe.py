@@ -1,9 +1,28 @@
 """Synthetic consumer used as the supervised command in lifecycle tests.
 
 Modes (argv[1]):
-  env-report OUT                 write env NAMES plus selected non-secret values
-  hold SECONDS READY LEASE       verify the inherited lease fd is LEASE, touch READY, sleep
-  exit CODE                      exit with CODE (77 is the BLOCKED_AUTH contract)
+  env-report OUT [LEASE]         write env NAMES plus selected non-secret values and the
+                                 number of inherited descriptors of LEASE
+  hold SECONDS READY [LEASE]     verify no descriptor of LEASE was inherited, touch READY, sleep
+  unlock-lease LEASE SECONDS READY REPORT
+                                 a consumer trying to release the run's lease: flock(LOCK_UN)
+                                 on every inherited descriptor of LEASE and on a fresh one,
+                                 write REPORT, touch READY, sleep
+  exit CODE                      exit with CODE (77 alone is not an auth failure)
+  auth-fail CLASS                write the auth-failure record ($GPTGREP_AUTH_FAILURE_RECORD)
+                                 with CLASS, then exit 77 (the BLOCKED_AUTH contract)
+  auth-record TEXT CODE          write TEXT verbatim as the auth-failure record, exit CODE
+  auth-record-symlink TARGET CODE
+                                 make the auth-failure record a symlink to TARGET, exit CODE
+  link-credential KIND NAME      link the credential into the run's results directory as NAME:
+                                 hard (a hard link to the canonical file), sym-canonical (a
+                                 symlink to it), sym-run-link (a relative symlink to the run's
+                                 auth.json link), sym-home (a symlink to the canonical auth
+                                 home); hard-outside PATH links it at PATH instead
+  move-canonical-keep NAME       hard-link the credential into results as NAME, then replace
+                                 the canonical path with another file (NAME is then the only
+                                 link to the original credential)
+  symlink TARGET LINK            create the symlink LINK -> TARGET
   ignore-term SECONDS READY      ignore SIGTERM and sleep
   survivor SECONDS keep|close    fork a grandchild that outlives this process;
                                  'close' also calls setsid() and closes inherited fds
@@ -13,6 +32,7 @@ Modes (argv[1]):
                                  SECONDS the grandchild runs ACTION, then exits:
                                    canonical-append      append to $CODEX_HOME/auth.json
                                    docker-add STATE ID   add a fake container id, sleep 1
+                                   hard-link NAME        hard-link the credential into results
   chmod-home PIDFILE SECONDS     an escaped grandchild as above, then chmod $CODEX_HOME 000
   write-canonical                append to $CODEX_HOME/auth.json through the run's link
                                  (a misbehaving consumer rewriting the fake credential)
@@ -23,6 +43,7 @@ Modes (argv[1]):
                                  not signalled yet, record it in DIR, stop it, exit 0
 Never prints environment values.
 """
+import fcntl
 import json
 import os
 import signal
@@ -34,27 +55,41 @@ REPORTED_VALUES = ("CODEX_HOME", "CODEX_SQLITE_HOME", "CODEX_REFRESH_TOKEN_URL_O
                    "CODEX_REVOKE_TOKEN_URL_OVERRIDE", "HOME", "TMPDIR",
                    "NO_PROXY", "no_proxy", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
                    "GPTGREP_AUTH_RUN_ID", "CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED", "PATH", "LANG",
-                   "LC_ALL", "DOCKER_HOST")
+                   "LC_ALL", "DOCKER_HOST", "GPTGREP_AUTH_FAILURE_RECORD")
 
 
-def lease_fd_matches(lease_path=None):
-    """True when GPTGREP_AUTH_LEASE_FD is an open descriptor (of LEASE_PATH, if given)."""
-    fd = os.environ.get("GPTGREP_AUTH_LEASE_FD")
-    if fd is None:
-        return None
-    try:
-        held = os.fstat(int(fd))
-    except OSError:
-        return False
-    if lease_path is None:
-        return True
+def lease_descriptors(lease_path):
+    """Inherited descriptors that refer to the lease file (none since supervisor 1.3.0)."""
     target = os.stat(lease_path)
-    return (held.st_dev, held.st_ino) == (target.st_dev, target.st_ino)
+    found = []
+    for fd in range(3, 256):
+        try:
+            info = os.fstat(fd)
+        except OSError:
+            continue
+        if (info.st_dev, info.st_ino) == (target.st_dev, target.st_ino):
+            found.append(fd)
+    return found
 
 
 def auth_link():
     path = os.path.join(os.environ["CODEX_HOME"], "auth.json")
     return {"is_symlink": os.path.islink(path), "target": os.readlink(path) if os.path.islink(path) else None}
+
+
+def results_dir():
+    return os.path.join(os.path.dirname(os.environ["CODEX_HOME"]), "results")
+
+
+def canonical_path():
+    """The canonical credential path, read from the run's link (readlink only)."""
+    return os.readlink(os.path.join(os.environ["CODEX_HOME"], "auth.json"))
+
+
+def write_record(text):
+    fd = os.open(os.environ["GPTGREP_AUTH_FAILURE_RECORD"], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.write(fd, text.encode())
+    os.close(fd)
 
 
 def escape(pidfile, seconds, action=None, args=()):
@@ -80,6 +115,9 @@ def escape(pidfile, seconds, action=None, args=()):
                 with open(args[0], "a") as handle:
                     handle.write("\n" + args[1] + "\n")
                 time.sleep(1.0)
+            elif action == "hard-link":
+                os.link(os.readlink(os.path.join(home, "auth.json")),
+                        os.path.join(os.path.dirname(home), "results", args[0]))
         finally:
             os._exit(0)
     deadline = time.time() + 10
@@ -95,19 +133,73 @@ def main(argv):
         canary = any("FAKE-CANARY" in v for v in os.environ.values())
         report = {"names": sorted(os.environ), "values": values, "canary_value_present": canary,
                   "openrouter_present": "OPENROUTER_API_KEY" in os.environ, "cwd": os.getcwd(),
-                  "lease_fd_open": lease_fd_matches(), "auth_link": auth_link()}
+                  "lease_fd_env": os.environ.get("GPTGREP_AUTH_LEASE_FD"), "auth_link": auth_link(),
+                  "lease_descriptors": len(lease_descriptors(argv[3])) if len(argv) > 3 else None}
         with open(argv[2], "w") as handle:
             json.dump(report, handle)
         return 0
     if mode == "hold":
         seconds, ready = float(argv[2]), argv[3]
-        if not lease_fd_matches(argv[4] if len(argv) > 4 else None):
+        if "GPTGREP_AUTH_LEASE_FD" in os.environ or (len(argv) > 4 and lease_descriptors(argv[4])):
             return 9
         open(ready, "w").close()
         time.sleep(seconds)
         return 0
+    if mode == "unlock-lease":
+        lease, seconds, ready, report = argv[2], float(argv[3]), argv[4], argv[5]
+        inherited = lease_descriptors(lease)
+        attempts = 0
+        for fd in inherited:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            attempts += 1
+        fresh = os.open(lease, os.O_RDONLY)
+        fcntl.flock(fresh, fcntl.LOCK_UN)  # releases nothing: a lock belongs to its own open file
+        attempts += 1
+        with open(report, "w") as handle:
+            json.dump({"inherited_lease_descriptors": len(inherited), "unlock_attempts": attempts}, handle)
+        open(ready, "w").close()
+        time.sleep(seconds)
+        os.close(fresh)
+        return 0
     if mode == "exit":
         return int(argv[2])
+    if mode == "auth-fail":
+        write_record(json.dumps({"schema": "gptgrep.codex-auth.auth-failure.v1", "class": argv[2]}))
+        return 77
+    if mode == "auth-record":
+        write_record(argv[2])
+        return int(argv[3])
+    if mode == "auth-record-symlink":
+        os.symlink(argv[2], os.environ["GPTGREP_AUTH_FAILURE_RECORD"])
+        return int(argv[3])
+    if mode == "link-credential":
+        kind, name = argv[2], argv[3]
+        target = os.path.join(results_dir(), name)
+        if kind == "hard":
+            os.link(canonical_path(), target)
+        elif kind == "hard-outside":
+            os.link(canonical_path(), name)
+        elif kind == "sym-canonical":
+            os.symlink(canonical_path(), target)
+        elif kind == "sym-run-link":
+            os.symlink(os.path.join("..", "codex-home", "auth.json"), target)
+        elif kind == "sym-home":
+            os.symlink(os.path.dirname(canonical_path()), target)
+        else:
+            return 2
+        return 0
+    if mode == "move-canonical-keep":
+        canonical = canonical_path()
+        os.link(canonical, os.path.join(results_dir(), argv[2]))
+        replacement = canonical + ".replacement"
+        fd = os.open(replacement, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.write(fd, b'{"auth_mode": "chatgpt", "tokens": {"refresh_token": "FAKE-CANARY-REPLACEMENT"}}')
+        os.close(fd)
+        os.rename(replacement, canonical)
+        return 0
+    if mode == "symlink":
+        os.symlink(argv[2], argv[3])
+        return 0
     if mode == "ignore-term":
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         open(argv[3], "w").close()

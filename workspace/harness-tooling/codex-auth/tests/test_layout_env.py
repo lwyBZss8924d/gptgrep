@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import time
 import tomllib
 import unittest
@@ -22,7 +23,8 @@ CANARY_ENV = {
     "DOCKER_HOST": "unix:///fake/docker.sock", "BASH_ENV": "/FAKE-CANARY-startup",
 }
 BASE_NAMES = {"CODEX_HOME", "CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED", "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
-              "CODEX_REVOKE_TOKEN_URL_OVERRIDE", "CODEX_SQLITE_HOME", "GPTGREP_AUTH_LEASE_FD", "GPTGREP_AUTH_RUN_ID", "GPTGREP_AUTH_SOURCE_ID",
+              "CODEX_REVOKE_TOKEN_URL_OVERRIDE", "CODEX_SQLITE_HOME", "GPTGREP_AUTH_FAILURE_RECORD",
+              "GPTGREP_AUTH_RUN_ID", "GPTGREP_AUTH_SOURCE_ID",
               "HOME", "LANG", "LC_ALL", "NO_PROXY", "no_proxy", "PATH", "TMPDIR", "XDG_CACHE_HOME",
               "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"}
 PLATFORM_NAMES = {"__CF_USER_TEXT_ENCODING"}  # injected by macOS at process start, not by the supervisor
@@ -73,6 +75,15 @@ ARGV_REFUSED = [
     (["exec", "--enable", "hooks", "say hi"], "--enable hooks"),
     (["--enable=secret_auth_storage", "exec", "say hi"], "--enable secret_auth_storage"),
 ]
+def judge_args(schema, root_args=("-C", "{work_dir}")):
+    """The owner's production Judge command line after the executable (H1)."""
+    return ["exec", "--skip-git-repo-check", "--ephemeral", "--json", *root_args, "-m", "gpt-6-luna",
+            "-c", 'model_reasoning_effort="max"', "-c", 'service_tier="fast"', "-c", 'web_search="disabled"',
+            "-c", "features.shell_tool=false", "-c", "features.view_image=false",
+            "-c", "features.code_mode.enabled=false", "-c", "features.code_mode_host.enabled=false",
+            "--output-schema", str(schema), "-o", "{results}/verdict.json", "-"]
+
+
 ARGV_ALLOWED = [
     ["exec", "-c", 'model="fake-model"', "-m", "fake-model", "-C", "/w", "-a", "never", "say hi"],
     ["exec", "-c", "features.fake_feature=true", "--skip-git-repo-check", "--", "--sandbox is prompt text"],
@@ -97,7 +108,7 @@ class LayoutEnvTests(unittest.TestCase):
         out = self.env.root / ("env-%s.json" % run_id)
         code, receipt, proc = self.env.supervisor(
             "run", "--role", role, "--run-id", run_id, "--", PY, "-I", "-B", PROBE, "env-report", str(out),
-            env=self.env.parent_env(**(extra_env or {})))
+            str(self.env.lease_path), env=self.env.parent_env(**(extra_env or {})))
         self.assertEqual(code, 0, proc.stderr)
         return json.loads(out.read_text()), receipt
 
@@ -140,6 +151,7 @@ class LayoutEnvTests(unittest.TestCase):
         self.assertEqual(values["CODEX_SQLITE_HOME"], str(run / "state"))
         self.assertEqual(values["HOME"], str(run / "home"))
         self.assertEqual(values["TMPDIR"], str(run / "tmp"))
+        self.assertEqual(values["GPTGREP_AUTH_FAILURE_RECORD"], str(run / "results" / "auth-failure.json"))
         self.assertEqual(report["cwd"], str(run / "work"))
         for key in ("XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"):
             self.assertTrue(Path(values[key]).is_relative_to(run / "home"), key)
@@ -158,7 +170,9 @@ class LayoutEnvTests(unittest.TestCase):
         for key in ("NO_PROXY", "no_proxy"):
             self.assertEqual(set(report["values"][key].split(",")), {"127.0.0.1", "localhost", "::1"})
         self.assertEqual(report["values"]["CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED"], "1")
-        self.assertTrue(report["lease_fd_open"])
+        # L1: the consumer gets no lease descriptor and no variable naming one.
+        self.assertIsNone(report["lease_fd_env"])
+        self.assertEqual(report["lease_descriptors"], 0)
         self.assertEqual(set(receipt["env_keys"]), BASE_NAMES)
         for name in sup.STRIPPED_ALWAYS:
             self.assertNotIn(name, receipt["env_keys"])
@@ -233,6 +247,83 @@ class LayoutEnvTests(unittest.TestCase):
         self.assertEqual(support.last_json(proc.stdout)["refusal"]["reason"],
                          "account_probe_requires_supervised_consumer_env")
         self.assertFalse((self.env.root / "never.json").exists())
+
+    def probe_run(self, run_id, *probe_args, before=None):
+        """account-probe as the supervised consumer; /usr/bin/false stands in for Codex and never
+        answers. `before` is a consumer_probe mode run first in the same consumer."""
+        probe = [PY, "-I", "-B", str(support.SUPERVISOR), "account-probe", "--codex-bin", "/usr/bin/false",
+                 *probe_args]
+        command = probe
+        if before:
+            script = " ".join("'%s'" % part for part in [PY, "-I", "-B", PROBE, *before]) + " && exec " + \
+                " ".join("'%s'" % part for part in probe)
+            command = ["/bin/sh", "-c", script]
+        code, receipt, proc = self.env.supervisor("run", "--role", "dev", "--run-id", run_id, "--", *command)
+        stdout = (self.env.run_dir("dev", run_id) / "state" / "logs" / "child.stdout.log").read_text()
+        return code, receipt, support.last_json(stdout) or {}
+
+    def test_account_probe_outputs_never_reach_the_credential_or_lease_paths(self):
+        """L3 (CS-5): --stderr-log and --out equal to or inside the canonical auth home, any run's
+        codex-home or the lease directory are refused before the app-server starts, in any spelling and
+        through symlinks. The log is opened O_NOFOLLOW|O_APPEND|O_CREAT (0600) and refused when the file
+        has another link (a hard link to the credential)."""
+        before = self.env.credential.meta()
+        home, lease_dir = self.env.credential.home, self.env.lease_path.parent
+        out = ["--out", "{results}/probe.json"]
+        cases = [("cs5-link", out + ["--stderr-log", "{codex_home}/auth.json"], "--stderr-log"),
+                 ("cs5-canonical", out + ["--stderr-log", str(self.env.credential.path)], "--stderr-log"),
+                 ("cs5-home-spelling", out + ["--stderr-log", str(home.parent / home.name.upper() / "x.log")],
+                  "--stderr-log"),
+                 ("cs5-lease-dir", out + ["--stderr-log", str(lease_dir / "probe.log")], "--stderr-log"),
+                 ("cs5-other-run", out + ["--stderr-log",
+                                          str(self.env.run_dir("dev", "other") / "codex-home" / "x.log")],
+                  "--stderr-log"),
+                 ("cs5-own-home", out + ["--stderr-log", "{codex_home}/probe.log"], "--stderr-log"),
+                 ("cs5-out-home", ["--out", str(home / "probe.json")], "--out"),
+                 ("cs5-out-codex-home", ["--out", "{codex_home}/probe.json"], "--out")]
+        for run_id, args, flag in cases:
+            with self.subTest(run_id=run_id):
+                code, receipt, result = self.probe_run(run_id, *args)
+                self.assertEqual(result.get("refusal"), {"reason": "account_probe_output_in_protected_path",
+                                                         "detail": flag})
+                self.assertEqual((code, receipt["state"], receipt["child_exit_code"]), (1, "FAILED", sup.EXIT_USAGE))
+                self.assertFalse((self.env.run_dir("dev", run_id) / "results" / "probe.json").exists())
+        self.assertEqual(self.env.credential.meta(), before)
+        # A symlink into the credential, created by the consumer in its results: refused (it resolves into
+        # the auth home), then removed by the post-run scan, which quarantines.
+        code, receipt, result = self.probe_run("cs5-symlink", *out, "--stderr-log", "{results}/s.log",
+                                               before=["link-credential", "sym-canonical", "s.log"])
+        self.assertEqual(result.get("refusal"), {"reason": "account_probe_output_in_protected_path",
+                                                 "detail": "--stderr-log"})
+        self.assertEqual((code, receipt["state"]), (sup.EXIT_QUARANTINED, "QUARANTINED"))
+        self.assertEqual(self.env.credential.meta(), before)
+        self.assertFalse(os.path.lexists(self.env.run_dir("dev", "cs5-symlink") / "results" / "s.log"))
+        self.env.supervisor("clear-quarantine", "--run-id", "cs5-clear1", "--confirm", "--reason", "fake drill")
+        # A hard link passes the path check but is refused after O_APPEND opens it (two links).
+        code, receipt, result = self.probe_run("cs5-hardlink", *out, "--stderr-log", "{results}/h.log",
+                                               before=["link-credential", "hard", "h.log"])
+        self.assertEqual(result.get("refusal"), {"reason": "account_probe_stderr_log_refused",
+                                                 "detail": "not_a_private_single_link_file"})
+        self.assertEqual((code, receipt["state"]), (sup.EXIT_QUARANTINED, "QUARANTINED"))
+        self.assertEqual(self.env.credential.meta()["size"], before["size"], "nothing was appended")
+        self.assertEqual(os.lstat(self.env.credential.path).st_nlink, 1, "the post-run scan removed the link")
+        self.env.supervisor("clear-quarantine", "--run-id", "cs5-clear2", "--confirm", "--reason", "fake drill")
+        # A symlink as the last component is never followed (O_NOFOLLOW), even to a harmless file.
+        elsewhere = self.env.root / "elsewhere.log"
+        elsewhere.write_text("")
+        code, receipt, result = self.probe_run(
+            "cs5-final-symlink", *out, "--stderr-log", "{log_dir}/s.log",
+            before=["symlink", str(elsewhere), "{log_dir}/s.log"])
+        self.assertEqual(result.get("refusal"), {"reason": "account_probe_stderr_log_refused", "detail": "ELOOP"})
+        self.assertEqual(elsewhere.read_text(), "")
+        # Allowed: a new log below the run's state directory, created 0600.
+        code, receipt, result = self.probe_run("cs5-ok", *out, "--stderr-log", "{log_dir}/probe.stderr.log")
+        self.assertEqual((receipt["state"], receipt["child_exit_code"], result.get("outcome")),
+                         ("FAILED", sup.EXIT_UNAVAILABLE, "SERVICE_UNAVAILABLE"))
+        log = self.env.run_dir("dev", "cs5-ok") / "state" / "logs" / "probe.stderr.log"
+        self.assertEqual(stat.S_IMODE(os.lstat(log).st_mode), 0o600)
+        self.assertEqual(self.env.credential.meta(), before)
+        support.observe("account_probe_protected_outputs", refused=len(cases) + 3, allowed=1)
 
     def test_invalid_or_unsafe_config_is_refused(self):
         self.env.config_path.write_text("{not json")
@@ -666,6 +757,101 @@ class ToolPathsAndArgvGuardTests(unittest.TestCase):
                                                     str(fake), *args)
                 self.assertEqual((code, plan["tool_credential_access"]["consumer_argv_guard"]), (0, "checked"))
         support.observe("argv_guard_root_refusals", cases=len(cases) + 1, allowed=5)
+
+    def judge_world(self):
+        """The production Judge role: deny paths that contain the runs root (its top-level
+        directory, as `/Users` does on the host, and the fake world root) plus `/Volumes`."""
+        fake = self.install_fake_codex()
+        top = "/" + self.env.runs_root.parts[1]
+        roles = dict(self.env.values["roles"])
+        roles["judge"] = dict(roles["judge"], tool_permissions={
+            "extends": ":workspace", "network_enabled": False,
+            "deny_paths": [top, str(self.env.root), "/Volumes"]})
+        self.env.reconfigure(roles=roles, allow_shared_consumers=True)
+        schema = self.env.root / "schemas" / "judge-schema.json"
+        schema.parent.mkdir(mode=0o700)
+        schema.write_text('{"type": "object"}')
+        for deny in (top, str(self.env.root)):
+            self.assertTrue(support.sup.is_within(self.env.runs_root, deny), "the deny contains the runs root")
+        return fake, schema
+
+    def test_own_directories_stay_roots_below_a_deny_that_contains_the_runs_root(self):
+        """H1: the exact production Judge command line passes the guard and runs (fake Codex,
+        --stdin inherit, --lease shared); so do -C ., --cd= and --add-dir {results}."""
+        fake, schema = self.judge_world()
+        code, plan, proc = self.env.supervisor("run", "--role", "judge", "--run-id", "jd-dry", "--stdin", "inherit",
+                                               "--lease", "shared", "--dry-run", "--", str(fake), *judge_args(schema))
+        self.assertEqual((code, plan["tool_credential_access"]["consumer_argv_guard"]), (0, "checked"), proc.stdout)
+        self.assertEqual(plan["tool_credential_access"]["denied_paths"][-3:],
+                         ["/" + self.env.runs_root.parts[1], str(self.env.root), "/Volumes"])
+        proc = subprocess.run(self.env.supervisor_argv("run", "--role", "judge", "--run-id", "jd-run", "--stdin",
+                                                       "inherit", "--lease", "shared", "--deadline-seconds", "60",
+                                                       "--", str(fake), *judge_args(schema)),
+                              input="Return the verdict JSON for the fake case.\n", capture_output=True, text=True,
+                              env=self.env.parent_env(), cwd=str(self.env.root), timeout=180)
+        receipt = support.last_json(proc.stdout)
+        self.assertEqual((proc.returncode, receipt["state"], receipt["child_exit_code"]), (0, "PASS", 0), proc.stderr)
+        self.assertEqual((receipt["lease"]["mode"], receipt["tool_credential_access"]["consumer_argv_guard"]),
+                         ("shared", "checked"))
+        run = self.env.run_dir("judge", "jd-run")
+        self.assertEqual(receipt["argv"][receipt["argv"].index("-C") + 1], str(run / "work"))
+        verdict = json.loads((run / "results" / "verdict.json").read_text())
+        self.assertGreater(verdict["stdin_bytes"], 0, "the prompt reached the consumer on stdin")
+        variants = [("jd-dot", ("-C", ".")), ("jd-cd-eq", ("--cd={work_dir}",)),
+                    ("jd-add-results", ("--add-dir", "{results}")),
+                    ("jd-mixed", ("-C", "{work_dir}", "--add-dir", "../results", "--add-dir", "{tmp}",
+                                  "--add-dir", "~", "--add-dir", "~/notes")),
+                    ("jd-inside", ("--cd={work_dir}/sub", "--add-dir", "{results}/out"))]
+        for run_id, root_args in variants:
+            with self.subTest(run_id=run_id):
+                code, plan, proc = self.env.supervisor("run", "--role", "judge", "--run-id", run_id, "--stdin",
+                                                       "inherit", "--lease", "shared", "--dry-run", "--", str(fake),
+                                                       *judge_args(schema, root_args))
+                self.assertEqual((code, plan["tool_credential_access"]["consumer_argv_guard"]), (0, "checked"),
+                                 proc.stdout)
+        support.observe("argv_guard_own_dirs_below_ancestor_deny", judge_exact="PASS", variants=len(variants))
+
+    def test_other_directories_below_a_deny_that_contains_the_runs_root_stay_refused(self):
+        """H1: only the run's own work, results, tmp and home directories are exempt."""
+        fake, schema = self.judge_world()
+        root, home = self.env.root, self.env.credential.home
+        os.symlink(home, root / "alias")
+        reopen, overlap = "consumer_argv_reopens_denied_path", "consumer_argv_root_overlaps_run_state"
+
+        def run_path(run_id, *parts):
+            return str(self.env.run_dir("judge", run_id).joinpath(*parts))
+
+        cases = [("jx1", ("-C", str(root / "elsewhere")), reopen, "-C " + str(root / "elsewhere")),
+                 ("jx2", ("--add-dir", "{codex_home}"), reopen, "--add-dir " + run_path("jx2", "codex-home")),
+                 ("jx3", ("--add-dir", "{run_dir}"), reopen, "--add-dir " + run_path("jx3")),
+                 ("jx4", ("--add-dir", "{log_dir}"), reopen, "--add-dir " + run_path("jx4", "state", "logs")),
+                 ("jx5", ("-C", "{work_dir}/../codex-home"), reopen, "-C " + run_path("jx5", "codex-home")),
+                 ("jx6", ("--add-dir", "~/../state"), reopen, "--add-dir " + run_path("jx6", "state")),
+                 ("jx7", ("--add-dir", str(home)), reopen, "--add-dir " + str(home)),
+                 ("jx8", ("--add-dir", str(root / "alias")), reopen, "--add-dir " + str(root / "alias")),
+                 ("jx9", ("-C", str(self.env.run_dir("judge", "other-run") / "work")), reopen,
+                  "-C " + str(self.env.run_dir("judge", "other-run") / "work")),
+                 ("jx10", ("--add-dir", "{results}/../../other-run/results"), reopen,
+                  "--add-dir " + str(self.env.run_dir("judge", "other-run") / "results")),
+                 ("jx11", ("--add-dir", "/"), overlap, "--add-dir /")]
+        for run_id, root_args, reason, detail in cases:
+            with self.subTest(run_id=run_id):
+                code, result, _ = self.env.supervisor("run", "--role", "judge", "--run-id", run_id, "--dry-run",
+                                                      "--", str(fake), *judge_args(schema, root_args))
+                self.assertEqual((code, result["state"], result["refusal"]),
+                                 (sup.EXIT_USAGE, "CONFIG_ERROR", {"reason": reason, "detail": detail}))
+        # A root that is inside an own directory as written but resolves elsewhere is not exempt.
+        cfg = self.env.cfg()
+        layout = sup.Layout(cfg, "judge", "jx-resolved")
+        layout.work_dir.mkdir(mode=0o700, parents=True)
+        os.symlink(str(root / "elsewhere"), layout.work_dir / "escape")
+        denied = sup.permission_denials(cfg, layout) + cfg.role("judge")["tool_permissions"]["deny_paths"]
+        violation = sup.codex_project_root_violation([str(fake), "exec", "--add-dir", "escape", "x"], layout,
+                                                     denied, cfg.runs_root)
+        self.assertEqual(violation, (reopen, "--add-dir " + str(layout.work_dir / "escape")))
+        self.assertIsNone(sup.codex_project_root_violation([str(fake), "exec", "-C", str(layout.work_dir),
+                                                            "--add-dir", ".", "x"], layout, denied, cfg.runs_root))
+        support.observe("argv_guard_other_dirs_below_ancestor_deny", refused=len(cases) + 1)
 
     def test_consumer_argv_guard_resolves_the_executable_like_the_launch(self):
         """A bare name is looked up in the role's PATH and a name is matched in any case; an executable

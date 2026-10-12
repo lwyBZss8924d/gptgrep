@@ -7,7 +7,8 @@ managed consumer. This supervisor:
 * serializes managed access with one kernel lease per auth source: a BSD
   ``flock`` on a lock file outside any checkout, bound to the auth source by a
   non-secret marker in the canonical auth home, exclusive or (when enabled)
-  shared, held for the whole process lifetime including descendants;
+  shared, held for the whole run. Consumers never receive the lease
+  descriptor: any holder of it could release the lock for every holder;
 * starts a lease guardian before any auth-using process. The guardian holds an
   inherited lease descriptor, so a cancelled, failing or killed supervisor
   cannot release the lease before the run's processes and labelled containers
@@ -54,12 +55,21 @@ import time
 import unicodedata
 import urllib.parse
 
-SUPERVISOR_VERSION = "1.2.0"
+SUPERVISOR_VERSION = "1.3.0"
 CONFIG_SCHEMA = "gptgrep.codex-auth.config.v1"
 RUN_SCHEMA = "gptgrep.codex-auth.run.v1"
 LEDGER_SCHEMA = "gptgrep.codex-auth.ledger.v1"
 BINDING_SCHEMA = "gptgrep.codex-auth.lease-binding.v1"
 BINDING_NAME = ".gptgrep-codex-auth-binding.json"
+# A consumer reports an auth failure by writing this record (in its results
+# directory, named by GPTGREP_AUTH_FAILURE_RECORD) AND exiting 77. Exit 77 alone
+# is also sysexits EX_NOPERM, so it no longer blocks other consumers.
+AUTH_FAILURE_SCHEMA = "gptgrep.codex-auth.auth-failure.v1"
+AUTH_FAILURE_RECORD = "auth-failure.json"
+AUTH_FAILURE_CLASSES = ("AUTH_UNAUTHORIZED", "AUTH_NOT_LOGGED_IN", "AUTH_UNEXPECTED_ACCOUNT_TYPE",
+                        "AUTH_REFRESH_REJECTED")
+AUTH_FAILURE_RECORD_MAX_BYTES = 4096
+CREDENTIAL_LINK_REPORT_LIMIT = 32
 
 EXIT_PASS = 0
 EXIT_USAGE = 64
@@ -442,10 +452,10 @@ def _reopens(path, denied, resolve=False):
     return any(is_within(_path_key(p), _path_key(d)) for p in paths for d in denies)
 
 
-def _is_run_auth_link(path, runs_root, resolve=False):
-    """True for RUNS_ROOT/<role>/<run-id>/codex-home/auth.json, or a path inside it,
-    for every role and run id and in any spelling (with `resolve`, also once symlinks
-    are resolved)."""
+def _is_run_path(path, runs_root, parts, resolve=False):
+    """True for RUNS_ROOT/<role>/<run-id>/<parts...>, or a path inside it, for every
+    role and run id and in any spelling (with `resolve`, also once symlinks are
+    resolved)."""
     paths, roots = {str(path)}, {str(runs_root)}
     if resolve:
         paths.add(os.path.realpath(path))
@@ -453,9 +463,14 @@ def _is_run_auth_link(path, runs_root, resolve=False):
     for candidate in paths:
         for root in roots:
             key, base = _path_key(candidate), _path_key(root)
-            if is_within(key, base) and Path(key).relative_to(base).parts[2:4] == ("codex-home", "auth.json"):
+            if is_within(key, base) and Path(key).relative_to(base).parts[2:2 + len(parts)] == tuple(parts):
                 return True
     return False
+
+
+def _is_run_auth_link(path, runs_root, resolve=False):
+    """True for RUNS_ROOT/<role>/<run-id>/codex-home/auth.json, or a path inside it."""
+    return _is_run_path(path, runs_root, ("codex-home", "auth.json"), resolve)
 
 
 class Config:
@@ -700,12 +715,120 @@ def canonical_preflight(cfg):
         raise SupervisorError("canonical_auth_not_0600", "BLOCKED_AUTH", EXIT_BLOCKED_AUTH)
     if meta["size"] <= 0:
         raise SupervisorError("canonical_auth_empty", "BLOCKED_AUTH", EXIT_BLOCKED_AUTH)
+    # Codex saves in place and a re-login installs by rename, so the file always has
+    # one link. Another link is a credential copy at an unknown place (it survives a
+    # rotation, and an archive or tool reading it reads the credential).
+    if meta["nlink"] != 1:
+        raise SupervisorError("canonical_auth_hardlinked", "QUARANTINED", EXIT_QUARANTINED,
+                              detail="nlink=%d" % meta["nlink"])
     return meta
+
+
+def preflight_or_quarantine(cfg, run_id, operation, receipt):
+    """The canonical preflight of a command about to use the credential. An extra hard
+    link also writes the quarantine marker: its location is unknown, so a human must
+    find and remove it (README, failure recovery)."""
+    try:
+        return canonical_preflight(cfg)
+    except SupervisorError as exc:
+        if exc.reason == "canonical_auth_hardlinked":
+            receipt["quarantine"] = write_quarantine(cfg, "CANONICAL_HARDLINKED", run_id, {
+                "operation": operation, "phase": "preflight",
+                "canonical_nlink": canonical_metadata(cfg).get("nlink")})
+        raise
 
 
 def canonical_changed(before, after):
     keys = ("exists", "mtime_ns", "size", "ino", "dev")
     return any(before.get(k) != after.get(k) for k in keys)
+
+
+def canonical_identities(*metas):
+    """(st_dev, st_ino) of the canonical file in the given lstat records."""
+    return {(meta["dev"], meta["ino"]) for meta in metas if meta and meta.get("exists") and "ino" in meta}
+
+
+def _symlink_reaches_credential(cfg, dirpath, name, dirfd, identities):
+    """A symlink through which the credential can be read: it resolves (through any
+    chain of links) to the canonical file, or to a directory that contains it, which an
+    archive that follows symlinks would copy. stat/realpath only; nothing is opened."""
+    try:
+        target = os.stat(name, dir_fd=dirfd)
+        if (target.st_dev, target.st_ino) in identities:
+            return True
+    except OSError:
+        pass
+    resolved = os.path.realpath(os.path.join(dirpath, name))
+    return is_within(_path_key(cfg.canonical_auth_file), _path_key(resolved))
+
+
+def _remove_credential_link(cfg, dirfd, name, info, kind):
+    """Remove one extra link, never the credential. The entry is unlinked by name in its
+    own directory descriptor, so no symlink in its path can redirect the removal. A hard
+    link is removed only while the canonical path still names the same file and so keeps
+    another link: a consumer that moved or replaced the canonical file may have left the
+    only copy of the original here, which stays for review."""
+    item = {"kind": kind, "removed": False}
+    if kind == "hardlink":
+        try:
+            canonical = os.lstat(cfg.canonical_auth_file)
+        except OSError:
+            canonical = None
+        if canonical is None or not stat.S_ISREG(canonical.st_mode) or canonical.st_nlink < 2 or \
+                (canonical.st_dev, canonical.st_ino) != (info.st_dev, info.st_ino):
+            item["kept"] = "canonical_path_keeps_no_other_link"
+            return item
+    try:
+        current = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino, stat.S_IFMT(current.st_mode)) != \
+                (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode)):
+            item["kept"] = "entry_changed"
+            return item
+        os.unlink(name, dir_fd=dirfd)
+        item["removed"] = True
+    except OSError as exc:
+        item["error"] = errno_name(exc)
+    return item
+
+
+def credential_links(cfg, layout, identities):
+    """Find and remove hard links and symlinks to the canonical credential below the run
+    directory, other than the run's own auth link (`codex-home/auth.json`, which
+    `link_state` judges). A consumer can create them through its link, and an archive of
+    `results/` would then carry the credential. Metadata only (lstat, stat, readlink via
+    realpath): nothing is opened. The walk never follows a symlink (`os.fwalk` re-checks
+    each directory it enters). Returns a non-secret summary with run-relative paths."""
+    top = str(layout.run_dir)
+    links, errors = [], []
+    try:
+        for dirpath, dirnames, filenames, dirfd in os.fwalk(top, follow_symlinks=False,
+                                                            onerror=lambda exc: errors.append(errno_name(exc))):
+            rel = os.path.relpath(dirpath, top)
+            for name in dirnames + filenames:
+                if rel == "codex-home" and name == "auth.json":
+                    continue
+                try:
+                    info = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+                except OSError as exc:
+                    errors.append(errno_name(exc))
+                    continue
+                if stat.S_ISREG(info.st_mode) and (info.st_dev, info.st_ino) in identities:
+                    kind = "hardlink"
+                elif stat.S_ISLNK(info.st_mode) and _symlink_reaches_credential(cfg, dirpath, name, dirfd,
+                                                                                identities):
+                    kind = "symlink"
+                else:
+                    continue
+                item = _remove_credential_link(cfg, dirfd, name, info, kind)
+                item["path"] = os.path.normpath(os.path.join(rel, name))
+                links.append(item)
+                if name in dirnames:
+                    dirnames.remove(name)  # a symlink is never entered; do not revisit a removed one
+    except OSError as exc:
+        errors.append(errno_name(exc))
+    return {"found": len(links), "removed": sum(1 for item in links if item["removed"]),
+            "links": links[:CREDENTIAL_LINK_REPORT_LIMIT], "scan_errors": len(errors),
+            "canonical_nlink_after": canonical_metadata(cfg).get("nlink")}
 
 
 def refresh_due(cfg):
@@ -732,7 +855,12 @@ def process_start_time(pid, ps_bin="/bin/ps"):
 
 class Lease:
     """flock on one lock file per auth source. Never LOCK_UN; the kernel releases
-    the lock when the last descriptor sharing this open file description closes."""
+    the lock when the last descriptor sharing this open file description closes.
+
+    Any holder of that open file description can release the lock for all holders
+    with flock(LOCK_UN). It is therefore shared only with the lease guardian and
+    the pinned official owner and re-login processes, never with a consumer (whose
+    model tool commands would inherit it)."""
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -994,6 +1122,7 @@ class Layout:
         self.tmp = self.run_dir / "tmp"
         self.work_dir = self.run_dir / "work"
         self.results = self.run_dir / "results"
+        self.auth_failure_record = self.results / AUTH_FAILURE_RECORD
         self.auth_link = self.codex_home / "auth.json"
         self.marker = self.state_dir / "lease-holder.marker"
         self.events = self.state_dir / "supervisor-events.jsonl"
@@ -1215,8 +1344,9 @@ def base_env(cfg, layout, run_id):
     return env
 
 
-def build_consumer_env(cfg, role, layout, parent_env, lease_fd=None):
-    """Allowlist only: nothing is inherited unless named for the role."""
+def build_consumer_env(cfg, role, layout, parent_env):
+    """Allowlist only: nothing is inherited unless named for the role. No lease
+    descriptor is named or passed: the lease guardian holds the lease for the run."""
     spec = cfg.role(role)
     env = base_env(cfg, layout, layout.run_id)
     if spec["path_env"]:
@@ -1225,13 +1355,13 @@ def build_consumer_env(cfg, role, layout, parent_env, lease_fd=None):
     env["CODEX_REFRESH_TOKEN_URL_OVERRIDE"] = cfg.blocker_url
     # Codex derives the revoke endpoint from the refresh override when unset; make it explicit.
     env["CODEX_REVOKE_TOKEN_URL_OVERRIDE"] = cfg.revoke_blocker_url
+    # Where a consumer writes its auth-failure record before exiting 77.
+    env["GPTGREP_AUTH_FAILURE_RECORD"] = str(layout.auth_failure_record)
     passed = []
     for name in spec["passthrough_env"]:
         if name in parent_env:
             env[name] = parent_env[name]
             passed.append(name)
-    if lease_fd is not None:
-        env["GPTGREP_AUTH_LEASE_FD"] = str(lease_fd)
     for name in STRIPPED_ALWAYS:
         env.pop(name, None)
     if not spec["allow_openrouter"]:
@@ -1371,34 +1501,48 @@ def _codex_root_path(base, value, home):
     return os.path.normpath(os.path.join(str(base), value))
 
 
+def _inside_own_dirs(path, own_keys):
+    """True when a root is one of this run's own directories or lies inside one, both
+    as written (lexically normalized, as Codex resolves `-C`/`--add-dir`) and with
+    symlinks resolved (as Codex's sandbox canonicalizes each writable root)."""
+    return all(any(is_within(_path_key(form), key) for key in own_keys)
+               for form in (path, os.path.realpath(path)))
+
+
 def codex_project_root_violation(argv, layout, denied, runs_root):
     """(reason, `FLAG PATH`) for the first `-C/--cd` or `--add-dir` of a Codex command
     line that Codex would turn into an unsafe writable project root, or None.
 
-    A project root is more specific than any deny above it, so a root equal to or
-    inside a denied path reopens that path (`consumer_argv_reopens_denied_path`).
-    A root inside the runs root other than this run's work, results, tmp and home
-    directories, or one that contains the runs root, would let tool commands rewrite
-    a generated config.toml or the supervisor's records of this or another run
-    (`consumer_argv_root_overlaps_run_state`). Values are resolved like Codex does:
-    `~` is the run's home, relative values are resolved against the consumer's
-    working directory, and an added directory also against each `-C` directory.
-    Spellings and symlinks are compared as in `_reopens`."""
+    This run's own work, results, tmp and home directories are its intended writable
+    roots: Codex makes the working directory one even without `-C`. A root that is one
+    of them, or lies inside one, both as written and resolved, is allowed before any
+    other check, also when a broad deny such as `/Users` contains the runs root (the
+    production Judge runs `codex exec -C {work_dir}` with that deny).
+
+    Any other root is checked. A project root is more specific than any deny above it,
+    so a root equal to or inside a denied path reopens that path
+    (`consumer_argv_reopens_denied_path`). A root inside the runs root, or one that
+    contains it, would let tool commands rewrite a generated config.toml or the
+    supervisor's records of this or another run (`consumer_argv_root_overlaps_run_state`).
+    Values are resolved like Codex does: `~` is the run's home, relative values are
+    resolved against the consumer's working directory, and an added directory also
+    against each `-C` directory. Spellings and symlinks are compared as in `_reopens`."""
     options = _codex_options(argv)
     cwd, home = layout.work_dir, layout.home
-    own = [layout.work_dir, layout.results, layout.tmp, layout.home]
+    own = [str(path) for path in (layout.work_dir, layout.results, layout.tmp, layout.home)]
+    own_keys = [_path_key(path) for path in dict.fromkeys(own + [os.path.realpath(path) for path in own])]
     bases = [str(cwd)] + [_codex_root_path(cwd, value, home)
                           for name, value in options if name in ("-C", "--cd") and value]
     for name, value in options:
         if name not in CODEX_WORKSPACE_ROOT_FLAGS or not value:
             continue
         paths = [_codex_root_path(base, value, home) for base in (bases if name == "--add-dir" else bases[:1])]
+        paths = [path for path in paths if not _inside_own_dirs(path, own_keys)]
         for path in paths:
             if any(_reopens(path, item, resolve=True) for item in denied):
                 return "consumer_argv_reopens_denied_path", name + " " + path
         for path in paths:
-            overlaps = _reopens(path, runs_root, resolve=True) or _reopens(runs_root, path, resolve=True)
-            if overlaps and not any(_reopens(path, item, resolve=True) for item in own):
+            if _reopens(path, runs_root, resolve=True) or _reopens(runs_root, path, resolve=True):
                 return "consumer_argv_root_overlaps_run_state", name + " " + path
     return None
 
@@ -1932,6 +2076,15 @@ def guardian_keep(cfg, layout, kind, mode, baseline, docker_label, sidecar):
     if kind == "owner" and mode == "takeover":
         ledger(cfg, {"run_id": layout.run_id, "decision": "OWNER_INTERRUPTED", "canonical_changed": changed,
                      "canonical_before": baseline, "canonical_after": after})
+    # Survivors may have linked the credential into the run directory after the
+    # supervisor's own scan.
+    links = credential_links(cfg, layout, canonical_identities(baseline, after))
+    outcome["credential_links"] = links
+    if links["found"] or (links["canonical_nlink_after"] or 1) > 1:
+        outcome["credential_link_quarantine"] = write_quarantine(
+            cfg, "CREDENTIAL_LINK_IN_RUN_DIR" if links["found"] else "CANONICAL_HARDLINKED", layout.run_id, {
+                "operation": kind, "guardian_mode": mode, "found": links["found"], "removed": links["removed"],
+                "canonical_nlink": links["canonical_nlink_after"]})
     link = layout.release_auth_link(cfg)
     outcome["auth_link_final"] = link
     if link.get("present") and not link.get("released"):
@@ -2296,7 +2449,7 @@ def owner_refresh(cfg, run_id, force, lease, parent_env, receipt, layout):
     lease handed to the guardian."""
     assert lease.mode == "exclusive"
     receipt["refresh"] = {"forced": bool(force), "max_age_seconds": cfg.refresh_max_age_seconds}
-    before = canonical_preflight(cfg)
+    before = preflight_or_quarantine(cfg, run_id, "refresh", receipt)
     receipt["canonical_before"] = before
     age = max(0.0, time.time() - before["mtime_ns"] / 1e9)
     auth_block = auth_block_state(cfg)
@@ -2316,6 +2469,8 @@ def owner_refresh(cfg, run_id, force, lease, parent_env, receipt, layout):
     layout.event("owner_launch")
     receipt["timings"]["owner_started_at"] = utc_iso()
     try:
+        # The pinned official app-server (no tool commands) keeps the lease even if the
+        # supervisor and the guardian are both killed during its in-place save.
         proc = subprocess.Popen(argv, cwd=str(layout.work_dir), env=env, stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=stderr_log, start_new_session=True,
                                 pass_fds=(lease.fd,))
@@ -2600,11 +2755,11 @@ def command_run(cfg, args):
 
 
 def _run_consumer(cfg, args, spec, layout, lease, receipt, signals, deadline):
-    before = canonical_preflight(cfg)
+    before = preflight_or_quarantine(cfg, args.run_id, "run", receipt)
     receipt["canonical_before"] = before
     receipt["blocker_probe"] = check_blocker_closed(cfg)
     layout.link_auth(cfg)
-    env, passed = build_consumer_env(cfg, args.role, layout, dict(os.environ), lease.fd)
+    env, passed = build_consumer_env(cfg, args.role, layout, dict(os.environ))
     argv = substitute(args.command, layout)
     receipt.update({"argv": argv, "cwd": str(layout.work_dir), "env_keys": sorted(env),
                     "passthrough_env": passed, "stripped_env": list(STRIPPED_ALWAYS)})
@@ -2616,10 +2771,13 @@ def _run_consumer(cfg, args, spec, layout, lease, receipt, signals, deadline):
     stdout_log = _open_log(layout.log_dir / "child.stdout.log")
     stderr_log = _open_log(layout.log_dir / "child.stderr.log")
     try:
+        # Only the marker descriptor is inherited (survivor tracking). The lease
+        # descriptor stays with the supervisor and the guardian: a model tool command
+        # holding it could release the lease for everyone with flock(LOCK_UN).
         proc = subprocess.Popen(argv, cwd=str(layout.work_dir), env=env,
                                 stdin=None if args.stdin == "inherit" else subprocess.DEVNULL,
                                 stdout=stdout_log, stderr=stderr_log, start_new_session=True,
-                                pass_fds=(lease.fd, marker_fd))
+                                pass_fds=(marker_fd,))
     except OSError as exc:
         receipt["launch_error"] = errno_name(exc)
         receipt["auth_link_final"] = layout.release_auth_link(cfg)
@@ -2733,6 +2891,9 @@ def _supervise(cfg, args, spec, layout, receipt, proc, tracker, guardian, docker
         receipt["anomalies"].append({"code": "RUN_CODEX_HOME_MODE_RESTORED"})
     changed = canonical_changed(before, after)
     receipt["canonical_changed"] = changed
+    identities = canonical_identities(before, after)
+    links = credential_links(cfg, layout, identities)
+    receipt["credential_links"] = links
     reasons = []
     if changed:
         reasons.append("CANONICAL_CHANGED_BY_CONSUMER")
@@ -2746,18 +2907,76 @@ def _supervise(cfg, args, spec, layout, receipt, proc, tracker, guardian, docker
     elif not (link.get("symlink") and link.get("target_matches") and link.get("home_physical")):
         # A per-run login or credential copy, or a redirected link: forbidden.
         reasons.append("RUN_AUTH_LINK_REPLACED")
+    if links["found"]:
+        # A hard link or symlink to the credential below the run directory: removed, but
+        # it shows the consumer reached for a copy of the credential.
+        reasons.append("CREDENTIAL_LINK_IN_RUN_DIR")
+    if (links["canonical_nlink_after"] or 1) > 1:
+        # An extra hard link remains somewhere outside this run directory.
+        reasons.append("CANONICAL_HARDLINKED")
+    if links["scan_errors"]:
+        receipt["anomalies"].append({"code": "CREDENTIAL_LINK_SCAN_INCOMPLETE", "errors": links["scan_errors"]})
     for reason in reasons:
         if reason != "BLOCKER_LISTENER_APPEARED":
             receipt["anomalies"].append({"code": reason})
     if reasons:
         receipt["quarantine"] = write_quarantine(cfg, reasons[0], args.run_id, {
             "role": args.role, "operation": "run", "reasons": reasons})
-    auth_failed = child_code == EXIT_BLOCKED_AUTH and not timed_out and not cancelled
+    # Exit 77 is also sysexits EX_NOPERM: it blocks other consumers only together with
+    # the consumer's auth-failure record.
+    auth_class = None
     if child_code == EXIT_BLOCKED_AUTH:
-        receipt["auth_block"] = write_auth_block(cfg, "CONSUMER_REPORTED_AUTH_FAILURE", args.run_id, {
-            "role": args.role, "child_exit_code": child_code})
+        auth_class, record = read_auth_failure_record(layout, identities)
+        receipt["auth_failure_record"] = record
+        if auth_class is None:
+            receipt["anomalies"].append({"code": "CONSUMER_EXIT_77_WITHOUT_AUTH_FAILURE_RECORD"})
+        else:
+            receipt["auth_block"] = write_auth_block(cfg, "CONSUMER_REPORTED_AUTH_FAILURE", args.run_id, {
+                "role": args.role, "child_exit_code": child_code, "auth_failure_class": auth_class})
+    auth_failed = auth_class is not None and not timed_out and not cancelled
     return _final_state(child_code, timed_out, cancelled, result["survivor_pids"], docker_uncleared,
                         result["inconclusive"] or link_inconclusive, bool(reasons), auth_failed)
+
+
+def read_auth_failure_record(layout, identities):
+    """(class or None, non-secret summary) of the consumer's auth-failure record,
+    `results/auth-failure.json` = {"schema": AUTH_FAILURE_SCHEMA, "class": one of
+    AUTH_FAILURE_CLASSES}. It is consumer-written, so it is read only when it is this
+    uid's regular file with one link that is not the credential and at most 4 KiB
+    (lstat, then O_NOFOLLOW and the same checks on the opened descriptor)."""
+    path = layout.auth_failure_record
+    summary = {"present": False, "valid": False}
+
+    def unsafe(info):
+        return (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or
+                info.st_size > AUTH_FAILURE_RECORD_MAX_BYTES or (info.st_dev, info.st_ino) in identities)
+
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None, summary
+    except OSError as exc:
+        return None, dict(summary, present=None, rejected=errno_name(exc))
+    summary["present"] = True
+    if unsafe(info):
+        return None, dict(summary, rejected="unsafe_file")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError as exc:
+        return None, dict(summary, rejected=errno_name(exc))
+    with os.fdopen(fd, "rb") as handle:
+        opened = os.fstat(handle.fileno())
+        if unsafe(opened) or (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+            return None, dict(summary, rejected="changed_while_opening")
+        data = handle.read(AUTH_FAILURE_RECORD_MAX_BYTES + 1)
+    try:
+        record = json.loads(data)
+    except ValueError:
+        return None, dict(summary, rejected="invalid_json")
+    if not isinstance(record, dict) or record.get("schema") != AUTH_FAILURE_SCHEMA or \
+            record.get("class") not in AUTH_FAILURE_CLASSES:
+        return None, dict(summary, rejected="schema_or_class")
+    return record["class"], dict(summary, valid=True, failure_class=record["class"])
 
 
 # --------------------------------------------------------------------------- maintenance
@@ -3047,13 +3266,70 @@ def classify_probe(steps):
     return "SERVICE_UNAVAILABLE"
 
 
+def _probe_protected(codex_home):
+    """What an account probe may never write into: the canonical auth home and the lease
+    directory (named in this run's manifest, which the supervisor writes before launch)
+    and the codex-home of every run below the runs root. Also the canonical file's
+    identity, by stat through the run's own link (metadata only)."""
+    home = Path(os.path.abspath(codex_home))
+    run_dir = home.parent
+    try:
+        if home.name != "codex-home":
+            raise ValueError("not a run home")
+        manifest = read_small_json(run_dir / "manifest.json", 4 << 20)
+        auth_home = _abs(manifest["canonical_auth_home"], "manifest.canonical_auth_home")
+        lease_dir = _abs(manifest["lease"]["path"], "manifest.lease.path").parent
+    except (OSError, ValueError, KeyError, TypeError, SupervisorError):
+        raise SupervisorError("account_probe_requires_supervised_consumer_env") from None
+    identities = set()
+    for candidate in (home / "auth.json", auth_home / "auth.json"):
+        try:
+            info = os.stat(candidate)
+        except OSError:
+            continue
+        identities.add((info.st_dev, info.st_ino))
+    return [auth_home, lease_dir], run_dir.parent.parent, identities
+
+
+def _probe_output_path(value, protected, runs_root, flag):
+    """An output of the account probe, refused when it is equal to or inside the canonical
+    auth home, the lease directory or any run's codex-home (in any spelling, symlinks
+    resolved): an append through `{codex_home}/auth.json` would write into the credential."""
+    path = os.path.abspath(value)
+    if any(_reopens(path, root, resolve=True) for root in protected) or \
+            _is_run_path(path, runs_root, ("codex-home",), resolve=True):
+        raise SupervisorError("account_probe_output_in_protected_path", detail=flag)
+    return path
+
+
+def _open_probe_log(path, identities):
+    """Append to the stderr log without ever reaching the credential: the last component
+    is never followed (O_NOFOLLOW), a missing file is created 0600, and the opened file
+    must be this uid's regular file with a single link that is not the canonical file (an
+    existing hard link would otherwise let the append write into the credential)."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                     0o600)
+    except OSError as exc:
+        raise SupervisorError("account_probe_stderr_log_refused", detail=errno_name(exc)) from None
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or \
+            (info.st_dev, info.st_ino) in identities:
+        os.close(fd)
+        raise SupervisorError("account_probe_stderr_log_refused", detail="not_a_private_single_link_file")
+    os.set_blocking(fd, True)
+    return os.fdopen(fd, "ab")
+
+
 def command_account_probe(args):
     """Consumer-side, non-model live check: initialize + account/read (refreshToken=false).
 
-    Must run inside `run` (the refresh blocker must already be in the environment).
+    Must run inside `run` (the refresh blocker and the run's manifest must exist).
     Records only the account type and a failure class. Exit 0 (account readable),
-    77 (explicit auth failure: the supervisor's BLOCKED_AUTH contract) or 69
-    (service unavailable: network, rate limit or server error)."""
+    77 with the auth-failure record (explicit auth failure: the supervisor's
+    BLOCKED_AUTH contract) or 69 (service unavailable: network, rate limit or server
+    error). `--out`, `--stderr-log` and the record are refused inside the canonical
+    auth home, the lease directory or any run's codex-home."""
     blocker = os.environ.get("CODEX_REFRESH_TOKEN_URL_OVERRIDE")
     try:
         _loopback_url(blocker, "CODEX_REFRESH_TOKEN_URL_OVERRIDE")
@@ -3062,9 +3338,17 @@ def command_account_probe(args):
     if "CODEX_HOME" not in os.environ:
         raise SupervisorError("account_probe_requires_supervised_consumer_env")
     codex_bin = _abs(args.codex_bin, "--codex-bin")
-    out = Path(args.out)
-    stderr_path = Path(args.stderr_log) if args.stderr_log else Path(os.devnull)
-    with open(stderr_path, "ab") as stderr_log:
+    protected, runs_root, identities = _probe_protected(os.environ["CODEX_HOME"])
+    out = _probe_output_path(args.out, protected, runs_root, "--out")
+    record_path = os.environ.get("GPTGREP_AUTH_FAILURE_RECORD")
+    if record_path:
+        record_path = _probe_output_path(record_path, protected, runs_root, "GPTGREP_AUTH_FAILURE_RECORD")
+    if args.stderr_log:
+        stderr_log = _open_probe_log(_probe_output_path(args.stderr_log, protected, runs_root, "--stderr-log"),
+                                     identities)
+    else:
+        stderr_log = open(os.devnull, "ab")
+    with stderr_log:
         proc = subprocess.Popen([str(codex_bin), "app-server", "--listen", "stdio://", "--strict-config"],
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr_log)
     client = RpcClient(proc)
@@ -3091,6 +3375,12 @@ def command_account_probe(args):
     result = {"schema": "gptgrep.codex-auth.account-probe.v1", "rpc": steps, "app_server_exit": proc.returncode,
               "refresh_requested": False, "model_request_sent": False, "account_ok": outcome == "OK",
               "outcome": outcome}
+    if outcome.startswith("AUTH_") and record_path:
+        try:
+            write_new_private(record_path, json.dumps({"schema": AUTH_FAILURE_SCHEMA, "class": outcome}) + "\n")
+            result["auth_failure_record_written"] = True
+        except OSError as exc:
+            result["auth_failure_record_error"] = errno_name(exc)
     write_new_private(out, json.dumps(result, indent=2, sort_keys=True) + "\n")
     if outcome == "OK":
         return result, EXIT_PASS
@@ -3174,7 +3464,7 @@ def main(argv=None):
         try:
             result, code = command_account_probe(args)
         except SupervisorError as exc:
-            result, code = {"state": exc.state, "refusal": {"reason": exc.reason}}, exc.exit_code
+            result, code = {"state": exc.state, "refusal": {"reason": exc.reason, "detail": exc.detail}}, exc.exit_code
         print(json.dumps(result, sort_keys=True, default=str))
         return code
     if not args.config:
