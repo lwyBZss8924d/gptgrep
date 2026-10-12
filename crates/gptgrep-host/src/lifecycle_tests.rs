@@ -810,12 +810,12 @@ async fn planned_ask_runs_two_distinct_turns_with_original_question_and_summed_u
         &json!({"answer":"It uses a ceramic chamber.",
         "citations":[citation],"insufficient_evidence":false}),
     );
-    let (client, jev_server) = crate::query_plan::tests::mock_jev(vec![200; 4]).await;
+    let (client, jev_server) = crate::query_plan::tests::mock_jev(vec![200]).await;
     let question = "  Explain ember storage.\n";
     let report = execute_with_client(root.path(), question, None, &config, Some(client))
         .await
         .unwrap();
-    assert_eq!(jev_server.await.unwrap().len(), 4);
+    assert_eq!(jev_server.await.unwrap().len(), 1);
     assert_eq!(report.status, "completed");
     assert_eq!(report.query_plan.as_ref().unwrap().status, "completed");
     assert_eq!(
@@ -915,7 +915,7 @@ async fn reader_validation_failures_preserve_completed_planner_and_both_turn_usa
         let (root, _) = planner_corpus().await;
         let home = tempfile::tempdir().unwrap();
         let config = two_process_mock(home.path(), &answer);
-        let (client, jev_server) = crate::query_plan::tests::mock_jev(vec![200; 4]).await;
+        let (client, jev_server) = crate::query_plan::tests::mock_jev(vec![200]).await;
         let error = execute_with_client(
             root.path(),
             "Explain ember storage.",
@@ -925,7 +925,7 @@ async fn reader_validation_failures_preserve_completed_planner_and_both_turn_usa
         )
         .await
         .unwrap_err();
-        assert_eq!(jev_server.await.unwrap().len(), 4);
+        assert_eq!(jev_server.await.unwrap().len(), 1);
         let error = error.downcast_ref::<HostRetrievalError>().unwrap();
         assert_eq!(error.stage, "citation_validation");
         assert_eq!(error.query_plan.as_ref().unwrap().status, "completed");
@@ -993,7 +993,7 @@ async fn integrated_budget_finalization_counts_latest_reader_usage_once_and_pres
     let mut config =
         two_process_mock_with_budget(home.path(), &budget_answer(&citation), Some("completed"));
     config.max_tool_calls = 1;
-    let (client, server) = crate::query_plan::tests::mock_jev(vec![200; 4]).await;
+    let (client, server) = crate::query_plan::tests::mock_jev(vec![200]).await;
     let report = execute_with_client(
         root.path(),
         "Explain ember storage.",
@@ -1005,7 +1005,7 @@ async fn integrated_budget_finalization_counts_latest_reader_usage_once_and_pres
     .unwrap();
     assert_eq!(
         server.await.unwrap().len(),
-        4,
+        1,
         "Denied search must not invoke Jev"
     );
     assert_eq!(
@@ -1025,7 +1025,7 @@ async fn integrated_budget_finalization_counts_latest_reader_usage_once_and_pres
         report.model_attempts[1].usage.as_ref().unwrap()["total"]["totalTokens"],
         40
     );
-    assert_eq!(report.jev.requests, 4);
+    assert_eq!(report.jev.requests, 1);
     assert!(
         report
             .tool_calls
@@ -1061,7 +1061,7 @@ async fn integrated_budget_failures_keep_identity_usage_and_original_deadline() 
             two_process_mock_with_budget(home.path(), &budget_answer(&citation), Some(ending));
         config.max_tool_calls = 1;
         config.timeout_secs = 2;
-        let (client, server) = crate::query_plan::tests::mock_jev(vec![200; 4]).await;
+        let (client, server) = crate::query_plan::tests::mock_jev(vec![200]).await;
         let started = Instant::now();
         let error = execute_with_client(
             root.path(),
@@ -1072,7 +1072,7 @@ async fn integrated_budget_failures_keep_identity_usage_and_original_deadline() 
         )
         .await
         .unwrap_err();
-        assert_eq!(server.await.unwrap().len(), 4);
+        assert_eq!(server.await.unwrap().len(), 1);
         let failure = error.downcast_ref::<HostRetrievalError>().unwrap();
         assert_eq!(failure.model_attempts.len(), 2);
         assert_eq!(failure.model_attempts[0].status, "completed");
@@ -1115,7 +1115,7 @@ async fn integrated_budget_cancellation_retains_bound_partial_observations() {
     let mut config =
         two_process_mock_with_budget(home.path(), &budget_answer(&citation), Some("stall"));
     config.max_tool_calls = 1;
-    let (client, server) = crate::query_plan::tests::mock_jev(vec![200; 4]).await;
+    let (client, server) = crate::query_plan::tests::mock_jev(vec![200]).await;
     let mut running = Box::pin(execute_with_client(
         root.path(),
         "Explain ember storage.",
@@ -1148,7 +1148,7 @@ async fn integrated_budget_cancellation_retains_bound_partial_observations() {
         ledger = observed => ledger,
     };
     drop(running);
-    assert_eq!(server.await.unwrap().len(), 4);
+    assert_eq!(server.await.unwrap().len(), 1);
     tokio::time::sleep(Duration::from_millis(200)).await;
     let raw = std::fs::read_to_string(ledger_path).unwrap();
     let last: Value = serde_json::from_str(raw.lines().last().unwrap()).unwrap();
@@ -1178,7 +1178,7 @@ async fn evidence_roles_preserve_two_turns_budget_finalization_and_treatment_onl
         two_process_mock_with_budget(home.path(), &budget_answer(&citation), Some("completed"));
     config.query_plan.as_mut().unwrap().evidence_roles = true;
     config.max_tool_calls = 1;
-    let (client, server) = crate::evidence_roles::tests::mock_roles(4).await;
+    let (client, server) = crate::evidence_roles::tests::mock_roles(1).await;
     let report = execute_with_client(
         root.path(),
         "Explain ember storage.",
@@ -1189,7 +1189,7 @@ async fn evidence_roles_preserve_two_turns_budget_finalization_and_treatment_onl
     .await
     .unwrap();
     let requests = server.await.unwrap();
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 1);
     assert_eq!(
         (
             report.model_usage.attempted_calls,
@@ -1198,7 +1198,7 @@ async fn evidence_roles_preserve_two_turns_budget_finalization_and_treatment_onl
         (2, 2)
     );
     assert_eq!(report.model_usage.known_totals.total_tokens, Some(54));
-    assert_eq!(report.jev.requests, 4);
+    assert_eq!(report.jev.requests, 1);
     let roles = report.jev.searches[0]
         .plan
         .as_ref()

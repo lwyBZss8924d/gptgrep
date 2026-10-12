@@ -127,6 +127,9 @@ pub struct RichTextCoverage {
     /// Routing samples and structural windows are bounded, even if all docs fit.
     pub semantic_scope_complete: bool,
     pub delivered_set_sufficiency: &'static str,
+    /// `routed`, or `skipped_single_document` when exactly one routing
+    /// candidate is selected without a Decisions call.
+    pub routing_status: &'static str,
 }
 #[derive(Clone, Serialize)]
 pub struct RichTextHit {
@@ -510,6 +513,11 @@ pub fn prepare_rich_text_search(
             lexical_query_terms_truncated: locations.lexical_terms_truncated,
             semantic_scope_complete: false,
             delivered_set_sufficiency: "unassessed",
+            routing_status: if routing.len() == 1 {
+                "skipped_single_document"
+            } else {
+                "routed"
+            },
         },
         attempts: Vec::with_capacity(2),
         logical_calls_attempted: 0,
@@ -548,6 +556,8 @@ impl PreparedRichTextSearch {
     }
     /// Exact first-stage request; inspection neither charges nor submits it.
     /// Contains source text, so callers must not publish the body as telemetry.
+    /// With exactly one routing candidate it is only a bound: execution selects
+    /// that document without sending it (`coverage.routing_status`).
     pub fn routing_request(&self) -> &PreparedRerank {
         self.route_request
             .as_ref()
@@ -596,54 +606,61 @@ impl PreparedRichTextSearch {
                 "rich_decisions_source_or_deadline_invalid",
             ));
         }
-        self.report.attempts.push(RichTextAttempt::pending(
-            "document_routing",
-            self.route_request
-                .as_ref()
-                .expect("one prepared routing request"),
-        ));
-        self.report.logical_calls_attempted += 1;
-        let request = self
-            .route_request
-            .take()
-            .expect("one prepared routing request");
-        // The private field is moved once; a replacement is never sent.
-        let mut route = match self.client.submit_rerank(request).await {
-            Ok(response) => response,
-            Err(_) => {
-                self.report.elapsed_ms = self.started.elapsed().as_millis();
-                return Err(
-                    self.failure("document_routing", "rich_decisions_required_stage_failed")
-                );
-            }
-        };
-        if self.report.attempts[0].observe(&mut route).is_err() {
-            return Err(self.failure("document_routing", "rich_decisions_accounting_failed"));
-        }
-        self.report.validated_responses += 1;
-        self.report.elapsed_ms = self.started.elapsed().as_millis();
-        if observer(self.report.attempts.last().expect("observed attempt")).is_err() {
-            let stage = self.report.attempts.last().expect("observed attempt").stage;
-            return Err(self.failure(stage, "rich_decisions_observer_failed"));
-        }
-        if validate_pool(&self.reader, &self.client, &self.pool).is_err() {
-            return Err(self.failure(
+        // Routing selects the top-ranked documents regardless of score, so a
+        // single routing candidate is always selected: no Decisions call is
+        // made for it, and the rerank pool and request are unchanged.
+        let selected: Vec<usize> = if self.routing.len() == 1 {
+            vec![self.routing[0].1]
+        } else {
+            self.report.attempts.push(RichTextAttempt::pending(
                 "document_routing",
-                "rich_decisions_source_or_deadline_invalid",
+                self.route_request
+                    .as_ref()
+                    .expect("one prepared routing request"),
             ));
-        }
-        // Subsequent handling no longer needs the moved routing request.
-        let selected: Vec<_> = route
-            .rankings
-            .iter()
-            .take(4)
-            .filter_map(|rank| {
-                self.routing
-                    .iter()
-                    .find(|(id, _)| id == &rank.id)
-                    .map(|(_, index)| *index)
-            })
-            .collect();
+            self.report.logical_calls_attempted += 1;
+            let request = self
+                .route_request
+                .take()
+                .expect("one prepared routing request");
+            // The private field is moved once; a replacement is never sent.
+            let mut route = match self.client.submit_rerank(request).await {
+                Ok(response) => response,
+                Err(_) => {
+                    self.report.elapsed_ms = self.started.elapsed().as_millis();
+                    return Err(
+                        self.failure("document_routing", "rich_decisions_required_stage_failed")
+                    );
+                }
+            };
+            if self.report.attempts[0].observe(&mut route).is_err() {
+                return Err(self.failure("document_routing", "rich_decisions_accounting_failed"));
+            }
+            self.report.validated_responses += 1;
+            self.report.elapsed_ms = self.started.elapsed().as_millis();
+            if observer(self.report.attempts.last().expect("observed attempt")).is_err() {
+                let stage = self.report.attempts.last().expect("observed attempt").stage;
+                return Err(self.failure(stage, "rich_decisions_observer_failed"));
+            }
+            if validate_pool(&self.reader, &self.client, &self.pool).is_err() {
+                return Err(self.failure(
+                    "document_routing",
+                    "rich_decisions_source_or_deadline_invalid",
+                ));
+            }
+            // Subsequent handling no longer needs the moved routing request.
+            route
+                .rankings
+                .iter()
+                .take(4)
+                .filter_map(|rank| {
+                    self.routing
+                        .iter()
+                        .find(|(id, _)| id == &rank.id)
+                        .map(|(_, index)| *index)
+                })
+                .collect()
+        };
         self.report.coverage.selected_documents = selected.len();
         let positions: Vec<_> = self
             .pool
@@ -694,7 +711,14 @@ impl PreparedRichTextSearch {
                 );
             }
         };
-        if self.report.attempts[1].observe(&mut reranked).is_err() {
+        if self
+            .report
+            .attempts
+            .last_mut()
+            .expect("pending rerank attempt")
+            .observe(&mut reranked)
+            .is_err()
+        {
             return Err(self.failure("evidence_reranking", "rich_decisions_accounting_failed"));
         }
         self.report.validated_responses += 1;

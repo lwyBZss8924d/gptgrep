@@ -157,6 +157,17 @@ fn publish(root: &Path, texts: &[&str]) -> Result<GenerationPin> {
     writer.publish()
 }
 
+/// `source.pdf` plus a second routed document, so routing makes a call.
+fn publish_two(root: &Path, texts: &[&str]) -> Result<GenerationPin> {
+    let (other_staging, other) = candidate(root, &["unrelated companion text\n"])?;
+    fs::copy(root.join("source.pdf"), root.join("other.pdf"))?;
+    let (staging, parsed) = candidate(root, texts)?;
+    let mut writer = RichGenerationWriter::begin(root, ResourceBudget::default())?;
+    writer.add_document("other.pdf", &other_staging.path().canonicalize()?, other)?;
+    writer.add_document("source.pdf", &staging.path().canonicalize()?, parsed)?;
+    writer.publish()
+}
+
 fn context(limit: u32) -> Result<ExecutionContext> {
     ExecutionContext::new(
         "ordinary-rich-text-fixture",
@@ -261,13 +272,13 @@ fn client(endpoint: &str, context: ExecutionContext) -> Result<JevClient> {
 }
 
 #[tokio::test]
-async fn native_initial_pass_routes_unmatched_source_and_preserves_full_usage() -> Result<()> {
+async fn native_initial_pass_selects_single_unmatched_source_without_routing_call() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().canonicalize()?;
     publish(&root, &["An entirely distinct source statement.\n"])?;
     let reader = RichGenerationReader::open(&root)?;
     let execution = context(2)?;
-    let (endpoint, server) = mock(2, Arc::new(|_| Ok(())), false).await?;
+    let (endpoint, server) = mock(1, Arc::new(|_| Ok(())), false).await?;
     let prepared = prepare_rich_text_search(
         reader,
         client(&endpoint, execution.clone())?,
@@ -276,16 +287,27 @@ async fn native_initial_pass_routes_unmatched_source_and_preserves_full_usage() 
     )?;
     assert_eq!(prepared.pool.len(), 1);
     assert!(!prepared.pool[0].lexical);
+    assert_eq!(
+        prepared.report.coverage.routing_status,
+        "skipped_single_document"
+    );
+    // Routing would select the only document, so the rerank sends the full pool.
+    let full_pool = prepared.rerank_pool_request().canonical_body().to_vec();
     let reserved = prepared.reserved_output_bytes();
     let initial = prepared.execute().await?;
     let requests = server.await??;
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[1]["questions"].as_object().unwrap().len(), 1);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body, full_pool);
+    assert_eq!(requests[0]["questions"].as_object().unwrap().len(), 1);
     initial.validate()?;
     let report = initial.report();
     assert_eq!(report.hits.len(), 1);
-    assert_eq!(report.validated_responses, 2);
-    assert_eq!(report.logical_calls_attempted, 2);
+    assert_eq!(report.coverage.routed_documents, 1);
+    assert_eq!(report.coverage.selected_documents, 1);
+    assert_eq!(report.validated_responses, 1);
+    assert_eq!(report.logical_calls_attempted, 1);
+    assert_eq!(report.attempts.len(), 1);
+    assert_eq!(report.attempts[0].stage, "evidence_reranking");
     assert!(report.accounting_complete);
     assert!(
         report.attempts[0].full_usage()["unknown_detail"]
@@ -294,10 +316,37 @@ async fn native_initial_pass_routes_unmatched_source_and_preserves_full_usage() 
             .len()
             > 100000
     );
-    assert_eq!(report.attempts[1].usage.cost, Some(json!(0.001)));
+    assert_eq!(report.attempts[0].usage.cost, Some(json!(0.001)));
     let encoded = serde_json::to_vec(report)?;
     assert!(encoded.len() < reserved);
     assert!(!std::str::from_utf8(&encoded)?.contains("unknown_detail"));
+    assert_eq!(execution.snapshot()?.logical_reservations, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn two_routed_documents_still_make_the_routing_call() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    publish_two(&root, &["An entirely distinct source statement.\n"])?;
+    let execution = context(2)?;
+    let (endpoint, server) = mock(2, Arc::new(|_| Ok(())), false).await?;
+    let prepared = prepare_rich_text_search(
+        RichGenerationReader::open(&root)?,
+        client(&endpoint, execution.clone())?,
+        "maturity mechanism",
+        &RichTextSearchOptions::default(),
+    )?;
+    assert_eq!(prepared.report.coverage.routing_status, "routed");
+    let route = prepared.routing_request().canonical_body().to_vec();
+    let initial = prepared.execute().await?;
+    let requests = server.await??;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].body, route);
+    let report = initial.report();
+    assert_eq!(report.coverage.routed_documents, 2);
+    assert_eq!(report.logical_calls_attempted, 2);
+    assert_eq!(report.attempts[0].stage, "document_routing");
     assert_eq!(execution.snapshot()?.logical_reservations, 2);
     Ok(())
 }
@@ -368,7 +417,7 @@ async fn preflight_output_and_encoded_request_reject_before_admission() -> Resul
 async fn required_second_stage_failure_preserves_first_receipt_and_observer() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().canonicalize()?;
-    publish(&root, &["ordinary source\n"])?;
+    publish_two(&root, &["ordinary source\n"])?;
     let execution = context(2)?;
     let (endpoint, server) = mock(2, Arc::new(|_| Ok(())), true).await?;
     let seen = std::sync::Mutex::new(Vec::new());
@@ -405,7 +454,7 @@ async fn required_second_stage_failure_preserves_first_receipt_and_observer() ->
 async fn source_change_after_routing_stops_before_second_submission() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().canonicalize()?;
-    publish(&root, &["ordinary source\n"])?;
+    publish_two(&root, &["ordinary source\n"])?;
     let source = root.join("source.pdf");
     let execution = context(2)?;
     let (endpoint, server) = mock(
@@ -439,7 +488,7 @@ async fn source_change_after_routing_stops_before_second_submission() -> Result<
 async fn global_one_credit_is_measured_partial_failure_without_fallback() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().canonicalize()?;
-    publish(&root, &["ordinary source\n"])?;
+    publish_two(&root, &["ordinary source\n"])?;
     let execution = context(1)?;
     let (endpoint, server) = mock(1, Arc::new(|_| Ok(())), false).await?;
     let error = prepare_rich_text_search(
@@ -469,7 +518,7 @@ async fn retained_pin_survives_new_current_and_literal_ties_are_stable() -> Resu
     let old = RichGenerationReader::open_pinned(&root, &pin)?;
     let publish_root = root.clone();
     let (endpoint, server) = mock(
-        2,
+        1,
         Arc::new(move |ordinal| {
             if ordinal == 0 {
                 publish(&publish_root, &["new parser text\n"])?;
@@ -689,7 +738,7 @@ async fn saved_ocr_and_native_windows_remain_distinct_with_raw_region_receipt_bi
     let dir = tempfile::tempdir()?;
     let root = dir.path().canonicalize()?;
     publish_saved_ocr(&root)?;
-    let (endpoint, server) = mock(2, Arc::new(|_| Ok(())), false).await?;
+    let (endpoint, server) = mock(1, Arc::new(|_| Ok(())), false).await?;
     let initial = prepare_rich_text_search(
         RichGenerationReader::open(&root)?,
         client(&endpoint, context(2)?)?,
@@ -739,7 +788,7 @@ async fn saved_ocr_and_native_windows_remain_distinct_with_raw_region_receipt_bi
 async fn expired_original_context_and_observer_stop_do_not_submit_later_stage() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().canonicalize()?;
-    publish(&root, &["ordinary source\n"])?;
+    publish_two(&root, &["ordinary source\n"])?;
     let execution = ExecutionContext::new(
         "ordinary-short-deadline",
         &"a".repeat(64),
@@ -905,7 +954,7 @@ async fn literal_eligibility_remains_atomic_and_term_omission_is_reported() -> R
     let root = dir.path().canonicalize()?;
     publish(&root, &["ordinary source\n"])?;
     for (query, retained) in [("ordinary", true), ("ordinary source", false)] {
-        let (endpoint, server) = mock_with_score(2, Arc::new(|_| Ok(())), false, 0.0).await?;
+        let (endpoint, server) = mock_with_score(1, Arc::new(|_| Ok(())), false, 0.0).await?;
         let initial = prepare_rich_text_search(
             RichGenerationReader::open(&root)?,
             client(&endpoint, context(2)?)?,
@@ -935,7 +984,7 @@ async fn literal_eligibility_remains_atomic_and_term_omission_is_reported() -> R
 async fn saved_text_change_after_rerank_rejects_results_and_keeps_both_receipts() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().canonicalize()?;
-    let pin = publish(&root, &["ordinary source\n"])?;
+    let pin = publish_two(&root, &["ordinary source\n"])?;
     let reader = RichGenerationReader::open_pinned(&root, &pin)?;
     let relative = reader.manifest()?.documents[0].pages[0]
         .native_text

@@ -251,6 +251,12 @@ query-token overlap. A second, per-candidate Score pass orders the bounded union
 **Semantic** uses that tree lane without a lexical seed. Initial routing examines
 at most 32 document descriptions and the final pass at most 24 candidates; this is
 an explicit development budget, not exhaustive semantic search over a large corpus.
+Routing selects the top-ranked documents regardless of score, so when exactly one
+document can be routed (for example an explicit `--document` scope or a single
+fresh indexed document) it is selected without a routing Decisions call. Its tree
+candidates and the rerank request are unchanged, and `coverage.routing_status`
+reports `skipped_single_document` instead of `routed`. The rich text initial pass
+applies the same rule.
 Coverage reports expose the inspected scope and truncation. Hierarchical corpus
 routing and resumable expansion are subsequent scalability work.
 

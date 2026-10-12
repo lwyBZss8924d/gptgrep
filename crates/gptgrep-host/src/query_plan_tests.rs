@@ -173,12 +173,13 @@ async fn host_retrieval_reuses_the_supplied_shared_decisions_context() -> Result
         "ordinary needle source evidence",
     )?;
     gptgrep_core::index(directory.path(), 10).await?;
-    let (client, server) = mock_jev(vec![200, 200]).await;
+    // One scoped document: the seed is one rerank submission.
+    let (client, server) = mock_jev(vec![200]).await;
     let context = gptgrep_jev::ExecutionContext::new(
         "ordinary-shared-host-test",
         &"a".repeat(64),
         std::time::SystemTime::now() + std::time::Duration::from_secs(10),
-        2,
+        1,
     )?;
     let config = HostConfig {
         decisions_execution: Some(context.clone()),
@@ -189,9 +190,9 @@ async fn host_retrieval_reuses_the_supplied_shared_decisions_context() -> Result
     let accounting = Accounting::create(directory.path(), &evidence.generation)?;
     evidence.configure(&config, accounting, Some(client))?;
     evidence.bootstrap("needle").await?;
-    assert_eq!(server.await?.len(), 2);
-    assert_eq!(context.snapshot()?.logical_reservations, 2);
-    assert_eq!(context.snapshot()?.terminal_submissions, 2);
+    assert_eq!(server.await?.len(), 1);
+    assert_eq!(context.snapshot()?.logical_reservations, 1);
+    assert_eq!(context.snapshot()?.terminal_submissions, 1);
     assert!(
         evidence
             .call(
@@ -202,7 +203,7 @@ async fn host_retrieval_reuses_the_supplied_shared_decisions_context() -> Result
             .await
             .is_err()
     );
-    assert_eq!(context.snapshot()?.logical_reservations, 2);
+    assert_eq!(context.snapshot()?.logical_reservations, 1);
     Ok(())
 }
 
@@ -276,7 +277,8 @@ async fn planned_bootstrap_accounts_disjoint_stages_and_issues_only_delivered_sp
     )
     .unwrap();
     gptgrep_core::index(root.path(), 10).await.unwrap();
-    let (client, server) = mock_jev(vec![200; 4]).await;
+    // One scoped document: each view selects it without a routing call.
+    let (client, server) = mock_jev(vec![200]).await;
     let (mut evidence, accounting) = configured(root.path(), client, Some("ledger.md"));
     let question = "  Which items are stored in the copper archive?  ";
     accounting
@@ -288,10 +290,10 @@ async fn planned_bootstrap_accounts_disjoint_stages_and_issues_only_delivered_sp
         .await
         .unwrap();
     let requests = server.await.unwrap();
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 1);
     assert_eq!(requests.last().unwrap()["state"]["query"], question);
     let summary = accounting.summary();
-    assert_eq!((summary.attempted_calls, summary.requests), (4, 4));
+    assert_eq!((summary.attempted_calls, summary.requests), (1, 1));
     assert_eq!(summary.searches.len(), 1);
     assert_eq!(summary.initial_status, "reranked");
     assert!(summary.accounting_complete);
@@ -299,16 +301,24 @@ async fn planned_bootstrap_accounts_disjoint_stages_and_issues_only_delivered_sp
     assert!(search.coverage.is_none());
     let plan = search.plan.as_ref().unwrap();
     assert_eq!(plan.operations.len(), 4);
-    assert!(
-        plan.operations
-            .values()
-            .all(|operation| operation.metrics.jev_requests == 1)
-    );
-    assert!(
-        plan.operations
-            .values()
-            .all(|operation| operation.provider_response_id.is_some())
-    );
+    for (id, operation) in &plan.operations {
+        if id == "union.rerank" {
+            assert_eq!(operation.metrics.jev_requests, 1);
+            assert!(operation.provider_response_id.is_some());
+        } else {
+            assert_eq!(operation.metrics.jev_calls_attempted, 0);
+            assert!(operation.provider_response_id.is_none());
+            assert_eq!(
+                operation
+                    .coverage
+                    .as_ref()
+                    .unwrap()
+                    .routing_status
+                    .as_deref(),
+                Some("skipped_single_document")
+            );
+        }
+    }
     let seed = evidence.initial_payload.as_ref().unwrap();
     assert_eq!(seed["query"], question);
     assert_eq!(seed["document_scope"], "ledger.md");
@@ -366,6 +376,8 @@ async fn planned_branch_failure_keeps_partial_accounting_without_issuing_evidenc
         "Copper otters store blue beads.",
     )
     .unwrap();
+    // A second document keeps one routing call per view.
+    std::fs::write(root.path().join("other.txt"), "Unrelated archive notes.").unwrap();
     gptgrep_core::index(root.path(), 10).await.unwrap();
     let (client, server) = mock_jev(vec![200, 500, 0]).await;
     let (mut evidence, accounting) = configured(root.path(), client, None);
@@ -409,6 +421,8 @@ async fn cancelled_plan_retains_reply_and_marks_unfinished_operations() {
         "Copper otters store blue beads.",
     )
     .unwrap();
+    // A second document keeps one routing call per view.
+    std::fs::write(root.path().join("other.txt"), "Unrelated archive notes.").unwrap();
     gptgrep_core::index(root.path(), 10).await.unwrap();
     let (client, server) = mock_jev(vec![200, 0]).await;
     let (mut evidence, accounting) = configured(root.path(), client, None);

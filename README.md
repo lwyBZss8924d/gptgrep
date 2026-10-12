@@ -190,7 +190,9 @@ stays reported with unknown cost. Timeouts and other failures are not retried.
 
 Hybrid search combines lexical candidates with semantically routed tree nodes.
 The initial policy routes at most 32 document descriptions and reranks at most
-24 evidence candidates. Check `coverage` before treating a result as exhaustive.
+24 evidence candidates. A single routable document, such as a `--document`
+scope, is selected without a routing call (`coverage.routing_status`).
+Check `coverage` before treating a result as exhaustive.
 `--min-score 0.5` is a relevance-rubric floor, **not calibrated confidence**;
 `--min-score 0` exposes low-score candidates for exploration. Large-corpus
 hierarchical semantic routing remains an explicit scalability task.

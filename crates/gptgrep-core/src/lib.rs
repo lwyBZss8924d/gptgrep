@@ -291,6 +291,12 @@ pub struct Coverage {
     pub stale_files: Vec<String>,
     pub truncated: bool,
     pub semantic_scope_complete: bool,
+    /// Model-assisted document routing: `routed` (one Decisions call),
+    /// `skipped_single_document` (exactly one routing candidate is selected
+    /// without a call; tree candidates are unchanged) or `no_candidates`.
+    /// Absent for local regex/lexical searches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_status: Option<String>,
 }
 
 /// One failed Jev submission that the bounded transient retry repeated. The
@@ -2104,7 +2110,27 @@ async fn collect_candidate_view(
         if !coverage.semantic_scope_complete {
             warnings.push("Semantic routing covers a bounded document prefix; increase --routing-docs up to 32, select --document, or search narrower roots. Lexical retrieval uses the same explicit document scope.".into());
         }
-        if !routing.is_empty() {
+        let skip_single = routing.len() == 1 && skip_single_document_routing();
+        coverage.routing_status = Some(
+            match routing.len() {
+                0 => "no_candidates",
+                _ if skip_single => "skipped_single_document",
+                _ => "routed",
+            }
+            .into(),
+        );
+        if skip_single {
+            // Routing selects the top-ranked documents regardless of score, so
+            // one candidate is always selected. Its tree candidates, and thus
+            // the rerank request, are identical without a Decisions call.
+            let only = routing.pop().expect("one routing candidate");
+            hits.truncate(options.max_candidates / 2);
+            let document = docs
+                .get(only.id.as_str())
+                .copied()
+                .context("routing document missing from scope")?;
+            add_tree_candidates(&mut hits, &[document], &texts, options, &mut coverage);
+        } else if !routing.is_empty() {
             metrics.jev_candidate_bytes += routing.iter().map(|c| c.text.len()).sum::<usize>();
             metrics.jev_calls_attempted += 1;
             metrics
@@ -2166,48 +2192,12 @@ async fn collect_candidate_view(
             ranks.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
             // Reserve half the final budget for tree candidates, protecting no-keyword recall.
             hits.truncate(options.max_candidates / 2);
-            let mut seen: HashSet<_> = hits.iter().map(|h| h.node_id.clone()).collect();
             let selected: Vec<_> = ranks
                 .iter()
                 .take(8)
                 .filter_map(|r| docs.get(r.id.as_str()).copied())
-                .map(|document| (document, leaf_nodes(&document.nodes)))
                 .collect();
-            let max_depth = selected
-                .iter()
-                .map(|(_, leaves)| leaves.len())
-                .max()
-                .unwrap_or(0);
-            for offset in 0..max_depth {
-                for (doc, leaves) in &selected {
-                    if let Some(node) = leaves.get(offset) {
-                        let h = hit(
-                            doc,
-                            node,
-                            &texts[&doc.id],
-                            node.line_start,
-                            node.line_end,
-                            None,
-                            0.0,
-                            1400,
-                        );
-                        if seen.insert(h.node_id.clone()) {
-                            hits.push(h);
-                        }
-                    }
-                    if hits.len() >= options.max_candidates {
-                        break;
-                    }
-                }
-                if hits.len() >= options.max_candidates {
-                    break;
-                }
-            }
-            coverage.truncated |= selected
-                .iter()
-                .map(|(doc, _)| doc.nodes.len())
-                .sum::<usize>()
-                > hits.len();
+            add_tree_candidates(&mut hits, &selected, &texts, options, &mut coverage);
         }
         coverage.truncated |= hits.len() > options.max_candidates;
         hits.truncate(options.max_candidates);
@@ -2373,6 +2363,95 @@ fn finish_candidate_batch(
             false
         }
     });
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override that still sends the single-candidate routing call,
+    /// so tests can compare the skipped path with the routed one and keep
+    /// exercising routing-call mechanics with one-document fixtures.
+    static ROUTE_SINGLE_DOCUMENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only guard: while alive on this thread, a single routing candidate is
+/// still sent to Decisions (the former behavior).
+#[cfg(test)]
+pub(crate) struct RouteSingleDocument;
+#[cfg(test)]
+impl RouteSingleDocument {
+    pub(crate) fn enable() -> Self {
+        ROUTE_SINGLE_DOCUMENT.with(|flag| flag.set(true));
+        Self
+    }
+}
+#[cfg(test)]
+impl Drop for RouteSingleDocument {
+    fn drop(&mut self) {
+        ROUTE_SINGLE_DOCUMENT.with(|flag| flag.set(false));
+    }
+}
+
+/// Exactly one routing candidate is selected without a Decisions call.
+fn skip_single_document_routing() -> bool {
+    #[cfg(test)]
+    {
+        !ROUTE_SINGLE_DOCUMENT.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
+/// Add selected documents' leaf nodes round-robin in their routed order until
+/// the candidate budget is full. Shared by routed and single-document scopes.
+fn add_tree_candidates(
+    hits: &mut Vec<Hit>,
+    selected: &[&Document],
+    texts: &HashMap<String, TextView>,
+    options: &SearchOptions,
+    coverage: &mut Coverage,
+) {
+    let mut seen: HashSet<_> = hits.iter().map(|h| h.node_id.clone()).collect();
+    let selected: Vec<_> = selected
+        .iter()
+        .map(|document| (*document, leaf_nodes(&document.nodes)))
+        .collect();
+    let max_depth = selected
+        .iter()
+        .map(|(_, leaves)| leaves.len())
+        .max()
+        .unwrap_or(0);
+    for offset in 0..max_depth {
+        for (doc, leaves) in &selected {
+            if let Some(node) = leaves.get(offset) {
+                let h = hit(
+                    doc,
+                    node,
+                    &texts[&doc.id],
+                    node.line_start,
+                    node.line_end,
+                    None,
+                    0.0,
+                    1400,
+                );
+                if seen.insert(h.node_id.clone()) {
+                    hits.push(h);
+                }
+            }
+            if hits.len() >= options.max_candidates {
+                break;
+            }
+        }
+        if hits.len() >= options.max_candidates {
+            break;
+        }
+    }
+    coverage.truncated |= selected
+        .iter()
+        .map(|(doc, _)| doc.nodes.len())
+        .sum::<usize>()
+        > hits.len();
 }
 
 /// Two linear passes preserve source/preorder while removing parents. Compute
@@ -3337,7 +3416,7 @@ mod tests {
             "# Scope\nDistinct source evidence.\n",
         )?;
         let indexed = index(directory.path(), unrelated_count + 1).await?;
-        let (client, server) = mock_jev(vec![200, 200]).await?;
+        let (client, server) = mock_jev(vec![200]).await?;
         let events: Arc<Mutex<Vec<JevSearchProgress>>> = Arc::new(Mutex::new(Vec::new()));
         let recorded = events.clone();
         let observer = move |progress: &JevSearchProgress| {
@@ -3355,19 +3434,28 @@ mod tests {
             &observer,
         )
         .await?;
+        // The scope leaves one routing candidate: it is selected without a
+        // routing call, and only the scoped evidence is reranked.
         let requests = server.await?;
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0]["questions"].as_object().unwrap().len(), 1);
-        let route = requests[0]["questions"]["candidate_0"]["instructions"]["candidate"]["text"]
-            .as_str()
-            .unwrap();
-        assert!(route.contains(selected));
-        assert!(!route.contains("unrelated-"));
+        assert_eq!(requests.len(), 1);
+        let candidates = requests[0]["questions"].as_object().unwrap();
+        assert!(!candidates.is_empty());
+        for question in candidates.values() {
+            let text = question["instructions"]["candidate"]["text"]
+                .as_str()
+                .unwrap();
+            assert!(text.starts_with(&format!("Document: {selected}\n")));
+            assert!(!text.contains("unrelated-"));
+        }
         assert!(report.hits.iter().all(|hit| hit.path == selected));
         assert_eq!(report.hits.len(), 1);
         assert_eq!(report.coverage.indexed_files, unrelated_count + 1);
         assert_eq!(report.coverage.scoped_files, 1);
         assert_eq!(report.coverage.routed_documents, 1);
+        assert_eq!(
+            report.coverage.routing_status.as_deref(),
+            Some("skipped_single_document")
+        );
         assert!(report.coverage.semantic_scope_complete);
         assert_eq!(report.document_scope.as_deref(), Some(selected));
         assert_eq!(
@@ -3375,45 +3463,166 @@ mod tests {
                 report.metrics.jev_calls_attempted,
                 report.metrics.jev_requests
             ),
-            (2, 2)
+            (1, 1)
         );
         assert_eq!(
             report.metrics.jev_models,
-            [
-                "openai/gpt-6-luna-decisions-20261006",
-                "openai/gpt-6-luna-decisions-20261006"
-            ]
+            ["openai/gpt-6-luna-decisions-20261006"]
         );
         // The requested selector and the served canonical build stay separate.
         assert_eq!(
             report.metrics.jev_requested_models,
-            [gptgrep_jev::DEFAULT_MODEL, gptgrep_jev::DEFAULT_MODEL]
+            [gptgrep_jev::DEFAULT_MODEL]
         );
         let events = events.lock().unwrap();
-        assert_eq!(events.len(), 4);
         assert_eq!(
             events
                 .iter()
                 .map(|event| (event.stage.as_str(), event.event.as_str()))
                 .collect::<Vec<_>>(),
             [
-                ("document_routing", "before_call"),
-                ("document_routing", "after_reply"),
                 ("evidence_reranking", "before_call"),
                 ("evidence_reranking", "after_reply")
             ]
         );
         assert_eq!(
             (
-                events[2].metrics.jev_calls_attempted,
-                events[2].metrics.jev_requests
+                events[1].metrics.jev_calls_attempted,
+                events[1].metrics.jev_requests
             ),
-            (2, 1)
+            (1, 1)
         );
-        assert_eq!(events[2].metrics.jev_usage[0]["cost"], json!(0.001));
+        assert_eq!(events[1].metrics.jev_usage[0]["cost"], json!(0.001));
         assert!(events.iter().all(|event| event.generation.as_deref()
             == Some(indexed.generation.as_str())
             && !event.accounting_complete));
+        Ok(())
+    }
+
+    /// Two indexed documents; `first.md` is the scoped one.
+    async fn two_document_corpus() -> Result<tempfile::TempDir> {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("first.md"),
+            "# Intake\nneedle intake evidence\n# Storage\nshelf storage notes\n# Review\nreview cadence notes\n",
+        )?;
+        fs::write(
+            directory.path().join("second.md"),
+            "# Other\nneedle other evidence\n",
+        )?;
+        index(directory.path(), 10).await?;
+        Ok(directory)
+    }
+
+    #[tokio::test]
+    async fn single_document_routing_is_skipped_with_identical_rerank_input() -> Result<()> {
+        let directory = two_document_corpus().await?;
+        for mode in ["hybrid", "semantic"] {
+            let options = SearchOptions {
+                mode: mode.into(),
+                document: Some("first.md".into()),
+                ..Default::default()
+            };
+            // Reference: the former path, which sent the one-candidate routing call.
+            let route = RouteSingleDocument::enable();
+            let (client, server) = mock_jev(vec![200, 200]).await?;
+            let routed = search_with_client(directory.path(), "needle", &options, &client).await;
+            drop(route);
+            let routed = routed?;
+            let routed_requests = server.await?;
+            assert_eq!(routed_requests.len(), 2, "{mode}");
+            assert_eq!(
+                routed.coverage.routing_status.as_deref(),
+                Some("routed"),
+                "{mode}"
+            );
+            // Default: no routing call; one request fewer.
+            let (client, server) = mock_jev(vec![200]).await?;
+            let skipped = search_with_client(directory.path(), "needle", &options, &client).await?;
+            let skipped_requests = server.await?;
+            assert_eq!(skipped_requests.len(), 1, "{mode}");
+            // The rerank request is identical to the routed path's second request.
+            assert_eq!(
+                serde_json::to_vec(&skipped_requests[0])?,
+                serde_json::to_vec(&routed_requests[1])?,
+                "{mode}"
+            );
+            assert_eq!(
+                skipped.coverage.routing_status.as_deref(),
+                Some("skipped_single_document")
+            );
+            assert_eq!(
+                (
+                    skipped.metrics.jev_calls_attempted,
+                    skipped.metrics.jev_requests
+                ),
+                (1, 1)
+            );
+            assert_eq!(
+                (
+                    routed.metrics.jev_calls_attempted,
+                    routed.metrics.jev_requests
+                ),
+                (2, 2)
+            );
+            // Outputs are otherwise unchanged.
+            let mut skipped_coverage = serde_json::to_value(&skipped.coverage)?;
+            let mut routed_coverage = serde_json::to_value(&routed.coverage)?;
+            skipped_coverage
+                .as_object_mut()
+                .unwrap()
+                .remove("routing_status");
+            routed_coverage
+                .as_object_mut()
+                .unwrap()
+                .remove("routing_status");
+            assert_eq!(skipped_coverage, routed_coverage, "{mode}");
+            assert_eq!(
+                serde_json::to_value(&skipped.hits)?,
+                serde_json::to_value(&routed.hits)?,
+                "{mode}"
+            );
+            assert!(!skipped.hits.is_empty());
+            assert_eq!(skipped.warnings, routed.warnings);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn two_document_scope_still_routes() -> Result<()> {
+        let directory = two_document_corpus().await?;
+        let (client, server) = mock_jev(vec![200, 200]).await?;
+        let report = search_with_client(
+            directory.path(),
+            "needle",
+            &SearchOptions::default(),
+            &client,
+        )
+        .await?;
+        let requests = server.await?;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["questions"].as_object().unwrap().len(), 2);
+        assert_eq!(report.coverage.routed_documents, 2);
+        assert_eq!(report.coverage.routing_status.as_deref(), Some("routed"));
+        assert_eq!(
+            (
+                report.metrics.jev_calls_attempted,
+                report.metrics.jev_requests
+            ),
+            (2, 2)
+        );
+        // Local primitives carry no routing status.
+        let lexical = search(
+            directory.path(),
+            "needle",
+            &SearchOptions {
+                mode: "lexical".into(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(lexical.coverage.routing_status, None);
+        assert!(!serde_json::to_string(&lexical.coverage)?.contains("routing_status"));
         Ok(())
     }
 
@@ -3424,6 +3633,7 @@ mod tests {
             directory.path().join("subject.txt"),
             "needle source evidence",
         )?;
+        fs::write(directory.path().join("other.txt"), "other background")?;
         index(directory.path(), 10).await?;
         let (client, server) = mock_jev(vec![200, 200]).await?;
         let context = gptgrep_jev::ExecutionContext::new(
@@ -3433,10 +3643,7 @@ mod tests {
             2,
         )?;
         let client = client.with_execution_context(context.clone());
-        let options = SearchOptions {
-            document: Some("subject.txt".into()),
-            ..Default::default()
-        };
+        let options = SearchOptions::default();
         let report =
             search_with_client(directory.path(), "needle", &options, &client.clone()).await?;
         assert_eq!(report.metrics.jev_requests, 2);
@@ -3468,15 +3675,13 @@ mod tests {
             directory.path().join("subject.txt"),
             "needle source evidence",
         )?;
+        fs::write(directory.path().join("other.txt"), "other background")?;
         let indexed = index(directory.path(), 10).await?;
         let (client, server) = mock_jev(vec![200, 503]).await?;
         let error = search_with_client(
             directory.path(),
             "needle",
-            &SearchOptions {
-                document: Some("subject.txt".into()),
-                ..Default::default()
-            },
+            &SearchOptions::default(),
             &client,
         )
         .await
@@ -3504,8 +3709,8 @@ mod tests {
             [gptgrep_jev::DEFAULT_MODEL, gptgrep_jev::DEFAULT_MODEL]
         );
         assert_eq!(failure.metrics.jev_usage[0]["cost"], json!(0.001));
-        assert_eq!(failure.coverage.scoped_files, 1);
-        assert_eq!(failure.document_scope.as_deref(), Some("subject.txt"));
+        assert_eq!(failure.coverage.scoped_files, 2);
+        assert_eq!(failure.document_scope, None);
         assert_eq!(
             failure.generation.as_deref(),
             Some(indexed.generation.as_str())
@@ -3524,6 +3729,7 @@ mod tests {
     async fn failed_first_stage_has_an_attempt_and_unknown_accounting() -> Result<()> {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("subject.txt"), "source evidence")?;
+        fs::write(directory.path().join("other.txt"), "other background")?;
         index(directory.path(), 10).await?;
         let (client, server) = mock_jev(vec![503]).await?;
         let error = search_with_client(
@@ -3696,6 +3902,7 @@ mod tests {
     async fn observer_failure_after_routing_stops_before_next_provider_call() -> Result<()> {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("subject.txt"), "source evidence")?;
+        fs::write(directory.path().join("other.txt"), "other background")?;
         index(directory.path(), 10).await?;
         let (client, server) = mock_jev(vec![200]).await?;
         let observer = |progress: &JevSearchProgress| {
@@ -3736,6 +3943,7 @@ mod tests {
     async fn cancellation_retains_prior_reply_in_progress_receipts() -> Result<()> {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("subject.txt"), "source evidence")?;
+        fs::write(directory.path().join("other.txt"), "other background")?;
         index(directory.path(), 10).await?;
         let (client, server) = mock_jev(vec![200, 0]).await?;
         let events: Arc<Mutex<Vec<JevSearchProgress>>> = Arc::new(Mutex::new(Vec::new()));
@@ -3938,13 +4146,14 @@ mod tests {
                 ..Default::default()
             };
             let report = if mode == "hybrid" {
-                let (client, server) = mock_jev(vec![200, 200]).await?;
+                // One indexed document: routing selects it without a call.
+                let (client, server) = mock_jev(vec![200]).await?;
                 let report =
                     search_with_client(directory.path(), "saffron capacitor", &options, &client)
                         .await?;
                 let requests = server.await?;
-                assert_eq!(requests.len(), 2);
-                let candidates = requests[1]["questions"].as_object().unwrap();
+                assert_eq!(requests.len(), 1);
+                let candidates = requests[0]["questions"].as_object().unwrap();
                 assert_eq!(candidates.len(), 1); // Same-node semantic dedup keeps the winning lexical window.
                 assert!(
                     candidates["candidate_0"]["instructions"]["candidate"]["text"]
@@ -3953,7 +4162,11 @@ mod tests {
                         .contains("threshold is 17 units")
                 );
                 assert_eq!(report.coverage.reranked_candidates, 1);
-                assert_eq!(report.metrics.jev_requests, 2);
+                assert_eq!(
+                    report.coverage.routing_status.as_deref(),
+                    Some("skipped_single_document")
+                );
+                assert_eq!(report.metrics.jev_requests, 1);
                 report
             } else {
                 search(directory.path(), "saffron capacitor", &options).await?

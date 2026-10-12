@@ -108,7 +108,8 @@ fn ledger_events(path: &Path) -> Vec<Value> {
 #[tokio::test]
 async fn first_excess_request_can_finalize_seed_evidence_without_more_jev_calls() {
     let root = corpus().await;
-    let (client, server, requests) = mock_jev(vec![(200, 3.0), (200, 3.0)]).await;
+    // One scoped document: the seed needs only the rerank call.
+    let (client, server, requests) = mock_jev(vec![(200, 3.0)]).await;
     let config = HostConfig {
         max_tool_calls: 1,
         document: Some("pipeline-notes.md".into()),
@@ -190,9 +191,9 @@ async fn first_excess_request_can_finalize_seed_evidence_without_more_jev_calls(
     let (_, citations, insufficient) = evidence.finish(&outcome.answer).unwrap();
     assert!(!insufficient);
     assert!(!citations.is_empty());
-    assert_eq!(requests.load(Ordering::SeqCst), 2);
-    assert_eq!(accounting.summary().requests, 2);
-    assert_eq!(accounting.summary().attempted_calls, 2);
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    assert_eq!(accounting.summary().requests, 1);
+    assert_eq!(accounting.summary().attempted_calls, 1);
     assert_eq!(accounting.summary().searches.len(), 1);
     assert_eq!(evidence.receipts.len(), 3);
     assert!(evidence.receipts[0].required_initial);
@@ -226,7 +227,7 @@ async fn first_excess_request_can_finalize_seed_evidence_without_more_jev_calls(
 #[tokio::test]
 async fn initial_jev_pass_is_query_bound_scoped_and_delivered_to_codex() {
     let root = corpus().await;
-    let (client, server, _) = mock_jev(vec![(200, 3.0), (200, 3.0)]).await;
+    let (client, server, _) = mock_jev(vec![(200, 3.0)]).await;
     let mut evidence = Evidence::open(root.path(), None).unwrap();
     let accounting = Accounting::create(root.path(), &evidence.generation).unwrap();
     let config = HostConfig {
@@ -238,10 +239,18 @@ async fn initial_jev_pass_is_query_bound_scoped_and_delivered_to_codex() {
         .unwrap();
     let question = "Which transformation removes blank records before assembly?";
     evidence.bootstrap(question).await.unwrap();
+    // The scope leaves one routing candidate, selected without a routing call.
     let requests = server.await.unwrap();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 1);
     assert_eq!(requests[0]["state"]["query"], question);
-    assert_eq!(requests[0]["questions"].as_object().unwrap().len(), 1);
+    let candidates = requests[0]["questions"].as_object().unwrap();
+    assert!(!candidates.is_empty());
+    assert!(candidates.values().all(|question| {
+        question["instructions"]["candidate"]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("Document: pipeline-notes.md\n")
+    }));
     let seed = evidence.initial_payload.as_ref().unwrap();
     assert_eq!(seed["query"], question);
     assert_eq!(seed["document_scope"], "pipeline-notes.md");
@@ -284,15 +293,17 @@ async fn initial_jev_pass_is_query_bound_scoped_and_delivered_to_codex() {
     assert_eq!(evidence.receipts.len(), 1);
     assert!(evidence.receipts[0].required_initial);
     let summary = accounting.summary();
-    assert_eq!(summary.requests, 2);
-    assert_eq!(summary.attempted_calls, 2);
+    assert_eq!(summary.requests, 1);
+    assert_eq!(summary.attempted_calls, 1);
     assert_eq!(summary.unobserved_attempts, 0);
-    assert_eq!(summary.usage.len(), 2);
+    assert_eq!(summary.usage.len(), 1);
     assert_eq!(summary.initial_status, "reranked");
     assert!(summary.accounting_complete);
+    let coverage = summary.searches[0].coverage.as_ref().unwrap();
+    assert_eq!(coverage.scoped_files, 1);
     assert_eq!(
-        summary.searches[0].coverage.as_ref().unwrap().scoped_files,
-        1
+        coverage.routing_status.as_deref(),
+        Some("skipped_single_document")
     );
     let catalog = evidence
         .call("catalog", "gptgrep_catalog", json!({}))
@@ -364,10 +375,10 @@ async fn partial_rerank_failure_preserves_routing_usage_in_typed_error_and_ledge
     let root = corpus().await;
     let (client, server, _) = mock_jev(vec![(200, 3.0), (503, 0.0)]).await;
     let home = tempfile::tempdir().unwrap();
+    // Unscoped two-document corpus: routing replies before the rerank fails.
     let config = HostConfig {
         codex_home: home.path().to_owned(),
         codex_bin: "/missing/mock-codex".into(),
-        document: Some("pipeline-notes.md".into()),
         ..HostConfig::default()
     };
     let error = execute_with_client(
@@ -401,7 +412,7 @@ async fn partial_rerank_failure_preserves_routing_usage_in_typed_error_and_ledge
 #[tokio::test]
 async fn codex_startup_failure_retains_successful_initial_accounting() {
     let root = corpus().await;
-    let (client, server, _) = mock_jev(vec![(200, 3.0), (200, 3.0)]).await;
+    let (client, server, _) = mock_jev(vec![(200, 3.0)]).await;
     let home = tempfile::tempdir().unwrap();
     let config = HostConfig {
         codex_home: home.path().to_owned(),
@@ -421,9 +432,9 @@ async fn codex_startup_failure_retains_successful_initial_accounting() {
     server.await.unwrap();
     let error = error.downcast_ref::<HostRetrievalError>().unwrap();
     assert_eq!(error.stage, "codex");
-    assert_eq!(error.jev.requests, 2);
-    assert_eq!(error.jev.attempted_calls, 2);
-    assert_eq!(error.jev.usage.len(), 2);
+    assert_eq!(error.jev.requests, 1);
+    assert_eq!(error.jev.attempted_calls, 1);
+    assert_eq!(error.jev.usage.len(), 1);
     assert_eq!(error.receipts.len(), 1);
     assert!(error.receipts[0].required_initial);
     assert_eq!(
@@ -438,9 +449,9 @@ async fn cancellation_retains_prior_reply_and_unobserved_attempt() {
     let (client, server, received) = mock_jev(vec![(200, 3.0), (0, 0.0)]).await;
     let root_path = root.path().to_owned();
     let home = tempfile::tempdir().unwrap();
+    // Unscoped: routing replies, then the rerank stays pending.
     let config = HostConfig {
         codex_home: home.path().to_owned(),
-        document: Some("pipeline-notes.md".into()),
         ..HostConfig::default()
     };
     let task = tokio::spawn(async move {
@@ -515,7 +526,7 @@ async fn summary_scope_is_derived_and_conflicts_are_rejected() {
         tree["document"]["id"].as_str().unwrap(),
         tree["document"]["nodes"][0]["id"].as_str().unwrap()
     );
-    let (client, server, _) = mock_jev(vec![(200, 3.0), (200, 3.0)]).await;
+    let (client, server, _) = mock_jev(vec![(200, 3.0)]).await;
     let mut evidence = Evidence::open(root.path(), Some(&id)).unwrap();
     let accounting = Accounting::create(root.path(), &evidence.generation).unwrap();
     evidence

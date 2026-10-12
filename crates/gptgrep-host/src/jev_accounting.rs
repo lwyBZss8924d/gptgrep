@@ -1056,7 +1056,9 @@ mod evidence_role_storage_tests {
         let index = accounting
             .start_search("initial", QUESTION, "hybrid", None, true)
             .unwrap();
-        let (client, server) = mock_roles(1).await;
+        // One document: the view selects it without a routing call, so the
+        // mixed request is the first and only admission.
+        let (client, server) = mock_roles(0).await;
         let observer = |event: &PlannedSearchEvent| {
             if event.evidence_roles.is_some() && event.event == "before_call" {
                 accounting.0.lock().unwrap().bytes = 4 * 1024 * 1024 - 4096;
@@ -1075,13 +1077,13 @@ mod evidence_role_storage_tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(server.await.unwrap().len(), 1);
+        assert_eq!(server.await.unwrap().len(), 0);
         let failure = error
             .downcast_ref::<gptgrep_core::PlannedSearchError>()
             .unwrap();
         assert!(failure.cause.contains("observer"));
-        assert_eq!(failure.metrics.jev_requests, 1);
-        assert_eq!(accounting.summary().requests, 1);
+        assert_eq!(failure.metrics.jev_requests, 0);
+        assert_eq!(accounting.summary().requests, 0);
         assert!(!accounting.summary().accounting_complete);
     }
 
@@ -1093,7 +1095,8 @@ mod evidence_role_storage_tests {
             .start_search("initial", QUESTION, "hybrid", None, true)
             .unwrap();
         let ledger = accounting.path();
-        let (client, server) = mock_roles(2).await;
+        // One document: no routing call; the mixed union request is the only one.
+        let (client, server) = mock_roles(1).await;
         let observer = |event: &PlannedSearchEvent| {
             if event.evidence_roles.is_some() && event.event == "after_reply" {
                 accounting.0.lock().unwrap().file = File::open(&ledger).unwrap();
@@ -1112,7 +1115,7 @@ mod evidence_role_storage_tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(server.await.unwrap().len(), 2);
+        assert_eq!(server.await.unwrap().len(), 1);
         assert!(
             error
                 .downcast_ref::<gptgrep_core::PlannedSearchError>()
@@ -1121,8 +1124,8 @@ mod evidence_role_storage_tests {
                 .contains("observer")
         );
         let summary = accounting.summary();
-        assert_eq!(summary.requests, 2);
-        assert_eq!(summary.usage.len(), 2);
+        assert_eq!(summary.requests, 1);
+        assert_eq!(summary.usage.len(), 1);
         // Served builds and requested selectors are reported separately.
         assert_eq!(summary.requested_models, [gptgrep_jev::DEFAULT_MODEL]);
         assert!(

@@ -168,6 +168,8 @@ fn event_sink(
 #[tokio::test]
 async fn three_views_have_four_calls_two_routes_and_stable_union_in_reverse_completion_order()
 -> Result<()> {
+    // Routing-call mechanics: keep the one-document routing request.
+    let _route = crate::RouteSingleDocument::enable();
     let question = " \tcobalt  ";
     let queries = [question, "黄鹂", "zephyr"];
     let (directory, generation, text) = fixture("目录/notes.txt", "\r\n", false).await?;
@@ -351,13 +353,97 @@ async fn zero_alternatives_preserves_default_candidates_and_scoring() -> Result<
         serde_json::to_value(default_report.hits)?,
         serde_json::to_value(planned_report.hits)?
     );
-    assert_eq!(default_report.metrics.jev_requests, 2);
-    assert_eq!(planned_report.metrics.jev_requests, 2);
+    // One scoped document: neither path sends a routing call.
+    assert_eq!(default_report.metrics.jev_requests, 1);
+    assert_eq!(planned_report.metrics.jev_requests, 1);
     assert_eq!(
         *plain.requests.lock().unwrap(),
         *planned.requests.lock().unwrap()
     );
     assert_eq!(planned_report.coverage.views.len(), 1);
+    assert_eq!(
+        planned_report.coverage.views[0]
+            .coverage
+            .routing_status
+            .as_deref(),
+        Some("skipped_single_document")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn single_document_views_skip_routing_and_keep_the_union_request() -> Result<()> {
+    let queries = ["cobalt", "黄鹂", "zephyr"];
+    let (directory, generation, _) = fixture("notes.txt", "\n", false).await?;
+    let alternatives = ["黄鹂".to_owned(), "zephyr".to_owned()];
+    let routed_mock = mock(&queries, [0; 3], [200; 4], 3.0, false).await?;
+    let route = crate::RouteSingleDocument::enable();
+    let routed = search_planned_with_client_and_observer(
+        directory.path(),
+        "cobalt",
+        &alternatives,
+        &options("notes.txt"),
+        &generation,
+        &routed_mock.client,
+        &|_| Ok(()),
+    )
+    .await;
+    drop(route);
+    let routed = routed?;
+    let skipped_mock = mock(&queries, [0; 3], [200; 4], 3.0, false).await?;
+    let skipped = search_planned_with_client_and_observer(
+        directory.path(),
+        "cobalt",
+        &alternatives,
+        &options("notes.txt"),
+        &generation,
+        &skipped_mock.client,
+        &|_| Ok(()),
+    )
+    .await?;
+    // Three views skip three one-candidate routing calls; one union rerank remains.
+    assert_eq!(routed_mock.requests.lock().unwrap().len(), 4);
+    let skipped_requests = skipped_mock.requests.lock().unwrap().clone();
+    assert_eq!(skipped_requests.len(), 1);
+    assert!(evidence_request(&skipped_requests[0]));
+    let routed_union = routed_mock
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|body| evidence_request(body))
+        .unwrap()
+        .clone();
+    assert_eq!(skipped_requests[0], routed_union);
+    assert_eq!(
+        (
+            skipped.metrics.jev_calls_attempted,
+            skipped.metrics.jev_requests
+        ),
+        (1, 1)
+    );
+    assert_eq!(
+        (
+            routed.metrics.jev_calls_attempted,
+            routed.metrics.jev_requests
+        ),
+        (4, 4)
+    );
+    assert_eq!(
+        serde_json::to_value(&skipped.hits)?,
+        serde_json::to_value(&routed.hits)?
+    );
+    assert_eq!(
+        skipped.coverage.selected_spans,
+        routed.coverage.selected_spans
+    );
+    assert!(
+        skipped
+            .coverage
+            .views
+            .iter()
+            .all(|view| view.coverage.routing_status.as_deref() == Some("skipped_single_document"))
+    );
     Ok(())
 }
 
@@ -533,6 +619,8 @@ fn same_view_duplicate_spans_count_once_and_do_not_become_cap_omissions() -> Res
 #[tokio::test]
 async fn route_failure_retains_completed_sibling_usage_and_interrupts_pending_sibling() -> Result<()>
 {
+    // Routing-call mechanics: keep the one-document routing request.
+    let _route = crate::RouteSingleDocument::enable();
     let (directory, generation, _) = fixture("notes.txt", "\n", false).await?;
     let mock = mock(
         &["cobalt", "黄鹂", "zephyr"],
@@ -600,6 +688,8 @@ async fn route_failure_retains_completed_sibling_usage_and_interrupts_pending_si
 
 #[tokio::test]
 async fn observer_failure_keeps_reply_and_prevents_fusion_admission() -> Result<()> {
+    // Routing-call mechanics: keep the one-document routing request.
+    let _route = crate::RouteSingleDocument::enable();
     let (directory, generation, _) = fixture("notes.txt", "\n", false).await?;
     let mock = mock(&["cobalt", "黄鹂", "zephyr"], [0; 3], [200; 4], 3.0, false).await?;
     let observer = |event: &PlannedSearchEvent| {
@@ -637,6 +727,8 @@ async fn observer_failure_keeps_reply_and_prevents_fusion_admission() -> Result<
 #[tokio::test]
 async fn caller_cancellation_records_all_admitted_pending_operations_and_prior_usage() -> Result<()>
 {
+    // Routing-call mechanics: keep the one-document routing request.
+    let _route = crate::RouteSingleDocument::enable();
     let (directory, generation, _) = fixture("notes.txt", "\n", false).await?;
     let mock = mock(
         &["cobalt", "黄鹂", "zephyr"],
@@ -692,6 +784,8 @@ async fn caller_cancellation_records_all_admitted_pending_operations_and_prior_u
 
 #[tokio::test]
 async fn generation_is_checked_before_candidates_after_routes_and_before_delivery() -> Result<()> {
+    // Routing-call mechanics: keep the one-document routing request.
+    let _route = crate::RouteSingleDocument::enable();
     for trigger in ["initial", "q0.route", "union.rerank"] {
         let (directory, original_generation, _) = fixture("notes.txt", "\n", false).await?;
         let pointer = directory.path().join(STATE).join("CURRENT.json");
@@ -739,6 +833,8 @@ async fn generation_is_checked_before_candidates_after_routes_and_before_deliver
 
 #[tokio::test]
 async fn stale_source_is_excluded_at_start_and_rechecked_after_final_reply() -> Result<()> {
+    // Routing-call mechanics: keep the one-document routing request.
+    let _route = crate::RouteSingleDocument::enable();
     for trigger in ["initial", "union.rerank"] {
         let (directory, generation, _) = fixture("notes.txt", "\n", false).await?;
         let source = directory.path().join("notes.txt");
@@ -831,6 +927,8 @@ async fn invalid_plan_bounds_are_rejected_without_call_admission() -> Result<()>
 
 #[tokio::test]
 async fn escaped_union_payload_obeys_jev_byte_cap_and_keeps_route_usage() -> Result<()> {
+    // Routing-call mechanics: keep the one-document routing request.
+    let _route = crate::RouteSingleDocument::enable();
     let directory = tempfile::tempdir()?;
     let text: String = (0..24)
         .map(|index| format!("# Invented Section {index}\n{}\n", "\"\\".repeat(750)))
@@ -873,6 +971,8 @@ async fn escaped_union_payload_obeys_jev_byte_cap_and_keeps_route_usage() -> Res
 
 #[tokio::test]
 async fn final_rerank_failure_and_cancellation_retain_all_route_receipts_once() -> Result<()> {
+    // Routing-call mechanics: keep the one-document routing request.
+    let _route = crate::RouteSingleDocument::enable();
     for status in [503, 0] {
         let (directory, generation, _) = fixture("notes.txt", "\n", false).await?;
         let mock = mock(
@@ -975,6 +1075,8 @@ async fn final_rerank_failure_and_cancellation_retain_all_route_receipts_once() 
 #[tokio::test]
 async fn before_call_observer_failure_counts_admission_without_claiming_a_provider_reply()
 -> Result<()> {
+    // Routing-call mechanics: keep the one-document routing request.
+    let _route = crate::RouteSingleDocument::enable();
     let (directory, generation, _) = fixture("notes.txt", "\n", false).await?;
     let mock = mock(&["cobalt"], [0; 3], [200; 4], 3.0, false).await?;
     let observer = |event: &PlannedSearchEvent| {

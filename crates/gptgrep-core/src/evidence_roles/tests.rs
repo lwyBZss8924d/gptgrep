@@ -423,6 +423,8 @@ async fn source_fixture(
 #[tokio::test]
 async fn opt_in_uses_one_mixed_union_request_with_original_query_and_private_dispositions()
 -> Result<()> {
+    // Routing-call mechanics: keep the one-document routing request.
+    let _route = crate::RouteSingleDocument::enable();
     for (name, eol, invert) in [("alpha.md", "\n", false), ("变式.md", "\r\n", true)] {
         let (temp, generation, relation) = source_fixture(name, eol, invert).await?;
         let server = server(relation.clone(), 200).await?;
@@ -527,6 +529,8 @@ async fn opt_in_uses_one_mixed_union_request_with_original_query_and_private_dis
 
 #[tokio::test]
 async fn disabled_policy_omits_new_json_and_keeps_score_only_requests() -> Result<()> {
+    // Routing-call mechanics: keep the one-document routing request.
+    let _route = crate::RouteSingleDocument::enable();
     let (temp, generation, relation) = source_fixture("notes.md", "\n", false).await?;
     let server = server(relation, 200).await?;
     let report = search_planned_with_client_and_observer(
@@ -563,6 +567,8 @@ async fn disabled_policy_omits_new_json_and_keeps_score_only_requests() -> Resul
 
 #[tokio::test]
 async fn union_failure_and_reply_observer_failure_retain_disjoint_accounting() -> Result<()> {
+    // Routing-call mechanics: keep the one-document routing request.
+    let _route = crate::RouteSingleDocument::enable();
     for status in [503, 200] {
         let (temp, generation, relation) = source_fixture("notes.md", "\n", false).await?;
         let server = server(relation, status).await?;
@@ -616,6 +622,8 @@ async fn union_failure_and_reply_observer_failure_retain_disjoint_accounting() -
 
 #[tokio::test]
 async fn dropped_mixed_request_retains_attempt_metadata_with_unknown_roles() -> Result<()> {
+    // Routing-call mechanics: keep the one-document routing request.
+    let _route = crate::RouteSingleDocument::enable();
     let (temp, generation, relation) = source_fixture("notes.md", "\n", false).await?;
     let server = server(relation, 0).await?;
     let events = Mutex::new(Vec::<PlannedSearchEvent>::new());
@@ -661,6 +669,8 @@ async fn dropped_mixed_request_retains_attempt_metadata_with_unknown_roles() -> 
 
 #[tokio::test]
 async fn source_change_after_mixed_reply_excludes_hits_but_preserves_judgments() -> Result<()> {
+    // Routing-call mechanics: keep the one-document routing request.
+    let _route = crate::RouteSingleDocument::enable();
     let (temp, generation, relation) = source_fixture("notes.md", "\r\n", false).await?;
     let server = server(relation, 200).await?;
     let report = search_planned_with_policy_and_observer(
