@@ -1,11 +1,12 @@
 """Runtime-only conversion of a pinned private cohort to 124 Harbor tasks."""
 from __future__ import annotations
 
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import string
 
 from .common import ARMS, MAX_READER_QUESTION_BYTES, PROFILE, canonical, copy_asset, digest, integer, parse, pinned, put, relative, require, sha
+from .native import JUDGE_OUTPUT_SCHEMA, output_schema_bytes
 from .runtime import (API_ENV, BASE_CAPABILITIES, BASE_TOOLS_PATH, CODEX_HOME, DECISIONS_BUDGET, DECISIONS_LEDGER_DIR, PASS_ENV, WORK_DIR, auth_compose, auth_paths,
                       base_tools_identity, model_config, native_identity, validate_asset_path)
 from .product_bundle import PRODUCT_ENTRYPOINT, PRODUCT_PROVENANCE, bundle_identity
@@ -188,6 +189,11 @@ class Full62Adapter:
                 schema.get("properties", {}).get("equivalent", {}).get("type") == "boolean" and
                 all(v.get("type") in ("boolean", "string") for v in schema["properties"].values()),
                 "supported_frozen_schema")
+        # The Judge passes this schema as native strict structured output: every
+        # property is required and no other key is allowed.
+        require(schema.get("additionalProperties") is False and
+                set(schema["required"]) == set(schema["properties"]), "strict_output_schema")
+        output_schema_bytes(schema)
         documents = runtime["documents"]
         require(len(documents) == 34 and len({d["document_id"] for d in documents}) == 34 and
                 {d["document_id"] for d in documents} == {r["document_id"] for r in self.rows}, "document_join")
@@ -311,9 +317,14 @@ class Full62Adapter:
                 # The unchanged financial guard caps each identifier at 96 bytes.
                 "run_id": runtime["run_id"][:63] + "-" + trial_id, "max_concurrent_batches": 1}
         put(task / "environment/reader.json", reader)
+        # The frozen response schema enters only the Judge's private /tests area.
+        schema_bytes = output_schema_bytes(self.judge["response_schema"])
+        put(task / "tests" / PurePosixPath(JUDGE_OUTPUT_SCHEMA).name, schema_bytes)
         judge = {"binding": binding, "question": row["question"], "reference": row["reference"],
                  "base_tool_environment": reader["base_tool_environment"],
                  "answer_format": row["answer_format"], "contract": self.judge,
+                 "output_schema": {"path": JUDGE_OUTPUT_SCHEMA, "bytes": len(schema_bytes),
+                                   "sha256": sha(schema_bytes)},
                  "codex_binary": runtime["codex_binary"],
                  "reader_base_binary": runtime["reader_base_binary"],
                  "judge_profile": runtime["judge_profile"],
@@ -341,7 +352,7 @@ class Full62Adapter:
                      "WORKDIR /data/corpus\n")
         judgedocker = ("FROM " + runtime["images"]["judge"] + "\n"
                        "COPY gptgrep_harbor /tests/gptgrep_harbor\n"
-                       "COPY judge.json test.sh /tests/\n"
+                       "COPY judge.json " + PurePosixPath(JUDGE_OUTPUT_SCHEMA).name + " test.sh /tests/\n"
                        "COPY config.toml " + CODEX_HOME + "/config.toml\n"
                        "RUN mkdir -p " + WORK_DIR + " && chmod 700 " + CODEX_HOME + " " + WORK_DIR + "\n"
                        "ENV PYTHONPATH=/tests PYTHONDONTWRITEBYTECODE=1 CODEX_HOME=" + CODEX_HOME + "\n"
@@ -369,7 +380,8 @@ class Full62Adapter:
             put(task / directory / "docker-compose.yaml", compose)
             # Credentials and arbitrary sibling files cannot enter either image.
             allowed = ["gptgrep_harbor", "config.toml"] + (
-                ["reader.json", "codex-native", "corpus"] if role == "reader" else ["judge.json", "test.sh"])
+                ["reader.json", "codex-native", "corpus"] if role == "reader" else
+                ["judge.json", PurePosixPath(JUDGE_OUTPUT_SCHEMA).name, "test.sh"])
             ignore = ["**"]
             for name in allowed:
                 ignore.append("!" + name)

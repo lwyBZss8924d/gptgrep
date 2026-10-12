@@ -21,7 +21,7 @@ from harbor.models.task.verifier_mode import resolve_verifier_environment_defini
 from gptgrep_harbor.adapter import Full62Adapter
 from gptgrep_harbor.agent import PairedNativeAgent
 from gptgrep_harbor.common import MAX_NATIVE_PROMPT_BYTES, MAX_READER_QUESTION_BYTES, PROFILE, canonical, sha
-from gptgrep_harbor.native import codex_argv
+from gptgrep_harbor.native import JUDGE_OUTPUT_SCHEMA, codex_argv
 from gptgrep_harbor.reader import reader_argv, product_result, product_accounting
 from gptgrep_harbor.process import run
 from gptgrep_harbor.product_bundle import PRODUCT_ENTRYPOINT, PRODUCT_PROVENANCE, release_bundle
@@ -98,7 +98,7 @@ class HarborMaterializationTests(unittest.TestCase):
                             gptgrep_bundle={"provenance": write_pin(product / "provenance.json", provenance)})
         self.judge = {"schema": "gptgrep.harbor.primary-judge.v1",
             "prompt": "Question:{question}\nReference:{answer}\nFormat:{answer_format}\nResponse:{response}",
-            "response_schema": {"type": "object", "required": ["equivalent"],
+            "response_schema": {"type": "object", "additionalProperties": False, "required": ["equivalent"],
                                 "properties": {"equivalent": {"type": "boolean"}}}}
 
     def materializer(self):
@@ -169,11 +169,31 @@ class HarborMaterializationTests(unittest.TestCase):
                 self.assertNotIn("COPY .", (task / directory / "Dockerfile").read_text())
             self.assertEqual(len(json.loads((task / "environment/docker-compose.yaml").read_text())["services"]["main"]["volumes"]), 3 if treatment else 1)
             judge = json.loads((task / "tests/judge.json").read_text())
+            # The frozen response schema is pinned in the Judge's private area only.
+            schema_bytes = (task / "tests/judge-output-schema.json").read_bytes()
+            self.assertEqual(json.loads(schema_bytes), self.judge["response_schema"])
+            self.assertEqual(judge["output_schema"], {"path": JUDGE_OUTPUT_SCHEMA, "bytes": len(schema_bytes),
+                                                      "sha256": sha(schema_bytes)})
+            self.assertEqual(judge["contract"]["prompt"], self.judge["prompt"])
+            self.assertIn("COPY judge.json judge-output-schema.json test.sh /tests/",
+                          (task / "tests/Dockerfile").read_text())
+            self.assertIn("!judge-output-schema.json", (task / "tests/.dockerignore").read_text().splitlines())
+            self.assertFalse((task / "environment/judge-output-schema.json").exists())
             self.assertEqual(judge["judge_profile"], self.runtime["judge_profile"])
             self.assertEqual(judge["base_tool_environment"], reader["base_tool_environment"])
             self.assertEqual(reader["base_tool_environment"]["provenance"]["path"], BASE_TOOLS_PATH)
             self.assertFalse((task / "tests/corpus").exists())
         self.assertEqual(reader_policies, {model_config(PROFILE, "reader")})
+
+    def test_frozen_judge_schema_must_be_strict_structured_output(self):
+        del self.judge["response_schema"]["additionalProperties"]
+        with self.assertRaisesRegex(ValueError, "strict_output_schema"):
+            self.materializer()
+        self.judge["response_schema"]["additionalProperties"] = False
+        self.judge["response_schema"]["properties"]["reason"] = {"type": "string"}
+        with self.assertRaisesRegex(ValueError, "strict_output_schema"):
+            self.materializer()
+        self.assertFalse((self.root / "dataset").exists())
 
     def test_shared_native_reader_fields_are_required_before_materialization(self):
         for key, value in (("native_ptc", False), ("native_ptc", None), ("codex_permissions", "other")):
@@ -310,10 +330,18 @@ class NativePolicyTests(unittest.TestCase):
         self.assertIsNone(response["failure"])
         self.assertEqual(response["stdout"], b"synthetic child\n")
 
+    def test_only_the_judge_requests_native_structured_output(self):
+        judge = codex_argv("/opt/codex", profile=PROFILE, role="judge", output_schema=JUDGE_OUTPUT_SCHEMA)
+        self.assertEqual(judge[-4:], ["--output-schema", JUDGE_OUTPUT_SCHEMA, "--", "-"])
+        self.assertEqual(codex_argv("/opt/codex", profile=PROFILE, role="judge")[:-2], judge[:-4])
+        with self.assertRaisesRegex(ValueError, "output_schema_argument"):
+            codex_argv("/opt/codex", output_schema=JUDGE_OUTPUT_SCHEMA)
+
     def test_named_permissions_have_no_legacy_sandbox_and_deny_private_paths(self):
         argv = codex_argv("/opt/codex")
         self.assertEqual(argv[-2:], ["--", "-"])
         self.assertNotIn("--sandbox", argv)
+        self.assertNotIn("--output-schema", argv)
         self.assertIn('default_permissions="full62_reader"', argv)
         self.assertIn('forced_login_method="chatgpt"', argv)
         config = tomllib.loads(model_config(PROFILE, "reader").decode())

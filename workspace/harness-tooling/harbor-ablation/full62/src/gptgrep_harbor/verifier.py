@@ -4,10 +4,21 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from .common import MAX_ANSWER, canonical, copy_asset, parse, put, read, require, sha, validate_binding
-from .native import codex_accounting, codex_argv, codex_result, prompt_bytes
+from .common import MAX_ANSWER, canonical, copy_asset, parse, pinned, put, read, require, sha, validate_binding
+from .native import (JUDGE_OUTPUT_SCHEMA, MAX_OUTPUT_SCHEMA_BYTES, codex_accounting, codex_argv, codex_result,
+                     output_schema_bytes, prompt_bytes)
 from .process import run
 from .runtime import CODEX_VERSION, WORK_DIR, check_config, native_environment
+
+
+def output_schema(config, schema):
+    """Verify the materialized frozen response schema immediately before native use."""
+    pin = config.get("output_schema")
+    require(type(pin) is dict and set(pin) == {"path", "bytes", "sha256"} and
+            pin["path"] == JUDGE_OUTPUT_SCHEMA and schema == config["contract"]["response_schema"],
+            "judge_output_schema_pin")
+    require(pinned(pin, MAX_OUTPUT_SCHEMA_BYTES) == output_schema_bytes(schema), "judge_output_schema_contract")
+    return pin
 
 
 def grade(config, envelope, invoke):
@@ -78,10 +89,14 @@ def main():
     attempt = {}
 
     def invoke(prompt, schema):
-        # The frozen prompt carries the original rubric. Append no new rubric,
-        # reference evidence or other-arm output. Strict JSON is already required
-        # by the frozen contract selected during materialization.
+        # The frozen prompt bytes carry the original rubric unchanged. Append no
+        # new rubric, reference evidence or other-arm output. The frozen response
+        # schema reaches the native CLI only through its pinned materialized file;
+        # a changed file stops this attempt before any process starts.
         native_input = prompt_bytes(prompt)
+        attempt.update(output_schema=config.get("output_schema"), output_schema_verified=False)
+        schema_pin = output_schema(config, schema)
+        attempt["output_schema_verified"] = True
         put("/logs/verifier/attempt-start.json", {"binding": config["binding"], "profile": config["judge_profile"]})
         import time
         started = time.monotonic()
@@ -92,7 +107,8 @@ def main():
                 version["stdout"].strip() == ("codex-cli " + CODEX_VERSION).encode(), "native_version_mismatch")
         remaining = config["judge_deadline_seconds"] - (time.monotonic() - started)
         require(remaining > 0, "judge_deadline")
-        response = run(codex_argv(config["codex_binary"], profile=config["judge_profile"], role="judge"),
+        response = run(codex_argv(config["codex_binary"], profile=config["judge_profile"], role="judge",
+                                  output_schema=schema_pin["path"]),
                        cwd=WORK_DIR, timeout=remaining, env=env, input_bytes=native_input)
         attempt.update(elapsed_ms=response["elapsed_ms"], return_code=response["return_code"],
                        observed_native_version=version["stdout"].decode().strip(),

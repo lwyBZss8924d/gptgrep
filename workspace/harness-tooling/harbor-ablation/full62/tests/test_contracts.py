@@ -13,7 +13,7 @@ from gptgrep_harbor.adapter import Full62Adapter, validate_cohort, env_templates
 import gptgrep_harbor.adapter as adapter_module
 from gptgrep_harbor.aggregate import paired, summarize, time_bounds
 from gptgrep_harbor.common import MAX_ANSWER, MAX_NATIVE_PROMPT_BYTES, PROFILE, canonical, parse, sha
-from gptgrep_harbor.native import codex_accounting, codex_result, prompt_bytes
+from gptgrep_harbor.native import codex_accounting, codex_result, output_schema_bytes, prompt_bytes
 from gptgrep_harbor.reader import product_accounting
 from gptgrep_harbor import reader, verifier
 from gptgrep_harbor.runtime import CODEX_VERSION
@@ -269,19 +269,34 @@ class NativeAccountingTests(unittest.TestCase):
         self.assertLess(child.call_args.kwargs["timeout"], config["deadline_seconds"])
         return outputs
 
-    def judge_main(self, stdout, answer="synthetic answer", **overrides):
+    single_field_schema = {"type": "object", "additionalProperties": False, "required": ["equivalent"],
+                           "properties": {"equivalent": {"type": "boolean"}}}
+
+    def judge_main(self, stdout, answer="synthetic answer", schema=None, schema_fault=None, **overrides):
+        schema = self.single_field_schema if schema is None else schema
+        directory = tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"])
+        self.addCleanup(directory.cleanup)
+        schema_file = Path(directory.name).resolve() / "judge-output-schema.json"
+        data = output_schema_bytes(schema)
+        schema_file.write_bytes(data)
+        pin = {"path": str(schema_file), "bytes": len(data), "sha256": sha(data)}
+        if schema_fault == "changed_file":
+            schema_file.write_bytes(data.replace(b'"boolean"', b'"string" ', 1))
+        elif schema_fault == "other_contract":
+            schema = {**schema, "required": list(schema["required"]) + ["synthetic_extra"]}
         config = {"binding": self.binding(), "codex_binary": "/synthetic/codex",
                   "reader_base_binary": {"path": "/synthetic/codex"}, "judge_profile": PROFILE,
                   "judge_deadline_seconds": 20, "native_config_sha256": "e" * 64,
                   "base_tool_environment": {},
                   "question": "synthetic question", "reference": "synthetic reference", "answer_format": "text",
                   "contract": {"prompt": "Q:{question}\nR:{answer}\nF:{answer_format}\nA:{response}",
-                      "response_schema": {"type": "object", "required": ["equivalent"],
-                                          "properties": {"equivalent": {"type": "boolean"}}}}}
+                               "response_schema": schema},
+                  "output_schema": pin}
         envelope = {"schema": "gptgrep.harbor.answer.v1", "binding": self.binding(),
                     "status": "response", "answer": answer}
         outputs = {}
         with patch.object(verifier, "read", side_effect=[canonical(config), canonical(envelope)]), \
+             patch.object(verifier, "JUDGE_OUTPUT_SCHEMA", str(schema_file)), \
              patch.object(verifier, "check_config"), patch.object(verifier, "copy_asset"), \
              patch.object(verifier, "native_environment", return_value={}), \
              patch.object(verifier.Path, "exists", return_value=False), \
@@ -289,10 +304,13 @@ class NativeAccountingTests(unittest.TestCase):
              patch.object(verifier, "run", side_effect=[self.native_run_result(("codex-cli " + CODEX_VERSION).encode()),
                                                         self.native_run_result(stdout, **overrides)]) as child:
             verifier.main()
+        self.judge_calls = child.call_count
         if child.call_count:
             argv = child.call_args.args[0]
             self.assertEqual(argv[-2:], ["--", "-"])
+            self.assertEqual(argv[argv.index("--output-schema") + 1], str(schema_file))
             self.assertNotIn(answer, argv)
+            # The frozen prompt bytes are unchanged by structured output.
             expected = config["contract"]["prompt"].format(question=config["question"], answer=config["reference"],
                                                          answer_format=config["answer_format"], response=answer).encode()
             self.assertEqual(child.call_args.kwargs["input_bytes"], expected)
@@ -319,6 +337,38 @@ class NativeAccountingTests(unittest.TestCase):
                     self.assertEqual(attempt["native_process_incomplete"], name == "failed_process")
                     if name != "failed_process":
                         self.assertTrue(attempt["native_stream_incomplete"])
+
+    frozen_like_schema = {"type": "object", "additionalProperties": False,
+                          "required": ["equivalent", "abstained", "reason"],
+                          "properties": {"equivalent": {"type": "boolean"}, "abstained": {"type": "boolean"},
+                                         "reason": {"type": "string"}}}
+
+    def test_schema_valid_structured_judge_reply_is_parsed(self):
+        reply = canonical({"equivalent": True, "abstained": False, "reason": "synthetic"}).decode()
+        output = self.judge_main(self.events(reply), schema=self.frozen_like_schema)
+        result = output["/logs/verifier/judgment.json"]
+        self.assertEqual((result["status"], result["label"]), ("judged", 1))
+        self.assertTrue(result["judge_attempts"][0]["output_schema_verified"])
+        self.assertEqual(output["/logs/verifier/reward.json"]["answer_equivalence"], 1)
+
+    def test_non_json_or_schema_invalid_judge_reply_stays_unknown(self):
+        for reply in ("Equivalent: yes", '{"equivalent": true', '{"equivalent": true, "abstained": false}'):
+            with self.subTest(reply=reply):
+                output = self.judge_main(self.events(reply), schema=self.frozen_like_schema)
+                self.assertEqual(self.judge_calls, 2)
+                result = output["/logs/verifier/judgment.json"]
+                self.assertEqual((result["status"], result["label"]), ("judge_unavailable", None))
+                self.assertNotIn("answer_equivalence", output["/logs/verifier/reward.json"])
+
+    def test_output_schema_pin_is_verified_before_any_native_process(self):
+        for fault in ("changed_file", "other_contract"):
+            with self.subTest(fault=fault):
+                output = self.judge_main(self.events('{"equivalent":true}'), schema_fault=fault)
+                self.assertEqual(self.judge_calls, 0)
+                result = output["/logs/verifier/judgment.json"]
+                self.assertEqual((result["status"], result["label"]), ("judge_unavailable", None))
+                self.assertFalse(result["judge_attempts"][0]["output_schema_verified"])
+                self.assertNotIn("/logs/verifier/attempt-start.json", output)
 
     def test_complete_maximum_answer_uses_judge_stdin_with_independent_prompt_bound(self):
         answer = "x" * MAX_ANSWER
