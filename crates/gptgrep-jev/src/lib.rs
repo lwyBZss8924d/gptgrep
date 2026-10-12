@@ -7,22 +7,30 @@ mod clock;
 mod execution;
 mod failure;
 mod input;
+mod models;
 #[cfg(test)]
 mod observer_tests;
 mod roles;
 mod validation;
 pub use clock::RunClockAnchor;
 pub use execution::{
-    DecisionsBudget, ExecutionContext, ExecutionSnapshot, MAX_CONCURRENT_REQUESTS, MAX_SUBMISSIONS,
+    DECISIONS_BUDGET_CONTRACT_SCHEMA, DECISIONS_BUDGET_STATUS_SCHEMA, DecisionsBudget,
+    DecisionsBudgetStatus, ExecutionContext, ExecutionSnapshot, MAX_CONCURRENT_REQUESTS,
+    MAX_SUBMISSIONS, ReservationOutcomeCounts,
 };
 pub use failure::{
-    DecisionFailure, DecisionFailureDiagnostic, DecisionFailureKind, FailedResponseUsage,
-    UsageObservation, UsagePresence,
+    DecisionFailure, DecisionFailureDiagnostic, DecisionFailureKind, FailedResponseMetadata,
+    FailedResponseUsage, UsageObservation, UsagePresence,
 };
 pub use input::{
     DecisionInput, ImageEvidence, MAX_IMAGE_BASE64_BYTES, MAX_IMAGE_BYTES,
     MAX_IMAGE_PIXEL_BUFFER_BYTES, MAX_IMAGE_PIXELS, MAX_IMAGES, MAX_MULTIMODAL_REQUEST_BYTES,
     MAX_TOTAL_IMAGE_PIXELS, PreparedImageQualification, SourceBinding, TextEvidence,
+};
+pub(crate) use models::luna_decisions_model;
+pub use models::{
+    DEFAULT_MODEL_CANONICAL, LEGACY_MODEL_CANONICAL, MODEL_ALIAS_PREFIX, ModelAlias,
+    is_model_alias, model_accepts_images, response_model_matches,
 };
 pub use roles::{
     EvidenceRole, EvidenceRoleCandidate, EvidenceRoleResponse, MAX_ROLE_CANDIDATES,
@@ -44,24 +52,6 @@ use std::{collections::BTreeMap, net::IpAddr, sync::Arc, time::Duration};
 pub const DEFAULT_MODEL: &str = "openai/gpt-6-luna-decisions";
 /// Explicit legacy text-only model. Never selected as fallback.
 pub const LEGACY_MODEL: &str = "typesafe/jev-1.13";
-
-/// Admit an exact requested identifier or an observed canonical identifier for
-/// the two supported aliases. Other models require exact equality.
-pub fn response_model_matches(requested: &str, actual: &str) -> bool {
-    requested == actual
-        || matches!(
-            (requested, actual),
-            (DEFAULT_MODEL, "openai/gpt-6-luna-decisions-20261006")
-                | (LEGACY_MODEL, "typesafe/jev-1.13-20260917")
-        )
-}
-
-pub(crate) fn luna_decisions_model(model: &str) -> bool {
-    matches!(
-        model,
-        DEFAULT_MODEL | "openai/gpt-6-luna-decisions-20261006"
-    )
-}
 pub const DEFAULT_ENDPOINT: &str = "https://openrouter.ai/api/alpha/decisions";
 /// A local application cap, not a provider-advertised limit.
 pub const MAX_QUESTIONS: usize = 64;
@@ -296,10 +286,8 @@ impl JevClient {
             "Jev endpoint requires a host"
         );
         let model = model.unwrap_or(DEFAULT_MODEL);
-        ensure!(
-            !model.trim().is_empty() && model.len() <= 256 && !model.chars().any(char::is_control),
-            "Invalid Jev model identifier"
-        );
+        // Malformed `~` aliases fail here, before any context, reservation or body.
+        models::validate_requested_model(model)?;
         let mut authorization = HeaderValue::from_str(&format!("Bearer {api_key}"))
             .map_err(|_| anyhow!("Invalid Jev API key header"))?;
         authorization.set_sensitive(true);
@@ -336,6 +324,13 @@ impl JevClient {
 
     pub fn execution_context(&self) -> &ExecutionContext {
         &self.execution
+    }
+
+    /// The requested model selector sent in every prepared body. Responses keep
+    /// their own served identifier; an alias selector is admitted per
+    /// [`response_model_matches`].
+    pub fn requested_model(&self) -> &str {
+        &self.model
     }
 
     /// Install before preparing requests. Existing prepared identities are

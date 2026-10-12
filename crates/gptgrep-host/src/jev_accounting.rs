@@ -65,7 +65,11 @@ pub struct JevReport {
     /// Logical client-call attempts, not proof that an HTTP request was sent.
     pub attempted_calls: usize,
     pub unobserved_attempts: usize,
+    /// Served (provider-returned) Decisions builds of validated responses.
     pub models: Vec<String>,
+    /// Requested Decisions selectors of all attempts, reported separately.
+    #[serde(default)]
+    pub requested_models: Vec<String>,
     pub usage: Vec<Value>,
     pub accounting_complete: bool,
     pub searches: Vec<SearchTelemetry>,
@@ -836,6 +840,9 @@ fn plan_metrics(operations: &BTreeMap<String, PlannedSearchEvent>, elapsed_ms: u
             .jev_models
             .extend(operation.metrics.jev_models.iter().cloned());
         metrics
+            .jev_requested_models
+            .extend(operation.metrics.jev_requested_models.iter().cloned());
+        metrics
             .jev_usage
             .extend(operation.metrics.jev_usage.iter().cloned());
     }
@@ -857,6 +864,10 @@ fn summarize(searches: &[SearchTelemetry]) -> JevReport {
         .iter()
         .flat_map(|s| s.metrics.jev_models.iter().cloned())
         .collect();
+    let requested_models: BTreeSet<_> = searches
+        .iter()
+        .flat_map(|s| s.metrics.jev_requested_models.iter().cloned())
+        .collect();
     JevReport {
         required: true,
         initial_status: searches
@@ -868,6 +879,7 @@ fn summarize(searches: &[SearchTelemetry]) -> JevReport {
         attempted_calls,
         unobserved_attempts: attempted_calls.saturating_sub(requests),
         models: models.into_iter().collect(),
+        requested_models: requested_models.into_iter().collect(),
         usage: searches
             .iter()
             .flat_map(|s| s.metrics.jev_usage.iter().cloned())
@@ -885,7 +897,9 @@ fn summarize_state(state: &State) -> JevReport {
             .attempted_calls
             .saturating_sub(navigation.requests);
         let mut models: BTreeSet<_> = summary.models.into_iter().collect();
+        let mut requested: BTreeSet<_> = summary.requested_models.into_iter().collect();
         for batch in &navigation.batches {
+            requested.insert(batch.requested_model.clone());
             if let Some(model) = &batch.model {
                 models.insert(model.clone());
                 summary
@@ -894,6 +908,7 @@ fn summarize_state(state: &State) -> JevReport {
             }
         }
         summary.models = models.into_iter().collect();
+        summary.requested_models = requested.into_iter().collect();
         summary.accounting_complete &= navigation.accounting_complete();
     }
     summary
@@ -1105,6 +1120,14 @@ mod evidence_role_storage_tests {
         let summary = accounting.summary();
         assert_eq!(summary.requests, 2);
         assert_eq!(summary.usage.len(), 2);
+        // Served builds and requested selectors are reported separately.
+        assert_eq!(summary.requested_models, [gptgrep_jev::DEFAULT_MODEL]);
+        assert!(
+            summary
+                .models
+                .iter()
+                .all(|model| model != gptgrep_jev::DEFAULT_MODEL)
+        );
         assert!(!summary.accounting_complete);
         let plan = summary.searches[0].plan.as_ref().unwrap();
         assert!(

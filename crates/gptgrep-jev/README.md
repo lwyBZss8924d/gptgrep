@@ -6,7 +6,7 @@ and reservations and refuses missing journal or lock files without initializing
 a replacement. The existing `with_ledger` initializer remains available for the
 owner of a new run; joining a ledger does not renew its deadline.
 
-A Rust client for Jev's structured Decisions endpoint on OpenRouter. It uses the process's `OPENROUTER_API_KEY` and does not read credential files. The default selector is `openai/gpt-6-luna-decisions`. Explicit `typesafe/jev-1.13` remains text-only. Responses preserve the actual model identifier and must match the requested identifier or its supported observed canonical mapping: Luna `openai/gpt-6-luna-decisions-20261006`, legacy Jev `typesafe/jev-1.13-20260917`. Other explicit models require exact equality; unknown aliases fail validation, with no fallback.
+A Rust client for Jev's structured Decisions endpoint on OpenRouter. It uses the process's `OPENROUTER_API_KEY` and does not read credential files. The default selector is `openai/gpt-6-luna-decisions`. Explicit `typesafe/jev-1.13` remains text-only. Responses preserve the actual model identifier and must match the requested identifier or its supported observed canonical mapping: Luna `openai/gpt-6-luna-decisions-20261006`, legacy Jev `typesafe/jev-1.13-20260917`. Other explicit models require exact equality, with no fallback. A requested OpenRouter alias of the form `~author/family-latest` (see `ModelAlias`) admits only a concrete `author/family-VERSION` build of the same author and family, where VERSION starts with a digit. For `~typesafe/jev-latest`, `typesafe/jev-1.13` and `typesafe/jev-1.13-20260917` are admitted. Another author or family, a variant such as `:free` and another alias are rejected as `model_mismatch` after the charged response. A malformed `~` selector is refused when the client is constructed. Aliases are text-only (`model_accepts_images`). `JevClient::requested_model()` exposes the selector, so callers can report it beside the served `model`.
 
 ```rust,no_run
 use gptgrep_jev::{Candidate, JevClient};
@@ -68,9 +68,23 @@ The CLI exposes this as `--decisions-budget FILE` for paid paths. Native Codex
 execution and its budget remain separate. Without an explicit context, one client
 invocation uses the bounded compatibility context.
 
+`DecisionsBudget::initialize` creates a new ledger with `ExecutionContext::new(..)`
+and `with_new_ledger(..)`, the create-only form of `with_ledger`. In that form, the
+attaching access must create the lock inode and write its header itself. The
+function then publishes the control file with mode 0600 and without replacement.
+Existing ledger, lock or control paths are refused before any write, and a
+concurrently created lock is refused too. Nothing is joined, reset or renewed.
+`DecisionsBudget::read` parses a control without joining; `join` attaches with
+`with_existing_ledger`. `status()` reads the lock and journal without locking or
+writing. It returns `DecisionsBudgetStatus`: reservations by outcome, remaining
+submissions, occupied slots, requested selectors, wall and original-anchor
+remaining time, and whether admission is open. It remains available after the
+deadline. The CLI exposes these as `gptgrep decisions-budget init` and
+`gptgrep decisions-budget status`.
+
 Response validation rejects missing, unexpected or duplicate answer IDs, duplicate JSON object keys, wrong answer types, non-finite/out-of-range numbers, invalid choices, inconsistent probability keys and malformed usage. Optional gateway confidence/distributions/legend stay optional; supplied values are validated. No provider body, query, excerpt or credential is included in error text. After a transport failure, usage may be unknown.
 
-An unsuccessful submission can be downcast to `DecisionFailure` for a serializable `diagnostic()`: the failure kind, observed HTTP status, retained response byte count, a fixed validation code and independently checked numeric usage fields. Usage distinguishes absent, null, invalid and reported values. Invalid answers remain rejected even when numeric usage can be retained; a reported cost is provider metadata, not a verified bill. Invalid JSON or duplicate keys cannot supply usage. The diagnostic stores no request or response contents, URL, headers or underlying exception, and does not authorize retrying a charged submission.
+An unsuccessful submission can be downcast to `DecisionFailure` for a serializable `diagnostic()`: the failure kind, observed HTTP status, retained response byte count, a fixed validation code and independently checked numeric usage fields. Usage distinguishes absent, null, invalid and reported values. A parsed but rejected response also yields `response_metadata`: the served `model`, response `id` and `provider`. Each is kept only as a nonblank string of at most 256 bytes without control characters, with the same presence states. Invalid answers remain rejected even when numeric usage can be retained; a reported cost is provider metadata, not a verified bill. Invalid JSON or duplicate keys cannot supply usage. Beyond those bounded identity fields, the diagnostic stores no request or response contents, URL, headers or underlying exception, and does not authorize retrying a charged submission.
 
 Rejecting oversized success headers or a partial response body happens before EOF, so it also quarantines the slot. A fully received invalid response releases its slot while remaining charged. The stable lock filename appends `.lock` to the complete selected filename; journal staging uses a uniquely created, owned temporary file. The lock stores and syncs the immutable initialization header before journal creation. Only the access that atomically creates the lock inode can initialize a journal; an existing empty header or a missing, malformed or mismatched journal fails closed. Bounded lock-contention waits retry only an unperformed journal action, never an ambiguous storage update or HTTP request.
 

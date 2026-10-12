@@ -287,6 +287,9 @@ fn aggregate(operations: &[PlannedSearchEvent], started: Instant) -> Metrics {
         result
             .jev_models
             .extend(operation.metrics.jev_models.clone());
+        result
+            .jev_requested_models
+            .extend(operation.metrics.jev_requested_models.clone());
         result.jev_usage.extend(operation.metrics.jev_usage.clone());
     }
     result
@@ -583,6 +586,7 @@ async fn score_evidence_roles(
     )?;
     metrics.jev_candidate_bytes = prepared.candidate_bytes();
     metrics.jev_calls_attempted = 1;
+    metrics.jev_requested_models = vec![client.requested_model().to_owned()];
     let mut before = operation.current();
     before.event = "before_call".into();
     before.metrics = metrics.clone();

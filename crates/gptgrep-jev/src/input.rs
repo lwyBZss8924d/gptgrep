@@ -303,7 +303,9 @@ impl JevClient {
 
     /// Prepare literal text and admitted PNG/JPEG evidence for Luna Decisions.
     /// Source bindings stay local; flat wire state preserves text/image order.
-    /// Explicit legacy and other models retain the text-only evidence object.
+    /// Explicit legacy, other exact models and every `~` alias retain the
+    /// text-only evidence object; their images are rejected here, before any
+    /// reservation or submission (see [`crate::model_accepts_images`]).
     pub fn prepare_input(
         &self,
         input: DecisionInput,
