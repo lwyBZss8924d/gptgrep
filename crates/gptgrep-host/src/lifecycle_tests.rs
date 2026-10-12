@@ -613,6 +613,13 @@ fn two_process_mock(directory: &Path, reader_answer: &Value) -> HostConfig {
     two_process_mock_with_budget(directory, reader_answer, None)
 }
 
+/// Token count reported for a foreign turn. Tests search the whole attempt
+/// ledger for it as text, and that ledger also holds run-dependent SHA-256
+/// digests and timestamps, so it must be long enough not to occur there by
+/// chance. The former 99999 did, inside a tool-output digest.
+#[cfg(unix)]
+const FOREIGN_TOTAL_TOKENS: u64 = 987_654_321;
+
 #[cfg(unix)]
 fn two_process_mock_with_budget(
     directory: &Path,
@@ -728,7 +735,7 @@ fn two_process_mock_with_budget(
                 "foreign" => emit(
                     &mut script,
                     json!({"method":"thread/tokenUsage/updated","params":{
-                    "threadId":thread_id,"turnId":"foreign-budget-turn","tokenUsage":{"total":{"totalTokens":99999}}}}),
+                    "threadId":thread_id,"turnId":"foreign-budget-turn","tokenUsage":{"total":{"totalTokens":FOREIGN_TOTAL_TOKENS}}}}),
                 ),
                 "stall" => {}
                 _ => panic!("unknown synthetic ending"),
@@ -1122,7 +1129,10 @@ async fn integrated_budget_failures_keep_identity_usage_and_original_deadline() 
                 .any(|receipt| receipt.tool_budget.is_some())
         );
         let ledger = std::fs::read_to_string(&failure.ledger_path).unwrap();
-        assert!(!ledger.contains("foreign-budget-turn") && !ledger.contains("99999"));
+        assert!(
+            !ledger.contains("foreign-budget-turn")
+                && !ledger.contains(&FOREIGN_TOTAL_TOKENS.to_string())
+        );
         if ending == "failed" {
             assert_eq!(
                 failure.cause.as_ref().unwrap()["tool_budget"]["denied_tool_calls"],
