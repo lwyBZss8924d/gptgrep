@@ -450,22 +450,24 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
                 "decisions_budget": {"path": "/opt/full62-private/decisions-budget.json", "bytes": 1,
                                      "sha256": "f" * 64}}
 
-    def run_reader(self, stdout, environ=None):
+    def run_reader(self, stdout, environ=None, config=None):
         outputs = {}
         version = {"stdout": ("codex-cli " + CODEX_VERSION).encode(), "stderr": b"", "elapsed_ms": 1,
                    "return_code": 0, "failure": None, "stdin_bytes": 0, "stdin_bytes_sent": 0, "stdin_complete": True}
         product = {**version, "stdout": stdout, "elapsed_ms": 10}
         budget = canonical({"ledger_path": "/opt/full62-private/ledger/decisions.json"})
-        with patch.object(reader, "read", side_effect=[canonical(self.config()), self.question.encode()]), \
+        config = self.config() if config is None else config
+        with patch.object(reader, "read", side_effect=[canonical(config), self.question.encode()]), \
              patch.object(reader, "check_config"), patch.object(reader, "copy_asset"), \
              patch.object(reader, "check_product_bundle"), \
-             patch.object(reader, "pinned", return_value=budget), \
+             patch.object(reader, "pinned", return_value=budget) as budget_read, \
              patch.object(reader.Path, "exists", return_value=False), \
              patch.object(reader, "put", side_effect=lambda path, value: outputs.update({path: value})), \
              patch.dict(os.environ, environ or {"PATH": "/usr/bin"}, clear=True), \
              patch("sys.argv", ["reader", "--instruction", "/synthetic/instruction.txt"]), \
              patch.object(reader, "run", side_effect=[version, product]) as child:
             reader.main()
+        self.budget_reads = budget_read.call_count
         return outputs, child
 
     def judge_config(self):
@@ -525,6 +527,37 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
         policy = tomllib.loads(model_config(PROFILE, "reader").decode())
         self.assertEqual(policy["web_search"], "disabled")
         self.assertIs(policy["permissions"]["full62_reader"]["network"]["enabled"], False)
+
+    def test_existing_context_ask_still_joins_the_mounted_budget(self):
+        outputs, child = self.run_reader(legacy_report())
+        self.assertEqual(self.budget_reads, 1)
+        self.assertEqual(child.call_args_list[1].args[0][1:4],
+                         ["--decisions-budget", "/opt/full62-private/decisions-budget.json", "ask"])
+        self.assertEqual(outputs["/logs/agent/operational.json"]["decisions_mode"], "existing_context")
+
+    def test_invocation_bounded_ask_joins_no_budget_and_keeps_its_cost_receipt(self):
+        config = {**self.config(), "decisions_mode": "invocation_bounded"}
+        del config["decisions_budget"]
+        jev = {"requests": 2, "attempted_calls": 2, "unobserved_attempts": 0, "accounting_complete": True,
+               "usage": [{"cost": 0.0125}, {"cost": 0.0075}]}
+        for status, expected in (("completed", "response"), ("failed", "operational_failure")):
+            with self.subTest(status=status):
+                report = legacy_report(status=status, jev=jev)
+                if status == "failed":
+                    # A failed Ask reports its Decisions accounting under error.
+                    report = canonical({"status": "failed", "error": {"jev": jev}})
+                outputs, child = self.run_reader(report, config=config)
+                self.assertEqual(self.budget_reads, 0)
+                argv = child.call_args_list[1].args[0]
+                self.assertEqual(argv[:2], ["/synthetic/gptgrep", "ask"])
+                self.assertNotIn("--decisions-budget", argv)
+                self.assertEqual(outputs["/answer/answer.json"]["status"], expected)
+                operation = outputs["/logs/agent/operational.json"]
+                self.assertEqual(operation["decisions_mode"], "invocation_bounded")
+                receipt = operation["attempts"][0]["decisions_cost"]
+                self.assertTrue(receipt["cost_complete"])
+                self.assertAlmostEqual(receipt["reported_cost_usd"], 0.02)
+                self.assertEqual((receipt["validated_requests"], receipt["priced_rows"]), (2, 2))
 
     def test_bare_prompt_states_the_enforced_no_external_search_policy(self):
         prompt = reader.raw_prompt({"raw_document": "/data/corpus/synthetic.txt"}, self.question).decode()

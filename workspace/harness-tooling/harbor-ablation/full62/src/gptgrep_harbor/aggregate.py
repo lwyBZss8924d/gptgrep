@@ -6,6 +6,30 @@ import random
 import statistics
 
 from .common import ARMS, MAX_ANSWER, binding_equal, canonical, finite_number, integer, parse, pinned, require, sha, validate_binding
+from .decisions import selected_mode
+
+
+def trial_decisions_cost(attempts):
+    """A trial's reported Decisions cost, or None unless every attempt's receipt is complete."""
+    receipts = [attempt.get("decisions_cost") for attempt in attempts]
+    complete = bool(receipts) and all(isinstance(receipt, dict) and receipt.get("cost_complete") is True
+                                      and finite_number(receipt.get("reported_cost_usd")) for receipt in receipts)
+    return sum(receipt["reported_cost_usd"] for receipt in receipts) if complete else None
+
+
+def decisions_costs(rows, runtime):
+    """Aggregate treatment receipts; one unknown trial keeps the cohort total unknown."""
+    known = [row["decisions_cost_usd"] for row in rows if row["decisions_cost_usd"] is not None]
+    partial = [value for row in rows for value in row["retrieval_known"]]
+    total = sum(known) if len(known) == len(rows) else None
+    cap = runtime.get("decisions_cost_cap_usd")
+    return {"mode": selected_mode(runtime), "treatment_trials": len(rows),
+            "cost_complete_trials": len(known), "cost_unknown_trials": len(rows) - len(known),
+            "reported_cost_receipts": sum(row["retrieval_receipts"] for row in rows),
+            "reported_cost_usd_known_subtotal": sum(partial) if partial else None,
+            "reported_cost_usd_total": total, "cost_cap_usd": cap,
+            "total_within_cap": total <= cap if total is not None and finite_number(cap) else None,
+            "currency_verified": False, "included_in_query_cost": False}
 
 
 def quantile(values, q):
@@ -149,6 +173,9 @@ def summarize(export, records, runtime):
                             "grounding_available": grounding is not None,
                             "retrieval_known": [a["reported_retrieval_cost_subtotal"] for a in attempts
                                                 if finite_number(a.get("reported_retrieval_cost_subtotal"))],
+                            "retrieval_receipts": sum(a["reported_retrieval_cost_receipts"] for a in attempts
+                                                      if type(a.get("reported_retrieval_cost_receipts")) is int),
+                            "decisions_cost_usd": trial_decisions_cost(attempts),
                             "final_reader_usage": [a["usage"] for a in attempts if isinstance(a.get("usage"), dict)]})
         if pair in pairs:
             require(binding_equal(pairs[pair]["binding"], binding) and arm not in pairs[pair], "paired_binding")
@@ -193,6 +220,7 @@ def summarize(export, records, runtime):
                             usage_subsets_not_added_twice=True)
     comparison = paired(list(pairs.values()), runtime["bootstrap_seed"])
     return {"schema": "gptgrep.harbor.paired-summary.v1", "search": summary, "paired": comparison,
+            "decisions": decisions_costs(values["gptgrep"], runtime),
             "judge": {"outer_attempts_observed": len(judge_attempts),
                       "observed_attempt_wall_ms_subtotal": sum(a["elapsed_ms"] for a in judge_attempts
                                                                if finite_number(a.get("elapsed_ms"))),

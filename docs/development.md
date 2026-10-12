@@ -306,10 +306,12 @@ uv run --project "$GPTGREP_FULL62_SOURCE" --frozen python -B -m unittest discove
 For a real run, follow the adapter's sequence: build and verify the common
 Python/Pillow/Poppler/native-Codex foundation; add the complete Linux GPTgrep plus
 PDFium bundle to the treatment derivative; qualify matching reader permissions
-and account mounts; supply the frozen private cohort and Judge contract; prepare
+and account mounts; supply the frozen private cohort and Judge contract; select
+one treatment Decisions mode (an existing shared ledger, per-trial preparation, or
+invocation-bounded contexts under a pinned price and cohort cost cap); prepare
 all 124 tasks; build exact role images; run the generated Harbor job; aggregate
 all paired outcomes. Its `prepare`, `build-local-images` and `aggregate` commands
-require pinned manifests. `harbor run -c GENERATED_JOB_JSON` uses the same installed
+require pinned manifests; `prepare` prints its budget preflight before writing tasks. `harbor run -c GENERATED_JOB_JSON` uses the same installed
 adapter environment and a fresh admitted output namespace, with one attempt and
 no automatic retry.
 

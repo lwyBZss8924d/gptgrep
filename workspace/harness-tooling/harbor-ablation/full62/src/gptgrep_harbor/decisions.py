@@ -1,7 +1,9 @@
-"""Caller-selected, treatment-only current Decisions preparation controls."""
+"""Caller-selected, treatment-only Decisions context modes and their controls."""
 from __future__ import annotations
 
 import fcntl
+from fractions import Fraction
+import math
 import os
 from pathlib import Path
 import stat
@@ -18,6 +20,65 @@ TRIAL_BUDGET = TRIAL_ROOT + "/budget.json"
 WRITER_LOCK = "/opt/full62-private/sole-writer.lock"
 ATTACH_PATH_ENV = "GPTGREP_DECISIONS_ATTACH_PLAN"
 ATTACH_SHA_ENV = "GPTGREP_DECISIONS_ATTACH_PLAN_SHA256"
+
+# Exactly one Decisions context mode per runtime. Fields of every unselected
+# mode stay null (as runtime.template.json ships them) or absent.
+DECISIONS_MODES = ("existing_context", "preparation", "invocation_bounded")
+MODE_FIELDS = {"existing_context": ("decisions_budget", "decisions_ledger_dir"),
+               "preparation": ("decisions_preparation",),
+               "invocation_bounded": ("decisions_cost_cap_usd", "decisions_prompt_price")}
+# Product limits mirrored from gptgrep-jev: a context admits at most
+# MAX_SUBMISSIONS, and one serialized request is at most MAX_REQUEST_BYTES.
+INVOCATION_MAX_SUBMISSIONS = 200
+MAX_REQUEST_BYTES = 64 * 1024
+
+
+def selected_mode(runtime):
+    """Resolve the one Decisions mode and reject any field of another mode."""
+    mode = runtime.get("decisions_mode")
+    if mode is None:
+        # Original field-based selection; invocation_bounded is explicit only.
+        mode = "preparation" if runtime.get("decisions_preparation") is not None else "existing_context"
+    require(mode in DECISIONS_MODES, "decisions_mode")
+    for other, fields in MODE_FIELDS.items():
+        require(other == mode or all(runtime.get(field) is None for field in fields),
+                "decisions_" + mode + "_mode_conflict")
+    return mode
+
+
+def decimal(value, code):
+    """The exact decimal value of a finite positive JSON number."""
+    require(type(value) in (int, float) and math.isfinite(value) and value > 0, code)
+    return Fraction(repr(value))
+
+
+def invocation_cost_bound(runtime, treatment_trials):
+    """Preflight: every treatment trial may spend its whole per-invocation context.
+
+    Each Ask without a budget file uses the product's own single-invocation
+    context of at most 200 submissions. A submission's worst case prices every
+    byte of the 64 KiB request bound as one prompt token at the pinned rate.
+    """
+    cap = decimal(runtime.get("decisions_cost_cap_usd"), "decisions_cost_cap_usd")
+    price = runtime.get("decisions_prompt_price")
+    require(type(price) is dict and set(price) == {"model", "usd_per_million_prompt_tokens", "provenance"}
+            and price["model"] == runtime["jev_model"], "decisions_prompt_price")
+    rate = decimal(price["usd_per_million_prompt_tokens"], "decisions_prompt_price")
+    # The price evidence is a host-side pin; it never enters a task context.
+    pinned(price["provenance"])
+    integer(treatment_trials, 1)
+    per_submission = MAX_REQUEST_BYTES * rate / 1000000
+    per_trial = INVOCATION_MAX_SUBMISSIONS * per_submission
+    worst = treatment_trials * per_trial
+    require(worst <= cap, "decisions_cost_cap_preflight")
+    return {"mode": "invocation_bounded", "treatment_trials": treatment_trials,
+            "max_submissions_per_trial": INVOCATION_MAX_SUBMISSIONS, "max_request_bytes": MAX_REQUEST_BYTES,
+            "token_bound": "one_prompt_token_per_request_byte",
+            "usd_per_million_prompt_tokens": price["usd_per_million_prompt_tokens"],
+            "price_model": price["model"], "price_provenance": price["provenance"],
+            "worst_case_usd_per_submission": float(per_submission),
+            "worst_case_usd_per_trial": float(per_trial), "worst_case_usd": float(worst),
+            "cost_cap_usd": runtime["decisions_cost_cap_usd"]}
 
 
 def directory(value):

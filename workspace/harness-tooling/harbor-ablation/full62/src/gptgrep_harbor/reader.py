@@ -11,7 +11,7 @@ from .common import MAX_ANSWER, MAX_READER_QUESTION_BYTES, PROFILE, canonical, c
 from .native import codex_accounting, codex_argv, codex_result, prompt_bytes
 from .process import run
 from .runtime import CODEX_VERSION, DECISIONS_BUDGET, DECISIONS_LEDGER_DIR, check_config, native_environment
-from .decisions import TRIAL_BUDGET, acquire_writer, prepare as prepare_decisions
+from .decisions import TRIAL_BUDGET, acquire_writer, prepare as prepare_decisions, selected_mode
 
 
 # A completed legacy report is a response. An insufficient_evidence report with
@@ -28,13 +28,23 @@ def reader_argv(config, binding, question):
                 "shared_native_reader_required")
         require(config["reader_mode"] in ("rich_multimodal", "legacy_text"), "explicit_reader_mode")
         mode_flags = ["--multimodal"] if config["reader_mode"] == "rich_multimodal" else []
-        preparing = config.get("decisions_preparation") is not None
-        if preparing:
+        decisions = selected_mode(config)
+        require((decisions == "preparation") == (config.get("decisions_preparation") is not None),
+                "decisions_mode")
+        if decisions == "preparation":
             require(config["reader_mode"] == "rich_multimodal"
                     and config["decisions_preparation"]["max_concurrent_batches"] == 1,
                     "decisions_preparation_mode")
             mode_flags += ["--max-concurrent-batches", "1"]
-        return [config["gptgrep_binary"], "--decisions-budget", TRIAL_BUDGET if preparing else DECISIONS_BUDGET,
+            budget = ["--decisions-budget", TRIAL_BUDGET]
+        elif decisions == "existing_context":
+            budget = ["--decisions-budget", DECISIONS_BUDGET]
+        else:
+            # invocation_bounded: no shared ledger or budget file. The Ask keeps
+            # the product's own single-invocation context (at most 200 submissions).
+            require(config["reader_mode"] == "legacy_text", "decisions_invocation_bounded_mode")
+            budget = []
+        return [config["gptgrep_binary"], *budget,
                 "ask", "--native-ptc", *mode_flags, "--document=" + config["source_relative_path"],
                 "--jev-model", config["jev_model"], "--codex-bin", "/opt/full62/codex-native",
                 "--codex-home", config["codex_home"], "--codex-permissions", config["codex_permissions"],
@@ -93,9 +103,32 @@ def product_accounting(report):
             "reported_retrieval_cost_subtotal": sum(costs) if costs else None,
             "reported_retrieval_cost_receipts": len(costs),
             "reported_retrieval_cost_currency_verified": False,
+            "decisions_cost": decisions_cost(jev),
             "cost_usd": None, "cost_complete": False,
             "physical_provider_requests": None,
             "usage_scope": "final_reader_summary_not_additive_to_model_attempts"}
+
+
+def decisions_cost(jev):
+    """One trial's reported Decisions cost receipt, retained even for failed Asks.
+
+    The cost is known only when every attempted call returned a validated
+    response with a finite reported cost; otherwise it stays unknown (null).
+    """
+    counts = {key: jev.get(key) if isinstance(jev, dict) else None
+              for key in ("requests", "attempted_calls", "unobserved_attempts")}
+    usage = jev.get("usage") if isinstance(jev, dict) and isinstance(jev.get("usage"), list) else []
+    costs = [row["cost"] for row in usage if isinstance(row, dict) and finite_number(row.get("cost"))]
+    accounted = isinstance(jev, dict) and jev.get("accounting_complete") is True
+    complete = (accounted and all(type(value) is int and value >= 0 for value in counts.values())
+                and counts["unobserved_attempts"] == 0
+                and counts["attempted_calls"] == counts["requests"] == len(usage) == len(costs))
+    return {"schema": "gptgrep.harbor.decisions-cost.v1", "observed": isinstance(jev, dict),
+            "validated_requests": counts["requests"], "attempted_calls": counts["attempted_calls"],
+            "unobserved_attempts": counts["unobserved_attempts"], "usage_rows": len(usage),
+            "priced_rows": len(costs), "accounting_complete": accounted,
+            "reported_cost_usd": sum(costs) if complete else None, "cost_complete": complete,
+            "currency_verified": False}
 
 
 def product_result(data, reader_mode):
@@ -200,16 +233,21 @@ def main():
         require(version["return_code"] == 0 and version["failure"] is None and
                 version["stdout"].strip() == ("codex-cli " + CODEX_VERSION).encode(), "native_version_mismatch")
         operation["observed_native_version"] = version["stdout"].decode().strip()
+        decisions = None
+        if binding["arm"] == "gptgrep":
+            decisions = operation["decisions_mode"] = selected_mode(config)
         argv = reader_argv(config, binding, question)
-        if binding["arm"] == "gptgrep" and config.get("decisions_preparation") is not None:
+        if decisions == "preparation":
             writer = acquire_writer()
             env, operation["decisions_preparation"] = prepare_decisions(
                 config, binding, question, argv, started=started,
                 deadline_unix_ms=deadline_unix_ms, environ=os.environ)
-        elif binding["arm"] == "gptgrep":
+        elif decisions == "existing_context":
             budget = parse(pinned(config["decisions_budget"], 16384))
             require(Path(budget["ledger_path"]).parent == Path(DECISIONS_LEDGER_DIR),
                     "decisions_ledger_mount_contract")
+        # invocation_bounded joins nothing: the Ask creates its own context and
+        # its reported Decisions cost receipt is kept per trial below.
         native_input = raw_prompt(config, question) if binding["arm"] == "raw_only" else None
         remaining = config["deadline_seconds"] - (time.monotonic() - started)
         require(remaining > 0, "reader_deadline")

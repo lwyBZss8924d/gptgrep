@@ -11,7 +11,7 @@ from .runtime import (API_ENV, BASE_CAPABILITIES, BASE_TOOLS_PATH, CODEX_HOME, D
                       base_tools_identity, model_config, native_identity, validate_asset_path)
 from .product_bundle import PRODUCT_ENTRYPOINT, PRODUCT_PROVENANCE, bundle_identity
 from .decisions import (CONTROL_ROOT, FAMILY_ROOT, TRIAL_ROOT, WRITER_LOCK,
-                        control as decisions_control)
+                        control as decisions_control, invocation_cost_bound, selected_mode)
 from .trial_order import paired_order
 
 
@@ -106,14 +106,20 @@ class Full62Adapter:
         if runtime["reader_mode"] == "rich_multimodal":
             require(runtime["jev_model"] in ("openai/gpt-6-luna-decisions", "openai/gpt-6-luna-decisions-20261006"),
                     "rich_decisions_model")
-        if runtime.get("decisions_preparation") is not None:
+        # runtime.template.json keeps every unselected mode field null; null and
+        # absent both mean unselected, and any value is a mode conflict.
+        mode = selected_mode(runtime)
+        self.preflight["decisions"] = {"mode": mode}
+        if mode == "preparation":
             decisions_control(runtime["decisions_preparation"])
-            # runtime.template.json keeps unselected mode fields as null; null
-            # and absent both mean unselected, any value is a conflict.
-            require(runtime.get("decisions_budget") is None and runtime.get("decisions_ledger_dir") is None
-                    and runtime["reader_mode"] == "rich_multimodal"
+            require(runtime["reader_mode"] == "rich_multimodal"
                     and runtime["jev_model"] == "openai/gpt-6-luna-decisions",
                     "decisions_preparation_mode_conflict")
+        elif mode == "invocation_bounded":
+            # No shared ledger or budget file: each legacy Ask keeps the product's
+            # own single-invocation context. The cohort's worst case must fit the cap.
+            require(runtime["reader_mode"] == "legacy_text", "decisions_invocation_bounded_mode_conflict")
+            self.preflight["decisions"] = invocation_cost_bound(runtime, len(self.rows))
         else:
             budget = runtime["decisions_budget"]
             require(type(budget) is dict and set(budget) == {"path", "bytes", "sha256"}
@@ -330,11 +336,12 @@ class Full62Adapter:
                      "deadline_seconds", "max_tool_calls", "max_input_bytes")},
                   "source_relative_path": document["relative_path"],
                   "raw_document": "/data/corpus/" + document["relative_path"]}
+        mode = reader["decisions_mode"] = selected_mode(runtime)
         preparation = runtime.get("decisions_preparation")
         trial_state = None
-        if preparation is None:
+        if mode == "existing_context":
             reader["decisions_budget"] = {**runtime["decisions_budget"], "path": DECISIONS_BUDGET}
-        elif arm == "gptgrep":
+        elif mode == "preparation" and arm == "gptgrep":
             trial_id = sha(canonical(binding))[:32]
             trial_state = Path(preparation["trial_state_directory"]) / trial_id
             trial_state.mkdir(mode=0o700)
@@ -392,13 +399,18 @@ class Full62Adapter:
             put(task / directory / "config.toml", model_config(profile, role))
             compose = auth_compose(runtime["auth"][auth_key], runtime["platform"], runtime["run_id"])
             if role == "reader" and arm == "gptgrep":
-                mounts = ([(preparation["controls_directory"], CONTROL_ROOT, True),
-                           (preparation["financial_family_directory"], FAMILY_ROOT, False),
-                           (str(trial_state), TRIAL_ROOT, False),
-                           (str(Path(preparation["trial_state_directory"]) / "sole-writer.lock"), WRITER_LOCK, False)]
-                          if preparation is not None else
-                          [(runtime["decisions_budget"]["path"], DECISIONS_BUDGET, True),
-                           (runtime["decisions_ledger_dir"], DECISIONS_LEDGER_DIR, False)])
+                if mode == "preparation":
+                    mounts = [(preparation["controls_directory"], CONTROL_ROOT, True),
+                              (preparation["financial_family_directory"], FAMILY_ROOT, False),
+                              (str(trial_state), TRIAL_ROOT, False),
+                              (str(Path(preparation["trial_state_directory"]) / "sole-writer.lock"), WRITER_LOCK,
+                               False)]
+                elif mode == "existing_context":
+                    mounts = [(runtime["decisions_budget"]["path"], DECISIONS_BUDGET, True),
+                              (runtime["decisions_ledger_dir"], DECISIONS_LEDGER_DIR, False)]
+                else:
+                    # invocation_bounded: no ledger or budget state leaves the host.
+                    mounts = []
                 for source, target, read_only in mounts:
                     compose["services"]["main"]["volumes"].append({"type": "bind",
                         "source": source, "target": target, "read_only": read_only,
