@@ -108,7 +108,9 @@ class Full62Adapter:
                     "rich_decisions_model")
         if runtime.get("decisions_preparation") is not None:
             decisions_control(runtime["decisions_preparation"])
-            require("decisions_budget" not in runtime and "decisions_ledger_dir" not in runtime
+            # runtime.template.json keeps unselected mode fields as null; null
+            # and absent both mean unselected, any value is a conflict.
+            require(runtime.get("decisions_budget") is None and runtime.get("decisions_ledger_dir") is None
                     and runtime["reader_mode"] == "rich_multimodal"
                     and runtime["jev_model"] == "openai/gpt-6-luna-decisions",
                     "decisions_preparation_mode_conflict")
