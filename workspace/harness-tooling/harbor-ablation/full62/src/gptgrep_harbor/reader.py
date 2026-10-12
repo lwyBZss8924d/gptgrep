@@ -14,6 +14,12 @@ from .runtime import CODEX_VERSION, DECISIONS_BUDGET, DECISIONS_LEDGER_DIR, chec
 from .decisions import TRIAL_BUDGET, acquire_writer, prepare as prepare_decisions
 
 
+# A completed legacy report is a response. An insufficient_evidence report with
+# a non-empty answer is a completed intentional abstention, judged under the
+# frozen answerability rubric. Every other status is an operational failure.
+LEGACY_ANSWER_STATUSES = ("completed", "insufficient_evidence")
+
+
 def reader_argv(config, binding, question):
     require(len(question.encode()) <= min(MAX_READER_QUESTION_BYTES, config["max_input_bytes"]),
             "instruction_bytes_limit")
@@ -107,7 +113,8 @@ def product_result(data, reader_mode):
                 isinstance(report.get("initial_retrieval"), dict), "rich_product_fields")
     else:
         require(report.get("schema_version") != "gptgrep.rich_multimodal.host.v1" and
-                report.get("status") == "completed", "product_not_completed")
+                report.get("status") in LEGACY_ANSWER_STATUSES, "product_not_completed")
+    # An empty abstention is not a completed answer: it stays an operational failure.
     answer = report.get("answer")
     require(isinstance(answer, str) and answer.strip() and
             len(answer.encode()) <= MAX_ANSWER, "product_answer")
@@ -130,6 +137,8 @@ def product_result(data, reader_mode):
     attempts = report.get("model_attempts")
     require(attempts is None or isinstance(attempts, list), "attempts_shape")
     return answer, {**product_accounting(report),
+                    "product_status": report["status"],
+                    "insufficient_evidence": report["status"] == "insufficient_evidence",
                     "retrieval": report.get("retrieval"),
                     "cost_usd": None, "cost_complete": False,
                     "physical_provider_requests": None,
@@ -233,6 +242,10 @@ def main():
         answer, metadata = (product_result(result["stdout"], config["reader_mode"]) if binding["arm"] == "gptgrep"
                             else codex_result(result["stdout"]))
         attempt.update(metadata)
+        if binding["arm"] == "gptgrep":
+            # A completed intentional abstention crosses as an ordinary response
+            # for judging; the flag stays in the private operation record.
+            operation["insufficient_evidence"] = metadata["insufficient_evidence"]
         outcome.update(status="response", answer=answer)
     except Exception:
         # Redacted code only: exception text may contain task/provider/private data.

@@ -411,6 +411,113 @@ class NativeAccountingTests(unittest.TestCase):
         self.assertFalse(result["cost_complete"])
 
 
+def legacy_report(**changes):
+    """A synthetic gptgrep.host.v1 ask report; no task text."""
+    report = {"schema_version": "gptgrep.host.v1", "status": "completed", "answer": "A complete synthetic answer.",
+              "model": PROFILE["model"], "requested_reasoning_effort": "max", "requested_service_tier": "fast",
+              "effective_reasoning_effort": "max", "effective_service_tier": "priority", "citations": [],
+              "jev": {"usage": [{"cost": 0.0125}]}}
+    report.update(changes)
+    return canonical(report)
+
+
+class LegacyTreatmentReaderTests(unittest.TestCase):
+    """The treatment entrypoint and primary Judge for reader_mode=legacy_text."""
+    question = "synthetic question"
+    schema = NativeAccountingTests.frozen_like_schema
+
+    def binding(self):
+        return {"arm": "gptgrep", "pair_id": "synthetic", "document_id": "synthetic-document",
+                "cohort_sha256": "a" * 64, "runtime_sha256": "b" * 64, "judge_sha256": "c" * 64,
+                "question_sha256": sha(self.question.encode()), "document_sha256": "d" * 64}
+
+    def config(self):
+        return {"binding": self.binding(), "profile": PROFILE, "codex_binary": "/synthetic/codex",
+                "gptgrep_binary": "/synthetic/gptgrep", "codex_home": "/opt/full62-home",
+                "reader_base_binary": {"path": "/synthetic/codex"}, "max_input_bytes": 8192, "max_tool_calls": 8,
+                "native_cli": {}, "native_config_sha256": "e" * 64, "deadline_seconds": 20,
+                "base_tool_environment": {}, "permitted_tools": [], "generic_capabilities": [],
+                "qualification_mismatches": [], "budget_scope": {}, "reader_mode": "legacy_text",
+                "jev_model": "synthetic-decisions", "native_ptc": True, "codex_permissions": "full62_reader",
+                "source_relative_path": "synthetic.txt",
+                "decisions_budget": {"path": "/opt/full62-private/decisions-budget.json", "bytes": 1,
+                                     "sha256": "f" * 64}}
+
+    def run_reader(self, stdout, environ=None):
+        outputs = {}
+        version = {"stdout": ("codex-cli " + CODEX_VERSION).encode(), "stderr": b"", "elapsed_ms": 1,
+                   "return_code": 0, "failure": None, "stdin_bytes": 0, "stdin_bytes_sent": 0, "stdin_complete": True}
+        product = {**version, "stdout": stdout, "elapsed_ms": 10}
+        budget = canonical({"ledger_path": "/opt/full62-private/ledger/decisions.json"})
+        with patch.object(reader, "read", side_effect=[canonical(self.config()), self.question.encode()]), \
+             patch.object(reader, "check_config"), patch.object(reader, "copy_asset"), \
+             patch.object(reader, "check_product_bundle"), \
+             patch.object(reader, "pinned", return_value=budget), \
+             patch.object(reader.Path, "exists", return_value=False), \
+             patch.object(reader, "put", side_effect=lambda path, value: outputs.update({path: value})), \
+             patch.dict(os.environ, environ or {"PATH": "/usr/bin"}, clear=True), \
+             patch("sys.argv", ["reader", "--instruction", "/synthetic/instruction.txt"]), \
+             patch.object(reader, "run", side_effect=[version, product]) as child:
+            reader.main()
+        return outputs, child
+
+    def judge_config(self):
+        return {"binding": self.binding(), "question": self.question, "reference": "synthetic reference",
+                "answer_format": "text",
+                "contract": {"prompt": "Q:{question}\nR:{answer}\nF:{answer_format}\nA:{response}",
+                             "response_schema": self.schema}}
+
+    def test_product_result_accepts_only_completed_answers_and_nonempty_abstentions(self):
+        abstention = "The supplied document does not state this."
+        answer, metadata = reader.product_result(legacy_report(status="insufficient_evidence", answer=abstention),
+                                                 "legacy_text")
+        self.assertEqual(answer, abstention)
+        self.assertEqual((metadata["product_status"], metadata["insufficient_evidence"]),
+                         ("insufficient_evidence", True))
+        _, completed = reader.product_result(legacy_report(), "legacy_text")
+        self.assertEqual((completed["product_status"], completed["insufficient_evidence"]), ("completed", False))
+        for status in ("failed", "interrupted", "partial", "", None):
+            with self.subTest(status=status), self.assertRaisesRegex(ValueError, "product_not_completed"):
+                reader.product_result(legacy_report(status=status), "legacy_text")
+        for empty in ("", "  \n", None):
+            with self.subTest(answer=empty), self.assertRaisesRegex(ValueError, "product_answer"):
+                reader.product_result(legacy_report(status="insufficient_evidence", answer=empty), "legacy_text")
+
+    def test_legacy_intentional_abstention_is_judged_and_recorded(self):
+        abstention = "The supplied document does not state this; no answer is given."
+        outputs, _ = self.run_reader(legacy_report(status="insufficient_evidence", answer=abstention))
+        envelope = outputs["/answer/answer.json"]
+        self.assertEqual((envelope["status"], envelope["answer"]), ("response", abstention))
+        operation = outputs["/logs/agent/operational.json"]
+        self.assertEqual(operation["status"], "response")
+        self.assertIs(operation["insufficient_evidence"], True)
+        self.assertIs(operation["attempts"][0]["insufficient_evidence"], True)
+        self.assertNotIn("failure", operation)
+        prompts = []
+        def judge(prompt, schema):
+            prompts.append(prompt)
+            return {"equivalent": False, "abstained": True, "reason": "synthetic"}, {}
+        result = grade(self.judge_config(), envelope, judge)
+        self.assertEqual((result["status"], result["label"]), ("judged", 0))
+        self.assertTrue(prompts[0].endswith(abstention))
+        completed, _ = self.run_reader(legacy_report())
+        self.assertIs(completed["/logs/agent/operational.json"]["insufficient_evidence"], False)
+
+    def test_other_legacy_statuses_are_zero_and_never_judged(self):
+        for status, answer in (("failed", "partial synthetic text"), ("interrupted", "partial synthetic text"),
+                               ("insufficient_evidence", "   ")):
+            with self.subTest(status=status, answer=answer):
+                outputs, _ = self.run_reader(legacy_report(status=status, answer=answer))
+                envelope = outputs["/answer/answer.json"]
+                self.assertEqual((envelope["status"], envelope["answer"]), ("operational_failure", None))
+                operation = outputs["/logs/agent/operational.json"]
+                self.assertEqual(operation["failure"], "reader_failed")
+                self.assertNotIn("insufficient_evidence", operation)
+                result = grade(self.judge_config(), envelope, lambda *_: self.fail("Judge called"))
+                self.assertEqual((result["status"], result["label"]), ("operational_failure", 0))
+                self.assertEqual(transport_reward(result)["answer_equivalence"], 0)
+
+
 class MaterializationIsolationTests(unittest.TestCase):
     def test_raw_context_has_no_gold_or_index_and_verifier_has_reference(self):
         # A future test run must have an explicitly admitted temporary root.
