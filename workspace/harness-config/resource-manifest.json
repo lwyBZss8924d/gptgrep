@@ -4,6 +4,6 @@
     {"id": "development-storage", "kind": "workflow", "path": "development-storage.md", "when": "Plan governed downloads, builds, tests or worker storage and checkpoint usage"},
     {"id": "workflow", "kind": "workflow", "path": "workflow.txt", "when": "Plan, implement, validate or hand off project work"},
     {"id": "checkpoint-template", "path": "templates/checkpoint.json", "when": "Record a continuation cursor"},
-    {"id": "goal-contract", "path": "goal-contract.json", "when": "Select live comparative PageIndex benchmark gates and research-preview acceptance"}
+    {"id": "goal-contract", "path": "goal-contract.json", "when": "Select the main same-Codex SEARCH comparison acceptance and the separate PageIndex first-release gate"}
   ]
 }

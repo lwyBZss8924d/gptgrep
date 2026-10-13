@@ -27,7 +27,13 @@ Use docs/development.md for portable Dev/Test/Eval setup, docs/experimental-stat
 for the dated public progress summary, and workspace/harness-tooling/harbor-ablation/full62/README.md
 for the current paired SEARCH adapter. The parent Harbor directory retains older
 adapter work; select the full62 entry for the approved main comparison.
-Update applicable root and docs/ entrypoints when interfaces or measured status change.
+Route every live Codex consumer that shares one login through
+workspace/harness-tooling/codex-auth/README.md (lease, per-run CODEX_HOME, single
+refresh owner); entry points it lists as unmanaged stay blocked for shared-login
+use. Rerun its qualification when it changes.
+Update applicable root, docs/ and crates/*/README.md entrypoints when interfaces or
+measured status change. Retire an obsolete doc by deleting it or marking it
+superseded with a pointer, and fix every link to it.
 Keep public progress aggregate and dated; exact local evidence stays private.
 Never modify the upstream reference checkouts. Pin reused source and retain licenses.
 Never hardcode benchmark questions, answers, document IDs, evidence pages or
@@ -48,7 +54,11 @@ Every completed code round requires a commit and verified refs/notes/commits PoU
 Back up Git history and notes to a verified bundle on registered external owner
 storage; keep only a small ignored locator under .local/backups/ and retain prior bundles.
 Deliver the fully integrated source revision to an explicitly authorized experimental
-branch after its matching checks and independent review. Source sharing does not
+branch after its matching checks and independent review. After each round with
+valid phase results, push that round's experimental worktree branch to its
+authorized remote branch for open-source researcher review and Dev follow-up, once
+its checks, independent review and a pre-push scan finding no machine paths,
+private identities or credentials have passed. Source sharing does not
 qualify the first release tag: retain G5 and all tag checks separately. Push source
 and tags only within their corresponding authorization. Do not push private PoUW
 notes or runtime evidence. No global configuration, toolchain or service
@@ -60,6 +70,14 @@ INDEX preparation is excluded from primary SEARCH reward/cost and reported separ
 Preserve failed and unknown outcomes; test/mock success alone cannot accept a live
 pipeline or advantage. Use the requested gpt-6-luna/max/fast native profile and the
 independent OpenRouter Decisions model; credentials and accepted controls are caller-owned.
+The core Opt goal is a measured win of the GPTgrep search harness over bare Codex on
+that comparison. Dev & Opt work covers tgrep regex search PTC dynamic workflows with
+agentic parsing/OCR and PageIndex reasoning-based retrieval, the System-one
+Decisions helper, and agentic parsing/OCR for reasoning-based agentic RAG.
+At each Opt→Test→Eval→Judge→Next-Opt turn, update the private SELF-PM checkpoint
+with goal objects and progress, the current cursor, the worktree branch and evidence
+links, and the latest completed Opt/Eval-run checkpoint; publish only its dated
+aggregate projection in docs/experimental-status.md.
 
 Run cargo fmt --all -- --check, cargo test --workspace, cargo clippy --workspace
 --all-targets -- -D warnings, the offline eval harness, and the applicable wrapper

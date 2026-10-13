@@ -9,6 +9,7 @@ license inventory and PDFium's full native notices, not only this summary.
 | --- | --- | --- | --- |
 | [Microsoft tgrep](https://github.com/microsoft/tgrep/tree/1120aca41dd192ae61bdd996e9886cb354a78a27) | v1.1.0 / `1120aca41dd192ae61bdd996e9886cb354a78a27` | Embedded tgrep-core; no upstream server | MIT |
 | [LiteParse](https://github.com/run-llama/liteparse/tree/ab8879623ee45a0b7a775d12b42a9a7ae9dab16b) | `ab8879623ee45a0b7a775d12b42a9a7ae9dab16b` | Native parser library, 2.15.1 | Apache-2.0 |
+| Vendored `liteparse-pdfium` ([`vendor/liteparse-pdfium`](vendor/liteparse-pdfium/UPSTREAM.json)) | LiteParse `crates/pdfium` 1.11.0 at `ab8879623ee45a0b7a775d12b42a9a7ae9dab16b`, modified | Cargo `[patch]` replacement adding bounded admission helpers; modifications and per-file upstream source hashes in `UPSTREAM.json` | Apache-2.0 (LICENSE and NOTICE retained) |
 | [PageIndex](https://github.com/VectifyAI/PageIndex/tree/9c4c3ff2ddd2cbd70501997635578064f2b7c7c3) | `9c4c3ff2ddd2cbd70501997635578064f2b7c7c3` | Studied structural semantics; custom Rust implementation, partial algorithm coverage | MIT |
 | [incur](https://github.com/wevm/incur) | published `0.5.1` | Optional gptgrep-ai wrapper | MIT |
 | [PDFium native binaries](https://github.com/run-llama/pdfium-binaries/releases/tag/chromium%2F8058) | `chromium/8058` | Runtime PDFium library | Per-component licenses bundled in release |

@@ -121,7 +121,10 @@ Use an owned canonical, non-symlink scratch directory. Cargo dependencies are
 exactly pinned and locked against the existing project identity seed:
 
 ```sh
-GPTGREP_MOCK_PYTHON=/path/to/qualified/harbor-python cargo test --offline --locked --manifest-path harness/Cargo.toml -- --test-threads=1
+GPTGREP_MOCK_PYTHON=/path/to/qualified/harbor-python \
+  GPTGREP_JUDGE_TEST_PYTHON=/path/to/qualified/harbor-python \
+  GPTGREP_JUDGE_TEST_PYTHON_SHA256=<interpreter-sha256> \
+  cargo test --offline --locked --manifest-path harness/Cargo.toml -- --test-threads=1
 cargo fmt --manifest-path harness/Cargo.toml -- --check
 cargo clippy --offline --locked --manifest-path harness/Cargo.toml --all-targets -- -D warnings
 cargo build --offline --locked --manifest-path harness/Cargo.toml

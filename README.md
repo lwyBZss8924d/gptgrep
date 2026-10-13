@@ -22,14 +22,20 @@ an [incur CLI covering the native operations](packages/cli/README.md), and
 Document/OCR callers choose their native capabilities, permissions, job budgets
 and package root; GPTgrep stages the selected guidance in each actual work directory.
 The core optimization goal is the actual **GPTgrep harness versus bare Codex
-ablation study**: the same reader on 62 paired tasks, with INDEX reported
-separately from SEARCH reward and cost. The source includes the native pipeline
-and full62 Harbor adapter; complete 34-document indexing and the 124 SEARCH
-trials remain unaccepted. Component qualifications support that comparison;
-they do not replace it. Its Goal is separate from the G5 tag gate.
+ablation study**: the same Codex reader runtime on 62 paired tasks, with INDEX
+reported separately from SEARCH reward and cost. GPTgrep's reader contract (its
+base instructions, citation and abstention rules, and answer rules) is part of the
+treatment; the bare arm receives the common task prompt with Codex's default base
+instructions. The source includes the native pipeline and full62 Harbor adapter;
+complete 34-document native indexing remains unaccepted and the 124 paired SEARCH
+trials have not run. Component qualifications and treatment-only development runs
+support that comparison; they do not replace it. Its Goal is separate from the G5
+tag gate.
 
-This is development source. The first experimental release requires a verified
-minimum live advantage over PageIndex Flash plus GPT-5.6 on PageIndex-OSS-Benchmark.
+This is development source at version `0.1.0-alpha.1`, an experimental
+pre-release; [SPEC](SPEC.md) states the version policy. The first experimental
+release requires a verified minimum live advantage over PageIndex Flash plus
+GPT-5.6 on PageIndex-OSS-Benchmark.
 The original local PageIndex OSS `results.json` reports 60/62 with Luna/high;
 our separately qualified live SDK/Codex control also reports 60/62 with Luna/max.
 These runs have distinct model/backend and evidence provenance.
@@ -100,10 +106,13 @@ Node reads return `next_offset`; pass that value to `read --offset` to continue.
 Offsets count UTF-8 bytes within the node, and each window retains exact source
 coordinates. This lets agents inspect large sections without an unbounded reply.
 
-For v2 generations published through the rich core API, `gptgrep batch --rich
---root ./documents --input rich-operations.json` accepts
-`gptgrep.batch.rich.request.v1`. Its local operations are `inspect_documents`,
-`inspect_pages`, `read_artifact` and `search_artifacts`. A batch resolves `CURRENT`
+For v2 generations published by `index --rich`/`--ocr`, `index --parse-agent-config`
+or the rich core API,
+`gptgrep batch --rich --root ./documents --input rich-operations.json` accepts
+`gptgrep.batch.rich.request.v1`. Its seven local
+operations are `inspect_documents`, `inspect_pages`, `inspect_native_metadata`,
+`read_artifact`, `search_artifacts`, `inspect_visual` and `read_visual`;
+`search_multimodal` and `rerank` are the explicit paid operations. A batch resolves `CURRENT`
 once or uses an explicit generation and manifest SHA. Input and output are bounded
 to 1 MiB with at most 64 operations, and every item reserves output space before
 execution. Inspection returns indexed metadata; text reads and searches retain
@@ -114,8 +123,8 @@ Reader byte counters describe partial API reads rather than complete physical I/
 Explicit `search_multimodal` also supports mandatory document routing and mixed
 text/visual reranking on that same retained reader and finite Decisions context.
 All complete output/call shares are admitted before submission; no paid cursor
-or fallback is provided. `budget.max_decisions_submissions` defaults to8 and
-never resets the parent allowance. See [rich batch composition](docs/rich-batch.md)
+or fallback is provided. `budget.max_decisions_submissions` defaults to 8 (hard
+cap 200) and never resets the parent allowance. See [rich batch composition](docs/rich-batch.md)
 for options, ordered failures, bounded telemetry, and observation limits.
 
 `gptgrep rerank --root ROOT --input candidates.json --json` scores only supplied
@@ -167,6 +176,13 @@ gptgrep judge --input evals/requests/decision-smoke.json \
   --model '~typesafe/jev-latest' --json
 ```
 
+Responses retain the actual returned model metadata. Admission requires the
+requested identifier or its observed canonical build
+(`openai/gpt-6-luna-decisions-20261006` for Luna and `typesafe/jev-1.13-20260917`
+for legacy Jev); other explicit models require exact identifier equality. No
+guessed dated identifiers, other families or fallback models are accepted. Native
+Codex reasoning uses `gpt-6-luna`, `max` and `fast` independently.
+
 `~typesafe/jev-latest` is an OpenRouter alias: the catalog resolves it to the
 latest build of the Jev family, and the response returns the build that answered.
 GPTgrep admits an `~author/family-latest` alias only when the served model is a
@@ -176,8 +192,9 @@ version starting with a digit. For this alias, `typesafe/jev-1.13` and
 `typesafe/jevx-2`, a `:free` variant or another alias is rejected. That rejection
 happens after the call was charged. A malformed alias is rejected before any request.
 Aliases are text-only: typed images and raw image parts are refused before any
-request. The judge output reports `requested_model` separately from
-the served `model`. Pin the canonical build when results must stay comparable.
+request. Reports keep the requested selector and the served model separate; the
+judge output reports `requested_model` alongside the served `model`. Pin the
+canonical build when results must stay comparable.
 
 Jev uses OpenRouter's typed **Decisions API**, not chat completions. It supplies
 dynamic Choice/Noul/Score judgments; application code retains parsing, offsets,
@@ -186,7 +203,12 @@ model, available usage and cost. Unknown metrics remain null. Network/schema
 errors are explicit; there is no silent fallback or redirect. Default retrieval
 routing/reranking retries a received HTTP 429/500/502/503/504 at most once,
 inside the original request deadline and submission budget; the failed attempt
-stays reported with unknown cost. Timeouts and other failures are not retried.
+stays reported with unknown cost. The retry waits a jittered 250–1000 ms, or a
+longer numeric `Retry-After` of whole seconds. Any other `Retry-After` form (an
+HTTP-date, a repeated field, or a negative, fractional or over-ten-digit value)
+refuses the retry and is recorded as `retry_after_refusal`. The retry is sent only
+if the original deadline still leaves the wait plus 2 seconds and a submission
+remains. Timeouts and other failures are not retried.
 
 Hybrid search combines lexical candidates with semantically routed tree nodes.
 The initial policy routes at most 32 document descriptions and reranks at most
@@ -205,6 +227,74 @@ low-confidence candidates flagged `below_threshold: true`, with
 Such a search exits 0 because hits are returned; plain-text output prints these
 candidates as grep context lines (`PATH-LINE-TEXT`), never as `PATH:LINE:TEXT`
 matches, so check `below_threshold` in `--json` output.
+
+## Decisions judge and typed images
+
+`gptgrep judge --input evidence.json --json` also accepts the normal typed image
+contract: `input.text` contains `{source, text}` objects and `input.images` contains
+`{source, path}` objects for local PNG/JPEG files, alongside `questions`. Each
+`source` contains `source_id`, `unit_id`, and `source_sha256`. The source digest is
+caller provenance, not an independent freshness claim. Text is literal; image
+bytes are admitted as bounded snapshots and sent in order as flat `image_url`
+data URLs. Source bindings and local paths stay out of the provider body. The
+64 KiB control/text envelope, four-image cap, per-image 1 MiB/8 million pixel cap,
+24 million total pixel cap, 8 MiB request cap and 1 MiB response cap remain explicit.
+Legacy Jev, other exact models and every alias reject typed images before
+reservation or submission. A raw `{state, questions}` input is held to the same
+rule: for these selectors, any object in `state` or `questions` with an `image_url`
+or `input_image` member or `type` is refused before reservation. Strings stay
+literal text. Luna receives the raw JSON unchanged.
+Refusals, unknown answers, partial bodies and malformed responses do not become
+successful decisions.
+
+A successful judge prints the validated response, where `model` is the served build,
+plus `requested_model`. A failed judge exits 2 with `gptgrep.error.v1`, code
+`decisions_judge_failed` and a `judge` object (`gptgrep.judge-failure.v1`). The
+object contains the stage, the requested and served models, and the provider
+response ID. It also records whether a send started (`not_submitted`,
+`sent_response_received` or `sent_outcome_unknown`). Reported usage and
+`cost_usd` appear when available. Otherwise they are null with a reason such as
+`not_submitted`, `http_status_body_not_read` or `cost_null`. The object also carries
+the latency, the failure diagnostic and the context's admission snapshot.
+It never contains request or response bodies, headers, URLs or keys.
+
+## Shared Decisions budget
+
+For a shared experiment, add `--decisions-budget budget.json` to hybrid/semantic
+search (including `--multimodal`), judge, ask, summarize, non-plan enrich, explicit
+`rerank` and paid `batch --rich` operations. The portable control file is at
+most 16 KiB and contains `schema_version: "gptgrep.decisions-budget-contract.v1"`,
+`run_id`, `plan_digest`, `deadline_unix_ms`, `max_submissions` and an absolute
+`ledger_path`. The option joins an existing matching ledger: its original clock and
+consumed reservations. Missing files or a changed run, deadline, plan or cap are
+errors, and it never creates or resets a ledger. Create a new ledger once with:
+
+```sh
+gptgrep decisions-budget init --run-id smoke-1 --plan-file plan.json \
+  --deadline-seconds 1800 --max-submissions 2 \
+  --ledger /abs/private/ledger.json --output /abs/private/budget.json
+gptgrep decisions-budget status --control /abs/private/budget.json --json
+```
+
+`init` sets `plan_digest` to the SHA-256 of the plan file (a regular file of at
+most 1 MiB) and the deadline to now plus N seconds (1–86,400, never renewed);
+`--max-submissions` accepts 1–200. The clock anchor is bound to the boot and clock
+namespace that created it, so joins fail closed after a reboot. It creates the journal and its `.lock` sidecar with the original
+clock anchor, then writes the control file once with mode 0600. It refuses
+relative paths and any existing ledger, lock or control path; it never joins, resets,
+renews or replaces. `status` is read-only. It reports reservations by outcome
+(`reserved`, `in_flight`, `unknown`, `terminal`), remaining submissions, requested
+selectors, the deadline state and whether admission is open. It stays readable
+after the deadline. Reservations are permanent: a joined run stops at
+`max_submissions` with `Decisions submission budget exhausted` before any POST.
+Routing, reranking and follow-up host clients share the same context. Without the
+option, calls use a bounded single-invocation context. Regex/lexical, local-only
+batches, schema, doctor and enrich `--plan-only` do not open the budget file;
+`parse-agent`, `ocr serve`, `index --parse-agent-config` and the `decisions-budget`
+subcommands reject the global option.
+Numeric usage and cost remain reported provider metadata; absent fields remain
+unavailable. The ledger counts submissions, not USD. Any spend cap is enforced
+outside the product, for example as submissions multiplied by a worst-case call price.
 
 ## Local Codex host
 
@@ -245,8 +335,18 @@ a summary is scoped to its selected node's document. Follow-up searches default
 to hybrid; tree reads and explicit exact refinements build on the initial result.
 Reports retain Jev coverage, actual model and usage alongside Codex usage.
 
-The host creates an ephemeral stdio app-server thread with an empty execution
-environment and bounded GPTgrep catalog/tree/search/read tools. It verifies the
+The text retrieval reader (restricted or native) also receives generic answer
+rules. They tell it to lead with the direct answer in the form the question asks
+for; to commit to that answer and cite it when the evidence it has read answers
+the question as asked; and to resolve in-text references (note markers, citation
+numbers, see-table or see-section pointers) by reading the referenced passage.
+The rules never relax the evidence, citation or `insufficient_evidence` rules.
+Rich text and multimodal readers do not receive them. They are part of GPTgrep's
+reader contract.
+
+In the default restricted mode, the host creates an ephemeral stdio app-server
+thread with an empty execution environment and bounded GPTgrep
+catalog/tree/search/read tools. It verifies the
 effective sandbox/approval settings, bounds time and tool calls, denies unexpected
 server requests, and kills/reaps its owned child. Model-written citations must
 refer to evidence actually issued in the run and still match the current source.
@@ -257,6 +357,18 @@ fails or is interrupted. Source documents stay unchanged; the Codex child has no
 access to the Jev credential.
 Citation identity checks do not independently prove semantic entailment.
 
+`ask --native-ptc --codex-permissions PROFILE` instead runs the final retrieval
+reader with native execution under an existing named Codex permission profile.
+The runtime must acknowledge the profile before the turn, and legacy sandbox
+overrides are omitted. The reader inherits the selected Codex capabilities and
+Skills, with shell and image viewing enabled. Observed native items and GPTgrep
+calls share `--max-tool-calls` (default 12). Native item notifications can arrive
+after execution starts, so this budget is accounting, not a pre-execution guard;
+a request or observed item beyond it fails `ask` with
+`host_native_ptc_tool_budget_exhausted` and no answer. The restricted reader's
+caps of 900 seconds for `--timeout` and 64 for `--max-tool-calls` do not apply in
+this mode. Native output creates no citation: answers still cite delivered
+GPTgrep evidence. Query planners and `host-complete` stay tool-free.
 
 The ask-only `--experimental-query-plan` option first runs a separate no-tools
 `gpt-6-luna` / caller-selected effort / `fast` planner by default (the normal
@@ -297,7 +409,22 @@ and latency; subsequent reader work remains budgeted and measured. This option
 adds no initial Jev operation or Codex step by itself. It requires
 `--experimental-query-plan` and never enables a fallback on failure.
 
-At the retrieval tool budget, the reader finalizes within its existing Codex turn and original deadline. Denied requests issue no new evidence and perform no Jev work; their diagnostics remain separate from model-turn counts. `node_coverage` describes each delivered excerpt, not cumulative reading: EOF can still leave a prefix outside that excerpt.
+`--experimental-source-continuation` (default off; requires
+`--experimental-query-plan` and `--document`) adds reader-only guidance.
+`next_offset = null` ends a node, not the inquiry, so the reader verifies
+unresolved claims through scoped tree/read nodes within the existing tool, time
+and output budgets, or returns `insufficient_evidence`. It adds no model calls,
+grants no citation authority beyond issued spans, and its quality effect is
+unmeasured.
+
+In the default restricted reader, at the retrieval tool budget
+(`--max-tool-calls`, default 12), further requests are denied with an instruction
+to finalize within the same Codex turn and original deadline. Denied requests
+issue no new evidence and perform no Jev work; their diagnostics remain separate
+from model-turn counts. If denied requests also reach the budget, the next request
+fails `ask` with `host_tool_budget_exhausted` (exit 2) and no answer.
+`node_coverage` describes each delivered excerpt, not cumulative reading: EOF can
+still leave a prefix outside that excerpt.
 
 `host-complete --input FILE_OR_DASH` supplies the same isolated local model as a
 typed workflow primitive. Its input is `{instructions, state, schema}` and its
@@ -309,6 +436,29 @@ PageIndex summary/optimization prompts during comparative evaluation.
 
 The app-server API is experimental. Supported boundaries and configuration are
 recorded in [the host crate documentation](crates/gptgrep-host/README.md).
+
+## Multimodal retrieval
+
+`search --multimodal` and `ask --multimodal` connect the v2 rich generation to the normal Decisions and native reader workflows:
+
+```sh
+gptgrep search 'What does the chart show?' ./documents --multimodal --max-visual-candidates 8 --json
+gptgrep ask 'Explain the chart and supporting text.' ./documents --multimodal --document report.pdf --max-citations 4 --json
+```
+
+Both commands resolve `CURRENT` once, retain that source-bound generation and one finite Decisions execution context, and perform mandatory document routing followed by reranking of text and independent visual candidates. The visual lane can include pages without a literal query match. The default Decisions model is `openai/gpt-6-luna-decisions`; multimodal retrieval also accepts its observed canonical `openai/gpt-6-luna-decisions-20261006` identifier. Multimodal ask requires the separate native `gpt-6-luna/max/fast` profile. Explicit legacy Jev remains available on the text workflow.
+
+Multimodal output is always one typed JSON report, including when `--json` is omitted. Search returns `gptgrep.rich_multimodal_search.v1`; its image exposure grants no citation rights. Ask returns `gptgrep.rich_multimodal.host.v1` and retains the initial retrieval report. Text and image citations require complete actual native reader delivery followed by source, hash and coordinate checks. Partial failures preserve observed retrieval/accounting in the existing `gptgrep.error.v1` envelope and exit 2.
+
+Bounds are configurable with `--window-bytes` (4–2048), `--max-visual-candidates` (1–16), `--max-concurrent-batches` (1–4), `--max-image-bytes` (up to 1 MiB), `--max-image-pixels` (up to 8 million), `--max-metadata-bytes` (up to 512 KiB), and `--max-output-bytes` (up to 1 MiB). Ask additionally admits 1–8 `--max-citations` and applies the host's 32 KiB candidate metadata and 512 KiB initial-report caps. Tight budgets may refuse preparation before a model call. Reports distinguish inspected/omitted candidates, truncation and incomplete semantic coverage. These limits describe owned buffers and transport; they are not whole-process RSS or exhaustive recall guarantees.
+
+`--multimodal-timeout` admits 1–900 seconds, default 180 for search; ask uses the smaller of this value and its existing `--timeout`. `--decisions-budget FILE` joins the same existing original-clock shared context for routing, reranking and host Decisions tools, without initializing or resetting its ledger. Without that file, the command creates one finite invocation context whose plan identity binds the retained generation manifest; it is not a portable campaign claim.
+
+A v1 generation, regex/lexical/semantic mode selection, legacy grep/window/candidate options, or ask's experimental planning/navigation/continuation options are rejected for this workflow. There is no text or regex fallback. Omitting `--multimodal` preserves the legacy paths and output. The rich ingestion frontdoor supports lossless UTF-8 text/Markdown, PDF, PNG and restricted strict baseline JPEG. Plaintext preserves original bytes and line spans without physical-page or OCR claims. Office inputs use one bounded LibreOffice conversion retained for parsing, rendering and OCR; a working converter is required. Existing scoped Office evidence does not establish support for every Office format or document. The wider JPEG family remains unsupported. CLI composition and offline mock checks establish implementation behavior. Scoped native image qualification is separate from complete-corpus native indexing, current-source provider outcomes and the still-pending paired comparison/release gates.
+
+## Foreground OCR
+
+Foreground OCR is served by the native `gptgrep ocr serve --config CONTROL_JSON --token-env GPTGREP_OCR_SERVE_TOKEN` frontdoor; the optional incur wrapper's `ocr serve` supervises that same native process in the foreground (POSIX only) and adds no second service. It uses authenticated loopback, explicit server-held source/task custody and a finite original-anchor phase. Full-task and PNG LiteParse compatibility have separate qualification and lineage; compatibility confidence is model-reported and uncalibrated. See [foreground OCR](docs/ocr-serve.md) for control schemas, create-only ledger behavior, limits and pending runtime qualification. Ordinary queries do not start OCR.
 
 ## Optional incur interface
 
@@ -372,6 +522,14 @@ and experimental interpretation remain under the ignored `docs/research/` path.
   Page/Document guard qualifications cover individual components only.
   Complete-corpus OCR/indexing and universal Office/image acceptance remain open;
   missing or invalid required extraction is an explicit failure.
+- The default (v1) index refuses the whole build when any supported document has
+  no extractable text, such as a scanned PDF, and the previous generation stays
+  current. Such corpora need explicit rich ingestion with `--ocr auto` or
+  parse-agent indexing.
+- The reader's answer-commitment rule is under evaluation: in development
+  measurements of the Opt-1 change that introduced it, failed runs fell but
+  answers to unanswerable questions rose; see the
+  [experimental status](docs/experimental-status.md).
 - Semantic candidate budgets can miss relevant documents/nodes. Jev cannot rescue
   evidence excluded upstream; its scores are not a truth guarantee.
 - Corpus freshness is a snapshot contract. Rerun indexing for new files; a search
@@ -382,95 +540,3 @@ and experimental interpretation remain under the ignored `docs/research/` path.
 
 Original code is [MIT licensed](LICENSE). Dependency and native-runtime notices
 are described in [THIRD_PARTY.md](THIRD_PARTY.md).
-
-
-The default OpenRouter Decisions selector is `openai/gpt-6-luna-decisions`.
-`--model typesafe/jev-1.13` explicitly selects the legacy text-only route. Native
-Codex reasoning uses `gpt-6-luna`, `max`, and `fast` independently. Responses retain
-actual returned model metadata; admission requires the requested identifier or the
-observed canonical mapping (`openai/gpt-6-luna-decisions-20261006` for Luna and
-`typesafe/jev-1.13-20260917` for legacy Jev). Other explicit models require exact
-identifier equality. An explicit `~author/family-latest` alias admits only a
-concrete `author/family-VERSION` build of the same author and family. Aliases are
-text-only, and a malformed alias fails before any request. No guessed dated
-identifiers, other families or fallback models are accepted. Reports keep the
-requested selector and the served model separate.
-
-`gptgrep judge --input evidence.json --json` also accepts the normal typed image
-contract: `input.text` contains `{source, text}` objects and `input.images` contains
-`{source, path}` objects for local PNG/JPEG files, alongside `questions`. Each
-`source` contains `source_id`, `unit_id`, and `source_sha256`. The source digest is
-caller provenance, not an independent freshness claim. Text is literal; image
-bytes are admitted as bounded snapshots and sent in order as flat `image_url`
-data URLs. Source bindings and local paths stay out of the provider body. The
-64 KiB control/text envelope, four-image cap, per-image 1 MiB/8 million pixel cap,
-24 million total pixel cap, 8 MiB request cap and 1 MiB response cap remain explicit.
-Legacy Jev, other exact models and every alias reject typed images before
-reservation or submission. A raw `{state, questions}` input is held to the same
-rule: for these selectors, any object in `state` or `questions` with an `image_url`
-or `input_image` member or `type` is refused before reservation. Strings stay
-literal text. Luna receives the raw JSON unchanged.
-Refusals, unknown answers, partial bodies and malformed responses do not become
-successful decisions.
-
-A successful judge prints the validated response, where `model` is the served build,
-plus `requested_model`. A failed judge exits 2 with `gptgrep.error.v1`, code
-`decisions_judge_failed` and a `judge` object (`gptgrep.judge-failure.v1`). The
-object contains the stage, the requested and served models, and the provider
-response ID. It also records whether a send started (`not_submitted`,
-`sent_response_received` or `sent_outcome_unknown`). Reported usage and
-`cost_usd` appear when available. Otherwise they are null with a reason such as
-`not_submitted`, `http_status_body_not_read` or `cost_null`. The object also carries
-the latency, the failure diagnostic and the context's admission snapshot.
-It never contains request or response bodies, headers, URLs or keys.
-
-For a shared experiment, add `--decisions-budget budget.json` to hybrid/semantic
-search, judge, ask, summarize, or non-plan enrich. The portable control file is at
-most 16 KiB and contains `schema_version: "gptgrep.decisions-budget-contract.v1"`,
-`run_id`, `plan_digest`, `deadline_unix_ms`, `max_submissions` and an absolute
-`ledger_path`. The option joins an existing matching ledger: its original clock and
-consumed reservations. Missing files or a changed run, deadline, plan or cap are
-errors, and it never creates or resets a ledger. Create a new ledger once with:
-
-```sh
-gptgrep decisions-budget init --run-id smoke-1 --plan-file plan.json \
-  --deadline-seconds 1800 --max-submissions 2 \
-  --ledger /abs/private/ledger.json --output /abs/private/budget.json
-gptgrep decisions-budget status --control /abs/private/budget.json --json
-```
-
-`init` sets `plan_digest` to the SHA-256 of the plan file and the deadline to now
-plus N seconds. It creates the journal and its `.lock` sidecar with the original
-clock anchor, then writes the control file once with mode 0600. It refuses
-relative paths and any existing ledger, lock or control path; it never joins, resets,
-renews or replaces. `status` is read-only. It reports reservations by outcome
-(`reserved`, `in_flight`, `unknown`, `terminal`), remaining submissions, requested
-selectors, the deadline state and whether admission is open. It stays readable
-after the deadline. Reservations are permanent: a joined run stops at
-`max_submissions` with `Decisions submission budget exhausted` before any POST.
-Routing, reranking and follow-up host clients share the same context. Without the
-option, calls use a bounded single-invocation context. Regex/lexical, schema,
-doctor, `decisions-budget` and enrich `--plan-only` do not open the budget file.
-Numeric usage and cost remain reported provider metadata; absent fields remain
-unavailable. The ledger counts submissions, not USD. Any spend cap is enforced
-outside the product, for example as submissions multiplied by a worst-case call price.
-
-
-`search --multimodal` and `ask --multimodal` connect the v2 rich generation to the normal Decisions and native reader workflows:
-
-```sh
-gptgrep search 'What does the chart show?' ./documents --multimodal --max-visual-candidates 8 --json
-gptgrep ask 'Explain the chart and supporting text.' ./documents --multimodal --document report.pdf --max-citations 4 --json
-```
-
-Both commands resolve `CURRENT` once, retain that source-bound generation and one finite Decisions execution context, and perform mandatory document routing followed by reranking of text and independent visual candidates. The visual lane can include pages without a literal query match. The default Decisions model is `openai/gpt-6-luna-decisions`; multimodal retrieval also accepts its observed canonical `openai/gpt-6-luna-decisions-20261006` identifier. Multimodal ask requires the separate native `gpt-6-luna/max/fast` profile. Explicit legacy Jev remains available on the text workflow.
-
-Multimodal output is always one typed JSON report, including when `--json` is omitted. Search returns `gptgrep.rich_multimodal_search.v1`; its image exposure grants no citation rights. Ask returns `gptgrep.rich_multimodal.host.v1` and retains the initial retrieval report. Text and image citations require complete actual native reader delivery followed by source, hash and coordinate checks. Partial failures preserve observed retrieval/accounting in the existing `gptgrep.error.v1` envelope and exit 2.
-
-Bounds are configurable with `--window-bytes` (4–2048), `--max-visual-candidates` (1–16), `--max-concurrent-batches` (1–4), `--max-image-bytes` (up to 1 MiB), `--max-image-pixels` (up to 8 million), `--max-metadata-bytes` (up to 512 KiB), and `--max-output-bytes` (up to 1 MiB). Ask additionally admits 1–8 `--max-citations` and applies the host's 32 KiB candidate metadata and 512 KiB initial-report caps. Tight budgets may refuse preparation before a model call. Reports distinguish inspected/omitted candidates, truncation and incomplete semantic coverage. These limits describe owned buffers and transport; they are not whole-process RSS or exhaustive recall guarantees.
-
-`--multimodal-timeout` admits 1–900 seconds, default 180 for search; ask uses the smaller of this value and its existing `--timeout`. `--decisions-budget FILE` joins the same existing original-clock shared context for routing, reranking and host Decisions tools, without initializing or resetting its ledger. Without that file, the command creates one finite invocation context whose plan identity binds the retained generation manifest; it is not a portable campaign claim.
-
-A v1 generation, regex/lexical/semantic mode selection, legacy grep/window/candidate options, or ask's experimental planning/navigation/continuation options are rejected for this workflow. There is no text or regex fallback. Omitting `--multimodal` preserves the legacy paths and output. The rich ingestion frontdoor supports lossless UTF-8 text/Markdown, PDF, PNG and restricted strict baseline JPEG. Plaintext preserves original bytes and line spans without physical-page or OCR claims. Office inputs use one bounded LibreOffice conversion retained for parsing, rendering and OCR; a working converter is required. Existing scoped Office evidence does not establish support for every Office format or document. The wider JPEG family remains unsupported. CLI composition and offline mock checks establish implementation behavior. Scoped native image qualification is separate from complete-corpus native indexing, current-source provider outcomes and the still-pending paired comparison/release gates.
-
-Foreground OCR is available through the native-only `gptgrep ocr serve --config CONTROL_JSON --token-env GPTGREP_OCR_SERVE_TOKEN` frontdoor. It uses authenticated loopback, explicit server-held source/task custody and a finite original-anchor phase. Full-task and PNG LiteParse compatibility have separate qualification and lineage; compatibility confidence is model-reported and uncalibrated. See [foreground OCR](docs/ocr-serve.md) for control schemas, create-only ledger behavior, limits and pending runtime qualification. Ordinary queries do not start OCR.

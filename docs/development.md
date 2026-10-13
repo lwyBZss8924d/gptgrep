@@ -8,9 +8,15 @@ native parse/OCR path and the full62 Harbor adapter. Read the
 
 ## Checkout and storage
 
+Set `GPTGREP_BRANCH` to the experimental branch you are reviewing, for example the
+current integration branch `claude/gptgrep-unified-runtime-20261012`. Each branch's
+dated [status](experimental-status.md) describes the source that contains it; the
+earlier `codex/gptgrep-unified-runtime-20261012` branch predates the shared
+Decisions budget commands, the credential supervisor and alias admission
+documented here.
+
 ```sh
-git clone --branch codex/gptgrep-unified-runtime-20261012 \
-  https://github.com/lwyBZss8924d/gptgrep.git
+git clone --branch "$GPTGREP_BRANCH" https://github.com/lwyBZss8924d/gptgrep.git
 cd gptgrep
 git rev-parse HEAD
 ```
@@ -103,9 +109,15 @@ It provides one lease per login, a lease guardian, and a per-run `CODEX_HOME`
 that links to the single `auth.json` only while the run holds the lease. It also
 provides an allowlisted environment that blocks consumer refresh and revoke, one
 refresh owner, and a re-login that never touches the existing login until a new
-one succeeds. Entry points that are not yet routed through it (local workstation
-wrappers, the harbor-ablation Rust harness run on its
-own) are listed in its README as unmanaged and stay blocked for shared-login use.
+one succeeds. Each role must declare `tool_permissions`. A generated profile
+denies model tool commands the credential, its per-run link and the lease
+directory. A consumer argv guard refuses Codex command-line overrides, such as
+`--sandbox`, that would silently replace that profile. After every run the
+supervisor scans the run directory for credential links; a finding, or a scan
+that cannot complete, quarantines the run (1.3.1). Entry points that do not route
+through it are unmanaged and stay blocked for shared-login use. Examples are a
+workstation launcher that exports a fixed `CODEX_HOME`, or the harbor-ablation
+Rust harness run on its own; its README lists the known cases.
 Its runbook covers the live sequence, failure recovery and the re-login procedure.
 
 GPTgrep's native roles request `gpt-6-luna`, reasoning effort `max`, service tier
@@ -165,6 +177,13 @@ same-boot clock anchor. The control file (`gptgrep.decisions-budget-contract.v1`
 is written completely with mode 0600 and published without replacement. A second
 `init` for the same paths fails and leaves the ledger and control unchanged. Use a
 new ledger for a new run.
+
+`--deadline-seconds` accepts 1–86,400 (24 hours) and is never renewed.
+`--max-submissions` accepts 1–200. The plan file must be a regular file of at most
+1 MiB. The clock anchor is bound to the boot and clock namespace that created it.
+After a reboot, or a container VM restart for containerized runs, every join fails
+closed and `status` reports `clock_binding_unavailable`; create a new ledger for a
+new run.
 
 `status` reads the control, lock and journal without locking or writing. It
 reports reservations by outcome (`reserved`, `in_flight`, `unknown`, `terminal`),
@@ -281,6 +300,17 @@ pnpm --dir packages/cli install --frozen-lockfile --ignore-scripts
 pnpm --dir packages/cli test
 ```
 
+When changing the harbor-ablation Rust harness (its own Cargo workspace, not
+covered by `cargo test --workspace`), run its suite from
+`workspace/harness-tooling/harbor-ablation` as its
+[README](../workspace/harness-tooling/harbor-ablation/README.md) describes, with
+`GPTGREP_MOCK_PYTHON`, `GPTGREP_JUDGE_TEST_PYTHON` and
+`GPTGREP_JUDGE_TEST_PYTHON_SHA256` naming a qualified interpreter and its digest:
+`cargo test --offline --locked --manifest-path harness/Cargo.toml -- --test-threads=1`.
+When changing `workspace/harness-tooling/codex-auth`, run
+`python3 -I -B tests/run_qualification.py --results-dir DIR` from that directory
+and keep its summary.
+
 Set pnpm's store to the selected external location using the local project/runtime
 configuration before installation. The offline suite does not establish native
 model behavior. A code change needs its relevant regression and the complete
@@ -298,10 +328,17 @@ the approved main comparison.
 export GPTGREP_FULL62_SOURCE="$PWD/workspace/harness-tooling/harbor-ablation/full62"
 export UV_PROJECT_ENVIRONMENT="$GPTGREP_DEV_ROOT/full62-venv"
 uv sync --project "$GPTGREP_FULL62_SOURCE" --frozen
+uv pip install --python "$UV_PROJECT_ENVIRONMENT/bin/python" --require-hashes \
+  -r "$GPTGREP_FULL62_SOURCE/base-image/requirements.lock"
 uv run --project "$GPTGREP_FULL62_SOURCE" --frozen gptgrep-harbor-full62 --help
 uv run --project "$GPTGREP_FULL62_SOURCE" --frozen python -B -m unittest discover \
   -s "$GPTGREP_FULL62_SOURCE/tests" -v
 ```
+
+The adapter's base-image tests import Pillow 12.3.0 on the host, but `uv.lock` pins
+only Harbor. Install the hashed `base-image/requirements.lock` into the same
+environment. An exact `uv sync` removes packages outside the lock, so reinstall
+after every sync.
 
 For a real run, follow the adapter's sequence: build and verify the common
 Python/Pillow/Poppler/native-Codex foundation; add the complete Linux GPTgrep plus
@@ -316,6 +353,11 @@ no automatic retry.
 Raw Codex receives only original documents and may extract/render during SEARCH.
 GPTgrep receives the same bytes plus a frozen index built before question access.
 Both readers use the same selected native binary and generic raw-document tools.
+GPTgrep's reader contract (base instructions, citation and abstention rules and
+answer rules) is part of the treatment; the raw-only reader receives the common
+task prompt with Codex's default base instructions. In this source the adapter's
+`legacy_text` mode still copies the answer rules into the raw-only prompt; that
+copy is to be removed before the paired run.
 The Judge runs in a separate environment with the complete answer and frozen
 reference, not the reader's history. Task failures stay in the denominator;
 unavailable judging stays unknown. INDEX and Judge costs are separate from
@@ -324,5 +366,10 @@ for the unchanged primary metric and missing-result rules.
 
 The private 62-task cohort, accepted image/account controls, budget state and
 prebuilt index are not distributed. Synthetic adapter checks can run from source;
-they do not make a real paired run ready or prove an advantage. Full34 native
-indexing and full62 paired acceptance remain the next live development gates.
+they do not make a real paired run ready or prove an advantage. The full62 paired
+comparison and full34 native PTC indexing remain open live gates; see the
+[experimental status](experimental-status.md). The first paired run uses a frozen
+zero-model text index. Build it inside the Linux treatment image at the
+in-container corpus root, from raw documents only and before question exposure.
+The product binds a generation to its canonical root, so an index built on the
+host fails with `index identity mismatch; reindex at current root`.

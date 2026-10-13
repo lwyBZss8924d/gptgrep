@@ -378,9 +378,11 @@ or see-section pointers) by reading the referenced note or section before
 answering. The rules say when to commit, never when to stop abstaining: every
 evidence, citation and abstention rule is unchanged, including
 `insufficient_evidence: true` when evidence is missing or cannot support the
-answer. Rich text and multimodal readers do not receive these rules. In the
-full62 paired comparison, the raw-only arm of a `legacy_text` run receives the
-same rule text.
+answer. Rich text and multimodal readers do not receive these rules. The rules
+are part of GPTgrep's reader contract, which the main comparison treats as part
+of the treatment. In this source the full62 adapter still gives the raw-only arm
+of a `legacy_text` run the same rule text; by owner direction that copy is
+removed before the paired run, so the bare arm then receives none.
 
 `HostConfig.native_ptc` (default false) and `--native-ptc` select native
 execution for the final retrieval reader. An existing named permission profile
