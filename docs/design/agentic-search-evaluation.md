@@ -8,7 +8,7 @@ The retained PageIndex first-release gate remains separate.
 The current executable adapter is [full62 Harbor](../../workspace/harness-tooling/harbor-ablation/full62/README.md).
 Use [development setup](../development.md) for its environment and
 [experimental status](../experimental-status.md) for observed progress. As of
-2026-10-12, its complete paired run and Judge remain pending; source and synthetic
+2026-10-13, its complete paired run and Judge remain pending; source and synthetic
 interface validation do not satisfy this protocol.
 
 ## Main question and two arms
@@ -19,7 +19,7 @@ its ordinary tools and raw documents alone?
 | Condition | Bare Codex | Codex with GPTgrep |
 | --- | --- | --- |
 | Initial material | Raw documents only; no prepared text, OCR, tree or index | The same raw documents and a frozen GPTgrep index built from raw documents alone |
-| Reader | Matched Codex version, model, effort, service tier, base instructions and sandbox resources | The same reader plus the GPTgrep tools and necessary tool instructions |
+| Reader | Matched Codex version, model, effort, service tier and sandbox resources; Codex's default base instructions plus the common task prompt | The same Codex runtime and resources, with GPTgrep's reader contract as base instructions (answer/citation/`insufficient_evidence` schema; citation, abstention and answer rules) plus the GPTgrep tools |
 | Normal tools | Normal permitted file search, reading, parsing and rendering tools | The same normal tools plus GPTgrep |
 | Task and scope | The same question and protocol-permitted document scope | Identical |
 | Initial state | A fresh reader without prior answers, judge state or the other arm's trace | Identical isolation |
@@ -38,9 +38,21 @@ available. Report separately what the actual trace used, failed to use or could
 not observe. The existing Harbor pilot with deterministic rich-batch tools and
 no Luna Decisions establishes protocol/tool-use development evidence only. It
 does not establish the full routing/reranking or System One helper capability.
+A treatment-only run, even over all 62 tasks with live Decisions, is development
+evidence. Without the matched raw-only arm it supports no `Q_gptgrep - Q_bare`
+claim, and the tasks it exposes remain development material.
 A feature present in the binary or index is not evidence that the run used it.
 This is honest configuration labelling, not a requirement that every mechanism
 be enabled or independently win; claims must stay within the frozen profile.
+
+GPTgrep's reader contract is a declared part of the treatment (owner direction,
+2026-10-13 UTC). A result therefore compares the GPTgrep harness, including that
+contract, with bare Codex; it does not isolate retrieval. For the paired run, the
+raw-only arm receives only the common task prompt and Codex's default base
+instructions. The full62 adapter's current `legacy_text` copy of the answer rules
+into the raw-only prompt must be removed before that run. An optional
+bare-Codex-plus-answer-rules diagnostic arm can separate prompt-contract effects;
+it is not part of the primary claim.
 
 This estimates the difference between two real product configurations. The
 prebuilt-index treatment and raw-only baseline do not identify the isolated

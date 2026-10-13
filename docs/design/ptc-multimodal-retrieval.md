@@ -137,7 +137,7 @@ Reader 的 `DeliveredEvidence` 登记本绑定本次已交付的文本窗口／�
 
 `OcrTask` 绑定 source、prepared artifact、页、regions、renditions、transform、parser/profile/schema digests、输出上限及预算。任务不含检索问题、benchmark ID 或 gold。parser 定义 `OcrExecutor` trait，CLI 将 host executor 注入 core 的 index options；trait 使用 owned DTO/有界 future，不能让 `PdfDocument` 跨 await 或 Send 边界。
 
-OCR 目标模型按用户补充选择为 `gpt-6.1-luna`，默认 max / fast，独立于 Decisions 与问答模型。启动前核查所选 runtime 的 model/effort/tier/image 能力；不可用时明确阻塞，不替换模型。每页一个 app-server turn、最多 8 次工具调用、180 秒；默认并发 2。区域任务在该页 turn 内聚合，未完成不能拆成隐形新 turn。
+OCR 模型默认 `gpt-6-luna`（`DEFAULT_OCR_MODEL`），默认 max / fast，独立于 Decisions 与问答模型；任务 profile 的模型、推理强度与服务层级必须与所选 profile 完全一致，否则校验失败（早期设计中的 `gpt-6.1-luna` 已不再被选用）。启动前核查所选 runtime 的 model/effort/tier/image 能力；不可用时明确阻塞，不替换模型。每页一个 app-server turn、最多 8 次工具调用、180 秒；默认并发 2。区域任务在该页 turn 内聚合，未完成不能拆成隐形新 turn。
 
 OCR 的独立资源预算在 M0 冻结，不能沿用 Decisions 上限便宣称有界。初始提议：单张交付PNG/JPEG文件≤1 MiB、base64≤1,398,104字节、≤8 MP、像素解码缓冲≤32 MiB；每页≤4张且合计≤24 MP／压缩文件≤4 MiB。单页持久化布局≤4 MiB、整文档metadata≤64 MiB、单次送入native/layout文本≤64 KiB；OCR JSON≤256 KiB、≤1,024 regions、单region文本≤16 KiB。app-server单frame≤4 MiB、会话总传输≤16 MiB（含可能重复回传的图像）；raster/metadata拥有的数据工作集≤256 MiB、单文档staging≤512 MiB、整次转换／图像staging≤1 GiB。
 
@@ -183,7 +183,7 @@ OpenRouter 模型页声明图像输入；核查时 OpenAPI 的 `state` 仍为 st
 
 独立候选的一组 Score／Choice 合并到同一请求；依赖 routing 结果的 rerank 分下一阶段。一个库内 `ExecutionContext` 默认最多 4 个在途 HTTP 请求，共享 semaphore、总提交额度、字节额度和绝对 deadline，不能每个子 batch 各建 4 个槽。64 是本地问题上限，不跟随模型宣称的 200 自动扩大；多项问题消耗 question 数而非仅候选数。
 
-外部多进程 PTC 使用显式 `--budget-ledger FILE`：账本绑定 run ID、冻结plan digest、同机时间锚与绝对deadline、Decisions/OCR计数及在途槽。所有子命令传同一账本，OS文件锁下原子校验/预留并durably写入后才发送；作用域不跨主机。进程崩溃且完成未知时，提交额度不退回，在途槽保守隔离到该run结束，不能凭PID消失或lease过期当免费重试。完成/失败的槽释放须有终态或确认取消证据。单独CLI不提供账本时，只保证该invocation的上限，并在输出标明budget scope；不声称多个独立CLI自动共享限制。首次200/24对照必须共用一个账本，不能复制上限给每个worker。账本是本地文件协调，不启动daemon。
+外部多进程 PTC 使用显式 `--decisions-budget FILE` 加入由 `gptgrep decisions-budget init` 一次性创建的 Decisions 账本（`status` 只读查看）；OCR 使用独立的 OCR phase/ledger（见 [ocr-serve.md](../ocr-serve.md)）。账本绑定 run ID、冻结plan digest、同机时间锚与绝对deadline、提交计数及在途槽。所有子命令传同一账本，OS文件锁下原子校验/预留并durably写入后才发送；作用域不跨主机。进程崩溃且完成未知时，提交额度不退回，在途槽保守隔离到该run结束，不能凭PID消失或lease过期当免费重试。完成/失败的槽释放须有终态或确认取消证据。单独CLI不提供账本时，只保证该invocation的上限，并在输出标明budget scope；不声称多个独立CLI自动共享限制。首次200/24对照必须共用一个账本，不能复制上限给每个worker。账本是本地文件协调，不启动daemon。
 
 | 初始本地预算 | 文本 | 多模态（设计值，D2 后冻结） |
 | --- | --- | --- |
@@ -193,7 +193,7 @@ OpenRouter 模型页声明图像输入；核查时 OpenAPI 的 `state` 仍为 st
 | response | ≤1 MiB | ≤1 MiB |
 | HTTP 时限 | ≤20 秒且不超过父 deadline | 同左；若不足作为失败证据，不运行中自动放宽 |
 
-完整 base64、envelope、题目和元数据全部进入实际字节测量。超限在提交前按稳定候选 ID 分组；单项仍超限显式错误，不截掉图片或改变 rubric。不同 batch 复用共享 state 时仍按实际重复发送的字节／tokens 计量。序列化一次，再持久化 reservation，最后 `submit_prepared` 一次提交；拒绝、429、timeout、坏 schema 与未知使用量都保留。
+完整 base64、envelope、题目和元数据全部进入实际字节测量。超限在提交前按稳定候选 ID 分组；单项仍超限显式错误，不截掉图片或改变 rubric。不同 batch 复用共享 state 时仍按实际重复发送的字节／tokens 计量。序列化一次，再持久化 reservation，然后 `submit_prepared` 提交。默认文本检索的 routing 与 rerank 在收到 429/500/502/503/504 后，于原始期限与提交预算内以相同字节至多重试一次，两次尝试都计量；rich/多模态、显式 rerank、batch、judge 等路径仍只提交一次。拒绝、timeout、坏 schema 与未知使用量都保留。
 
 响应必须 exact ID set、无重复 key、类型正确、概率有限且合法、Score 范围正确；缺失和重复不能补零。保持原有统一四级相关性 rubric 和归一化方式；Score 不是答案正确概率。并发收集后按分数及稳定 ID 排序。某个 rerank 项失败时不给假分；batch 可报告该项失败，但默认 search/ask 的必需 Decisions 失败仍使该 operation 失败，不静默降为纯词面结果。
 
@@ -201,7 +201,7 @@ OpenRouter 模型页声明图像输入；核查时 OpenAPI 的 `state` 仍为 st
 
 ### 7.1 入口
 
-以下均为待实现接口，以实现阶段的版本化 JSON Schema 为最终合同。
+下表为设计时的接口草案。batch、rerank 与 `search/ask --multimodal` 已实现；inspect/render 以 rich batch 操作（`inspect_*`、`read_visual`）和阅读器工具（`gptgrep_inspect_artifact`、`gptgrep_render`）提供，没有独立的 `inspect`/`render` 命令。当前合同以 `--schema` 为准。
 
 | 接口 | 行为 |
 | --- | --- |

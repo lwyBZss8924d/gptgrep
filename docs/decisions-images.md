@@ -61,8 +61,14 @@ response parsing retains its existing 1 MiB cap and typed validation.
 
 The prepared body stays bound to the preparing client's identity, endpoint and
 requested model. Its execution context and remaining deadline checks are shared
-with the existing transport. Submission uses the existing single-attempt path,
-without provider fallback, redirects or implicit retries.
+with the existing transport. Submission uses `submit_prepared` on the preparing
+client. It makes one attempt unless that client explicitly opted into the bounded
+`TransientRetry` (see [retrieval modes](architecture.md#retrieval-modes)), which
+repeats the identical bytes once after a received 429, 500, 502, 503 or 504,
+within the original deadline and submission budget. There is no provider
+fallback, redirect or implicit retry. The product's rich/multimodal paths remove
+any attached retry policy; use a client without that policy when a qualification
+must stay single-submission.
 
 Documented syntax does not establish actual backend image interpretation,
 semantic eligibility, useful answers or a gateway refusal mapping. Unknown or

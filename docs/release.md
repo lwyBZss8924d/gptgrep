@@ -2,7 +2,7 @@
 
 The release package contains the native Rust CLI and the exact PDFium library needed for local PDF parsing. Local regex/lexical retrieval needs no Node, Bun, Python, vector database or MCP service. The optional `gptgrep-ai` incur wrapper is a separate source package. Office conversion needs an existing LibreOffice installation. Agentic parsing/OCR and reasoning additionally require their selected Codex runtime, independent authentication, qualified controls and generic tools; see [development setup](development.md). The package does not bundle those private runtime inputs.
 
-The initial package targets are `aarch64-apple-darwin` and `x86_64-unknown-linux-gnu`. macOS ARM64 is the local development host. A configured Linux job is not evidence of a successful Linux run; platform validation is established by that target's completed native CI and archive smoke receipt. macOS binaries are unsigned and not notarized. Linux compatibility is with the runner/build environment used for that release, not a promise of arbitrary older glibc support. The packaging source additionally supports `aarch64-unknown-linux-gnu` for the experimental Harbor workflow. Its current-source Linux build, complete license bundle and relocation/native smoke must be verified separately; support in the script is not an accepted release artifact. Windows, macOS Intel and musl remain outside this release set.
+The initial package targets are `aarch64-apple-darwin` and `x86_64-unknown-linux-gnu`. Development has used a macOS ARM64 host and, since 2026-10-12, a macOS Intel (x86_64) host. macOS Intel is not a release target, so local qualification there is development evidence, not a release artifact. A configured Linux job is not evidence of a successful Linux run; platform validation is established by that target's completed native CI and archive smoke receipt. macOS binaries are unsigned and not notarized. Linux compatibility is with the runner/build environment used for that release, not a promise of arbitrary older glibc support. The packaging source additionally supports `aarch64-unknown-linux-gnu` for the experimental Harbor workflow. Its current-source Linux build, complete license bundle and relocation/native smoke must be verified separately; support in the script is not an accepted release artifact. Windows, macOS Intel and musl remain outside this release set.
 
 ## Package an existing native build
 
@@ -64,6 +64,12 @@ An authorized experimental source branch is a collaborator handoff, not a binary
 release or a successful benchmark. Its current development limits are recorded in
 [experimental status](experimental-status.md).
 
+The Cargo workspace and the optional wrapper are version `0.1.0-alpha.1`
+(experimental). Experimental builds keep `0.x.y-alpha.N` versions. The version
+moves to a canary `x.y.z` only after the paired same-Codex benchmark criterion in
+[SPEC](../SPEC.md) passes. A version change alone creates no tag or release. Tags
+need explicit owner authorization, and the first release tag still requires G5.
+
 ## CI and publication
 
 The first experimental release is gated on a real paired PageIndex-OSS-Benchmark
@@ -75,7 +81,7 @@ failures, citation checks and the matching source revisions. The comparison rule
 is defined in [SPEC.md](../SPEC.md) and the project goal contract. Do not create or
 push the first release tag while G5 remains unaccepted.
 
-CI runs native Rust formatting, workspace tests, Clippy with denied warnings, the offline retrieval evaluation, its oracle tests, packaging self-tests, and complete license collection on both targets. A separate job tests the locked optional incur package. The PDFium archive is checksum-verified before use. The official runner table lists `macos-14` as ARM64 and `ubuntu-latest` as x86_64; jobs still verify native target artifacts. [GitHub runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
+CI runs native Rust formatting, workspace tests, Clippy with denied warnings, the offline retrieval evaluation and its oracle tests, packaging self-tests, the runtime staging regression, and complete license collection on both targets. Separate jobs test the offline PageIndex baseline adapter and the locked optional incur package. The PDFium archive is checksum-verified before use. The official runner table lists `macos-14` as ARM64 and `ubuntu-latest` as x86_64; jobs still verify native target artifacts. [GitHub runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
 
 The release workflow runs on an existing `vVERSION` tag or a manual dispatch naming that tag. It binds the tag to the Cargo workspace version and exact source revision, runs CI against that revision, builds each native artifact, collects licenses, packages and runs relocation tests, then publishes only after both targets succeed. Only the final publish job has `contents: write`. Checkout credentials are not persisted. The workflow does not publish to crates.io or npm, create a source tag, replace existing release assets, sign binaries or notarize macOS executables. Prerelease version tags produce GitHub prereleases.
 
