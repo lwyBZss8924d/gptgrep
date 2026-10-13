@@ -12,6 +12,7 @@ from .runtime import (API_ENV, BASE_CAPABILITIES, BASE_TOOLS_PATH, CODEX_HOME, D
                       base_tools_identity, model_config, native_identity, reader_seccomp_profile, reader_security_opt,
                       validate_asset_path)
 from .product_bundle import PRODUCT_ENTRYPOINT, PRODUCT_PROVENANCE, bundle_identity
+from .reader import ANSWER_RULES_DESCRIPTION_FIELD, TREATMENT_IDENTITY
 from .decisions import (CLAIM_ROOT, CONTROL_ROOT, FAMILY_ROOT, TRIAL_ROOT, WRITER_LOCK,
                         control as decisions_control, decisions_model, directory as decisions_directory,
                         invocation_cost_bound, selected_mode, shared_allowance)
@@ -66,8 +67,12 @@ def treatment_feature_profile(runtime):
             "reader_contract": {
                 "declared_treatment": True, "treatment": "gptgrep_reader_contract",
                 "components": components + (["answer_rules"] if mode == "legacy_text" else []),
-                "answer_rules_identity": ("per treatment trial: product_schema:commands.ask.reader_answer_rules"
-                                          if mode == "legacy_text" else None),
+                # The bundle provenance binds the contract text compiled into the
+                # product; the --schema field only describes the answer rules.
+                "identity": "per treatment trial: " + TREATMENT_IDENTITY,
+                "answer_rules_description": ("per treatment trial: product_schema:"
+                                             + ".".join(ANSWER_RULES_DESCRIPTION_FIELD)
+                                             if mode == "legacy_text" else None),
                 "baseline": "codex_default_base_instructions_and_common_task_prompt",
                 "baseline_receives_gptgrep_rules": False,
                 "qualification_code": READER_CONTRACT_DIFFERENCE,

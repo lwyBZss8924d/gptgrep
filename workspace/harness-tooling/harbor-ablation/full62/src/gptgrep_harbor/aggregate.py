@@ -9,6 +9,7 @@ from .common import (ARMS, MAX_ANSWER, binding_equal, canonical, finite_number, 
                      tool_cap_parity, validate_binding)
 from .adapter import qualification, treatment_feature_profile
 from .decisions import selected_mode
+from .reader import TREATMENT_IDENTITY
 
 
 def trial_decisions_cost(attempts):
@@ -75,20 +76,28 @@ def trial_claims(values, runtime):
 def reader_contracts(contracts, runtime):
     """Check the operation records' reader contracts against the frozen declaration.
 
-    The raw-only arm must report that it received none of GPTgrep's contract;
-    legacy_text treatment trials report the answer-rules identity of their
-    pinned product, and one cohort is expected to share one identity.
+    The raw-only arm must report that it received none of GPTgrep's contract.
+    Treatment trials report their identity, the verified bundle provenance
+    digest, which binds the contract text compiled into the product; one cohort
+    is expected to share one build. legacy_text treatment trials also report the
+    digest of the product's own description of its answer rules: it is not the
+    rule text and is never counted as the identity.
     """
-    def identity(contract):
-        return contract.get("answer_rules_sha256") if type(contract) is dict else None
-    expected = runtime.get("reader_mode") == "legacy_text"
+    def recorded(contract, key):
+        value = contract.get(key) if type(contract) is dict else None
+        return value if isinstance(value, str) else None
+    described = runtime.get("reader_mode") == "legacy_text"
     treatment, raw = contracts["gptgrep"], contracts["raw_only"]
-    identities = sorted({identity(c) for c in treatment if isinstance(identity(c), str)})
-    return {"declared_treatment": True, "treatment_answer_rules_expected": expected,
-            "treatment_answer_rules_sha256": identities,
-            "treatment_identity_consistent": len(identities) <= 1,
-            "treatment_records_without_identity": (sum(not isinstance(identity(c), str) for c in treatment)
-                                                   if expected else 0),
+    builds = sorted({recorded(c, TREATMENT_IDENTITY) for c in treatment} - {None})
+    descriptions = sorted({recorded(c, "answer_rules_description_sha256") for c in treatment} - {None})
+    return {"declared_treatment": True, "treatment_identity": TREATMENT_IDENTITY,
+            "treatment_product_provenance_sha256": builds,
+            "treatment_identity_consistent": len(builds) <= 1,
+            "treatment_records_without_identity": sum(recorded(c, TREATMENT_IDENTITY) is None for c in treatment),
+            "treatment_answer_rules_expected": described,
+            "treatment_answer_rules_description_sha256": descriptions,
+            "treatment_records_without_answer_rules_description": (
+                sum(recorded(c, "answer_rules_description_sha256") is None for c in treatment) if described else 0),
             "raw_only_records_without_gptgrep_contract": sum(type(c) is dict and c.get("gptgrep_contract_received")
                                                              is False for c in raw),
             "raw_only_records_reporting_gptgrep_contract": sum(type(c) is dict and c.get("gptgrep_contract_received")
@@ -334,9 +343,15 @@ def summarize(export, records, runtime):
         reexecuted = [str(claims["pairs_with_pre_existing_claim"]) + " pairs include a trial that found its claim "
                       "already present (a re-execution); that trial is an operational failure and its pair may "
                       "mix two executions."]
+    contract = reader_contracts(contracts, runtime)
+    builds = len(contract["treatment_product_provenance_sha256"])
+    mixed_builds = []
+    if builds > 1:
+        mixed_builds = [str(builds) + " distinct product provenance digests among the treatment records: the "
+                        "treatment trials did not all run one product build, so their reader contracts may differ."]
     return {"schema": "gptgrep.harbor.paired-summary.v1", "search": summary, "paired": comparison,
             "decisions": decisions_costs(values["gptgrep"], runtime),
-            "reader_contract": reader_contracts(contracts, runtime),
+            "reader_contract": contract,
             "trial_claims": claims,
             "judge": {"outer_attempts_observed": len(judge_attempts),
                       "observed_attempt_wall_ms_subtotal": sum(a["elapsed_ms"] for a in judge_attempts
@@ -366,4 +381,4 @@ def summarize(export, records, runtime):
               "No full62 result establishes comprehensive INDEX quality.",
               "Answerable and unanswerable slices need evaluator-side answerability metadata, "
               "which the cohort projection does not carry; abstention counts are not those slices.",
-              "Source preparation and aggregation do not grant release or Goal acceptance."] + reexecuted}
+              "Source preparation and aggregation do not grant release or Goal acceptance."] + reexecuted + mixed_builds}

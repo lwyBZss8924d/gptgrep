@@ -36,7 +36,7 @@ GPTGREP_RULE_MARKERS = ("Answer rules", "answer rules", "Lead with the direct an
 RAW_READER_CONTRACT = {"schema": "gptgrep.harbor.reader-contract.v1", "arm": "raw_only",
                        "base_instructions": "codex_default", "prompt": "common_task_prompt",
                        "gptgrep_contract_received": False, "answer_rules_received": False,
-                       "answer_rules_sha256": None}
+                       "answer_rules_description_sha256": None}
 
 
 def assert_no_gptgrep_rule_text(case, prompt):
@@ -259,10 +259,12 @@ class PairedTests(unittest.TestCase):
         export, records, runtime, blobs = synthetic_results()
         unobserved = self.aggregate(export, records, runtime, blobs)["reader_contract"]
         self.assertEqual((unobserved["raw_only_records_unobserved"], unobserved["treatment_records_without_identity"],
-                          unobserved["treatment_answer_rules_sha256"]), (62, 62, []))
+                          unobserved["treatment_records_without_answer_rules_description"],
+                          unobserved["treatment_product_provenance_sha256"]), (62, 62, 62, []))
         treatment = {"schema": "gptgrep.harbor.reader-contract.v1", "arm": "gptgrep",
                      "base_instructions": "gptgrep_reader_contract", "reader_mode": "legacy_text",
-                     "answer_rules_received": True, "answer_rules_sha256": "1" * 64}
+                     "answer_rules_received": True, "answer_rules_description_sha256": "1" * 64,
+                     "identity": "product_provenance_sha256", "product_provenance_sha256": "9" * 64}
 
         def stamp(index, arm, contract):
             record = [r for r, row in zip(records, export["tasks"]) if row["binding"]["arm"] == arm][index]
@@ -272,25 +274,56 @@ class PairedTests(unittest.TestCase):
         for index in range(62):
             stamp(index, "gptgrep", treatment)
             stamp(index, "raw_only", RAW_READER_CONTRACT)
-        summary = self.aggregate(export, records, runtime, blobs)["reader_contract"]
-        self.assertEqual(summary, {"declared_treatment": True, "treatment_answer_rules_expected": True,
-                                   "treatment_answer_rules_sha256": ["1" * 64],
-                                   "treatment_identity_consistent": True, "treatment_records_without_identity": 0,
-                                   "raw_only_records_without_gptgrep_contract": 62,
-                                   "raw_only_records_reporting_gptgrep_contract": 0,
-                                   "raw_only_records_unobserved": 0})
-        # A second identity or a raw-only record that reports the contract is visible.
-        stamp(0, "gptgrep", {**treatment, "answer_rules_sha256": "2" * 64})
+        result = self.aggregate(export, records, runtime, blobs)
+        self.assertEqual(result["reader_contract"],
+                         {"declared_treatment": True, "treatment_identity": "product_provenance_sha256",
+                          "treatment_product_provenance_sha256": ["9" * 64],
+                          "treatment_identity_consistent": True, "treatment_records_without_identity": 0,
+                          "treatment_answer_rules_expected": True,
+                          "treatment_answer_rules_description_sha256": ["1" * 64],
+                          "treatment_records_without_answer_rules_description": 0,
+                          "raw_only_records_without_gptgrep_contract": 62,
+                          "raw_only_records_reporting_gptgrep_contract": 0,
+                          "raw_only_records_unobserved": 0})
+        self.assertFalse(any("product provenance" in note for note in result["limitations"]))
+        # A raw-only record that reports the contract is visible.
         stamp(0, "raw_only", {**RAW_READER_CONTRACT, "gptgrep_contract_received": True})
         summary = self.aggregate(export, records, runtime, blobs)["reader_contract"]
-        self.assertIs(summary["treatment_identity_consistent"], False)
-        self.assertEqual(summary["treatment_answer_rules_sha256"], ["1" * 64, "2" * 64])
         self.assertEqual((summary["raw_only_records_reporting_gptgrep_contract"],
                           summary["raw_only_records_without_gptgrep_contract"]), (1, 61))
-        # rich_multimodal treatment trials have no answer-rules identity by design.
+        # rich_multimodal treatment trials have no answer-rules description by design,
+        # but every treatment record still carries its build identity.
+        stamp(0, "gptgrep", {**treatment, "reader_mode": "rich_multimodal", "answer_rules_received": False,
+                             "answer_rules_description_sha256": None})
         runtime["reader_mode"] = "rich_multimodal"
-        self.assertEqual(self.aggregate(export, records, runtime, blobs)["reader_contract"]
-                         ["treatment_records_without_identity"], 0)
+        summary = self.aggregate(export, records, runtime, blobs)["reader_contract"]
+        self.assertEqual((summary["treatment_records_without_identity"],
+                          summary["treatment_records_without_answer_rules_description"]), (0, 0))
+
+    def test_summary_binds_the_treatment_identity_to_the_build_not_the_rules_description(self):
+        # The product's --schema description of its answer rules is written separately
+        # from the rule text the reader receives: an unchanged description digest cannot
+        # show that two builds gave the reader the same rules. Only the bundle
+        # provenance digest binds the build.
+        export, records, runtime, blobs = synthetic_results()
+        treatment = {"schema": "gptgrep.harbor.reader-contract.v1", "arm": "gptgrep",
+                     "base_instructions": "gptgrep_reader_contract", "reader_mode": "legacy_text",
+                     "answer_rules_received": True, "answer_rules_description_sha256": "1" * 64,
+                     "identity": "product_provenance_sha256"}
+        for index, (record, row) in enumerate((r, row) for r, row in zip(records, export["tasks"])
+                                              if row["binding"]["arm"] == "gptgrep"):
+            operation = parse(blobs[record["operation"]])
+            operation["reader_contract"] = {**treatment, "product_provenance_sha256": ("8" if index else "9") * 64}
+            blobs[record["operation"]] = canonical(operation)
+        result = self.aggregate(export, records, runtime, blobs)
+        contract = result["reader_contract"]
+        self.assertEqual(contract["treatment_answer_rules_description_sha256"], ["1" * 64])
+        self.assertEqual(contract["treatment_product_provenance_sha256"], ["8" * 64, "9" * 64])
+        self.assertIs(contract["treatment_identity_consistent"], False)
+        self.assertNotIn("treatment_answer_rules_sha256", contract)
+        self.assertEqual([note for note in result["limitations"] if "product provenance" in note],
+                         ["2 distinct product provenance digests among the treatment records: the treatment trials "
+                          "did not all run one product build, so their reader contracts may differ."])
 
     def test_summary_flags_pairs_with_a_pre_existing_trial_claim(self):
         export, records, runtime, blobs = synthetic_results()
@@ -1024,24 +1057,31 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
                 self.assertEqual((result["status"], result["label"]), ("operational_failure", 0))
                 self.assertEqual(transport_reward(result)["answer_equivalence"], 0)
 
-    def test_treatment_records_the_answer_rules_identity_from_the_product_schema(self):
+    def test_treatment_records_its_build_identity_and_the_product_rules_description(self):
         outputs, child = self.run_reader(legacy_report())
         operation = outputs["/logs/agent/operational.json"]
         contract = operation["reader_contract"]
-        self.assertEqual(contract["answer_rules_sha256"], sha(SYNTHETIC_ANSWER_RULES.encode()))
+        # The identity is the verified bundle's provenance digest, which binds the
+        # rule text compiled into the product.
+        self.assertEqual((contract["identity"], contract["product_provenance_sha256"]),
+                         ("product_provenance_sha256", "9" * 64))
+        # The --schema field is the product's own description of its rules, not the
+        # rule text: its digest is recorded under that name and never as the identity.
+        self.assertEqual(contract["answer_rules_description_sha256"], sha(SYNTHETIC_ANSWER_RULES.encode()))
+        self.assertEqual(contract["answer_rules_description_source"], "product_schema:commands.ask.reader_answer_rules")
+        self.assertNotIn("answer_rules_sha256", contract)
         self.assertEqual(contract["product_schema_sha256"], sha(product_schema_report()))
-        self.assertEqual(contract["answer_rules_source"], "product_schema:commands.ask.reader_answer_rules")
         self.assertEqual((contract["arm"], contract["base_instructions"], contract["answer_rules_received"]),
                          ("gptgrep", "gptgrep_reader_contract", True))
-        self.assertEqual(contract["product_provenance_sha256"], "9" * 64)
         self.assertEqual(outputs["/answer/answer.json"]["status"], "response")
         # Observed once, before the query timer and the Ask.
         self.assertEqual(child.call_args_list[0].args[0], ["/synthetic/gptgrep", "--schema"])
         self.assertEqual(len(ask_calls(child)), 1)
-        # A product change to the rules changes the identity with no adapter edit.
+        # A changed description changes only its own digest; the identity follows the bundle.
         changed, _ = self.run_reader(legacy_report(), schema={"stdout": product_schema_report("Changed rules.")})
-        self.assertEqual(changed["/logs/agent/operational.json"]["reader_contract"]["answer_rules_sha256"],
-                         sha(b"Changed rules."))
+        changed = changed["/logs/agent/operational.json"]["reader_contract"]
+        self.assertEqual((changed["answer_rules_description_sha256"], changed["product_provenance_sha256"]),
+                         (sha(b"Changed rules."), "9" * 64))
         # The materialized split travels unchanged: the declared contract difference is no mismatch.
         declared = [{"code": "reader_contract_differs"}]
         config = {**self.config(), "qualification_mismatches": [{"code": "observed generic mismatch"}],
@@ -1223,7 +1263,8 @@ class ReaderContractTests(unittest.TestCase):
         self.assertEqual((schema, failure), (None, None))
         self.assertEqual(record, {"schema": "gptgrep.harbor.reader-contract.v1", "arm": "gptgrep",
                                   "base_instructions": "gptgrep_reader_contract", "reader_mode": "rich_multimodal",
-                                  "answer_rules_received": False, "answer_rules_sha256": None,
+                                  "answer_rules_received": False, "answer_rules_description_sha256": None,
+                                  "identity": "product_provenance_sha256",
                                   "product_provenance_sha256": "9" * 64})
 
 

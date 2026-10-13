@@ -324,9 +324,14 @@ class HarborMaterializationTests(unittest.TestCase):
                 self.assertIs(contract["declared_treatment"], True)
                 self.assertIs(contract["baseline_receives_gptgrep_rules"], False)
                 self.assertEqual(contract["qualification_code"], "reader_contract_differs")
-                # Only the text reader receives the answer rules and reports their identity.
+                # Every treatment trial reports its build identity; only the text reader
+                # receives the answer rules and records the product's description of them.
+                self.assertEqual(contract["identity"], "per treatment trial: product_provenance_sha256")
                 self.assertEqual("answer_rules" in contract["components"], mode == "legacy_text")
-                self.assertEqual(contract["answer_rules_identity"] is None, mode == "rich_multimodal")
+                self.assertEqual(contract["answer_rules_description"],
+                                 "per treatment trial: product_schema:commands.ask.reader_answer_rules"
+                                 if mode == "legacy_text" else None)
+                self.assertNotIn("answer_rules_identity", contract)
                 row = adapter.rows[0]
                 document = next(d for d in self.runtime["documents"] if d["document_id"] == row["document_id"])
                 for arm in ("gptgrep", "raw_only"):

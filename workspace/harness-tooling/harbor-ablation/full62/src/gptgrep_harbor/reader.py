@@ -77,10 +77,15 @@ def raw_prompt(config, question):
 
 
 READER_CONTRACT_SCHEMA = "gptgrep.harbor.reader-contract.v1"
-# The pinned product describes the answer rules its legacy_text reader receives
-# in its own offline `--schema` report. The digest of that field identifies the
-# treatment's rules, so a later product change to them needs no adapter edit.
-ANSWER_RULES_FIELD = ("commands", "ask", "reader_answer_rules")
+# The treatment's identity is the digest of its verified bundle provenance,
+# which pins the product binary and so the contract text compiled into it: a
+# product change to the rules changes it with no adapter edit. The pinned
+# product's offline `--schema` report also describes the answer rules its
+# legacy_text reader receives. That field is the product's own prose
+# description, written separately from the rule text, so its digest identifies
+# only the description: it is recorded beside the identity, never as it.
+TREATMENT_IDENTITY = "product_provenance_sha256"
+ANSWER_RULES_DESCRIPTION_FIELD = ("commands", "ask", "reader_answer_rules")
 # A local report: Harbor's agent timeout leaves only ten seconds beyond the
 # query deadline for everything outside it.
 PRODUCT_SCHEMA_SECONDS = 5
@@ -109,29 +114,31 @@ def reader_contract(config, binding, schema=None):
     """This arm's reader-contract record for its operation record.
 
     The raw-only arm records that it received none of GPTgrep's contract. The
-    treatment records its contract and, in legacy_text, the identity of the
-    answer rules that the pinned product itself reports; rich_multimodal readers
-    receive no answer rules, so that identity stays null.
+    treatment records its contract and its identity, the verified bundle
+    provenance digest. In legacy_text it also records the digest of the pinned
+    product's own description of its answer rules, which is not the rule text;
+    rich_multimodal readers receive no answer rules, so that digest stays null.
     """
     if binding["arm"] == "raw_only":
         return {"schema": READER_CONTRACT_SCHEMA, "arm": "raw_only",
                 "base_instructions": "codex_default", "prompt": "common_task_prompt",
                 "gptgrep_contract_received": False, "answer_rules_received": False,
-                "answer_rules_sha256": None}
+                "answer_rules_description_sha256": None}
     require(binding["arm"] == "gptgrep", "arm")
     mode = config["reader_mode"]
     require(mode in ("rich_multimodal", "legacy_text"), "explicit_reader_mode")
     record = {"schema": READER_CONTRACT_SCHEMA, "arm": "gptgrep",
               "base_instructions": "gptgrep_reader_contract", "reader_mode": mode,
-              "answer_rules_received": mode == "legacy_text", "answer_rules_sha256": None,
-              "product_provenance_sha256": config["gptgrep_bundle"]["provenance"]["sha256"]}
+              "answer_rules_received": mode == "legacy_text", "answer_rules_description_sha256": None,
+              "identity": TREATMENT_IDENTITY,
+              TREATMENT_IDENTITY: config["gptgrep_bundle"]["provenance"]["sha256"]}
     if mode == "legacy_text":
         require(schema is not None, "product_reader_contract_unavailable")
         data, contract = schema
-        rules = field_at(contract, ANSWER_RULES_FIELD)
-        require(isinstance(rules, str) and rules.strip(), "product_reader_contract_unavailable")
-        record.update(answer_rules_source="product_schema:" + ".".join(ANSWER_RULES_FIELD),
-                      answer_rules_sha256=sha(rules.encode()), product_schema_sha256=sha(data))
+        description = field_at(contract, ANSWER_RULES_DESCRIPTION_FIELD)
+        require(isinstance(description, str) and description.strip(), "product_reader_contract_unavailable")
+        record.update(answer_rules_description_source="product_schema:" + ".".join(ANSWER_RULES_DESCRIPTION_FIELD),
+                      answer_rules_description_sha256=sha(description.encode()), product_schema_sha256=sha(data))
     return record
 
 

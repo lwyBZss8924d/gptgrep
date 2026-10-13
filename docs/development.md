@@ -383,8 +383,10 @@ GPTgrep's reader contract (base instructions, citation and abstention rules and
 answer rules) is part of the treatment; the raw-only reader receives only the
 common task prompt with Codex's default base instructions and no GPTgrep rule
 text, in every reader mode. Each operation record identifies the reader contract
-its arm received; the treatment's answer-rules identity comes from the pinned
-product's own `--schema` report.
+its arm received. The treatment's identity is the digest of its verified product
+bundle's provenance, which binds the rule text compiled into the product. The
+product's own `--schema` description of its answer rules is a separately written
+summary, so its digest is recorded beside the identity, not as it.
 The Judge runs in a separate environment with the complete answer and frozen
 reference, not the reader's history. Task failures stay in the denominator;
 unavailable judging stays unknown. INDEX and Judge costs are separate from

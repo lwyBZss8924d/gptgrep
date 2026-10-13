@@ -219,8 +219,9 @@ part of the declared treatment. That contract covers its base instructions, its
 citation and abstention rules, and its answer rules. The comparison therefore
 measures the GPTgrep harness against bare Codex, not retrieval alone. The full62
 adapter gives the raw-only arm none of GPTgrep's rule text in any reader mode, and
-each operation record identifies the reader contract its arm received; the
-treatment's answer-rules identity comes from the pinned product's own report.
+each operation record identifies the reader contract its arm received. The
+treatment's identity is its verified product bundle's provenance digest; the
+product's own description of its answer rules is recorded beside it, not as it.
 The adapter's open review fixes are applied in source; the runtime qualification
 must be repeated on the changed reader and Judge configuration bytes. An optional
 bare-Codex-plus-answer-rules arm can later separate prompt-contract effects; it is
