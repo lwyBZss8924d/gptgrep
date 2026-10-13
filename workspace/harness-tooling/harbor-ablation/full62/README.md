@@ -42,7 +42,7 @@ datasets/gptgrep-full62/
     environment/
       Dockerfile
       .dockerignore                # Explicit image input allowlist
-      docker-compose.yaml          # Runtime-only auth and treatment budget mounts
+      docker-compose.yaml          # Runtime-only auth and treatment Decisions mounts
       config.toml                  # Identical named permissions for both readers
       codex-native                 # Pinned native CLI environment wrapper
       reader.json                  # Reader bindings, never reference answer
