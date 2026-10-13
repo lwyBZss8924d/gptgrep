@@ -24,7 +24,10 @@ setting. The bare arm receives none of GPTgrep's reader contract, including its
 answer rules, in any reader mode, and the product enforces an explicit per-trial
 Decisions submission limit that the cost preflight uses. The adapter's open
 review fixes are applied. The current cursor is **freeze the inputs on a published
-commit → Judge-container check and paired smoke →
+commit → re-qualify permissions and external tools on the changed reader and Judge
+configuration bytes → set the per-trial submission limit with retry headroom and
+re-bind the admission → check the pinned product's `--schema` report and trial
+ledger in the treatment image → Judge-container check and paired smoke →
 complete full62 paired SEARCH → Judge → analyze failures → next Opt**. The first paired run
 is prepared in the adapter's `legacy_text` mode with a frozen zero-model text
 index, built inside the Linux treatment image before question exposure. Native
@@ -85,8 +88,15 @@ Done in this round: common and treatment images rebuilt, the zero-model text ind
 built and pinned inside the Linux treatment image before any question exposure,
 the approved reader sandbox setting integrated, the raw-only answer-rules copy
 removed, Decisions submissions bounded per trial by the product, and the adapter's
-open review fixes applied. Next: freeze inputs on a published commit → check the Judge/verifier
-containers → paired smoke → complete full62 paired SEARCH in the
+open review fixes applied. Next: freeze inputs on a published commit →
+re-qualify both readers' permissions, now including the writable per-trial claim
+mount, and the excluded external tools on the changed reader and Judge
+configuration bytes → set the per-trial Decisions submission limit with headroom
+for retries and re-bind the admission, which must now cover that required field →
+check in the treatment image that the pinned product's `gptgrep --schema` reports
+the fields every `legacy_text` treatment trial reads and that
+`decisions-budget init` creates a trial ledger on the claim mount → check the
+Judge/verifier containers → paired smoke → complete full62 paired SEARCH in the
 adapter's `legacy_text` mode → Judge → failure analysis → next Opt. In parallel,
 Opt-1b removes or conditions the answer-commitment rule and re-measures all three
 cohorts, and native PTC parsing/OCR (D3) continues.
