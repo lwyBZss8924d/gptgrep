@@ -1,5 +1,6 @@
-"""Owner-approved reader seccomp profile: vendored upstream, derivation, provenance, runtime pin
-and generated compose. No engine; Docker's CLI only for the opt-in offline compose render."""
+"""Owner-approved reader seccomp profile: vendored upstream, derivation, provenance, README
+acceptance record, runtime pin and generated compose. No engine; Docker's CLI only for the opt-in
+offline compose render."""
 from __future__ import annotations
 
 import contextlib
@@ -9,6 +10,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
@@ -18,8 +20,13 @@ from gptgrep_harbor.runtime import READER_SECCOMP_BYTES, READER_SECCOMP_SHA256, 
 import test_harbor_runtime as fixtures
 
 SECCOMP = Path(__file__).resolve().parents[1] / "seccomp"
+README = SECCOMP.parent / "README.md"
 APPROVED_SHA256 = "769a5dbb42b7b10edb07b516be7077e4a602a214a4c55ec892abd6d323bab48b"
 ENGINE_COMMIT = "daa0cb7f23594cdbcce5002e370027d3fd36ffd7"
+# Acceptance probe 1 verbatim as the owner approved it, and as amended after the kernel refused
+# bubblewrap's fresh /proc mount inside a reader container.
+APPROVED_PROBE_1 = "bwrap --unshare-user --unshare-pid --ro-bind / / --proc /proc --dev /dev true"
+AMENDED_PROBE_1 = "bwrap --unshare-user --unshare-pid --ro-bind / / --dev /dev true"
 
 
 def load_derive():
@@ -182,6 +189,32 @@ class ReaderSeccompProfileTests(unittest.TestCase):
         for data in (json.dumps(value), self.derived_bytes.decode()):
             for marker in ("/Users/", "/home/", "/private/"):
                 self.assertNotIn(marker, data)
+
+
+class ReaderSeccompReadmeTests(unittest.TestCase):
+    """The README's acceptance record never presents an amended probe as the approved one."""
+
+    def setUp(self):
+        text = README.read_text(encoding="utf-8")
+        section = text.split("\n### Reader seccomp profile\n", 1)[1].split("\n### ", 1)[0]
+        record = section.split("\n**Acceptance probes.**", 1)[1]
+        self.probes = dict(re.findall(r"^(\d)\. (.+)$", record, flags=re.M))
+        self.status = record.rstrip().rsplit("\n\n", 1)[1]
+
+    def test_amended_probe_keeps_the_approved_form_and_is_not_reported_as_passed_as_approved(self):
+        self.assertEqual(sorted(self.probes), ["1", "2", "3", "4", "5"])
+        first = self.probes["1"]
+        self.assertTrue(first.startswith("**Amended"), first)
+        # Both forms stay visible: the approved one with its observed refusal, and the amendment.
+        self.assertIn("`%s`" % APPROVED_PROBE_1, first)
+        self.assertIn("`%s`" % AMENDED_PROBE_1, first)
+        self.assertIn("refuses", first)
+        # The owner's acknowledgement of the amended criterion is stated, whichever way it stands.
+        self.assertRegex(first, r"owner[^.]*acknowledg")
+        # The status never counts probe 1 among the probes that passed as approved.
+        self.assertNotRegex(self.status, r"Probes 1\s*(?:[-–]|to)\s*\d passed")
+        self.assertRegex(self.status, r"Probe 1 passed[^.]*\bamended form")
+        self.assertRegex(self.status, r"owner[^.]*acknowledg")
 
 
 class ReaderSeccompMaterializationTests(unittest.TestCase):

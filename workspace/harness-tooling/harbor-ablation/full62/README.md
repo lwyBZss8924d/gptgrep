@@ -193,13 +193,13 @@ The project owner approved this setting on 2026-10-13 for the **two reader roles
 
 **Acceptance probes.** Each runs without model calls:
 
-1. On the common image with the profile, bubblewrap creates its namespaces. `--proc /proc` is refused as described above, and `bwrap --unshare-user --unshare-pid --ro-bind / / --dev /dev true` exits 0 with a read-only root.
-2. Under Docker's default profile the same command fails with "No permissions to create a new namespace".
+1. **Amended from the approved criterion.** The owner approved this probe as `bwrap --unshare-user --unshare-pid --ro-bind / / --proc /proc --dev /dev true` exiting 0 on the common image with the profile. In that form bubblewrap creates its namespaces, but the kernel refuses its fresh `--proc /proc` mount, as expected (see `/proc` above). The amended probe drops `--proc`, as Codex's launcher does in its fallback: `bwrap --unshare-user --unshare-pid --ro-bind / / --dev /dev true` exits 0 with a read-only root. The owner has not yet acknowledged the amended criterion.
+2. Under Docker's default profile bubblewrap fails with "No permissions to create a new namespace".
 3. With a fake `auth.json` mounted at `/opt/full62-home/auth.json` and the adapter-generated reader configuration, `codex sandbox --permission-profile full62_reader` denies reading the credential, listing `/root` and writing under `/etc`, and allows corpus reads and work-directory writes.
 4. `docker inspect` of a trial's Judge/verifier container shows no seccomp entry in `SecurityOpt`, so Docker's default profile applies.
 5. One paired smoke task per arm completes with tool calls observed in the native logs.
 
-Probes 1–3 passed on 2026-10-13 with Docker Engine 29.4.0. Probes 4 and 5 stay open until the rebuilt images and a trial exist. This source change and its synthetic tests do not accept either open probe.
+Probes 2 and 3 passed as approved on 2026-10-13 with Docker Engine 29.4.0. Probe 1 passed only in its amended form: its approved form was refused as expected, and probe 1 counts as accepted only once the owner acknowledges the amended criterion. Probes 4 and 5 stay open until the rebuilt images and a trial exist. This source change and its synthetic tests accept neither the amendment nor either open probe.
 
 ### Running Individual Trial
 
