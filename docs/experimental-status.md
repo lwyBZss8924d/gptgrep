@@ -2,7 +2,8 @@
 
 Updated **2026-10-13 UTC**. This is a public, aggregate development checkpoint for
 the experimental source branch that contains this file in
-[`lwyBZss8924d/gptgrep`](https://github.com/lwyBZss8924d/gptgrep). The earlier
+[`lwyBZss8924d/gptgrep`](https://github.com/lwyBZss8924d/gptgrep); the current
+integration branch is `claude/gptgrep-unified-runtime-20261012`. The earlier
 `codex/gptgrep-unified-runtime-20261012` branch is the previous source cursor.
 Use the checked-out commit and its validation results when comparing changes.
 The branch is a collaboration snapshot, not an accepted first release.
@@ -18,7 +19,8 @@ tgrep and Decisions routing/reranking support this comparison; component
 completion does not complete the goal.
 
 The current cursor is **rebuild the reader images and the in-image Linux text
-index → integrate the approved reader sandbox setting → paired smoke → complete
+index → integrate the approved reader sandbox setting → remove the bare-arm copy of
+GPTgrep's answer rules and apply the adapter's open review fixes → paired smoke → complete
 full62 paired SEARCH → Judge → analyze failures → next Opt**. The first paired run
 is prepared in the adapter's `legacy_text` mode with a frozen zero-model text
 index, built inside the Linux treatment image before question exposure. Native
@@ -44,7 +46,7 @@ establish a retrieval advantage.
 | Goal | Required outcome | State and evidence scope |
 | --- | --- | --- |
 | D1 | Pinned embedded engine with exact regex parity | **Done, scoped.** tgrep 1.1.0 source/license identity, indexed/direct parity and explicit rebuild boundary accepted |
-| D2 | Typed concurrent Decisions with verified image transport | **Done, scoped.** Text/image transport, wire contract, shared accounting and failure handling accepted; provider failures and unknown usage retained. The 2026-10-13 additions (alias-aware admission and text-only image refusal, `decisions-budget init`/`status`, judge failure accounting, and the bounded transient retry for text routing/reranking) were reviewed and tested offline; the live retry has not yet been exercised |
+| D2 | Typed concurrent Decisions with verified image transport | **Done, scoped.** Text/image transport, wire contract, shared accounting and failure handling accepted; provider failures and unknown usage retained. This round's additions (alias-aware admission and text-only image refusal, `decisions-budget init`/`status`, judge failure accounting, and the bounded transient retry for text routing/reranking) were reviewed and tested offline; the live retry has not yet been exercised |
 | D3 | Source-bound rich parsing and v2 artifact manifest | **Active.** Earlier parsing criteria remain accepted; full native PTC coding for parsing/OCR, complete index integration and the 34-document generation still require acceptance |
 | D4 | Explicit OCR completes all required content before publication | **Done, scoped.** OCR contract and component acceptance retained; every required task must still succeed before a new full generation can publish |
 | D5 | Generation-pinned batch operations with shared reader | **Done, scoped.** Stable batch order, item/global errors, bounded output, cursors and shared ledger behavior accepted |
@@ -134,7 +136,7 @@ the served profile is not independently verified. Decisions requested
 `openai/gpt-6-luna-decisions-20261006`.
 
 A frozen MMLongBench-Doc-V2 answer-equivalence judge prompt and schema, run
-tool-free on Codex `gpt-6-luna`/`max`/`fast`, scored **59/62**: 2 judged
+tool-free with a requested Codex `gpt-6-luna`/`max`/`fast` profile, scored **59/62**: 2 judged
 incorrect, 1 failed run and 0 judge unknowns. The failed run was a provider HTTP
 502 during initial evidence reranking, before the bounded retry existed. The run
 made 182 Decisions requests with $0.0696 known Decisions cost. Median product
@@ -230,7 +232,7 @@ historical verdicts. This compact projection records their aggregate outcomes.
 | 2026-10-12, private Decisions integration | Per-trial preparation and request-ID isolation repair received scoped source acceptance; the private Linux build and 13 tests passed. A current-source Ask received two real known-settled Decisions responses, totaling $0.0001347 | Native reader permission projection failed before `turn/start`; Ask, complete SEARCH/Judge and full62 remain unaccepted |
 | 2026-10-12, unified native runtime source | Formatting, Clippy, 1,024 Rust tests with 4 ignored, 142 evaluator tests and 11 offline cases passed. The repaired full62 wrapper passed all 83 tests; five staging scenarios and the direct Rust API example passed | Source and synthetic checks only; SDK package consumer validation, complete index, paired SEARCH/Judge and source delivery remain separate |
 | 2026-10-12, second development host | Environment preflight on macOS Intel x86_64: 20 pass, 2 partial, 1 blocked; Codex CLI 0.162.1 binary verified against the official release | Reader container sandbox needed owner approval and rebuilt images |
-| 2026-10-12, credential supervisor | `codex-auth` 1.3.1 qualified with fake credentials: 125/125 guarded and 13/13 unguarded tests, no leaks in 18 scans; live supervised runs and one live owner refresh observed | Unmanaged entry points stay blocked for shared-login use |
+| 2026-10-12, credential supervisor | `codex-auth` 1.3.1 qualified with fake credentials: 125/125 guarded and 13/13 unguarded tests, no leaks in 18 scans; live supervised runs observed on 1.3.1, and one live owner refresh observed with 1.3.0 | Unmanaged entry points stay blocked for shared-login use |
 | 2026-10-12, host development pilot | Treatment arm only: full62 59/62 under a frozen MMLongBench-Doc-V2 judge (2 incorrect; 1 failed run from a provider HTTP 502); 182 Decisions requests, $0.0696 known cost | Development evidence only: no bare arm, not the paired comparison or G5 |
 | 2026-10-12, development cohorts | H-text 60/98 and H-unans 97/152 on 107 text-ingestible MMLongBench-Doc-V2 documents; 27 of 134 need OCR | Question-level holdouts that share some full62 documents; development material |
 | 2026-10-13, Opt-1 measured | full62 59/62 (+0), H-text 62/98 (+2), H-unans 87/152 (−10; over-commitments 31 → 46); failed runs fell in every cohort | Regression retained; Opt-1b next |
