@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from gptgrep_harbor import decisions
 from gptgrep_harbor.aggregate import summarize
-from gptgrep_harbor.common import canonical, parse
+from gptgrep_harbor.common import canonical, parse, sha
 from gptgrep_harbor.reader import decisions_cost, reader_argv
 from gptgrep_harbor.runtime import CODEX_HOME, DECISIONS_BUDGET
 import test_contracts
@@ -16,7 +16,8 @@ import test_harbor_runtime as fixtures
 
 write_pin = fixtures.write_pin
 RATE = 0.5  # synthetic USD per million prompt tokens
-BOUND = 406.3232  # 62 trials x 200 submissions x 65,536 bytes x RATE / 1,000,000
+LIMIT = 8  # synthetic per-trial submission limit
+BOUND = 16.252928  # 62 trials x LIMIT submissions x 65,536 bytes x RATE / 1,000,000
 
 
 class InvocationBoundedMaterializationTests(unittest.TestCase):
@@ -31,7 +32,7 @@ class InvocationBoundedMaterializationTests(unittest.TestCase):
             decisions_prompt_price={"model": self.runtime["jev_model"], "usd_per_million_prompt_tokens": RATE,
                                     "usd_per_million_completion_tokens": 0, "usd_per_request": 0,
                                     "provenance": price},
-            decisions_claims_dir=str(self.claims))
+            decisions_claims_dir=str(self.claims), decisions_max_submissions_per_trial=LIMIT)
 
     def materializer(self):
         return fixtures.HarborMaterializationTests.materializer(self)
@@ -51,14 +52,18 @@ class InvocationBoundedMaterializationTests(unittest.TestCase):
         preflight = result["preflight"]["decisions"]
         self.assertEqual((preflight["mode"], preflight["treatment_trials"], preflight["asks_per_trial"],
                           preflight["max_submissions_per_trial"], preflight["max_request_bytes"]),
-                         ("invocation_bounded", 62, 1, 200, 65536))
+                         ("invocation_bounded", 62, 1, LIMIT, 65536))
         self.assertAlmostEqual(preflight["submission_bound_usd"], 65536 * RATE / 1e6)
-        self.assertAlmostEqual(preflight["trial_bound_usd"], 200 * 65536 * RATE / 1e6)
+        self.assertAlmostEqual(preflight["trial_bound_usd"], LIMIT * 65536 * RATE / 1e6)
+        self.assertEqual(preflight["bound_formula"], decisions.BOUND_FORMULA)
         self.assertEqual((preflight["cohort_bound_usd"], preflight["cost_cap_usd"]), (BOUND, BOUND))
         self.assertEqual(preflight["price"], self.runtime["decisions_prompt_price"])
         # The preflight cannot be read as an enforced spending cap.
         self.assertIs(preflight["cap_runtime_enforced"], False)
-        self.assertEqual(preflight["limits_enforced_by"]["asks_per_trial"], "adapter_create_new_claim")
+        self.assertIs(preflight["submission_limit_runtime_enforced"], True)
+        self.assertEqual(preflight["limits_enforced_by"], {"asks_per_trial": "adapter_create_new_claim",
+                                                           "submissions_per_trial": "product_trial_decisions_budget",
+                                                           "request_bytes": "product"})
         self.assertIn("provider_prompt_tokens_beyond_one_per_request_byte", preflight["excluded"])
         treatments, claims = 0, set()
         for record in result["tasks"]:
@@ -69,6 +74,9 @@ class InvocationBoundedMaterializationTests(unittest.TestCase):
             for key in ("decisions_budget", "decisions_preparation", "decisions_cost_cap_usd",
                         "decisions_prompt_price", "decisions_claims_dir"):
                 self.assertNotIn(key, config)
+            # Only the treatment reader needs the per-trial limit.
+            self.assertEqual(config.get("decisions_max_submissions_per_trial"),
+                             LIMIT if record["binding"]["arm"] == "gptgrep" else None)
             if record["binding"]["arm"] != "gptgrep":
                 self.assertEqual([mount["target"] for mount in mounts], [CODEX_HOME + "/auth.json"])
                 continue
@@ -81,8 +89,10 @@ class InvocationBoundedMaterializationTests(unittest.TestCase):
             self.assertEqual(list(Path(claim["source"]).iterdir()), [])
             claims.add(claim["source"])
             argv = reader_argv(config, record["binding"], "synthetic request")
-            self.assertEqual(argv[1:3], ["ask", "--native-ptc"])
-            for flag in ("--decisions-budget", "--multimodal", "--max-concurrent-batches"):
+            # The Ask joins the trial's own ledger in its claim directory.
+            self.assertEqual(argv[1:5], ["--decisions-budget", decisions.CLAIM_ROOT + "/decisions-budget.json",
+                                         "ask", "--native-ptc"])
+            for flag in ("--multimodal", "--max-concurrent-batches"):
                 self.assertNotIn(flag, argv)
         self.assertEqual((treatments, len(claims)), (62, 62))
         self.assertEqual(json.loads((self.claims / "cohort.json").read_text())["treatment_trials"], 62)
@@ -116,17 +126,39 @@ class InvocationBoundedMaterializationTests(unittest.TestCase):
         for suffix in (".export.json", ".job.json"):
             self.assertFalse((self.root / ("dataset" + suffix)).exists())
 
-    def test_preflight_requires_trials_times_200_times_the_submission_bound_within_cap(self):
+    def test_preflight_requires_trials_times_the_trial_limit_times_the_submission_bound_within_cap(self):
         self.assertEqual(self.materializer().preflight["decisions"]["cohort_bound_usd"], BOUND)
-        self.rejected("decisions_cost_cap_preflight", decisions_cost_cap_usd=406.3231)
+        self.rejected("decisions_cost_cap_preflight", decisions_cost_cap_usd=16.252927)
         price = self.runtime["decisions_prompt_price"]
         self.rejected("decisions_cost_cap_preflight",
                       decisions_prompt_price={**price, "usd_per_million_prompt_tokens": 0.5000001})
         # Each submission's bound also carries the pinned per-request fee.
         fee = {**price, "usd_per_request": 0.001}
         self.rejected("decisions_cost_cap_preflight", decisions_prompt_price=fee)
-        self.runtime.update(decisions_prompt_price=fee, decisions_cost_cap_usd=419)
-        self.assertAlmostEqual(self.materializer().preflight["decisions"]["cohort_bound_usd"], BOUND + 12.4)
+        self.runtime.update(decisions_prompt_price=fee, decisions_cost_cap_usd=16.75)
+        self.assertAlmostEqual(self.materializer().preflight["decisions"]["cohort_bound_usd"], BOUND + 62 * LIMIT * 0.001)
+        self.assertFalse((self.root / "dataset").exists())
+
+    def test_per_trial_submission_limit_is_explicit_bounded_and_scales_the_preflight(self):
+        for value in (None, 0, 201, True, 8.0, "8"):
+            with self.subTest(limit=value):
+                self.rejected("decisions_max_submissions_per_trial", decisions_max_submissions_per_trial=value)
+        original = copy.deepcopy(self.runtime)
+        del self.runtime["decisions_max_submissions_per_trial"]
+        with self.assertRaisesRegex(ValueError, "decisions_max_submissions_per_trial"):
+            self.materializer()
+        self.runtime = original
+        # The product maximum would need 25 times this cap.
+        self.rejected("decisions_cost_cap_preflight", decisions_max_submissions_per_trial=200)
+        self.runtime.update(decisions_max_submissions_per_trial=200, decisions_cost_cap_usd=406.3232)
+        self.assertEqual(self.materializer().preflight["decisions"]["cohort_bound_usd"], 406.3232)
+        self.runtime.update(decisions_max_submissions_per_trial=1, decisions_cost_cap_usd=BOUND)
+        self.assertAlmostEqual(self.materializer().preflight["decisions"]["cohort_bound_usd"], BOUND / LIMIT)
+        # The field belongs to this mode only.
+        self.rejected("decisions_existing_context_mode_conflict", decisions_mode=None, decisions_cost_cap_usd=None,
+                      decisions_prompt_price=None, decisions_claims_dir=None,
+                      decisions_budget={"path": "/synthetic/budget.json", "bytes": 1, "sha256": "d" * 64},
+                      decisions_ledger_dir="/synthetic/ledger")
         self.assertFalse((self.root / "dataset").exists())
 
     def test_completion_price_must_be_zero_because_output_tokens_are_unbounded(self):
@@ -162,7 +194,7 @@ class InvocationBoundedMaterializationTests(unittest.TestCase):
                 self.rejected("decisions_model", jev_model=model, decisions_prompt_price={**price, "model": model})
         # The same check applies to every legacy_text Decisions mode.
         self.rejected("decisions_model", jev_model=None, decisions_mode=None, decisions_prompt_price=None,
-                      decisions_cost_cap_usd=None, decisions_claims_dir=None,
+                      decisions_cost_cap_usd=None, decisions_claims_dir=None, decisions_max_submissions_per_trial=None,
                       decisions_budget={"path": "/synthetic/budget.json", "bytes": 1, "sha256": "d" * 64},
                       decisions_ledger_dir="/synthetic/ledger")
         for model in ("~typesafe/jev-latest", "openai/gpt-6-luna-decisions-20261006"):
@@ -221,20 +253,25 @@ class ModeSelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "decisions_mode"):
             self.argv(decisions_mode="preparation")
 
-    def test_invocation_bounded_is_explicit_and_drops_the_budget_flag(self):
-        argv = self.argv(decisions_mode="invocation_bounded")
-        self.assertEqual(argv[:3], ["/opt/gptgrep", "ask", "--native-ptc"])
-        self.assertNotIn("--decisions-budget", argv)
+    def test_invocation_bounded_is_explicit_and_joins_the_trial_ledger(self):
+        argv = self.argv(decisions_mode="invocation_bounded", decisions_max_submissions_per_trial=8)
+        self.assertEqual(argv[:5], ["/opt/gptgrep", "--decisions-budget",
+                                    decisions.CLAIM_ROOT + "/decisions-budget.json", "ask", "--native-ptc"])
         self.assertEqual(argv[argv.index("--max-tool-calls") + 1], "10000")
+        for limit in (None, 0, 201):
+            with self.subTest(limit=limit), self.assertRaisesRegex(ValueError, "decisions_max_submissions_per_trial"):
+                self.argv(decisions_mode="invocation_bounded", decisions_max_submissions_per_trial=limit)
         with self.assertRaisesRegex(ValueError, "decisions_invocation_bounded_mode"):
-            self.argv(decisions_mode="invocation_bounded", reader_mode="rich_multimodal")
+            self.argv(decisions_mode="invocation_bounded", reader_mode="rich_multimodal",
+                      decisions_max_submissions_per_trial=8)
         for fields in ({"decisions_cost_cap_usd": 1.0, "decisions_prompt_price": {"model": "x"}},
-                       {"decisions_claims_dir": "/synthetic/claims"}):
+                       {"decisions_claims_dir": "/synthetic/claims"}, {"decisions_max_submissions_per_trial": 8}):
             with self.subTest(fields=fields), \
                     self.assertRaisesRegex(ValueError, "decisions_existing_context_mode_conflict"):
                 decisions.selected_mode(fields)
         with self.assertRaisesRegex(ValueError, "decisions_invocation_bounded_mode_conflict"):
-            self.argv(decisions_mode="invocation_bounded", decisions_budget=self.budget)
+            self.argv(decisions_mode="invocation_bounded", decisions_budget=self.budget,
+                      decisions_max_submissions_per_trial=8)
 
 
 class CostReceiptTests(unittest.TestCase):
@@ -267,21 +304,37 @@ class CostAggregationTests(unittest.TestCase):
     def results(self, receipts):
         export, records, runtime, blobs = test_contracts.synthetic_results()
         runtime.update(decisions_mode="invocation_bounded", decisions_cost_cap_usd=1.0,
+                       decisions_max_submissions_per_trial=LIMIT,
                        decisions_prompt_price={"model": "synthetic", "usd_per_million_prompt_tokens": RATE,
                                                "usd_per_million_completion_tokens": 0, "usd_per_request": 0,
                                                "provenance": {"path": "/synthetic/price.json", "bytes": 1,
                                                               "sha256": "f" * 64}},
                        decisions_claims_dir="/synthetic/claims")
         treatment = [record for record, row in zip(records, export["tasks"]) if row["binding"]["arm"] == "gptgrep"]
-        for record, receipt in zip(treatment, receipts):
+        for index, (record, receipt) in enumerate(zip(treatment, receipts)):
             operation = parse(blobs[record["operation"]])
             if receipt is not None:
                 operation["attempts"][0].update(decisions_cost=receipt,
                                                 reported_retrieval_cost_subtotal=receipt["reported_cost_usd"] or 0.004,
                                                 reported_retrieval_cost_receipts=receipt["priced_rows"])
+            budget = getattr(self, "budgets", None)
+            if budget is not None:
+                operation["decisions_trial_budget"] = {"max_submissions": LIMIT, **budget[index]}
+                if budget[index]["limit_bound"]:
+                    # The product refused a submission: the Ask failed and was judged a known zero.
+                    answer = parse(blobs[record["answer"]])
+                    answer.update(status="operational_failure", answer=None)
+                    blobs[record["answer"]] = canonical(answer)
+                    operation.update(status="operational_failure", answer_sha256=sha(canonical(answer)),
+                                     failure="reader_failed", failure_code="decisions_submission_limit_reached")
+                    judgment = parse(blobs[record["judgment"]])
+                    judgment.update(status="operational_failure", label=0,
+                                    answer_envelope_sha256=sha(canonical(answer)))
+                    blobs[record["judgment"]] = canonical(judgment)
             blobs[record["operation"]] = canonical(operation)
         with patch("gptgrep_harbor.aggregate.pinned", side_effect=lambda pin, *args: blobs[pin]):
-            return summarize(export, records, runtime)["decisions"]
+            self.summary = summarize(export, records, runtime)
+        return self.summary["decisions"]
 
     def test_cohort_total_is_known_only_when_every_treatment_trial_is_known(self):
         # One Ask reports several priced Jev usage rows; they are not receipts.
@@ -304,6 +357,20 @@ class CostAggregationTests(unittest.TestCase):
                 self.assertIsNone(summary["total_within_cap"])
                 self.assertGreater(summary["reported_cost_usd_known_subtotal"], 0.6)
         self.assertFalse(summary["currency_verified"])
+
+    def test_limit_bound_trials_are_judged_failures_visible_in_the_summary(self):
+        known = {"cost_complete": True, "reported_cost_usd": 0.01, "priced_rows": 3}
+        budgets = ([{"limit_reached": True, "limit_bound": True}] * 2 + [{"limit_reached": True, "limit_bound": False}]
+                   + [{"limit_reached": False, "limit_bound": False}] * 58 + [{"limit_reached": None, "limit_bound": None}])
+        self.budgets = budgets
+        summary = self.results([known] * 62)
+        self.assertEqual(summary["submission_limit"], {"max_submissions_per_trial": LIMIT,
+                                                       "enforced_by": "product_decisions_budget_ledger",
+                                                       "bound_trials": 2, "reached_trials": 3, "unobserved_trials": 1})
+        treatment = self.summary["search"]["gptgrep"]
+        self.assertEqual((treatment["operational_failures"], treatment["correct"]), (2, 60))
+        self.assertEqual(treatment["operational_failure_codes"], {"decisions_submission_limit_reached": 2})
+        self.assertEqual(self.summary["search"]["raw_only"]["operational_failure_codes"], {})
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ import stat
 import time
 import unicodedata
 
-from .common import canonical, digest, integer, parse, pinned, put, require, sha
+from .common import canonical, digest, integer, parse, pinned, put, read, require, sha
 from .process import run
 from .runtime import DECISIONS_LEDGER_DIR, native_environment, validate_asset_path
 
@@ -20,8 +20,13 @@ TRIAL_ROOT = "/opt/full62-private/trial"
 TRIAL_BUDGET = TRIAL_ROOT + "/budget.json"
 WRITER_LOCK = "/opt/full62-private/sole-writer.lock"
 # invocation_bounded: this trial's own claim directory, mounted from the host
-# outside the Harbor job directory.
+# outside the Harbor job directory. It also holds the trial's own Decisions
+# ledger, lock and control file: the product creates them right after the claim
+# with the per-trial submission limit, and the Ask joins them, so the product
+# itself refuses any submission beyond that limit.
 CLAIM_ROOT = "/opt/full62-private/claim"
+TRIAL_LEDGER_NAME = "decisions-ledger.json"
+TRIAL_CONTROL_NAME = "decisions-budget.json"
 ATTACH_PATH_ENV = "GPTGREP_DECISIONS_ATTACH_PLAN"
 ATTACH_SHA_ENV = "GPTGREP_DECISIONS_ATTACH_PLAN_SHA256"
 
@@ -30,9 +35,11 @@ ATTACH_SHA_ENV = "GPTGREP_DECISIONS_ATTACH_PLAN_SHA256"
 DECISIONS_MODES = ("existing_context", "preparation", "invocation_bounded")
 MODE_FIELDS = {"existing_context": ("decisions_budget", "decisions_ledger_dir"),
                "preparation": ("decisions_preparation",),
-               "invocation_bounded": ("decisions_cost_cap_usd", "decisions_prompt_price", "decisions_claims_dir")}
+               "invocation_bounded": ("decisions_cost_cap_usd", "decisions_prompt_price", "decisions_claims_dir",
+                                      "decisions_max_submissions_per_trial")}
 # Product limits mirrored from gptgrep-jev: a context admits at most
-# MAX_SUBMISSIONS, and one serialized request is at most MAX_REQUEST_BYTES.
+# MAX_SUBMISSIONS, which is also the range limit of `decisions-budget init
+# --max-submissions`, and one serialized request is at most MAX_REQUEST_BYTES.
 INVOCATION_MAX_SUBMISSIONS = 200
 MAX_REQUEST_BYTES = 64 * 1024
 # The product accepts a Decisions model selector of at most 256 bytes.
@@ -45,6 +52,15 @@ BUDGET_CONTRACT_SCHEMA = "gptgrep.decisions-budget-contract.v1"
 MIN_BOOTSTRAP_SUBMISSIONS = 2
 PRICE_FIELDS = {"model", "usd_per_million_prompt_tokens", "usd_per_million_completion_tokens",
                 "usd_per_request", "provenance"}
+TRIAL_BUDGET_SCHEMA = "gptgrep.harbor.decisions-trial-budget.v1"
+BUDGET_INIT_SCHEMA = "gptgrep.decisions-budget-init.v1"
+BUDGET_STATUS_SCHEMA = "gptgrep.decisions-budget-status.v1"
+RESERVATION_COUNTS = ("total", "reserved", "in_flight", "unknown", "terminal")
+# Product ledger commands are local file operations. Harbor's agent timeout
+# leaves ten seconds beyond the query deadline for the reader's own bookkeeping.
+BUDGET_COMMAND_SECONDS = 5
+BOUND_FORMULA = ("treatment_trials * max_submissions_per_trial * "
+                 "(max_request_bytes * usd_per_million_prompt_tokens / 1000000 + usd_per_request)")
 
 
 def selected_mode(runtime):
@@ -104,18 +120,31 @@ def decimal(value, code, *, zero=False):
     return exact
 
 
+def trial_submission_limit(value):
+    """The per-trial Decisions submission limit: an explicit integer in 1..200, never defaulted."""
+    require(type(value) is int and 1 <= value <= INVOCATION_MAX_SUBMISSIONS, "decisions_max_submissions_per_trial")
+    return value
+
+
+def trial_paths():
+    """This trial's claim, Decisions ledger and control file in its own claim directory."""
+    root = Path(CLAIM_ROOT)
+    return root / "claim.json", root / TRIAL_LEDGER_NAME, root / TRIAL_CONTROL_NAME
+
+
 def invocation_cost_bound(runtime, treatment_trials):
     """Admission bound on the cohort's Decisions spend in invocation_bounded mode.
 
-    A create-new claim lets each treatment trial launch at most one Ask, and an
-    Ask without a budget file uses the product's own single-invocation context
-    of at most 200 submissions of at most 64 KiB each. One submission's bound
-    prices every request byte as one prompt token at the pinned rate and adds
-    the pinned per-request fee. The pinned completion rate must be zero: the
-    product sets no output-token limit per submission, so a priced completion
-    has no bound. The cap is checked here, before any task exists; nothing
-    stops spending at runtime.
+    A create-new claim lets each treatment trial launch at most one Ask, and
+    that Ask joins the trial's own product ledger, which admits at most
+    decisions_max_submissions_per_trial submissions of at most 64 KiB each. One
+    submission's bound prices every request byte as one prompt token at the
+    pinned rate and adds the pinned per-request fee. The pinned completion rate
+    must be zero: the product sets no output-token limit per submission, so a
+    priced completion has no bound. The USD cap is checked here, before any
+    task exists; at runtime the product enforces the per-trial submission limit.
     """
+    limit = trial_submission_limit(runtime.get("decisions_max_submissions_per_trial"))
     cap = decimal(runtime.get("decisions_cost_cap_usd"), "decisions_cost_cap_usd")
     price = runtime.get("decisions_prompt_price")
     require(type(price) is dict and set(price) == PRICE_FIELDS and
@@ -129,11 +158,12 @@ def invocation_cost_bound(runtime, treatment_trials):
     pinned(price["provenance"])
     integer(treatment_trials, 1)
     per_submission = MAX_REQUEST_BYTES * prompt_rate / 1000000 + request_fee
-    per_trial = INVOCATION_MAX_SUBMISSIONS * per_submission
+    per_trial = limit * per_submission
     bound = treatment_trials * per_trial
     require(bound <= cap, "decisions_cost_cap_preflight")
     return {"mode": "invocation_bounded", "treatment_trials": treatment_trials, "asks_per_trial": 1,
-            "max_submissions_per_trial": INVOCATION_MAX_SUBMISSIONS, "max_request_bytes": MAX_REQUEST_BYTES,
+            "max_submissions_per_trial": limit, "max_request_bytes": MAX_REQUEST_BYTES,
+            "bound_formula": BOUND_FORMULA,
             "token_bound": "one_prompt_token_per_request_byte", "price": price,
             "submission_bound_usd": float(per_submission), "trial_bound_usd": float(per_trial),
             "cohort_bound_usd": float(bound), "cost_cap_usd": runtime["decisions_cost_cap_usd"],
@@ -142,9 +172,10 @@ def invocation_cost_bound(runtime, treatment_trials):
             "excluded": ["provider_prompt_tokens_beyond_one_per_request_byte",
                          "price_components_absent_from_the_pinned_price"],
             "limits_enforced_by": {"asks_per_trial": "adapter_create_new_claim",
-                                   "submissions_per_ask": "product_single_invocation_context",
+                                   "submissions_per_trial": "product_trial_decisions_budget",
                                    "request_bytes": "product"},
-            "cap_runtime_enforced": False}
+            "limit_binding": "refused_submission_fails_the_ask_as_operational_failure_no_retry",
+            "submission_limit_runtime_enforced": True, "cap_runtime_enforced": False}
 
 
 def claim_invocation(binding, deadline_unix_ms):
@@ -162,6 +193,81 @@ def claim_invocation(binding, deadline_unix_ms):
     put(root / "claim.json", claim)
     data = canonical(claim) + b"\n"
     return {"path": str(root / "claim.json"), "bytes": len(data), "sha256": sha(data)}
+
+
+def init_trial_budget(config, binding, claim, deadline_unix_ms, remaining, environ):
+    """Create this trial's own Decisions ledger through the product, right after its claim.
+
+    `decisions-budget init` runs offline and refuses any existing ledger, lock or
+    control path, so like the claim it is create-new. Its plan file is the claim,
+    which binds the ledger to this trial, and its deadline is the reader's
+    original query deadline. The Ask joins it with --decisions-budget, and the
+    product refuses every submission beyond the limit before sending it. Any
+    failure stops the trial before its Ask, with no Decisions submission.
+    """
+    try:
+        limit = trial_submission_limit(config.get("decisions_max_submissions_per_trial"))
+        claim_path, ledger, control = trial_paths()
+        run_id = "gptgrep-full62-trial-" + sha(canonical(binding))[:32]
+        seconds = math.ceil((deadline_unix_ms - time.time_ns() // 1000000) / 1000)
+        require(0 < seconds <= 86400 and remaining > 0, "decisions_trial_budget_unavailable")
+        result = run([config["gptgrep_binary"], "decisions-budget", "init", "--run-id", run_id,
+                      "--plan-file", str(claim_path), "--deadline-seconds", str(seconds),
+                      "--max-submissions", str(limit), "--ledger", str(ledger), "--output", str(control)],
+                     cwd="/data/corpus", timeout=min(BUDGET_COMMAND_SECONDS, remaining),
+                     env=native_environment(environ))
+        require(result["failure"] is None and result["return_code"] == 0, "decisions_trial_budget_unavailable")
+        report = parse(result["stdout"])
+        data = read(str(control), 16384)
+        budget = parse(data)
+        require(type(report) is dict and type(budget) is dict and
+                report.get("schema_version") == BUDGET_INIT_SCHEMA and report.get("status") == "initialized" and
+                report.get("joins_existing") is False and report.get("control_path") == str(control) and
+                report.get("control_sha256") == sha(data) and
+                budget.get("schema_version") == BUDGET_CONTRACT_SCHEMA and budget.get("run_id") == run_id and
+                budget.get("plan_digest") == claim["sha256"] and budget.get("max_submissions") == limit and
+                budget.get("ledger_path") == str(ledger) and type(budget.get("deadline_unix_ms")) is int and
+                all(report.get(key) == budget[key] for key in
+                    ("run_id", "plan_digest", "deadline_unix_ms", "max_submissions", "ledger_path")),
+                "decisions_trial_budget_unavailable")
+    except Exception:
+        # Redacted code only: product output is never copied into the record.
+        raise ValueError("decisions_trial_budget_unavailable") from None
+    return {"schema": TRIAL_BUDGET_SCHEMA, "max_submissions": limit,
+            "enforced_by": "product_decisions_budget_ledger", "run_id": run_id, "plan_sha256": claim["sha256"],
+            "deadline_unix_ms": budget["deadline_unix_ms"], "ledger_path": str(ledger),
+            "control": {"path": str(control), "bytes": len(data), "sha256": sha(data)},
+            "init_elapsed_ms": result["elapsed_ms"], "status_after_ask": None,
+            "remaining_submissions": None, "limit_reached": None, "limit_bound": None}
+
+
+def trial_budget_status(config, record):
+    """Read this trial's ledger through the product's read-only status after the Ask.
+
+    Evidence only: it never changes the Ask's outcome, and any failure leaves the
+    observation null (unknown). Status never creates, locks, joins or writes.
+    """
+    _, _, control = trial_paths()
+    try:
+        result = run([config["gptgrep_binary"], "decisions-budget", "status", "--control", str(control), "--json"],
+                     cwd="/data/corpus", timeout=BUDGET_COMMAND_SECONDS, env=native_environment(os.environ))
+        require(result["failure"] is None and result["return_code"] == 0, "status")
+        value = parse(result["stdout"])
+        counts = value.get("reservations") if type(value) is dict else None
+        require(type(value) is dict and value.get("schema_version") == BUDGET_STATUS_SCHEMA and
+                value.get("run_id") == record["run_id"] and
+                value.get("max_submissions") == record["max_submissions"] and type(counts) is dict and
+                all(type(counts.get(key)) is int and counts[key] >= 0 for key in RESERVATION_COUNTS) and
+                type(value.get("remaining_submissions")) is int and
+                value["remaining_submissions"] == record["max_submissions"] - counts["total"] >= 0, "status")
+    except Exception:
+        return None
+    return {"remaining_submissions": value["remaining_submissions"],
+            "reservations": {key: counts[key] for key in RESERVATION_COUNTS},
+            "send_started": value.get("send_started") if type(value.get("send_started")) is int else None,
+            "submission_observations": (value.get("submission_observations")
+                                        if type(value.get("submission_observations")) is int else None),
+            "status_sha256": sha(result["stdout"])}
 
 
 def record_invocation(binding, stdout, attempt):

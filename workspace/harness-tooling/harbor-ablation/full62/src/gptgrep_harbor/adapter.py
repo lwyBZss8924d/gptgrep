@@ -530,6 +530,7 @@ class Full62Adapter:
             # One fresh claim directory per treatment trial, outside the job.
             trial_state = Path(runtime["decisions_claims_dir"]) / sha(canonical(binding))[:32]
             trial_state.mkdir(mode=0o700)
+            reader["decisions_max_submissions_per_trial"] = runtime["decisions_max_submissions_per_trial"]
         put(task / "environment/reader.json", reader)
         # The frozen response schema enters only the Judge's private /tests area.
         schema_bytes = output_schema_bytes(self.judge["response_schema"])

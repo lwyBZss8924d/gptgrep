@@ -11,8 +11,9 @@ from .common import MAX_ANSWER, MAX_READER_QUESTION_BYTES, PROFILE, canonical, c
 from .native import codex_accounting, codex_argv, codex_result, prompt_bytes
 from .process import run
 from .runtime import CODEX_VERSION, DECISIONS_BUDGET, DECISIONS_LEDGER_DIR, check_config, native_environment
-from .decisions import (TRIAL_BUDGET, acquire_writer, claim_invocation, prepare as prepare_decisions,
-                        record_invocation, selected_mode)
+from .decisions import (TRIAL_BUDGET, acquire_writer, claim_invocation, init_trial_budget,
+                        prepare as prepare_decisions, record_invocation, selected_mode, trial_budget_status,
+                        trial_paths, trial_submission_limit)
 
 
 # A completed legacy report is a response. An insufficient_evidence report with
@@ -41,10 +42,12 @@ def reader_argv(config, binding, question):
         elif decisions == "existing_context":
             budget = ["--decisions-budget", DECISIONS_BUDGET]
         else:
-            # invocation_bounded: no shared ledger or budget file. The Ask keeps
-            # the product's own single-invocation context (at most 200 submissions).
+            # invocation_bounded: no shared ledger. The Ask joins this trial's own
+            # product ledger, created right after its claim with the per-trial
+            # submission limit, so the product enforces that limit.
             require(config["reader_mode"] == "legacy_text", "decisions_invocation_bounded_mode")
-            budget = []
+            trial_submission_limit(config.get("decisions_max_submissions_per_trial"))
+            budget = ["--decisions-budget", str(trial_paths()[2])]
         return [config["gptgrep_binary"], *budget,
                 "ask", "--native-ptc", *mode_flags, "--document=" + config["source_relative_path"],
                 "--jev-model", config["jev_model"], "--codex-bin", "/opt/full62/codex-native",
@@ -77,10 +80,13 @@ READER_CONTRACT_SCHEMA = "gptgrep.harbor.reader-contract.v1"
 # in its own offline `--schema` report. The digest of that field identifies the
 # treatment's rules, so a later product change to them needs no adapter edit.
 ANSWER_RULES_FIELD = ("commands", "ask", "reader_answer_rules")
-PRODUCT_SCHEMA_SECONDS = 30
+# A local report: Harbor's agent timeout leaves only ten seconds beyond the
+# query deadline for everything outside it.
+PRODUCT_SCHEMA_SECONDS = 5
 # Adapter-defined failure codes that an operation record may carry verbatim.
 # Every other exception stays the redacted generic failure.
-RECORDED_FAILURE_CODES = ("product_reader_contract_unavailable",)
+RECORDED_FAILURE_CODES = ("product_reader_contract_unavailable", "decisions_max_submissions_per_trial",
+                          "decisions_trial_budget_unavailable", "decisions_submission_limit_reached")
 
 
 def schema_field(value, path):
@@ -332,15 +338,21 @@ def main():
             budget = parse(pinned(config["decisions_budget"], 16384))
             require(Path(budget["ledger_path"]).parent == Path(DECISIONS_LEDGER_DIR),
                     "decisions_ledger_mount_contract")
-        # invocation_bounded joins no ledger: the Ask creates its own context and
-        # its reported Decisions cost receipt is kept per trial below.
+        # invocation_bounded joins no shared ledger: the trial's own ledger is
+        # created after its claim, and its cost receipt is kept per trial below.
         native_input = raw_prompt(config, question) if binding["arm"] == "raw_only" else None
         remaining = config["deadline_seconds"] - (time.monotonic() - started)
         require(remaining > 0, "reader_deadline")
         if decisions == "invocation_bounded":
             # Create-new, immediately before the one Ask: a re-executed trial
             # stops here as an operational failure with no Decisions spend.
-            operation["decisions_claim"] = claim_invocation(binding, deadline_unix_ms)
+            claim = operation["decisions_claim"] = claim_invocation(binding, deadline_unix_ms)
+            # The product creates this trial's own ledger with the per-trial
+            # submission limit; the Ask joins it and the product enforces it.
+            operation["decisions_trial_budget"] = init_trial_budget(config, binding, claim, deadline_unix_ms,
+                                                                    remaining, os.environ)
+            remaining = config["deadline_seconds"] - (time.monotonic() - started)
+            require(remaining > 0, "reader_deadline")
         result = run(argv, cwd="/data/corpus", timeout=remaining, env=env, input_bytes=native_input)
         attempt = {"ordinal": 0, "elapsed_ms": result["elapsed_ms"],
                    "return_code": result["return_code"], "failure": result["failure"],
@@ -374,6 +386,12 @@ def main():
                 operation["decisions_receipt"] = record_invocation(binding, result["stdout"], attempt)
             except (OSError, ValueError, TypeError):
                 operation["decisions_receipt"] = None
+            # The product's own ledger shows whether the Ask used its whole allowance.
+            trial_budget = operation["decisions_trial_budget"]
+            status = trial_budget["status_after_ask"] = trial_budget_status(config, trial_budget)
+            if status is not None:
+                trial_budget["remaining_submissions"] = status["remaining_submissions"]
+                trial_budget["limit_reached"] = status["remaining_submissions"] == 0
         require(result["failure"] is None and result["return_code"] == 0, "reader_process")
         answer, metadata = (product_result(result["stdout"], config["reader_mode"]) if binding["arm"] == "gptgrep"
                             else codex_result(result["stdout"]))
@@ -392,6 +410,14 @@ def main():
     finally:
         if writer is not None:
             os.close(writer)
+    trial_budget = operation.get("decisions_trial_budget")
+    if trial_budget is not None and trial_budget["limit_reached"] is not None:
+        # The product refuses a submission beyond the limit and that fails the
+        # whole legacy Ask: a failed Ask with no remaining submission is bound
+        # by the per-trial limit. It stays an operational failure, never retried.
+        trial_budget["limit_bound"] = outcome["status"] != "response" and trial_budget["limit_reached"]
+        if trial_budget["limit_bound"]:
+            operation["failure_code"] = "decisions_submission_limit_reached"
     operation["cumulative_query_wall_ms"] = round((time.monotonic() - started) * 1000)
     operation["status"] = outcome["status"]
     operation["answer_sha256"] = sha(canonical(outcome))

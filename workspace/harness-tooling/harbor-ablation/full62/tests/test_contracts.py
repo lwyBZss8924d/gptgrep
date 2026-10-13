@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from gptgrep_harbor.adapter import Full62Adapter, validate_cohort, env_templates
 import gptgrep_harbor.adapter as adapter_module
@@ -584,6 +584,46 @@ def product_schema_report(rules=SYNTHETIC_ANSWER_RULES):
     return canonical({"schema_version": "gptgrep.cli.v1", "commands": {"ask": {"reader_answer_rules": rules}}})
 
 
+class FakeTrialLedger:
+    """Synthetic stand-in for the product's offline `decisions-budget init` and `status`; nothing is executed."""
+
+    def __init__(self, remaining=6, init=None, status=None):
+        self.remaining, self.init_changes, self.status_changes = remaining, init or {}, status
+        self.control = None
+
+    def __call__(self, argv, result):
+        options = dict(zip(argv[3::2], argv[4::2]))
+        if argv[2] == "init":
+            control = {"schema_version": "gptgrep.decisions-budget-contract.v1", "run_id": options["--run-id"],
+                       "plan_digest": sha(Path(options["--plan-file"]).read_bytes()),
+                       "deadline_unix_ms": 1000 * (10**9 + int(options["--deadline-seconds"])),
+                       "max_submissions": int(options["--max-submissions"]), "ledger_path": options["--ledger"]}
+            data = canonical(control)
+            Path(options["--output"]).write_bytes(data)
+            self.control = control
+            report = {"schema_version": "gptgrep.decisions-budget-init.v1", "status": "initialized",
+                      "control_schema": control["schema_version"],
+                      **{key: control[key] for key in ("run_id", "plan_digest", "deadline_unix_ms",
+                                                         "max_submissions", "ledger_path")},
+                      "max_concurrent_requests": 4, "control_path": options["--output"],
+                      "control_sha256": sha(data), "control_mode": "0600", "joins_existing": False}
+            report.update(self.init_changes)
+            return {**result, "stdout": canonical(report)}
+        if self.status_changes == "unavailable":
+            return {**result, "return_code": 2, "stdout": b"{}"}
+        limit = self.control["max_submissions"]
+        used = limit - self.remaining
+        status = {"schema_version": "gptgrep.decisions-budget-status.v1", "run_id": self.control["run_id"],
+                  "plan_digest": self.control["plan_digest"], "ledger_path": self.control["ledger_path"],
+                  "max_submissions": limit, "max_concurrent_requests": 4,
+                  "reservations": {"total": used, "reserved": 0, "in_flight": 0, "unknown": 0, "terminal": used},
+                  "send_started": used, "submission_observations": used, "remaining_submissions": self.remaining,
+                  "occupied_slots": 0, "requested_models": {}, "deadline_unix_ms": self.control["deadline_unix_ms"],
+                  "deadline_state": "open", "wall_remaining_ms": 1, "anchor_remaining_ms": 1,
+                  "admission_open": self.remaining > 0, "read_only": True}
+        return {**result, "stdout": canonical(status)}
+
+
 def ask_calls(child):
     """The product Ask launches among a mocked reader's child processes."""
     return [call for call in child.call_args_list if "ask" in call.args[0]]
@@ -614,7 +654,7 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
                                      "sha256": "f" * 64}}
 
     def run_reader(self, stdout, environ=None, config=None, claim_root="/synthetic/unmounted-claim",
-                   schema=None):
+                   schema=None, ledger=None):
         outputs = {}
         version = {"stdout": ("codex-cli " + CODEX_VERSION).encode(), "stderr": b"", "elapsed_ms": 1,
                    "return_code": 0, "failure": None, "stdin_bytes": 0, "stdin_bytes_sent": 0, "stdin_complete": True}
@@ -622,13 +662,17 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
         report = {**version, "stdout": product_schema_report(), **(schema or {})}
         budget = canonical({"ledger_path": "/opt/full62-private/ledger/decisions.json"})
         config = self.config() if config is None else config
+        self.ledger = FakeTrialLedger() if ledger is None else ledger
 
         def child(argv, **_kwargs):
             # The pinned product's offline contract report, the native version
-            # check, then the one Ask.
+            # check, the trial ledger commands, then the one Ask.
             if argv[1:] == ["--schema"]:
                 return report
+            if argv[1] == "decisions-budget":
+                return self.ledger(argv, version)
             return version if argv[1:] == ["--version"] else product
+        process = Mock(side_effect=child)
         with patch("gptgrep_harbor.decisions.CLAIM_ROOT", str(claim_root)), \
              patch.object(reader, "read", side_effect=[canonical(config), self.question.encode()]), \
              patch.object(reader, "check_config"), patch.object(reader, "copy_asset"), \
@@ -638,7 +682,7 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
              patch.object(reader, "put", side_effect=lambda path, value: outputs.update({path: value})), \
              patch.dict(os.environ, environ or {"PATH": "/usr/bin"}, clear=True), \
              patch("sys.argv", ["reader", "--instruction", "/synthetic/instruction.txt"]), \
-             patch.object(reader, "run", side_effect=child) as process:
+             patch.object(reader, "run", process), patch("gptgrep_harbor.decisions.run", process):
             reader.main()
         self.budget_reads = budget_read.call_count
         return outputs, process
@@ -717,8 +761,95 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         return Path(directory.name).resolve()
 
+    def invocation_config(self):
+        config = {**self.config(), "decisions_mode": "invocation_bounded", "decisions_max_submissions_per_trial": 8}
+        del config["decisions_budget"]
+        return config
+
+    def ledger_calls(self, child, command):
+        return [call for call in child.call_args_list if call.args[0][1:3] == ["decisions-budget", command]]
+
+    def test_invocation_bounded_ask_joins_its_own_product_ledger_with_the_trial_limit(self):
+        claim_root = self.claim_root()
+        outputs, child = self.run_reader(legacy_report(), config=self.invocation_config(), claim_root=claim_root,
+                                         environ={"PATH": "/usr/bin", "OPENROUTER_API_KEY": "synthetic-only"})
+        control = claim_root / "decisions-budget.json"
+        (init,), (status,) = self.ledger_calls(child, "init"), self.ledger_calls(child, "status")
+        options = dict(zip(init.args[0][3::2], init.args[0][4::2]))
+        self.assertEqual((options["--max-submissions"], options["--plan-file"], options["--ledger"],
+                          options["--output"]),
+                         ("8", str(claim_root / "claim.json"), str(claim_root / "decisions-ledger.json"), str(control)))
+        self.assertTrue(0 < int(options["--deadline-seconds"]) <= 20)
+        self.assertEqual(status.args[0][1:], ["decisions-budget", "status", "--control", str(control), "--json"])
+        # Ledger commands are offline: no provider credential.
+        for call in (init, status):
+            self.assertNotIn("OPENROUTER_API_KEY", call.kwargs["env"])
+        # The ledger exists before the one Ask, which joins it.
+        order = [call.args[0][1:3] for call in child.call_args_list]
+        self.assertLess(order.index(["decisions-budget", "init"]), order.index(["--decisions-budget", str(control)]))
+        self.assertEqual(ask_calls(child)[0].args[0][1:4], ["--decisions-budget", str(control), "ask"])
+        operation = outputs["/logs/agent/operational.json"]
+        budget = operation["decisions_trial_budget"]
+        data = control.read_bytes()
+        self.assertEqual(budget["control"], {"path": str(control), "bytes": len(data), "sha256": sha(data)})
+        self.assertEqual((budget["max_submissions"], budget["enforced_by"], budget["plan_sha256"]),
+                         (8, "product_decisions_budget_ledger", operation["decisions_claim"]["sha256"]))
+        self.assertEqual((budget["remaining_submissions"], budget["limit_reached"], budget["limit_bound"]),
+                         (6, False, False))
+        self.assertEqual(budget["status_after_ask"]["reservations"]["total"], 2)
+        self.assertEqual(outputs["/answer/answer.json"]["status"], "response")
+        self.assertNotIn("failure_code", operation)
+
+    def test_binding_trial_limit_is_a_recorded_operational_failure_and_never_retried(self):
+        failed = canonical({"status": "failed", "error": {"jev": {"requests": 8, "attempted_calls": 9}}})
+        cases = (("failed_at_limit", failed, FakeTrialLedger(remaining=0), "operational_failure", True, True),
+                 ("completed_at_limit", legacy_report(), FakeTrialLedger(remaining=0), "response", True, False),
+                 ("failed_below_limit", failed, FakeTrialLedger(remaining=3), "operational_failure", False, False),
+                 ("status_unavailable", failed, FakeTrialLedger(status="unavailable"), "operational_failure",
+                  None, None))
+        for name, report, ledger, status, reached, bound in cases:
+            with self.subTest(case=name):
+                outputs, child = self.run_reader(report, config=self.invocation_config(),
+                                                 claim_root=self.claim_root(), ledger=ledger)
+                self.assertEqual(len(ask_calls(child)), 1)
+                envelope = outputs["/answer/answer.json"]
+                self.assertEqual(envelope["status"], status)
+                operation = outputs["/logs/agent/operational.json"]
+                budget = operation["decisions_trial_budget"]
+                self.assertEqual((budget["limit_reached"], budget["limit_bound"]), (reached, bound))
+                self.assertEqual(operation.get("failure_code"),
+                                 "decisions_submission_limit_reached" if bound else None)
+                if bound:
+                    # A recorded, judged failure: label 0 without any Judge call.
+                    result = grade(self.judge_config(), envelope, lambda *_: self.fail("Judge called"))
+                    self.assertEqual((result["status"], result["label"]), ("operational_failure", 0))
+
+    def test_trial_ledger_must_exist_before_the_ask_or_the_trial_stops_unspent(self):
+        cases = {"init_failed": FakeTrialLedger(init={"status": "joined"}),
+                 "other_limit": FakeTrialLedger(init={"max_submissions": 9}),
+                 "joins_existing": FakeTrialLedger(init={"joins_existing": True}),
+                 "other_control": FakeTrialLedger(init={"control_sha256": "0" * 64})}
+        for name, ledger in cases.items():
+            with self.subTest(case=name):
+                claim_root = self.claim_root()
+                outputs, child = self.run_reader(legacy_report(), config=self.invocation_config(),
+                                                 claim_root=claim_root, ledger=ledger)
+                self.assertEqual(ask_calls(child), [])
+                operation = outputs["/logs/agent/operational.json"]
+                self.assertEqual(operation["failure_code"], "decisions_trial_budget_unavailable")
+                self.assertNotIn("decisions_trial_budget", operation)
+                self.assertTrue((claim_root / "claim.json").exists())
+        # An unset limit stops before the claim, the ledger and the Ask.
+        config = self.invocation_config()
+        del config["decisions_max_submissions_per_trial"]
+        claim_root = self.claim_root()
+        outputs, child = self.run_reader(legacy_report(), config=config, claim_root=claim_root)
+        self.assertEqual((ask_calls(child), self.ledger_calls(child, "init")), ([], []))
+        self.assertEqual(outputs["/logs/agent/operational.json"]["failure_code"], "decisions_max_submissions_per_trial")
+        self.assertEqual(list(claim_root.iterdir()), [])
+
     def test_invocation_bounded_ask_claims_once_and_keeps_its_cost_receipt(self):
-        config = {**self.config(), "decisions_mode": "invocation_bounded"}
+        config = {**self.config(), "decisions_mode": "invocation_bounded", "decisions_max_submissions_per_trial": 8}
         del config["decisions_budget"]
         jev = {"requests": 2, "attempted_calls": 2, "unobserved_attempts": 0, "accounting_complete": True,
                "usage": [{"cost": 0.0125}, {"cost": 0.0075}]}
@@ -732,8 +863,8 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
                 outputs, child = self.run_reader(report, config=config, claim_root=claim_root)
                 self.assertEqual(self.budget_reads, 0)
                 argv = ask_calls(child)[0].args[0]
-                self.assertEqual(argv[:2], ["/synthetic/gptgrep", "ask"])
-                self.assertNotIn("--decisions-budget", argv)
+                self.assertEqual(argv[:4], ["/synthetic/gptgrep", "--decisions-budget",
+                                            str(claim_root / "decisions-budget.json"), "ask"])
                 self.assertEqual(outputs["/answer/answer.json"]["status"], expected)
                 operation = outputs["/logs/agent/operational.json"]
                 self.assertEqual(operation["decisions_mode"], "invocation_bounded")
@@ -753,7 +884,7 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
                 # A re-executed trial (for example in a resumed Harbor job) finds
                 # the claim and fails closed before the Ask: no Decisions spend.
                 again, child = self.run_reader(report, config=config, claim_root=claim_root)
-                self.assertEqual(ask_calls(child), [])
+                self.assertEqual((ask_calls(child), self.ledger_calls(child, "init")), ([], []))
                 self.assertEqual(again["/answer/answer.json"]["status"], "operational_failure")
                 repeated = again["/logs/agent/operational.json"]
                 self.assertEqual((repeated["failure"], repeated["attempts"]), ("reader_failed", []))
@@ -761,7 +892,7 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
                 self.assertEqual((claim_root / "claim.json").read_bytes(), claim)
 
     def test_invocation_bounded_ask_requires_its_claim_mount(self):
-        config = {**self.config(), "decisions_mode": "invocation_bounded"}
+        config = {**self.config(), "decisions_mode": "invocation_bounded", "decisions_max_submissions_per_trial": 8}
         del config["decisions_budget"]
         missing = self.claim_root() / "not-mounted"
         outputs, child = self.run_reader(legacy_report(), config=config, claim_root=missing)

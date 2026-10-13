@@ -21,8 +21,9 @@ completion does not complete the goal.
 The reader images are rebuilt, the zero-model Linux text index is built and pinned
 inside the treatment image, and the adapter carries the approved reader-only sandbox
 setting. The bare arm receives none of GPTgrep's reader contract, including its
-answer rules, in any reader mode. The current cursor is **bound Decisions
-submissions per trial and apply the adapter's open review fixes →
+answer rules, in any reader mode, and the product enforces an explicit per-trial
+Decisions submission limit that the cost preflight uses. The current cursor is
+**apply the adapter's open review fixes →
 freeze the inputs on a published commit → Judge-container check and paired smoke →
 complete full62 paired SEARCH → Judge → analyze failures → next Opt**. The first paired run
 is prepared in the adapter's `legacy_text` mode with a frozen zero-model text
@@ -81,10 +82,10 @@ no tag or binary release was created.
 ### Current cursor
 
 Done in this round: common and treatment images rebuilt, the zero-model text index
-built and pinned inside the Linux treatment image before any question exposure, and
-the approved reader sandbox setting integrated, and the raw-only answer-rules copy
-removed. Next: bound Decisions submissions per trial and apply the adapter's
-open review fixes → freeze inputs on a published commit → check the Judge/verifier
+built and pinned inside the Linux treatment image before any question exposure,
+the approved reader sandbox setting integrated, the raw-only answer-rules copy
+removed, and Decisions submissions bounded per trial by the product. Next: apply
+the adapter's open review fixes → freeze inputs on a published commit → check the Judge/verifier
 containers → paired smoke → complete full62 paired SEARCH in the
 adapter's `legacy_text` mode → Judge → failure analysis → next Opt. In parallel,
 Opt-1b removes or conditions the answer-commitment rule and re-measures all three

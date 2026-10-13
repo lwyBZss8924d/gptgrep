@@ -359,9 +359,9 @@ documents, such as a host-built index); qualify matching reader permissions and 
 the owner-approved reader seccomp profile that both reader containers need for Codex's
 bubblewrap sandbox (the adapter's `seccomp/` directory); supply
 the frozen private cohort and Judge contract; select one treatment Decisions mode
-(an existing shared ledger, per-trial preparation, or invocation-bounded contexts
-with one create-new host claim per treatment trial, a pinned price and a cohort
-cost cap that is checked at admission, not enforced at runtime); prepare all 124
+(an existing shared ledger, per-trial preparation, or invocation-bounded trials,
+each with one create-new host claim and its own product-enforced Decisions
+submission limit, a pinned price and a cohort cost cap checked at admission); prepare all 124
 tasks; build exact role images; run the generated Harbor job; aggregate all paired
 outcomes. Its `prepare`,
 `build-local-images` and `aggregate` commands require pinned manifests; `prepare`

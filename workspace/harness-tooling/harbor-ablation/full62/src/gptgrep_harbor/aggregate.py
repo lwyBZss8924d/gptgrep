@@ -30,7 +30,18 @@ def decisions_costs(rows, runtime):
     partial = [value for row in rows for value in row["retrieval_known"]]
     total = sum(known) if len(known) == len(rows) else None
     cap = runtime.get("decisions_cost_cap_usd")
-    return {"mode": selected_mode(runtime), "treatment_trials": len(rows),
+    mode = selected_mode(runtime)
+    limit = None
+    if mode == "invocation_bounded":
+        # The product enforces the per-trial submission limit; a failed Ask with
+        # no remaining submission is limit-bound (an operational failure).
+        budgets = [row["trial_budget"] if type(row["trial_budget"]) is dict else {} for row in rows]
+        limit = {"max_submissions_per_trial": runtime.get("decisions_max_submissions_per_trial"),
+                 "enforced_by": "product_decisions_budget_ledger",
+                 "bound_trials": sum(budget.get("limit_bound") is True for budget in budgets),
+                 "reached_trials": sum(budget.get("limit_reached") is True for budget in budgets),
+                 "unobserved_trials": sum(type(budget.get("limit_reached")) is not bool for budget in budgets)}
+    return {"mode": mode, "treatment_trials": len(rows),
             "cost_complete_trials": len(known), "cost_unknown_trials": len(rows) - len(known),
             # Trials whose attempts carry a decisions-cost receipt, and the priced
             # Jev usage rows inside those receipts (one Ask has many rows).
@@ -40,6 +51,7 @@ def decisions_costs(rows, runtime):
             "reported_cost_usd_known_subtotal": sum(partial) if partial else None,
             "reported_cost_usd_total": total, "cost_cap_usd": cap,
             "total_within_cap": total <= cap if total is not None and finite_number(cap) else None,
+            "submission_limit": limit,
             "currency_verified": False, "included_in_query_cost": False}
 
 
@@ -238,6 +250,9 @@ def summarize(export, records, runtime):
                                                 if finite_number(a.get("reported_retrieval_cost_subtotal"))],
                             "decisions_receipts": decisions_receipts(attempts),
                             "decisions_cost_usd": trial_decisions_cost(attempts),
+                            "trial_budget": operation.get("decisions_trial_budget") if operation else None,
+                            "failure_code": (operation.get("failure_code") if operation is not None and
+                                             isinstance(operation.get("failure_code"), str) else None),
                             "judge_abstained": abstained,
                             # A completed legacy abstention keeps this flag in the private operation record.
                             "insufficient_evidence": operation is not None and status in ("judged", "judge_unavailable")
@@ -279,7 +294,12 @@ def summarize(export, records, runtime):
                         "cost_per_correct_usd": known / correct if cost_complete and correct else None,
                         "outer_attempts_observed": sum(r["attempt_count"] for r in rows),
                         "grounding_unassessed": sum(not r["grounding_available"] for r in rows)}
+        codes = {}
+        for row in rows:
+            if row["failure_code"] is not None and row["status"] in ("operational_failure", "missing_task"):
+                codes[row["failure_code"]] = codes.get(row["failure_code"], 0) + 1
         summary[arm].update(intentional_abstentions=abstentions(rows),
+                            operational_failure_codes=dict(sorted(codes.items())),
                             final_reader_usage_diagnostic=usage_subtotals,
                             all_model_turn_usage_complete=False,
                             reported_retrieval_cost_known_subtotal=sum(retrieval_costs) if retrieval_costs else None,
