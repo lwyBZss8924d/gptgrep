@@ -259,6 +259,8 @@ uv run --frozen python -B -m unittest discover -s tests -v
 
 The suite uses authored synthetic fixtures under explicit `TMPDIR`, including a complete 124-task conversion and real Harbor schema checks. It never starts Docker or models. One bounded child test invokes the selected Python interpreter to verify a fractional remaining deadline; native/model execution is mocked in interface tests.
 
+The suite must import this checkout's `src/gptgrep_harbor`. An environment shared between checkouts keeps one editable install that points at only one of them, so when reusing such an interpreter for another checkout, run the suite with `PYTHONPATH="$PWD/src"` from this directory and record the `gptgrep_harbor.__file__` it imported. `tests/test_source_identity.py` fails when the imported package is not the adjacent source tree. Python's `-I` isolation mode ignores `PYTHONPATH`, so it cannot be combined with that override.
+
 ## Troubleshooting
 
 A pin or physical-path mismatch stops materialization. Existing output or attempt markers stop reuse. Keep partial artifacts and select a fresh successor; do not erase a consumed attempt. Unknown judge labels, native costs and served metadata remain explicit. A failed cached login requires the host refresh owner (`codex_auth_supervisor.py refresh`) or, if that fails, the supervised device re-login outside the job; it does not authorize an API-key fallback or an in-trial refresh.

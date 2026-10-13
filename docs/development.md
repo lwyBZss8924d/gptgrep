@@ -311,6 +311,12 @@ test imports Pillow 12.3.0 on the host. Install it only from hashed requirements
 the base image's `requirements.lock` above, or a local extras file in the same
 `pillow==12.3.0 --hash=sha256:...` format that lists the host wheel's hash.
 
+An environment shared between checkouts has one editable install that points at
+only one of them. When reusing such an interpreter for another checkout, run the
+suite with `PYTHONPATH="$GPTGREP_FULL62_SOURCE/src"` (not with `python -I`, which
+ignores it) and record the `gptgrep_harbor.__file__` it imported;
+`tests/test_source_identity.py` fails if the suite imports any other source tree.
+
 For a real run, follow the adapter's sequence: build and verify the common
 Python/Pillow/Poppler/native-Codex foundation; add the complete Linux GPTgrep plus
 PDFium bundle to the treatment derivative; build the treatment index inside that
