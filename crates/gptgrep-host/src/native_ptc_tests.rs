@@ -285,7 +285,7 @@ async fn opt_in_exposes_direct_tools_without_fallback_and_preserves_the_permissi
     let original = default_thread["baseInstructions"].as_str().unwrap();
     assert_eq!(
         crate::retrieval::hash(original.as_bytes()),
-        "a65714ee9d695bdfab9ffbff94d7ae6747f1c6fe6575055dd8c0e978e2bb18e9"
+        "445ee2b24761954e86393b79661e257fc6204cfddab3900cf2c5016bf17bfbc2"
     );
     assert!(original.contains("Do not run commands, access browsers"));
     assert!(!original.contains("Native PTC"));
