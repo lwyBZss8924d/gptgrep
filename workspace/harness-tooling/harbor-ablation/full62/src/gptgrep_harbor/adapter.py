@@ -296,9 +296,11 @@ class Full62Adapter:
                     and runtime["jev_model"] == "openai/gpt-6-luna-decisions",
                     "decisions_preparation_mode_conflict")
         elif mode == "invocation_bounded":
-            # No shared ledger or budget file: each legacy Ask keeps the product's
-            # own single-invocation context, and a per-trial host claim allows one
-            # Ask per trial. The cohort's bound must fit the cap.
+            # No shared ledger or budget file from the host. A per-trial host claim
+            # allows one Ask per trial; right after it the product creates the
+            # trial's own ledger with the per-trial submission limit, and the legacy
+            # Ask joins that ledger with --decisions-budget, so the product enforces
+            # the limit. The cohort's bound must fit the cap.
             require(runtime["reader_mode"] == "legacy_text", "decisions_invocation_bounded_mode_conflict")
             decisions_directory(runtime.get("decisions_claims_dir"))
             self.preflight["decisions"] = invocation_cost_bound(runtime, len(self.rows))

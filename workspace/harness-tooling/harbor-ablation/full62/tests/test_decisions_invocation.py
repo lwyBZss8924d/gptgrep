@@ -335,6 +335,25 @@ class ModeSelectionTests(unittest.TestCase):
                       decisions_max_submissions_per_trial=8)
 
 
+    def test_readme_names_the_budget_each_mode_actually_passes(self):
+        # The front-door paragraph must name the --decisions-budget file that the
+        # reader passes in every Decisions mode, invocation-bounded included.
+        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+        paragraph = next(block for block in readme.split("\n\n")
+                         if block.startswith("The runtime explicitly requires `native_ptc=true`"))
+        self.assertNotIn("passes no `--decisions-budget`", paragraph)
+        argv = {"existing_context": self.argv(decisions_budget=self.budget),
+                "preparation": self.argv(reader_mode="rich_multimodal",
+                                         decisions_preparation={"max_concurrent_batches": 1}),
+                "invocation_bounded": self.argv(decisions_mode="invocation_bounded",
+                                                decisions_max_submissions_per_trial=8)}
+        for mode, args in argv.items():
+            with self.subTest(mode=mode):
+                self.assertEqual(args[1], "--decisions-budget")
+                self.assertIn("`" + args[2] + "`" if mode != "existing_context" else
+                              "`--decisions-budget " + args[2] + " ask --native-ptc", paragraph)
+
+
 class CostReceiptTests(unittest.TestCase):
     complete = {"requests": 3, "attempted_calls": 3, "unobserved_attempts": 0, "accounting_complete": True,
                 "usage": [{"cost": 0.25}, {"cost": 0.125}, {"cost": 0.0}]}
