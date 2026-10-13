@@ -70,6 +70,18 @@ class PreparationMaterializationTests(unittest.TestCase):
             adapter.run(self.root / "repeat-dataset")
         self.assertFalse((self.root / "repeat-dataset").exists())
 
+    def test_template_null_existing_context_fields_mean_unselected(self):
+        template = json.loads((Path(fixtures.__file__).parents[1] / "runtime.template.json").read_text())
+        unselected = {key: template[key] for key in ("decisions_budget", "decisions_ledger_dir")}
+        self.assertEqual(unselected, {"decisions_budget": None, "decisions_ledger_dir": None})
+        self.runtime.update(unselected)
+        adapter = fixtures.HarborMaterializationTests.materializer(self)
+        self.assertEqual(adapter.runtime["decisions_preparation"]["schema"],
+                         "gptgrep.harbor.decisions-preparation.v1")
+        self.runtime["decisions_ledger_dir"] = "/synthetic/unselected-ledger"
+        with self.assertRaisesRegex(ValueError, "decisions_preparation_mode_conflict"):
+            fixtures.HarborMaterializationTests.materializer(self)
+
     def test_ambiguous_context_mode_and_parallel_preparation_are_rejected(self):
         self.runtime["decisions_budget"] = {"path": "/synthetic/unselected.json", "bytes": 1, "sha256": "d" * 64}
         with self.assertRaisesRegex(ValueError, "decisions_preparation_mode_conflict"):

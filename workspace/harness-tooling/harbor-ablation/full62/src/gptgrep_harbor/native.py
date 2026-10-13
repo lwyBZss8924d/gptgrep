@@ -5,21 +5,64 @@ import json
 
 from .common import MAX_ANSWER, MAX_JSON, MAX_NATIVE_PROMPT_BYTES, PROFILE, integer, parse, require
 
+# Materialized from the frozen contract's response_schema into the Judge's
+# private /tests area; judge.json pins these exact bytes.
+JUDGE_OUTPUT_SCHEMA = "/tests/judge-output-schema.json"
+MAX_OUTPUT_SCHEMA_BYTES = 65536
 
-def codex_argv(binary, *, profile=None, role="reader"):
+
+def _key_sorted(value):
+    if isinstance(value, dict):
+        return {key: _key_sorted(value[key]) for key in sorted(value)}
+    if isinstance(value, list):
+        return [_key_sorted(item) for item in value]
+    return value
+
+
+def output_schema_bytes(schema):
+    """Exact bytes of the frozen response schema that the native Judge reads.
+
+    Strict structured output generates keys in `properties` order, and Codex
+    sends the file's key order unchanged. The frozen contract file is key-sorted,
+    so `properties` follows the contract's `required` list, which keeps the
+    frozen judge's order. Every other object is key-sorted, so the verifier can
+    recompute these exact bytes from the contract.
+    """
+    required = schema.get("required") if type(schema) is dict else None
+    properties = schema.get("properties") if type(schema) is dict else None
+    require(type(required) is list and type(properties) is dict and
+            all(isinstance(name, str) for name in required) and
+            len(set(required)) == len(required) and set(required) == set(properties),
+            "output_schema_property_order")
+    ordered = _key_sorted(schema)
+    # Replacing the value keeps the key's sorted position at the top level.
+    ordered["properties"] = {name: _key_sorted(properties[name]) for name in required}
+    data = json.dumps(ordered, separators=(",", ":"), ensure_ascii=False,
+                      allow_nan=False).encode("utf-8") + b"\n"
+    require(len(data) <= MAX_OUTPUT_SCHEMA_BYTES, "output_schema_bound")
+    return data
+
+
+def codex_argv(binary, *, profile=None, role="reader", output_schema=None):
     # The isolated sandbox supplies its own Dev/Test/Eval account environment.
     # No session resume, caller home copy, arbitrary shell command or retry.
     profile = PROFILE if profile is None else profile
     require(role in ("reader", "judge"), "native_role")
-    return [binary, "exec", "--skip-git-repo-check", "--ephemeral",
+    argv = [binary, "exec", "--skip-git-repo-check", "--ephemeral",
             "--model", profile["model"], "--json",
             "-c", "default_permissions=" + json.dumps("full62_" + role),
             "-c", 'cli_auth_credentials_store="file"',
             "-c", 'forced_login_method="chatgpt"',
             "-c", 'model_provider="openai"',
             "-c", "model_reasoning_effort=" + json.dumps(profile["reasoning_effort"]),
-            "-c", "service_tier=" + json.dumps(profile["service_tier"]),
-            "--", "-"]
+            "-c", "service_tier=" + json.dumps(profile["service_tier"])]
+    if output_schema is not None:
+        # Only the Judge requests native structured output. The CLI reads this
+        # file itself before the turn; reader argv stays unchanged.
+        require(role == "judge" and isinstance(output_schema, str) and output_schema.startswith("/"),
+                "output_schema_argument")
+        argv += ["--output-schema", output_schema]
+    return argv + ["--", "-"]
 
 
 def prompt_bytes(prompt):

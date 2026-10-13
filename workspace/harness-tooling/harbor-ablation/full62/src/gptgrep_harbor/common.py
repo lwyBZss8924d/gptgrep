@@ -17,6 +17,13 @@ MAX_ANSWER = 1024 * 1024
 # private row parser. Both reader arms share this UTF-8 byte bound.
 MAX_READER_QUESTION_BYTES = 8192
 MAX_NATIVE_PROMPT_BYTES = MAX_JSON
+# The treatment's adapter maximum tool-call cap; the bare arm has none.
+MAX_TOOL_CALLS = 10000
+
+
+def tool_cap_parity(value):
+    """budget_scope label: only the adapter maximum matches the uncapped bare arm."""
+    return "adapter_maximum" if value == MAX_TOOL_CALLS else "declared_deviation"
 
 
 def require(condition, code):
@@ -51,8 +58,8 @@ def duplicate_free(pairs):
     return result
 
 
-def parse(data):
-    require(len(data) <= MAX_JSON, "json_size")
+def parse(data, cap=MAX_JSON):
+    require(len(data) <= cap, "json_size")
     return json.loads(data, object_pairs_hook=duplicate_free,
                       parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite")))
 

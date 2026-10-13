@@ -1,17 +1,60 @@
 """Runtime-only conversion of a pinned private cohort to 124 Harbor tasks."""
 from __future__ import annotations
 
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import string
 
-from .common import ARMS, MAX_READER_QUESTION_BYTES, PROFILE, canonical, copy_asset, digest, integer, parse, pinned, put, relative, require, sha
+from .common import (ARMS, MAX_READER_QUESTION_BYTES, MAX_TOOL_CALLS, PROFILE, canonical, copy_asset, digest, integer,
+                     parse, pinned, put, relative, require, sha, tool_cap_parity)
+from .native import JUDGE_OUTPUT_SCHEMA, output_schema_bytes
 from .runtime import (API_ENV, BASE_CAPABILITIES, BASE_TOOLS_PATH, CODEX_HOME, DECISIONS_BUDGET, DECISIONS_LEDGER_DIR, PASS_ENV, WORK_DIR, auth_compose, auth_paths,
-                      base_tools_identity, model_config, native_identity, validate_asset_path)
+                      base_tools_identity, model_config, native_identity, reader_seccomp_profile, reader_security_opt,
+                      validate_asset_path)
 from .product_bundle import PRODUCT_ENTRYPOINT, PRODUCT_PROVENANCE, bundle_identity
-from .decisions import (CONTROL_ROOT, FAMILY_ROOT, TRIAL_ROOT, WRITER_LOCK,
-                        control as decisions_control)
+from .decisions import (CLAIM_ROOT, CONTROL_ROOT, FAMILY_ROOT, TRIAL_ROOT, WRITER_LOCK,
+                        control as decisions_control, decisions_model, directory as decisions_directory,
+                        invocation_cost_bound, selected_mode, shared_allowance)
 from .trial_order import paired_order
+
+
+# The bare arm has no tool-call cap; the stock CLI only observes native calls.
+# In the treatment, native shell, image, MCP and sub-agent items count toward
+# max_tool_calls together with GPTgrep calls, and exceeding it fails the Ask.
+# Only the adapter maximum (MAX_TOOL_CALLS) is the parity choice; a lower cap is
+# a declared, admission-bound deviation, and a cap below the floor is likely to bind.
+TOOL_CALL_WARNING_FLOOR = 64
+TOOL_CAP_DEVIATION = "treatment_tool_cap_below_adapter_maximum"
+
+
+def tool_cap_deviation(value):
+    """The exact qualification_mismatches entry that declares a treatment cap below the maximum."""
+    return {"code": TOOL_CAP_DEVIATION, "treatment_max_tool_calls": value, "raw_tool_call_cap": "none"}
+
+
+def tool_budget(value, qualification_mismatches=()):
+    """Validate the treatment tool cap against the uncapped bare arm.
+
+    Returns its budget_scope record and advisory warnings. A cap below the
+    adapter maximum must be declared in qualification_mismatches, which the
+    admission binds through the runtime subject; a stale declaration is
+    rejected too.
+    """
+    integer(value, 1, MAX_TOOL_CALLS)
+    declared = [entry for entry in qualification_mismatches
+                if isinstance(entry, dict) and entry.get("code") == TOOL_CAP_DEVIATION]
+    parity = value == MAX_TOOL_CALLS
+    require(parity or declared == [tool_cap_deviation(value)], "treatment_tool_cap_deviation_undeclared")
+    require(not parity or not declared, "treatment_tool_cap_deviation_stale")
+    warnings = []
+    if not parity:
+        warnings.append({"code": ("treatment_tool_cap_may_bind_before_deadline" if value < TOOL_CALL_WARNING_FLOOR
+                                  else TOOL_CAP_DEVIATION),
+                         "max_tool_calls": value, "adapter_maximum": MAX_TOOL_CALLS,
+                         "warning_floor": TOOL_CALL_WARNING_FLOOR})
+    return {"treatment_max_tool_calls": value, "raw_tool_call_cap": "none",
+            "adapter_maximum": MAX_TOOL_CALLS, "warning_floor": TOOL_CALL_WARNING_FLOOR,
+            "parity": tool_cap_parity(value)}, warnings
 
 
 def validate_cohort(cohort):
@@ -57,6 +100,80 @@ def toml_string(value):
     return json.dumps(value, ensure_ascii=True)
 
 
+# The in-container corpus root and the product's index identity (gptgrep-core):
+# .gptgrep/CURRENT.json points to one generation whose manifest records its
+# canonical root and every source digest. Legacy text and rich multimodal
+# readers open different manifest schemas.
+CORPUS_ROOT = "/data/corpus"
+INDEX_SCHEMAS = {"legacy_text": "gptgrep.v1", "rich_multimodal": "gptgrep.manifest.v2"}
+MAX_INDEX_POINTER_BYTES = 4096
+MAX_INDEX_MANIFEST_BYTES = 128 * 1024 * 1024
+
+
+def index_identity(runtime):
+    """Check that the pinned index was built at the container corpus root from the pinned documents.
+
+    The product binds a generation to its canonical root, so an index built on
+    the host or at another root would fail every treatment Ask at query time
+    ("index identity mismatch"). Only build state under .gptgrep/ is an index
+    file; query-time host-attempts ledgers never are. Reads only index files.
+    """
+    rows = {row["relative_path"]: row["pin"] for row in runtime["index_files"]}
+    require(all(path.startswith(".gptgrep/") and "host-attempts" not in PurePosixPath(path).parts for path in rows),
+            "index_state_files_only")
+    schema = INDEX_SCHEMAS[runtime["reader_mode"]]
+    require(".gptgrep/CURRENT.json" in rows, "index_current_pointer")
+    pointer = parse(pinned(rows[".gptgrep/CURRENT.json"], MAX_INDEX_POINTER_BYTES))
+    require(type(pointer) is dict and pointer.get("schema_version") == schema and
+            isinstance(pointer.get("generation"), str) and
+            re.fullmatch(r"[A-Za-z0-9-]{1,128}", pointer["generation"]), "index_current_pointer")
+    digest(pointer.get("manifest_sha256"))
+    manifest_path = ".gptgrep/generations/" + pointer["generation"] + "/manifest.json"
+    require(manifest_path in rows and rows[manifest_path]["sha256"] == pointer["manifest_sha256"], "index_manifest_pin")
+    manifest = parse(pinned(rows[manifest_path], MAX_INDEX_MANIFEST_BYTES), MAX_INDEX_MANIFEST_BYTES)
+    require(type(manifest) is dict and manifest.get("schema_version") == schema and
+            manifest.get("generation") == pointer["generation"] and manifest.get("root") == CORPUS_ROOT,
+            "index_root_identity")
+    require(isinstance(manifest.get("documents"), list), "index_sources")
+    sources = {}
+    for entry in manifest["documents"]:
+        source = entry.get("document") if schema == INDEX_SCHEMAS["rich_multimodal"] and type(entry) is dict else entry
+        require(type(source) is dict and isinstance(source.get("path"), str) and source["path"] not in sources,
+                "index_sources")
+        sources[source["path"]] = source.get("source_sha256")
+    # Exactly the pinned raw documents, byte for byte: nothing more, nothing stale.
+    require(sources == {row["relative_path"]: row["pin"]["sha256"] for row in runtime["documents"]}, "index_sources")
+    return {"schema_version": schema, "generation": pointer["generation"], "root": CORPUS_ROOT,
+            "documents": len(sources), "manifest_sha256": pointer["manifest_sha256"]}
+
+
+def judge_contract(judge):
+    """Validate the frozen primary judge contract; return the Judge's exact schema-file bytes.
+
+    Materialization calls this before creating any task; pre-admission
+    validators can call it directly on the private contract.
+    """
+    require(type(judge) is dict and set(judge) == {"schema", "prompt", "response_schema"} and
+            judge["schema"] == "gptgrep.harbor.primary-judge.v1" and isinstance(judge["prompt"], str),
+            "frozen_judge_contract")
+    fields = [field for _, field, _, _ in string.Formatter().parse(judge["prompt"]) if field]
+    require(set(fields) == {"question", "answer", "answer_format", "response"}, "primary_only_fields")
+    schema = judge["response_schema"]
+    require(type(schema) is dict and schema.get("type") == "object" and
+            type(schema.get("required")) is list and "equivalent" in schema["required"] and
+            type(schema.get("properties")) is dict and
+            schema["properties"].get("equivalent", {}).get("type") == "boolean" and
+            all(type(v) is dict and v.get("type") in ("boolean", "string") for v in schema["properties"].values()),
+            "supported_frozen_schema")
+    # The Judge passes this schema as native strict structured output: every
+    # property is required exactly once and no other key is allowed.
+    required = schema["required"]
+    require(schema.get("additionalProperties") is False and all(isinstance(name, str) for name in required) and
+            len(set(required)) == len(required) and set(required) == set(schema["properties"]),
+            "strict_output_schema")
+    return output_schema_bytes(schema)
+
+
 class Full62Adapter:
     def __init__(self, manifest, manifest_sha256):
         self.manifest_path = Path(manifest).absolute()
@@ -69,6 +186,9 @@ class Full62Adapter:
         self.runtime = parse(pinned(self.manifest["runtime"]))
         self.judge = parse(pinned(self.manifest["judge_contract"]))
         self.rows = validate_cohort(self.cohort)
+        # Validation output: bounded budget checks and advisory warnings. The
+        # prepare command prints it before creating any task; the export keeps it.
+        self.preflight = {"schema": "gptgrep.harbor.preflight.v1", "warnings": []}
         self._validate_runtime()
 
     def _validate_runtime(self):
@@ -80,16 +200,34 @@ class Full62Adapter:
         require(runtime["codex_home"] == CODEX_HOME, "isolated_codex_home")
         require(runtime.get("native_ptc") is True and runtime.get("codex_permissions") == "full62_reader",
                 "shared_native_reader_required")
+        # Both reader roles run Codex's bubblewrap under the one owner-approved
+        # seccomp profile. A missing, malformed, other or changed profile stops
+        # here, before the preflight and before any task exists. It is a small
+        # control pin, read like the admission, not a streamed task asset.
+        pinned(reader_seccomp_profile(runtime.get("reader_seccomp_profile")))
         require(runtime["reader_mode"] in ("rich_multimodal", "legacy_text"), "explicit_reader_mode")
         if runtime["reader_mode"] == "rich_multimodal":
             require(runtime["jev_model"] in ("openai/gpt-6-luna-decisions", "openai/gpt-6-luna-decisions-20261006"),
                     "rich_decisions_model")
-        if runtime.get("decisions_preparation") is not None:
+        else:
+            # Every treatment Ask passes this value as one --jev-model argument.
+            decisions_model(runtime.get("jev_model"))
+        # runtime.template.json keeps every unselected mode field null; null and
+        # absent both mean unselected, and any value is a mode conflict.
+        mode = selected_mode(runtime)
+        self.preflight["decisions"] = {"mode": mode}
+        if mode == "preparation":
             decisions_control(runtime["decisions_preparation"])
-            require("decisions_budget" not in runtime and "decisions_ledger_dir" not in runtime
-                    and runtime["reader_mode"] == "rich_multimodal"
+            require(runtime["reader_mode"] == "rich_multimodal"
                     and runtime["jev_model"] == "openai/gpt-6-luna-decisions",
                     "decisions_preparation_mode_conflict")
+        elif mode == "invocation_bounded":
+            # No shared ledger or budget file: each legacy Ask keeps the product's
+            # own single-invocation context, and a per-trial host claim allows one
+            # Ask per trial. The cohort's bound must fit the cap.
+            require(runtime["reader_mode"] == "legacy_text", "decisions_invocation_bounded_mode_conflict")
+            decisions_directory(runtime.get("decisions_claims_dir"))
+            self.preflight["decisions"] = invocation_cost_bound(runtime, len(self.rows))
         else:
             budget = runtime["decisions_budget"]
             require(type(budget) is dict and set(budget) == {"path", "bytes", "sha256"}
@@ -101,6 +239,9 @@ class Full62Adapter:
             require(isinstance(ledger_dir, str) and ledger_dir.startswith("/") and ledger_dir != "/" and
                     Path(ledger_dir).as_posix() == ledger_dir and ".." not in Path(ledger_dir).parts and
                     not any(c in ledger_dir for c in ("$", "\n", "\r", "\x00")), "ledger_directory_reference")
+            # One shared allowance for all treatment trials: record it and warn.
+            self.preflight["decisions"], warnings = shared_allowance(budget, len(self.rows))
+            self.preflight["warnings"] += warnings
         require(runtime["account_scope"] == "Dev/Test/Eval" and runtime["admitted"] is True,
                 "isolated_runtime_admission")
         # This receipt is independently selected by root. Source preparation does
@@ -123,6 +264,9 @@ class Full62Adapter:
         require(approval.get("named_permissions_qualified") is True and
                 approval.get("reader_effective_permissions_equal") is True and
                 approval.get("native_cli") == runtime["native_cli"], "native_permissions_admission")
+        # Runtime-only fact: the qualified readers and Judge expose no connector,
+        # plugin, MCP or hosted web-search tool. Configuration alone cannot show it.
+        require(approval.get("reader_external_tools_excluded") is True, "external_tools_admission")
         reader_pin = runtime["reader_base_binary"]
         require(set(reader_pin) == {"path", "bytes", "sha256"} and
                 reader_pin["path"] == runtime["codex_binary"], "same_search_reader_binary")
@@ -165,10 +309,18 @@ class Full62Adapter:
         integer(runtime["trial_order_seed"])
         require(re.fullmatch(r"[a-z0-9][a-z0-9-]{0,79}", runtime["run_id"]), "run_id")
         require(Path(runtime["jobs_dir"]).is_absolute(), "explicit_jobs_directory")
+        if mode == "invocation_bounded":
+            # Harbor deletes unfinished trial directories when it resumes a job;
+            # the claims must survive that, so they never share jobs_dir.
+            claims, jobs = Path(runtime["decisions_claims_dir"]), Path(runtime["jobs_dir"]).resolve()
+            require(not claims.is_relative_to(jobs) and not jobs.is_relative_to(claims),
+                    "decisions_claims_inside_jobs_dir")
         integer(runtime["max_asset_bytes"], 1, 2**40)
         for key in ("deadline_seconds", "judge_deadline_seconds"):
             integer(runtime[key], 1, 3600)
-        integer(runtime["max_tool_calls"], 1, 10000)
+        self.preflight["tool_budget"], warnings = tool_budget(runtime["max_tool_calls"],
+                                                              runtime["qualification_mismatches"])
+        self.preflight["warnings"] += warnings
         integer(runtime["max_input_bytes"], 1024, 1048576)
         # Validate every selected row before run() can create either arm. The
         # broad private row parser is not the product question capacity.
@@ -179,15 +331,7 @@ class Full62Adapter:
             value = runtime[key]
             require(isinstance(value, str) and value.startswith("/") and ".." not in Path(value).parts,
                     "sandbox_absolute_path")
-        require(set(self.judge) == {"schema", "prompt", "response_schema"} and
-                self.judge["schema"] == "gptgrep.harbor.primary-judge.v1", "frozen_judge_contract")
-        fields = [field for _, field, _, _ in string.Formatter().parse(self.judge["prompt"]) if field]
-        require(set(fields) == {"question", "answer", "answer_format", "response"}, "primary_only_fields")
-        schema = self.judge["response_schema"]
-        require(schema.get("type") == "object" and "equivalent" in schema.get("required", []) and
-                schema.get("properties", {}).get("equivalent", {}).get("type") == "boolean" and
-                all(v.get("type") in ("boolean", "string") for v in schema["properties"].values()),
-                "supported_frozen_schema")
+        judge_contract(self.judge)
         documents = runtime["documents"]
         require(len(documents) == 34 and len({d["document_id"] for d in documents}) == 34 and
                 {d["document_id"] for d in documents} == {r["document_id"] for r in self.rows}, "document_join")
@@ -203,6 +347,8 @@ class Full62Adapter:
                 integer(runtime["max_assets_total_bytes"], 1), "asset_total_bound")
         require(approval.get("assets_sha256") == sha(canonical(documents + runtime["index_files"])) and
                 approval.get("judge_sha256") == self.manifest["judge_contract"]["sha256"], "assets_judge_admission")
+        # Fail before any task exists rather than in every treatment Ask.
+        self.preflight["index"] = index_identity(runtime)
 
     def run(self, output_dir, *, limit=None, task_ids=None, overwrite=False):
         # No destructive overwrite: an interrupted or consumed output is retained.
@@ -220,6 +366,9 @@ class Full62Adapter:
         assets = self.runtime["documents"] + self.runtime["index_files"]
         for asset in assets:
             copy_asset(asset["pin"], self.runtime["max_asset_bytes"])
+        # Docker Compose reads the reader seccomp profile from its host path when
+        # it creates each reader container; recheck the approved bytes first.
+        pinned(reader_seccomp_profile(self.runtime.get("reader_seccomp_profile")))
         require(not (root.parent / (root.name + ".export.json")).exists() and
                 not (root.parent / (root.name + ".job.json")).exists(), "fresh_companion_outputs")
         preparation = self.runtime.get("decisions_preparation")
@@ -227,6 +376,17 @@ class Full62Adapter:
             for key in ("controls_directory", "financial_family_directory", "trial_state_directory"):
                 require(not Path(preparation[key]).is_relative_to(root), "decisions_inside_task_output")
             put(Path(preparation["trial_state_directory"]) / "sole-writer.lock", b"")
+        if selected_mode(self.runtime) == "invocation_bounded":
+            claims = Path(self.runtime["decisions_claims_dir"])
+            require(not claims.is_relative_to(root) and not root.is_relative_to(claims),
+                    "decisions_inside_task_output")
+            # One claims root per materialized cohort: a consumed root, whose
+            # trials may already have spent, cannot be materialized again.
+            require(not any(claims.iterdir()), "decisions_claims_not_fresh")
+            put(claims / "cohort.json", {"schema": "gptgrep.harbor.decisions-invocation-claims.v1",
+                                         "run_id": self.runtime["run_id"],
+                                         "runtime_sha256": self.manifest["runtime"]["sha256"],
+                                         "treatment_trials": len(self.rows)})
         root.mkdir(mode=0o700, parents=False)
         package = Path(__file__).parent
         exported = []
@@ -251,7 +411,8 @@ class Full62Adapter:
         index = {"schema": "gptgrep.harbor.export.v1", "cohort": self.manifest["cohort"],
                  "runtime": self.manifest["runtime"], "judge_contract": self.manifest["judge_contract"],
                  "source_cohort_sha256": self.cohort["source_cohort_sha256"], "tasks": exported,
-                 "expected_pairs": 62, "expected_documents": 34, "runtime_started": False}
+                 "expected_pairs": 62, "expected_documents": 34, "runtime_started": False,
+                 "preflight": self.preflight}
         order = paired_order(exported, self.runtime["trial_order_seed"])
         job = {"job_name": self.runtime["run_id"], "jobs_dir": self.runtime["jobs_dir"],
                "n_attempts": 1, "n_concurrent_trials": 1, "retry": {"max_retries": 0},
@@ -272,6 +433,8 @@ class Full62Adapter:
 
     def _task(self, task, package, row, document, binding):
         runtime, arm = self.runtime, binding["arm"]
+        # Every task materializes a reader role: refuse a missing pin before writing.
+        reader_security = reader_security_opt(runtime.get("reader_seccomp_profile"))
         template = package / "task-template"
         # Templates are finite source members, not a task-data discovery surface.
         for name in ("solution/solve.sh", "tests/test.sh"):
@@ -292,17 +455,20 @@ class Full62Adapter:
                   "budget_scope": {"query_deadline": "shared", "instruction_bytes": "shared_local_cap",
                       "reader_question_max_bytes": min(MAX_READER_QUESTION_BYTES, runtime["max_input_bytes"]),
                       "tool_calls": "treatment_enforced_raw_observed_only",
+                      "treatment_max_tool_calls": runtime["max_tool_calls"], "raw_tool_call_cap": "none",
+                      "treatment_tool_cap_parity": tool_cap_parity(runtime["max_tool_calls"]),
                       "total_provider_input": "not_enforced_by_raw_cli"},
                   **{key: runtime[key] for key in ("platform", "codex_binary", "gptgrep_binary", "codex_home",
                      "jev_model", "reader_mode", "native_ptc", "codex_permissions",
                      "deadline_seconds", "max_tool_calls", "max_input_bytes")},
                   "source_relative_path": document["relative_path"],
                   "raw_document": "/data/corpus/" + document["relative_path"]}
+        mode = reader["decisions_mode"] = selected_mode(runtime)
         preparation = runtime.get("decisions_preparation")
         trial_state = None
-        if preparation is None:
+        if mode == "existing_context":
             reader["decisions_budget"] = {**runtime["decisions_budget"], "path": DECISIONS_BUDGET}
-        elif arm == "gptgrep":
+        elif mode == "preparation" and arm == "gptgrep":
             trial_id = sha(canonical(binding))[:32]
             trial_state = Path(preparation["trial_state_directory"]) / trial_id
             trial_state.mkdir(mode=0o700)
@@ -310,10 +476,19 @@ class Full62Adapter:
                 "seed": {**preparation["seed"], "path": CONTROL_ROOT + "/seed.json"},
                 # The unchanged financial guard caps each identifier at 96 bytes.
                 "run_id": runtime["run_id"][:63] + "-" + trial_id, "max_concurrent_batches": 1}
+        elif mode == "invocation_bounded" and arm == "gptgrep":
+            # One fresh claim directory per treatment trial, outside the job.
+            trial_state = Path(runtime["decisions_claims_dir"]) / sha(canonical(binding))[:32]
+            trial_state.mkdir(mode=0o700)
         put(task / "environment/reader.json", reader)
+        # The frozen response schema enters only the Judge's private /tests area.
+        schema_bytes = output_schema_bytes(self.judge["response_schema"])
+        put(task / "tests" / PurePosixPath(JUDGE_OUTPUT_SCHEMA).name, schema_bytes)
         judge = {"binding": binding, "question": row["question"], "reference": row["reference"],
                  "base_tool_environment": reader["base_tool_environment"],
                  "answer_format": row["answer_format"], "contract": self.judge,
+                 "output_schema": {"path": JUDGE_OUTPUT_SCHEMA, "bytes": len(schema_bytes),
+                                   "sha256": sha(schema_bytes)},
                  "codex_binary": runtime["codex_binary"],
                  "reader_base_binary": runtime["reader_base_binary"],
                  "judge_profile": runtime["judge_profile"],
@@ -341,7 +516,7 @@ class Full62Adapter:
                      "WORKDIR /data/corpus\n")
         judgedocker = ("FROM " + runtime["images"]["judge"] + "\n"
                        "COPY gptgrep_harbor /tests/gptgrep_harbor\n"
-                       "COPY judge.json test.sh /tests/\n"
+                       "COPY judge.json " + PurePosixPath(JUDGE_OUTPUT_SCHEMA).name + " test.sh /tests/\n"
                        "COPY config.toml " + CODEX_HOME + "/config.toml\n"
                        "RUN mkdir -p " + WORK_DIR + " && chmod 700 " + CODEX_HOME + " " + WORK_DIR + "\n"
                        "ENV PYTHONPATH=/tests PYTHONDONTWRITEBYTECODE=1 CODEX_HOME=" + CODEX_HOME + "\n"
@@ -354,14 +529,24 @@ class Full62Adapter:
             profile = PROFILE if role == "reader" else runtime["judge_profile"]
             put(task / directory / "config.toml", model_config(profile, role))
             compose = auth_compose(runtime["auth"][auth_key], runtime["platform"], runtime["run_id"])
+            if role == "reader":
+                # Both arms identically. The Judge/verifier compose keeps
+                # Docker's default profile and carries no security option.
+                compose["services"]["main"]["security_opt"] = list(reader_security)
             if role == "reader" and arm == "gptgrep":
-                mounts = ([(preparation["controls_directory"], CONTROL_ROOT, True),
-                           (preparation["financial_family_directory"], FAMILY_ROOT, False),
-                           (str(trial_state), TRIAL_ROOT, False),
-                           (str(Path(preparation["trial_state_directory"]) / "sole-writer.lock"), WRITER_LOCK, False)]
-                          if preparation is not None else
-                          [(runtime["decisions_budget"]["path"], DECISIONS_BUDGET, True),
-                           (runtime["decisions_ledger_dir"], DECISIONS_LEDGER_DIR, False)])
+                if mode == "preparation":
+                    mounts = [(preparation["controls_directory"], CONTROL_ROOT, True),
+                              (preparation["financial_family_directory"], FAMILY_ROOT, False),
+                              (str(trial_state), TRIAL_ROOT, False),
+                              (str(Path(preparation["trial_state_directory"]) / "sole-writer.lock"), WRITER_LOCK,
+                               False)]
+                elif mode == "existing_context":
+                    mounts = [(runtime["decisions_budget"]["path"], DECISIONS_BUDGET, True),
+                              (runtime["decisions_ledger_dir"], DECISIONS_LEDGER_DIR, False)]
+                else:
+                    # invocation_bounded: no ledger or budget state leaves the
+                    # host; only this trial's own claim directory is writable.
+                    mounts = [(str(trial_state), CLAIM_ROOT, False)]
                 for source, target, read_only in mounts:
                     compose["services"]["main"]["volumes"].append({"type": "bind",
                         "source": source, "target": target, "read_only": read_only,
@@ -369,7 +554,8 @@ class Full62Adapter:
             put(task / directory / "docker-compose.yaml", compose)
             # Credentials and arbitrary sibling files cannot enter either image.
             allowed = ["gptgrep_harbor", "config.toml"] + (
-                ["reader.json", "codex-native", "corpus"] if role == "reader" else ["judge.json", "test.sh"])
+                ["reader.json", "codex-native", "corpus"] if role == "reader" else
+                ["judge.json", PurePosixPath(JUDGE_OUTPUT_SCHEMA).name, "test.sh"])
             ignore = ["**"]
             for name in allowed:
                 ignore.append("!" + name)

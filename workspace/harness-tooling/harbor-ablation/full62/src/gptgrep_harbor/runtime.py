@@ -42,6 +42,16 @@ LOOPBACK_NO_PROXY = ("127.0.0.1", "localhost", "::1")
 # supervisor (codex-auth `run --harbor-job-label`) can see the job's containers
 # and keep the credential lease until they are gone.
 AUTH_JOB_LABEL = "gptgrep.auth-job"
+# Codex 0.162.1 enables these by default; every role disables them explicitly.
+EXTERNAL_TOOL_FEATURES = ("apps", "plugins", "tool_suggest")
+# The owner-approved (2026-10-13) seccomp profile of the two reader roles only:
+# Docker 29.4.0's default profile plus one unconditional allow for exactly
+# unshare, clone, clone3, setns, mount, umount2 and pivot_root, which Codex's
+# bundled bubblewrap needs for its user, mount and PID namespaces. The source
+# tree's seccomp/ directory derives these exact bytes from the vendored
+# upstream profile. Judge and verifier containers keep Docker's default.
+READER_SECCOMP_BYTES = 12447
+READER_SECCOMP_SHA256 = "769a5dbb42b7b10edb07b516be7077e4a602a214a4c55ec892abd6d323bab48b"
 
 
 def native_identity(value):
@@ -197,7 +207,7 @@ def auth_paths(value):
 
 
 def model_config(profile, role):
-    """Both reader arms receive exactly these same bytes and filesystem policy."""
+    """Both reader arms receive exactly these same bytes, filesystem and network policy."""
     require(role in ("reader", "judge"), "native_role")
     name = "full62_" + role
     settings = {
@@ -205,19 +215,30 @@ def model_config(profile, role):
         "service_tier": profile["service_tier"], "model_provider": "openai",
         "cli_auth_credentials_store": "file", "forced_login_method": "chatgpt",
         "approval_policy": "never", "default_permissions": name,
-        "web_search": "live" if role == "reader" else "disabled",
+        # No reader or Judge has external access: no hosted web search here, no
+        # connector or plugin tools and no model-tool network below. GPTgrep's
+        # Decisions requests come from its host process, outside this Codex
+        # tool sandbox.
+        "web_search": "disabled",
     }
     lines = [key + " = " + json.dumps(value) for key, value in settings.items()]
     enabled = "true" if role == "reader" else "false"
     lines += ["", "[features]", "shell_tool = " + enabled, "view_image = " + enabled]
     if role == "reader":
-        lines += [feature + " = true" for feature in (
-            "unified_exec", "multi_agent", "plugins", "apps", "tool_suggest")]
+        lines += [feature + " = true" for feature in ("unified_exec", "multi_agent")]
+    else:
+        lines += ["code_mode_only = false", "code_mode_prewarm = false"]
+    # Host-side external tools stay off for every role. With ChatGPT auth,
+    # `apps` registers the account's Codex Apps connector server and `plugins`
+    # loads account cloud plugins and their MCP servers; `tool_suggest` offers
+    # to install more. Their traffic leaves from the Codex process itself, so
+    # the network policy below does not govern it.
+    lines += [feature + " = false" for feature in EXTERNAL_TOOL_FEATURES]
+    if role == "reader":
         lines += ["", "[features.code_mode]", "enabled = true",
                   "", "[features.code_mode_host]", "enabled = true"]
     else:
-        lines += ["code_mode_only = false", "code_mode_prewarm = false",
-                  "", "[features.code_mode]", "enabled = false",
+        lines += ["", "[features.code_mode]", "enabled = false",
                   "direct_only_tool_namespaces = []",
                   "", "[features.code_mode_host]", "enabled = false",
                   "disable_in_process_fallback = true"]
@@ -229,7 +250,7 @@ def model_config(profile, role):
         lines.append(json.dumps(path) + ' = "deny"')
     if role == "judge":
         lines.append('"/data" = "deny"')
-    lines += ["", "[permissions." + name + ".network]", "enabled = " + enabled, ""]
+    lines += ["", "[permissions." + name + ".network]", "enabled = false", ""]
     return "\n".join(lines).encode()
 
 
@@ -245,6 +266,35 @@ def auth_compose(auth_file, platform, job_id):
         "type": "bind", "source": auth_file, "target": CODEX_HOME + "/auth.json",
         "read_only": True, "bind": {"create_host_path": False},
     }]}}}
+
+
+def reader_seccomp_profile(value):
+    """Validate the strict host pin of the approved reader profile; reads no file.
+
+    Any other profile, even with a self-consistent pin, needs a new owner
+    approval and a reviewed source change.
+    """
+    require(value is not None, "reader_seccomp_profile_required")
+    require(type(value) is dict and set(value) == {"path", "bytes", "sha256"}, "reader_seccomp_profile_pin")
+    path = value["path"]
+    # Compose would interpolate "$"; the path must be literal and normalized.
+    require(isinstance(path, str) and path.startswith("/") and PurePosixPath(path).as_posix() == path and
+            ".." not in PurePosixPath(path).parts and
+            not any(c in path for c in ("$", "\n", "\r", "\x00")), "reader_seccomp_profile_path")
+    integer(value["bytes"], 1, 2**20)
+    digest(value["sha256"])
+    require(value["bytes"] == READER_SECCOMP_BYTES and value["sha256"] == READER_SECCOMP_SHA256,
+            "reader_seccomp_profile_not_approved")
+    return value
+
+
+def reader_security_opt(value):
+    """The reader roles' only Docker security option, identical in both arms.
+
+    Docker Compose reads the profile from this absolute host path when it
+    creates the container. The Judge/verifier compose never carries it.
+    """
+    return ["seccomp=" + reader_seccomp_profile(value)["path"]]
 
 
 def native_environment(environ, *, product=False):

@@ -1,0 +1,89 @@
+{
+  "schema": "gptgrep.harbor.reader-seccomp-provenance.v1",
+  "engine": {
+    "product": "Docker Engine",
+    "version": "29.4.0",
+    "source_repository": "https://github.com/moby/moby",
+    "source_tag": "docker-v29.4.0",
+    "source_commit": "daa0cb7f23594cdbcce5002e370027d3fd36ffd7"
+  },
+  "upstream": {
+    "repository": "https://github.com/moby/moby",
+    "commit": "daa0cb7f23594cdbcce5002e370027d3fd36ffd7",
+    "path": "vendor/github.com/moby/profiles/seccomp/default.json",
+    "module": "github.com/moby/profiles/seccomp",
+    "module_version": "v0.1.0",
+    "module_source": {
+      "repository": "https://github.com/moby/profiles",
+      "tag": "seccomp/v0.1.0",
+      "commit": "c936cc7b4074219137bc0bee45670f5e4618d462",
+      "path": "seccomp/default.json"
+    },
+    "vendored": {
+      "path": "upstream/default.json",
+      "bytes": 13063,
+      "sha256": "01536f1d1df938ae611eba20d6349e0de7a99b6ecdee1549427a0b01b8301e28"
+    },
+    "license": {
+      "spdx": "Apache-2.0",
+      "path": "upstream/LICENSE",
+      "bytes": 11358,
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "notice_file": null
+    }
+  },
+  "derived": {
+    "path": "gptgrep-reader-seccomp.json",
+    "bytes": 12447,
+    "sha256": "769a5dbb42b7b10edb07b516be7077e4a602a214a4c55ec892abd6d323bab48b",
+    "derivation": "derive.py",
+    "serialization": "json.dumps(indent=1, ensure_ascii=True) followed by one LF"
+  },
+  "syscalls": ["unshare", "clone", "clone3", "setns", "mount", "umount2", "pivot_root"],
+  "change": {
+    "removed": [
+      {
+        "upstream_index": 15,
+        "upstream_rule": "SCMP_ACT_ALLOW only when CAP_SYS_ADMIN is held",
+        "names": ["clone", "clone3", "mount", "setns", "umount2", "unshare"],
+        "rule_kept_for_other_names": true
+      },
+      {
+        "upstream_index": 16,
+        "upstream_rule": "SCMP_ACT_ALLOW clone without namespace flags (argument 0); excludes s390/s390x and CAP_SYS_ADMIN",
+        "names": ["clone"],
+        "rule_kept_for_other_names": false
+      },
+      {
+        "upstream_index": 17,
+        "upstream_rule": "SCMP_ACT_ALLOW clone without namespace flags on s390/s390x (argument 1); excludes CAP_SYS_ADMIN",
+        "names": ["clone"],
+        "rule_kept_for_other_names": false
+      },
+      {
+        "upstream_index": 18,
+        "upstream_rule": "SCMP_ACT_ERRNO 38 (ENOSYS) for clone3 without CAP_SYS_ADMIN",
+        "names": ["clone3"],
+        "rule_kept_for_other_names": false
+      }
+    ],
+    "not_in_upstream": ["pivot_root"],
+    "not_in_upstream_effect": "denied by defaultAction SCMP_ACT_ERRNO with defaultErrnoRet 1 (EPERM)",
+    "added": "one final SCMP_ACT_ALLOW rule for exactly the seven syscalls, with no args, includes or excludes",
+    "unchanged": "defaultAction, defaultErrnoRet, archMap and every rule of every other syscall, in upstream order"
+  },
+  "approval": {
+    "owner_approved_utc_date": "2026-10-13",
+    "scope": "The two full62 reader roles only (bare Codex and GPTgrep + Codex arms, identically), through security_opt seccomp=<absolute host path> in the adapter's generated reader compose file",
+    "unchanged": [
+      "Judge and verifier containers keep Docker's default seccomp profile",
+      "no added capabilities",
+      "privileged stays false",
+      "no systempaths change",
+      "mounts unchanged",
+      "network policy unchanged",
+      "container engine and host settings unchanged"
+    ],
+    "rollback": "Remove the security_opt entry from the adapter's generated reader compose files and delete the profile file; images, engine and host settings need no change"
+  }
+}

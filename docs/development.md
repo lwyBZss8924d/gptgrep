@@ -328,6 +328,7 @@ the approved main comparison.
 export GPTGREP_FULL62_SOURCE="$PWD/workspace/harness-tooling/harbor-ablation/full62"
 export UV_PROJECT_ENVIRONMENT="$GPTGREP_DEV_ROOT/full62-venv"
 uv sync --project "$GPTGREP_FULL62_SOURCE" --frozen
+# Host test extra: the hashed Pillow 12.3.0 lock.
 uv pip install --python "$UV_PROJECT_ENVIRONMENT/bin/python" --require-hashes \
   -r "$GPTGREP_FULL62_SOURCE/base-image/requirements.lock"
 uv run --project "$GPTGREP_FULL62_SOURCE" --frozen gptgrep-harbor-full62 --help
@@ -335,24 +336,46 @@ uv run --project "$GPTGREP_FULL62_SOURCE" --frozen python -B -m unittest discove
   -s "$GPTGREP_FULL62_SOURCE/tests" -v
 ```
 
-The adapter's base-image tests import Pillow 12.3.0 on the host, but `uv.lock` pins
-only Harbor. Install the hashed `base-image/requirements.lock` into the same
-environment. An exact `uv sync` removes packages outside the lock, so reinstall
-after every sync.
+`uv.lock` pins only the adapter's runtime dependencies (Harbor), while the
+base-image probe test imports Pillow 12.3.0 on the host. Install it into the same
+environment only from hashed requirements: the base image's `requirements.lock`
+above, or a local extras file in the same `pillow==12.3.0 --hash=sha256:...`
+format that lists the host wheel's hash. An exact `uv sync` removes packages
+outside the lock, so reinstall after every sync.
+
+An environment shared between checkouts has one editable install that points at
+only one of them. When reusing such an interpreter for another checkout, run the
+suite with `PYTHONPATH="$GPTGREP_FULL62_SOURCE/src"` (not with `python -I`, which
+ignores it) and record the `gptgrep_harbor.__file__` it imported;
+`tests/test_source_identity.py` fails if the suite imports any other source tree.
 
 For a real run, follow the adapter's sequence: build and verify the common
 Python/Pillow/Poppler/native-Codex foundation; add the complete Linux GPTgrep plus
-PDFium bundle to the treatment derivative; qualify matching reader permissions
-and account mounts; supply the frozen private cohort and Judge contract; prepare
-all 124 tasks; build exact role images; run the generated Harbor job; aggregate
-all paired outcomes. Its `prepare`, `build-local-images` and `aggregate` commands
-require pinned manifests. `harbor run -c GENERATED_JOB_JSON` uses the same installed
-adapter environment and a fresh admitted output namespace, with one attempt and
-no automatic retry.
+PDFium bundle to the treatment derivative; build the treatment index inside that
+Linux image at `/data/corpus` with its product binary, from the raw documents only
+and before any question is exposed (materialization rejects an index whose pinned
+manifest root is not `/data/corpus` or whose sources differ from the pinned
+documents, such as a host-built index); qualify matching reader permissions and account mounts; pin
+the owner-approved reader seccomp profile that both reader containers need for Codex's
+bubblewrap sandbox (the adapter's `seccomp/` directory); supply
+the frozen private cohort and Judge contract; select one treatment Decisions mode
+(an existing shared ledger, per-trial preparation, or invocation-bounded contexts
+with one create-new host claim per treatment trial, a pinned price and a cohort
+cost cap that is checked at admission, not enforced at runtime); prepare all 124
+tasks; build exact role images; run the generated Harbor job; aggregate all paired
+outcomes. Its `prepare`,
+`build-local-images` and `aggregate` commands require pinned manifests; `prepare`
+prints its budget preflight before writing tasks. `harbor run -c GENERATED_JOB_JSON`
+uses the same installed adapter environment and a fresh admitted output namespace,
+with one attempt and no automatic retry.
 
 Raw Codex receives only original documents and may extract/render during SEARCH.
 GPTgrep receives the same bytes plus a frozen index built before question access.
-Both readers use the same selected native binary and generic raw-document tools.
+Both readers use the same selected native binary and generic raw-document tools,
+with identical configuration bytes that disable hosted web search, the host-side
+connector, plugin and tool-suggestion features, and model-tool network access.
+Both reader containers run under the same seccomp profile, which adds only the
+namespace calls bubblewrap needs to Docker's default; the Judge keeps the default.
 GPTgrep's reader contract (base instructions, citation and abstention rules and
 answer rules) is part of the treatment; the raw-only reader receives the common
 task prompt with Codex's default base instructions. In this source the adapter's

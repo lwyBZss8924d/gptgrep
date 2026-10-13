@@ -14,10 +14,10 @@ from gptgrep_harbor.adapter import Full62Adapter, validate_cohort, env_templates
 import gptgrep_harbor.adapter as adapter_module
 from gptgrep_harbor.aggregate import paired, summarize, time_bounds
 from gptgrep_harbor.common import MAX_ANSWER, MAX_NATIVE_PROMPT_BYTES, PROFILE, canonical, parse, sha
-from gptgrep_harbor.native import codex_accounting, codex_result, prompt_bytes
+from gptgrep_harbor.native import codex_accounting, codex_result, output_schema_bytes, prompt_bytes
 from gptgrep_harbor.reader import product_accounting
 from gptgrep_harbor import reader, verifier
-from gptgrep_harbor.runtime import CODEX_VERSION
+from gptgrep_harbor.runtime import CODEX_VERSION, READER_SECCOMP_BYTES, READER_SECCOMP_SHA256
 from gptgrep_harbor.verifier import grade, transport_reward
 from gptgrep_harbor.process import run as bounded_process
 
@@ -169,6 +169,57 @@ class PairedTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.aggregate(export, records, runtime, blobs)
 
+    def test_summary_records_treatment_tool_cap_against_uncapped_bare_arm(self):
+        export, records, runtime, blobs = synthetic_results()
+        runtime["max_tool_calls"] = 10000
+        scope = self.aggregate(export, records, runtime, blobs)["profile"]["budget_scope"]
+        self.assertEqual((scope["treatment_max_tool_calls"], scope["raw_tool_call_cap"]), (10000, "none"))
+        self.assertEqual(scope["tool_calls"], "treatment_enforced_raw_observed_only")
+        self.assertEqual(scope["treatment_tool_cap_parity"], "adapter_maximum")
+        runtime["max_tool_calls"] = 500
+        scope = self.aggregate(export, records, runtime, blobs)["profile"]["budget_scope"]
+        self.assertEqual(scope["treatment_tool_cap_parity"], "declared_deviation")
+
+    def test_abstention_counts_come_from_retained_verdicts_and_operation_records(self):
+        export, records, runtime, blobs = synthetic_results()
+        by_arm = {arm: [record for record, row in zip(records, export["tasks"]) if row["binding"]["arm"] == arm]
+                  for arm in ("gptgrep", "raw_only")}
+
+        def judged(record, verdict):
+            judgment = parse(blobs[record["judgment"]])
+            judgment.update(label=int(verdict["equivalent"]), verdict=verdict,
+                            verdict_sha256=sha(canonical(verdict)))
+            blobs[record["judgment"]] = canonical(judgment)
+
+        for record in by_arm["gptgrep"][:3]:
+            judged(record, {"equivalent": False, "abstained": True, "reason": "synthetic"})
+            operation = parse(blobs[record["operation"]])
+            operation["insufficient_evidence"] = True
+            blobs[record["operation"]] = canonical(operation)
+        for record in by_arm["gptgrep"][3:10] + by_arm["raw_only"][:5]:
+            judged(record, {"equivalent": True, "abstained": False, "reason": "synthetic"})
+        judged(by_arm["raw_only"][5], {"equivalent": True, "abstained": True, "reason": "synthetic"})
+        summary = self.aggregate(export, records, runtime, blobs)
+        self.assertEqual(summary["search"]["gptgrep"]["intentional_abstentions"],
+                         {"product_insufficient_evidence": 3, "judge_abstained": 3,
+                          "judged_abstention_unobserved": 52, "answerability_slices": None})
+        self.assertEqual(summary["search"]["raw_only"]["intentional_abstentions"],
+                         {"product_insufficient_evidence": 0, "judge_abstained": 1,
+                          "judged_abstention_unobserved": 56, "answerability_slices": None})
+        self.assertTrue(any("answerability" in note for note in summary["limitations"]))
+        # A retained verdict must match its digest and its label.
+        for change in ({"abstained": False}, {"equivalent": True}):
+            with self.subTest(change=change):
+                original = blobs[by_arm["gptgrep"][0]["judgment"]]
+                judgment = parse(original)
+                judgment["verdict"].update(change)
+                if "equivalent" in change:
+                    judgment["verdict_sha256"] = sha(canonical(judgment["verdict"]))
+                blobs[by_arm["gptgrep"][0]["judgment"]] = canonical(judgment)
+                with self.assertRaisesRegex(ValueError, "judge_verdict_binding"):
+                    self.aggregate(export, records, runtime, blobs)
+                blobs[by_arm["gptgrep"][0]["judgment"]] = original
+
     def test_unknown_cost_is_not_free(self):
         export, records, runtime, blobs = synthetic_results()
         result = self.aggregate(export, records, runtime, blobs)
@@ -274,19 +325,34 @@ class NativeAccountingTests(unittest.TestCase):
         self.assertLess(child.call_args.kwargs["timeout"], config["deadline_seconds"])
         return outputs
 
-    def judge_main(self, stdout, answer="synthetic answer", **overrides):
+    single_field_schema = {"type": "object", "additionalProperties": False, "required": ["equivalent"],
+                           "properties": {"equivalent": {"type": "boolean"}}}
+
+    def judge_main(self, stdout, answer="synthetic answer", schema=None, schema_fault=None, **overrides):
+        schema = self.single_field_schema if schema is None else schema
+        directory = tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"])
+        self.addCleanup(directory.cleanup)
+        schema_file = Path(directory.name).resolve() / "judge-output-schema.json"
+        data = output_schema_bytes(schema)
+        schema_file.write_bytes(data)
+        pin = {"path": str(schema_file), "bytes": len(data), "sha256": sha(data)}
+        if schema_fault == "changed_file":
+            schema_file.write_bytes(data.replace(b'"boolean"', b'"string" ', 1))
+        elif schema_fault == "other_contract":
+            schema = {**schema, "required": list(schema["required"]) + ["synthetic_extra"]}
         config = {"binding": self.binding(), "codex_binary": "/synthetic/codex",
                   "reader_base_binary": {"path": "/synthetic/codex"}, "judge_profile": PROFILE,
                   "judge_deadline_seconds": 20, "native_config_sha256": "e" * 64,
                   "base_tool_environment": {},
                   "question": "synthetic question", "reference": "synthetic reference", "answer_format": "text",
                   "contract": {"prompt": "Q:{question}\nR:{answer}\nF:{answer_format}\nA:{response}",
-                      "response_schema": {"type": "object", "required": ["equivalent"],
-                                          "properties": {"equivalent": {"type": "boolean"}}}}}
+                               "response_schema": schema},
+                  "output_schema": pin}
         envelope = {"schema": "gptgrep.harbor.answer.v1", "binding": self.binding(),
                     "status": "response", "answer": answer}
         outputs = {}
         with patch.object(verifier, "read", side_effect=[canonical(config), canonical(envelope)]), \
+             patch.object(verifier, "JUDGE_OUTPUT_SCHEMA", str(schema_file)), \
              patch.object(verifier, "check_config"), patch.object(verifier, "copy_asset"), \
              patch.object(verifier, "native_environment", return_value={}), \
              patch.object(verifier.Path, "exists", return_value=False), \
@@ -294,10 +360,13 @@ class NativeAccountingTests(unittest.TestCase):
              patch.object(verifier, "run", side_effect=[self.native_run_result(("codex-cli " + CODEX_VERSION).encode()),
                                                         self.native_run_result(stdout, **overrides)]) as child:
             verifier.main()
+        self.judge_calls = child.call_count
         if child.call_count:
             argv = child.call_args.args[0]
             self.assertEqual(argv[-2:], ["--", "-"])
+            self.assertEqual(argv[argv.index("--output-schema") + 1], str(schema_file))
             self.assertNotIn(answer, argv)
+            # The frozen prompt bytes are unchanged by structured output.
             expected = config["contract"]["prompt"].format(question=config["question"], answer=config["reference"],
                                                          answer_format=config["answer_format"], response=answer).encode()
             self.assertEqual(child.call_args.kwargs["input_bytes"], expected)
@@ -324,6 +393,64 @@ class NativeAccountingTests(unittest.TestCase):
                     self.assertEqual(attempt["native_process_incomplete"], name == "failed_process")
                     if name != "failed_process":
                         self.assertTrue(attempt["native_stream_incomplete"])
+
+    frozen_like_schema = {"type": "object", "additionalProperties": False,
+                          "required": ["equivalent", "abstained", "reason"],
+                          "properties": {"equivalent": {"type": "boolean"}, "abstained": {"type": "boolean"},
+                                         "reason": {"type": "string"}}}
+
+    def test_schema_valid_structured_judge_reply_is_parsed(self):
+        verdict = {"equivalent": True, "abstained": False, "reason": "synthetic"}
+        output = self.judge_main(self.events(canonical(verdict).decode()), schema=self.frozen_like_schema)
+        result = output["/logs/verifier/judgment.json"]
+        self.assertEqual((result["status"], result["label"]), ("judged", 1))
+        self.assertTrue(result["judge_attempts"][0]["output_schema_verified"])
+        self.assertEqual(output["/logs/verifier/reward.json"]["answer_equivalence"], 1)
+        # The validated verdict stays reviewable beside its digest.
+        self.assertEqual(result["verdict"], verdict)
+        self.assertEqual(result["verdict_sha256"], sha(canonical(verdict)))
+
+    def test_schema_file_lists_properties_in_the_frozen_required_order(self):
+        # A key-sorted contract file (as the frozen-contract builder writes it)
+        # keeps the upstream generation order only in `required`.
+        sorted_contract = parse(canonical({**self.frozen_like_schema, "properties": {
+            "equivalent": {"type": "boolean", "description": "same answer"},
+            "abstained": {"type": "boolean", "description": "no answer"},
+            "reason": {"type": "string", "description": "short"}}}))
+        self.assertEqual(list(sorted_contract["properties"]), ["abstained", "equivalent", "reason"])
+        data = output_schema_bytes(sorted_contract)
+        written = json.loads(data)
+        self.assertEqual(list(written["properties"]), ["equivalent", "abstained", "reason"])
+        self.assertEqual(list(written), sorted(written))
+        self.assertEqual(list(written["properties"]["equivalent"]), ["description", "type"])
+        self.assertEqual(written, sorted_contract)
+        # Deterministic: a reordered but equal contract yields the same bytes.
+        self.assertEqual(output_schema_bytes(json.loads(data)), data)
+        for broken in ({**sorted_contract, "required": ["equivalent", "abstained", "abstained"]},
+                       {**sorted_contract, "required": ["equivalent", "abstained"]},
+                       {**sorted_contract, "required": [["equivalent"], "abstained", "reason"]}):
+            with self.subTest(required=broken["required"]), \
+                    self.assertRaisesRegex(ValueError, "output_schema_property_order"):
+                output_schema_bytes(broken)
+
+    def test_non_json_or_schema_invalid_judge_reply_stays_unknown(self):
+        for reply in ("Equivalent: yes", '{"equivalent": true', '{"equivalent": true, "abstained": false}'):
+            with self.subTest(reply=reply):
+                output = self.judge_main(self.events(reply), schema=self.frozen_like_schema)
+                self.assertEqual(self.judge_calls, 2)
+                result = output["/logs/verifier/judgment.json"]
+                self.assertEqual((result["status"], result["label"]), ("judge_unavailable", None))
+                self.assertNotIn("answer_equivalence", output["/logs/verifier/reward.json"])
+
+    def test_output_schema_pin_is_verified_before_any_native_process(self):
+        for fault in ("changed_file", "other_contract"):
+            with self.subTest(fault=fault):
+                output = self.judge_main(self.events('{"equivalent":true}'), schema_fault=fault)
+                self.assertEqual(self.judge_calls, 0)
+                result = output["/logs/verifier/judgment.json"]
+                self.assertEqual((result["status"], result["label"]), ("judge_unavailable", None))
+                self.assertFalse(result["judge_attempts"][0]["output_schema_verified"])
+                self.assertNotIn("/logs/verifier/attempt-start.json", output)
 
     def test_complete_maximum_answer_uses_judge_stdin_with_independent_prompt_bound(self):
         answer = "x" * MAX_ANSWER
@@ -366,6 +493,207 @@ class NativeAccountingTests(unittest.TestCase):
         self.assertFalse(result["cost_complete"])
 
 
+def legacy_report(**changes):
+    """A synthetic gptgrep.host.v1 ask report; no task text."""
+    report = {"schema_version": "gptgrep.host.v1", "status": "completed", "answer": "A complete synthetic answer.",
+              "model": PROFILE["model"], "requested_reasoning_effort": "max", "requested_service_tier": "fast",
+              "effective_reasoning_effort": "max", "effective_service_tier": "priority", "citations": [],
+              "jev": {"usage": [{"cost": 0.0125}]}}
+    report.update(changes)
+    return canonical(report)
+
+
+class LegacyTreatmentReaderTests(unittest.TestCase):
+    """The treatment entrypoint and primary Judge for reader_mode=legacy_text."""
+    question = "synthetic question"
+    schema = NativeAccountingTests.frozen_like_schema
+
+    def binding(self):
+        return {"arm": "gptgrep", "pair_id": "synthetic", "document_id": "synthetic-document",
+                "cohort_sha256": "a" * 64, "runtime_sha256": "b" * 64, "judge_sha256": "c" * 64,
+                "question_sha256": sha(self.question.encode()), "document_sha256": "d" * 64}
+
+    def config(self):
+        return {"binding": self.binding(), "profile": PROFILE, "codex_binary": "/synthetic/codex",
+                "gptgrep_binary": "/synthetic/gptgrep", "codex_home": "/opt/full62-home",
+                "reader_base_binary": {"path": "/synthetic/codex"}, "max_input_bytes": 8192, "max_tool_calls": 8,
+                "native_cli": {}, "native_config_sha256": "e" * 64, "deadline_seconds": 20,
+                "base_tool_environment": {}, "permitted_tools": [], "generic_capabilities": [],
+                "qualification_mismatches": [], "budget_scope": {}, "reader_mode": "legacy_text",
+                "jev_model": "synthetic-decisions", "native_ptc": True, "codex_permissions": "full62_reader",
+                "source_relative_path": "synthetic.txt",
+                "decisions_budget": {"path": "/opt/full62-private/decisions-budget.json", "bytes": 1,
+                                     "sha256": "f" * 64}}
+
+    def run_reader(self, stdout, environ=None, config=None, claim_root="/synthetic/unmounted-claim"):
+        outputs = {}
+        version = {"stdout": ("codex-cli " + CODEX_VERSION).encode(), "stderr": b"", "elapsed_ms": 1,
+                   "return_code": 0, "failure": None, "stdin_bytes": 0, "stdin_bytes_sent": 0, "stdin_complete": True}
+        product = {**version, "stdout": stdout, "elapsed_ms": 10}
+        budget = canonical({"ledger_path": "/opt/full62-private/ledger/decisions.json"})
+        config = self.config() if config is None else config
+        with patch("gptgrep_harbor.decisions.CLAIM_ROOT", str(claim_root)), \
+             patch.object(reader, "read", side_effect=[canonical(config), self.question.encode()]), \
+             patch.object(reader, "check_config"), patch.object(reader, "copy_asset"), \
+             patch.object(reader, "check_product_bundle"), \
+             patch.object(reader, "pinned", return_value=budget) as budget_read, \
+             patch.object(reader.Path, "exists", return_value=False), \
+             patch.object(reader, "put", side_effect=lambda path, value: outputs.update({path: value})), \
+             patch.dict(os.environ, environ or {"PATH": "/usr/bin"}, clear=True), \
+             patch("sys.argv", ["reader", "--instruction", "/synthetic/instruction.txt"]), \
+             patch.object(reader, "run", side_effect=[version, product]) as child:
+            reader.main()
+        self.budget_reads = budget_read.call_count
+        return outputs, child
+
+    def judge_config(self):
+        return {"binding": self.binding(), "question": self.question, "reference": "synthetic reference",
+                "answer_format": "text",
+                "contract": {"prompt": "Q:{question}\nR:{answer}\nF:{answer_format}\nA:{response}",
+                             "response_schema": self.schema}}
+
+    def test_product_result_accepts_only_completed_answers_and_nonempty_abstentions(self):
+        abstention = "The supplied document does not state this."
+        answer, metadata = reader.product_result(legacy_report(status="insufficient_evidence", answer=abstention),
+                                                 "legacy_text")
+        self.assertEqual(answer, abstention)
+        self.assertEqual((metadata["product_status"], metadata["insufficient_evidence"]),
+                         ("insufficient_evidence", True))
+        _, completed = reader.product_result(legacy_report(), "legacy_text")
+        self.assertEqual((completed["product_status"], completed["insufficient_evidence"]), ("completed", False))
+        for status in ("failed", "interrupted", "partial", "", None):
+            with self.subTest(status=status), self.assertRaisesRegex(ValueError, "product_not_completed"):
+                reader.product_result(legacy_report(status=status), "legacy_text")
+        for empty in ("", "  \n", None):
+            with self.subTest(answer=empty), self.assertRaisesRegex(ValueError, "product_answer"):
+                reader.product_result(legacy_report(status="insufficient_evidence", answer=empty), "legacy_text")
+
+    def test_legacy_intentional_abstention_is_judged_and_recorded(self):
+        abstention = "The supplied document does not state this; no answer is given."
+        outputs, _ = self.run_reader(legacy_report(status="insufficient_evidence", answer=abstention))
+        envelope = outputs["/answer/answer.json"]
+        self.assertEqual((envelope["status"], envelope["answer"]), ("response", abstention))
+        operation = outputs["/logs/agent/operational.json"]
+        self.assertEqual(operation["status"], "response")
+        self.assertIs(operation["insufficient_evidence"], True)
+        self.assertIs(operation["attempts"][0]["insufficient_evidence"], True)
+        self.assertNotIn("failure", operation)
+        prompts = []
+        def judge(prompt, schema):
+            prompts.append(prompt)
+            return {"equivalent": False, "abstained": True, "reason": "synthetic"}, {}
+        result = grade(self.judge_config(), envelope, judge)
+        self.assertEqual((result["status"], result["label"]), ("judged", 0))
+        self.assertTrue(prompts[0].endswith(abstention))
+        completed, _ = self.run_reader(legacy_report())
+        self.assertIs(completed["/logs/agent/operational.json"]["insufficient_evidence"], False)
+
+    def test_treatment_product_keeps_openrouter_key_while_reader_tools_have_no_network(self):
+        import tomllib
+        from gptgrep_harbor.runtime import model_config
+        outputs, child = self.run_reader(legacy_report(),
+                                         environ={"PATH": "/usr/bin", "OPENROUTER_API_KEY": "synthetic-only"})
+        version_call, product_call = child.call_args_list
+        # Decisions requests come from the GPTgrep host process, outside the
+        # Codex tool sandbox whose network the shared reader policy disables.
+        self.assertEqual(product_call.args[0][0], "/synthetic/gptgrep")
+        self.assertEqual(product_call.kwargs["env"]["OPENROUTER_API_KEY"], "synthetic-only")
+        self.assertNotIn("OPENROUTER_API_KEY", version_call.kwargs["env"])
+        self.assertEqual(outputs["/answer/answer.json"]["status"], "response")
+        policy = tomllib.loads(model_config(PROFILE, "reader").decode())
+        self.assertEqual(policy["web_search"], "disabled")
+        self.assertIs(policy["permissions"]["full62_reader"]["network"]["enabled"], False)
+
+    def test_existing_context_ask_still_joins_the_mounted_budget(self):
+        outputs, child = self.run_reader(legacy_report())
+        self.assertEqual(self.budget_reads, 1)
+        self.assertEqual(child.call_args_list[1].args[0][1:4],
+                         ["--decisions-budget", "/opt/full62-private/decisions-budget.json", "ask"])
+        self.assertEqual(outputs["/logs/agent/operational.json"]["decisions_mode"], "existing_context")
+
+    def claim_root(self):
+        directory = tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"])
+        self.addCleanup(directory.cleanup)
+        return Path(directory.name).resolve()
+
+    def test_invocation_bounded_ask_claims_once_and_keeps_its_cost_receipt(self):
+        config = {**self.config(), "decisions_mode": "invocation_bounded"}
+        del config["decisions_budget"]
+        jev = {"requests": 2, "attempted_calls": 2, "unobserved_attempts": 0, "accounting_complete": True,
+               "usage": [{"cost": 0.0125}, {"cost": 0.0075}]}
+        for status, expected in (("completed", "response"), ("failed", "operational_failure")):
+            with self.subTest(status=status):
+                report = legacy_report(status=status, jev=jev)
+                if status == "failed":
+                    # A failed Ask reports its Decisions accounting under error.
+                    report = canonical({"status": "failed", "error": {"jev": jev}})
+                claim_root = self.claim_root()
+                outputs, child = self.run_reader(report, config=config, claim_root=claim_root)
+                self.assertEqual(self.budget_reads, 0)
+                argv = child.call_args_list[1].args[0]
+                self.assertEqual(argv[:2], ["/synthetic/gptgrep", "ask"])
+                self.assertNotIn("--decisions-budget", argv)
+                self.assertEqual(outputs["/answer/answer.json"]["status"], expected)
+                operation = outputs["/logs/agent/operational.json"]
+                self.assertEqual(operation["decisions_mode"], "invocation_bounded")
+                receipt = operation["attempts"][0]["decisions_cost"]
+                self.assertTrue(receipt["cost_complete"])
+                self.assertAlmostEqual(receipt["reported_cost_usd"], 0.02)
+                self.assertEqual((receipt["validated_requests"], receipt["priced_rows"]), (2, 2))
+                # The create-new claim and the host copy of the receipt live in the
+                # trial's own host directory, outside the Harbor job directory.
+                claim = (claim_root / "claim.json").read_bytes()
+                self.assertEqual(json.loads(claim)["binding_sha256"], sha(canonical(self.binding())))
+                self.assertEqual(operation["decisions_claim"]["sha256"], sha(claim))
+                host = (claim_root / "decisions-cost.json").read_bytes()
+                self.assertEqual(json.loads(host)["decisions_cost"], receipt)
+                self.assertEqual(json.loads(host)["product_report_sha256"], sha(report))
+                self.assertEqual(operation["decisions_receipt"]["sha256"], sha(host))
+                # A re-executed trial (for example in a resumed Harbor job) finds
+                # the claim and fails closed before the Ask: no Decisions spend.
+                again, child = self.run_reader(report, config=config, claim_root=claim_root)
+                self.assertEqual(child.call_count, 1)
+                self.assertEqual(again["/answer/answer.json"]["status"], "operational_failure")
+                repeated = again["/logs/agent/operational.json"]
+                self.assertEqual((repeated["failure"], repeated["attempts"]), ("reader_failed", []))
+                self.assertNotIn("decisions_receipt", repeated)
+                self.assertEqual((claim_root / "claim.json").read_bytes(), claim)
+
+    def test_invocation_bounded_ask_requires_its_claim_mount(self):
+        config = {**self.config(), "decisions_mode": "invocation_bounded"}
+        del config["decisions_budget"]
+        missing = self.claim_root() / "not-mounted"
+        outputs, child = self.run_reader(legacy_report(), config=config, claim_root=missing)
+        self.assertEqual(child.call_count, 1)
+        self.assertEqual(outputs["/answer/answer.json"]["status"], "operational_failure")
+        self.assertFalse(missing.exists())
+
+    def test_bare_prompt_states_the_enforced_no_external_search_policy(self):
+        # raw_prompt requires an explicit reader_mode (explicit_reader_mode), so the
+        # policy wording is checked in both modes.
+        for mode in ("legacy_text", "rich_multimodal"):
+            with self.subTest(reader_mode=mode):
+                prompt = reader.raw_prompt({"raw_document": "/data/corpus/synthetic.txt", "reader_mode": mode},
+                                           self.question).decode()
+                self.assertIn("No external search or network access is available.", prompt)
+                self.assertNotIn("Do not use external search", prompt)
+                self.assertTrue(prompt.endswith("Question:\n" + self.question))
+
+    def test_other_legacy_statuses_are_zero_and_never_judged(self):
+        for status, answer in (("failed", "partial synthetic text"), ("interrupted", "partial synthetic text"),
+                               ("insufficient_evidence", "   ")):
+            with self.subTest(status=status, answer=answer):
+                outputs, _ = self.run_reader(legacy_report(status=status, answer=answer))
+                envelope = outputs["/answer/answer.json"]
+                self.assertEqual((envelope["status"], envelope["answer"]), ("operational_failure", None))
+                operation = outputs["/logs/agent/operational.json"]
+                self.assertEqual(operation["failure"], "reader_failed")
+                self.assertNotIn("insufficient_evidence", operation)
+                result = grade(self.judge_config(), envelope, lambda *_: self.fail("Judge called"))
+                self.assertEqual((result["status"], result["label"]), ("operational_failure", 0))
+                self.assertEqual(transport_reward(result)["answer_equivalence"], 0)
+
+
 class MaterializationIsolationTests(unittest.TestCase):
     def test_raw_context_has_no_gold_or_index_and_verifier_has_reference(self):
         # A future test run must have an explicitly admitted temporary root.
@@ -392,6 +720,8 @@ class MaterializationIsolationTests(unittest.TestCase):
                            "provenance": {"path": "/synthetic/base-tools.json", "bytes": 1, "sha256": "f" * 64}},
                        "codex_binary": "/opt/codex", "gptgrep_binary": "/opt/gptgrep", "codex_home": "/opt/full62-home",
                        "native_ptc": True, "codex_permissions": "full62_reader",
+                       "reader_seccomp_profile": {"path": "/synthetic/reader-seccomp.json",
+                                                  "bytes": READER_SECCOMP_BYTES, "sha256": READER_SECCOMP_SHA256},
                        "platform": "linux/amd64", "run_id": "synthetic-full62",
                        "native_cli": {"version": "0.162.1", "release_tag": "rust-v0.162.1", "source_commit": "a" * 40},
                        "auth": {"method": "chatgpt_device_file", "reader_file": "/synthetic/reader/auth.json",
@@ -404,17 +734,28 @@ class MaterializationIsolationTests(unittest.TestCase):
             owner = object.__new__(Full62Adapter)
             owner.runtime = runtime
             owner.judge = {"schema": "gptgrep.harbor.primary-judge.v1", "prompt": "synthetic rubric",
-                           "response_schema": {"type": "object"}}
+                           "response_schema": {"type": "object", "additionalProperties": False,
+                                               "required": ["equivalent"],
+                                               "properties": {"equivalent": {"type": "boolean"}}}}
             row = {"pair_id": "synthetic-pair", "document_id": document["document_id"],
                    "question": "Read the generic number.", "reference": "PRIVATE_SYNTHETIC_REFERENCE_ONLY",
                    "answer_format": "text"}
             binding = {"arm": "raw_only", "pair_id": row["pair_id"], "document_id": row["document_id"]}
             destination = root / "generated-raw-task"
+            # No reader role is materialized without the approved seccomp pin.
+            owner.runtime = {key: value for key, value in runtime.items() if key != "reader_seccomp_profile"}
+            with self.assertRaisesRegex(ValueError, "reader_seccomp_profile_required"):
+                owner._task(destination, Path(adapter_module.__file__).parent, row, document, binding)
+            self.assertFalse(destination.exists())
+            owner.runtime = runtime
             owner._task(destination, Path(adapter_module.__file__).parent, row, document, binding)
             self.assertFalse((destination / "environment/corpus/.gptgrep/index.bin").exists())
             for directory in ("environment", "tests"):
                 compose = json.loads((destination / directory / "docker-compose.yaml").read_text())
                 self.assertEqual(compose["services"]["main"]["labels"], {"gptgrep.auth-job": "synthetic-full62"})
+                # Only the reader role carries the approved seccomp profile.
+                self.assertEqual(compose["services"]["main"].get("security_opt"),
+                                 ["seccomp=/synthetic/reader-seccomp.json"] if directory == "environment" else None)
             self.assertEqual((destination / "environment/corpus/arbitrary-document.txt").read_bytes(), raw.read_bytes())
             reader = (destination / "environment/reader.json").read_text()
             self.assertNotIn(row["reference"], reader)
@@ -430,17 +771,19 @@ class NativeDirectToolPolicyTests(unittest.TestCase):
         import tomllib
         from gptgrep_harbor.runtime import model_config
         config = tomllib.loads(model_config(PROFILE, "reader").decode())
+        # Native code, shell, image and sub-agent tools stay on; host-side
+        # connector, plugin and tool-suggestion features are off for both arms.
         self.assertEqual(config["features"], {
             "shell_tool": True, "view_image": True, "unified_exec": True,
-            "multi_agent": True, "plugins": True, "apps": True,
-            "tool_suggest": True, "code_mode": {"enabled": True}, "code_mode_host": {"enabled": True}})
-        self.assertEqual(config["web_search"], "live")
+            "multi_agent": True, "plugins": False, "apps": False,
+            "tool_suggest": False, "code_mode": {"enabled": True}, "code_mode_host": {"enabled": True}})
+        self.assertEqual(config["web_search"], "disabled")
         self.assertEqual(config["default_permissions"], "full62_reader")
         self.assertEqual(config["model"], PROFILE["model"])
         self.assertEqual(config["model_reasoning_effort"], PROFILE["reasoning_effort"])
         self.assertEqual(config["service_tier"], PROFILE["service_tier"])
         policy = config["permissions"]["full62_reader"]
-        self.assertTrue(policy["network"]["enabled"])
+        self.assertFalse(policy["network"]["enabled"])
         self.assertEqual(policy["filesystem"]["/data/corpus"], "read")
         self.assertEqual(policy["filesystem"]["/tmp/full62-work"], "write")
         self.assertEqual(policy["filesystem"]["/opt/full62-home"], "deny")
@@ -455,6 +798,9 @@ class NativeDirectToolPolicyTests(unittest.TestCase):
                          {"enabled": False, "direct_only_tool_namespaces": []})
         self.assertFalse(config["features"]["shell_tool"])
         self.assertFalse(config["features"]["view_image"])
+        # Codex enables these by default; the Judge disables them explicitly.
+        for feature in ("apps", "plugins", "tool_suggest"):
+            self.assertIs(config["features"][feature], False)
         self.assertEqual(config["default_permissions"], "full62_judge")
         self.assertEqual(config["web_search"], "disabled")
         self.assertFalse(config["permissions"]["full62_judge"]["network"]["enabled"])

@@ -18,10 +18,11 @@ from harbor.models.task.config import TaskConfig, VerifierEnvironmentMode
 from harbor.models.task.paths import TaskPaths
 from harbor.models.task.verifier_mode import resolve_verifier_environment_definition
 
-from gptgrep_harbor.adapter import Full62Adapter
+from gptgrep_harbor import adapter as adapter_module, verifier
+from gptgrep_harbor.adapter import MAX_TOOL_CALLS, TOOL_CALL_WARNING_FLOOR, Full62Adapter
 from gptgrep_harbor.agent import PairedNativeAgent
-from gptgrep_harbor.common import MAX_NATIVE_PROMPT_BYTES, MAX_READER_QUESTION_BYTES, PROFILE, canonical, sha
-from gptgrep_harbor.native import codex_argv
+from gptgrep_harbor.common import MAX_NATIVE_PROMPT_BYTES, MAX_READER_QUESTION_BYTES, PROFILE, canonical, parse, sha
+from gptgrep_harbor.native import JUDGE_OUTPUT_SCHEMA, codex_argv, output_schema_bytes
 from gptgrep_harbor.reader import reader_argv, product_result, product_accounting
 from gptgrep_harbor.process import run
 from gptgrep_harbor.product_bundle import PRODUCT_ENTRYPOINT, PRODUCT_PROVENANCE, release_bundle
@@ -32,11 +33,39 @@ from gptgrep_harbor.runtime import (
     validate_asset_path,
 )
 
+SECCOMP_SOURCE = Path(__file__).resolve().parents[1] / "seccomp"
+
 
 def write_pin(path, value):
     data = value if isinstance(value, bytes) else canonical(value)
     path.write_bytes(data)
     return {"path": str(path), "bytes": len(data), "sha256": sha(data)}
+
+
+def synthetic_index(directory, documents, reader_mode, root="/data/corpus"):
+    """Synthetic pinned .gptgrep pointer and manifest rows; no product index is built."""
+    directory.mkdir(parents=True, exist_ok=True)
+    schema = {"legacy_text": "gptgrep.v1", "rich_multimodal": "gptgrep.manifest.v2"}[reader_mode]
+    generation = "g1-synthetic"
+    sources = [{"path": row["relative_path"], "source_sha256": row["pin"]["sha256"]} for row in documents]
+    if reader_mode == "rich_multimodal":
+        sources = [{"document": source} for source in sources]
+    manifest = write_pin(directory / (reader_mode + "-manifest.json"),
+                         {"schema_version": schema, "generation": generation, "root": root, "documents": sources})
+    pointer = write_pin(directory / (reader_mode + "-current.json"),
+                        {"schema_version": schema, "generation": generation, "manifest_sha256": manifest["sha256"]})
+    data = write_pin(directory / (reader_mode + "-index.bin"), b"generic synthetic index")
+    prefix = ".gptgrep/generations/" + generation + "/"
+    return [{"relative_path": ".gptgrep/CURRENT.json", "pin": pointer},
+            {"relative_path": prefix + "manifest.json", "pin": manifest},
+            {"relative_path": prefix + "trigram/index.bin", "pin": data}]
+
+
+def synthetic_budget(max_submissions):
+    """A synthetic existing-context budget control; no finance owner or ledger behind it."""
+    return {"schema_version": "gptgrep.decisions-budget-contract.v1", "run_id": "synthetic-run",
+            "plan_digest": "a" * 64, "max_submissions": max_submissions, "deadline_unix_ms": 1,
+            "ledger_path": "/opt/full62-private/ledger/decisions.json"}
 
 
 class HarborMaterializationTests(unittest.TestCase):
@@ -56,7 +85,7 @@ class HarborMaterializationTests(unittest.TestCase):
             "native_cli": {"version": "0.162.1", "release_tag": "rust-v0.162.1", "source_commit": CODEX_SOURCE_COMMIT},
             "auth": {"method": "chatgpt_device_file", "reader_file": "/synthetic-private/reader/auth.json",
                      "judge_file": "/synthetic-private/judge/auth.json"},
-            "decisions_budget": {"path": "/synthetic-private/decisions-budget.json", "bytes": 2, "sha256": "e" * 64},
+            "decisions_budget": write_pin(self.root / "decisions-budget.json", synthetic_budget(200)),
             "decisions_ledger_dir": "/synthetic-private/ledger",
             "admitted": True, "admission": None, "account_scope": "Dev/Test/Eval", "platform": "linux/amd64",
             "run_id": "synthetic-full62", "jobs_dir": str(self.root / "jobs"),
@@ -72,10 +101,17 @@ class HarborMaterializationTests(unittest.TestCase):
             "native_ptc": True, "codex_permissions": "full62_reader",
             "primary_metric": "answer_equivalence_delta", "bootstrap_seed": 17, "trial_order_seed": 23,
             "max_asset_bytes": 1048576, "max_assets_total_bytes": 1048576,
-            "deadline_seconds": 20, "judge_deadline_seconds": 20, "max_tool_calls": 8, "max_input_bytes": 8192,
-            "documents": documents, "index_files": [{"relative_path": ".gptgrep/index.bin",
-                "pin": write_pin(self.root / "index.bin", b"generic synthetic index")}],
-            "resources": {"cpus": 1, "memory_mb": 512, "storage_mb": 512}}
+            "deadline_seconds": 20, "judge_deadline_seconds": 20, "max_tool_calls": MAX_TOOL_CALLS,
+            "max_input_bytes": 8192,
+            "documents": documents, "resources": {"cpus": 1, "memory_mb": 512, "storage_mb": 512}}
+        # The owner-approved reader seccomp profile, copied to a fresh physical host path.
+        self.runtime["reader_seccomp_profile"] = write_pin(
+            self.root / "reader-seccomp.json", (SECCOMP_SOURCE / "gptgrep-reader-seccomp.json").read_bytes())
+        # One synthetic index per reader mode; materializer() follows reader_mode
+        # unless a test pins its own index_files.
+        self.indexes = {mode: synthetic_index(self.root / "index", documents, mode)
+                        for mode in ("legacy_text", "rich_multimodal")}
+        self.runtime["index_files"] = self.indexes["rich_multimodal"]
         self.runtime["images"]["judge"] = self.runtime["images"]["raw_only"]
         tools = {"schema": "gptgrep.harbor.base-tools.v1", "build_inputs": {"platform": "linux/amd64"},
                  "pillow_version": "12.3.0", "native_cli_version": "0.162.1",
@@ -98,10 +134,14 @@ class HarborMaterializationTests(unittest.TestCase):
                             gptgrep_bundle={"provenance": write_pin(product / "provenance.json", provenance)})
         self.judge = {"schema": "gptgrep.harbor.primary-judge.v1",
             "prompt": "Question:{question}\nReference:{answer}\nFormat:{answer_format}\nResponse:{response}",
-            "response_schema": {"type": "object", "required": ["equivalent"],
+            "response_schema": {"type": "object", "additionalProperties": False, "required": ["equivalent"],
                                 "properties": {"equivalent": {"type": "boolean"}}}}
+        # The synthetic admission attests the runtime-only external-tool qualification.
+        self.external_tools_excluded = True
 
     def materializer(self):
+        if self.runtime.get("index_files") in self.indexes.values():
+            self.runtime["index_files"] = self.indexes.get(self.runtime["reader_mode"], self.runtime["index_files"])
         cohort = write_pin(self.root / "cohort.json", self.cohort)
         judge = write_pin(self.root / "judge-contract.json", self.judge)
         approval = {"accepted": True, "scope": "harbor_full62_paired_once", "run_id": self.runtime["run_id"],
@@ -111,6 +151,7 @@ class HarborMaterializationTests(unittest.TestCase):
             "native_cli_contract_qualified": True, "reader_base_binary": self.runtime["reader_base_binary"],
             "bare_image_excludes_gptgrep_and_indexes": True, "raw_only_index_provenance_verified": True,
             "named_permissions_qualified": True, "reader_effective_permissions_equal": True,
+            "reader_external_tools_excluded": self.external_tools_excluded,
             "native_cli": self.runtime["native_cli"],
             "assets_sha256": sha(canonical(self.runtime["documents"] + self.runtime["index_files"])),
             "judge_sha256": judge["sha256"]}
@@ -134,7 +175,18 @@ class HarborMaterializationTests(unittest.TestCase):
                          [output / name for name in result["trial_order"]["task_names"]])
         self.assertTrue(all(task.source == output.name for task in job.tasks))
         self.assertEqual(job.agents[0].import_path, "gptgrep_harbor.agent:PairedNativeAgent")
-        reader_policies = set()
+        # The fixture uses the parity cap and one shared existing-context ledger,
+        # whose allowance is warned against the cohort's mandatory bootstraps.
+        self.assertEqual((result["preflight"]["tool_budget"]["treatment_max_tool_calls"],
+                          result["preflight"]["tool_budget"]["parity"]), (MAX_TOOL_CALLS, "adapter_maximum"))
+        self.assertEqual([warning["code"] for warning in result["preflight"]["warnings"]],
+                         ["decisions_shared_allowance_may_exhaust"])
+        # Decisions run in the treatment's GPTgrep host process, outside the Codex
+        # tool sandbox, so the job keeps the OpenRouter key reference (never a value).
+        job_record = json.loads((self.root / "dataset.job.json").read_text())
+        self.assertEqual(job_record["agents"][0]["env"], {"OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}"})
+        self.assertEqual(job_record["verifier"]["env"], {})
+        reader_policies, budget_scopes, pair_policies = set(), set(), {}
         for record in result["tasks"]:
             task = output / record["task_name"]
             config = TaskConfig.model_validate(tomllib.loads((task / "task.toml").read_text()))
@@ -150,12 +202,24 @@ class HarborMaterializationTests(unittest.TestCase):
             self.assertNotIn("auth", reader)
             self.assertEqual(reader["budget_scope"]["reader_question_max_bytes"], 8192)
             self.assertEqual(reader["budget_scope"]["tool_calls"], "treatment_enforced_raw_observed_only")
+            self.assertEqual(reader["budget_scope"]["treatment_max_tool_calls"], MAX_TOOL_CALLS)
+            self.assertEqual(reader["budget_scope"]["treatment_tool_cap_parity"], "adapter_maximum")
+            self.assertEqual(reader["budget_scope"]["raw_tool_call_cap"], "none")
+            budget_scopes.add(canonical(reader["budget_scope"]))
             self.assertIs(reader["native_ptc"], True)
             self.assertEqual(reader["codex_permissions"], "full62_reader")
             self.assertEqual(len(list((task / "environment/corpus").glob("raw-*.txt"))), 34)
             treatment = record["binding"]["arm"] == "gptgrep"
-            self.assertEqual((task / "environment/corpus/.gptgrep/index.bin").exists(), treatment)
+            self.assertEqual((task / "environment/corpus/.gptgrep/CURRENT.json").exists(), treatment)
+            self.assertEqual((task / "environment/corpus/.gptgrep/generations/g1-synthetic/manifest.json").exists(),
+                             treatment)
             reader_policies.add((task / "environment/config.toml").read_bytes())
+            pair_policies.setdefault(record["binding"]["pair_id"], {})[record["binding"]["arm"]] = (
+                task / "environment/config.toml").read_bytes()
+            # The container keeps network for the native CLI's model connection
+            # and the product's host-side Decisions requests; tools have none.
+            self.assertEqual(tomllib.loads((task / "task.toml").read_text())["environment"]["network_mode"],
+                             "public")
             for directory, key in (("environment", "reader_file"), ("tests", "judge_file")):
                 compose = json.loads((task / directory / "docker-compose.yaml").read_text())
                 mounts = compose["services"]["main"]["volumes"]
@@ -169,11 +233,159 @@ class HarborMaterializationTests(unittest.TestCase):
                 self.assertNotIn("COPY .", (task / directory / "Dockerfile").read_text())
             self.assertEqual(len(json.loads((task / "environment/docker-compose.yaml").read_text())["services"]["main"]["volumes"]), 3 if treatment else 1)
             judge = json.loads((task / "tests/judge.json").read_text())
+            # The frozen response schema is pinned in the Judge's private area only.
+            schema_bytes = (task / "tests/judge-output-schema.json").read_bytes()
+            self.assertEqual(json.loads(schema_bytes), self.judge["response_schema"])
+            self.assertEqual(judge["output_schema"], {"path": JUDGE_OUTPUT_SCHEMA, "bytes": len(schema_bytes),
+                                                      "sha256": sha(schema_bytes)})
+            self.assertEqual(judge["contract"]["prompt"], self.judge["prompt"])
+            self.assertIn("COPY judge.json judge-output-schema.json test.sh /tests/",
+                          (task / "tests/Dockerfile").read_text())
+            self.assertIn("!judge-output-schema.json", (task / "tests/.dockerignore").read_text().splitlines())
+            self.assertFalse((task / "environment/judge-output-schema.json").exists())
             self.assertEqual(judge["judge_profile"], self.runtime["judge_profile"])
             self.assertEqual(judge["base_tool_environment"], reader["base_tool_environment"])
             self.assertEqual(reader["base_tool_environment"]["provenance"]["path"], BASE_TOOLS_PATH)
             self.assertFalse((task / "tests/corpus").exists())
         self.assertEqual(reader_policies, {model_config(PROFILE, "reader")})
+        self.assertEqual(len(budget_scopes), 1)
+        # Both arms of every pair receive identical reader configuration bytes,
+        # with no hosted web search and no model-tool network.
+        self.assertEqual(len(pair_policies), 62)
+        for policies in pair_policies.values():
+            self.assertEqual(set(policies), {"gptgrep", "raw_only"})
+            self.assertEqual(policies["gptgrep"], policies["raw_only"])
+        policy = tomllib.loads(next(iter(reader_policies)).decode())
+        self.assertEqual(policy["web_search"], "disabled")
+        self.assertIs(policy["permissions"]["full62_reader"]["network"]["enabled"], False)
+
+    def tool_cap_warnings(self, preflight):
+        return [warning for warning in preflight["warnings"] if warning["code"].startswith("treatment_tool_cap")]
+
+    def test_treatment_tool_cap_is_the_adapter_maximum_or_a_declared_deviation(self):
+        adapter = self.materializer()
+        self.assertEqual(adapter.preflight["tool_budget"],
+                         {"treatment_max_tool_calls": 10000, "raw_tool_call_cap": "none",
+                          "adapter_maximum": 10000, "warning_floor": 64, "parity": "adapter_maximum"})
+        self.assertEqual(self.tool_cap_warnings(adapter.preflight), [])
+        argv = reader_argv({**self.runtime, "source_relative_path": "raw-0.txt"},
+                           {"arm": "gptgrep"}, "generic question")
+        self.assertEqual(argv[argv.index("--max-tool-calls") + 1], "10000")
+        # Native items count toward the treatment cap and exceeding it fails the
+        # Ask, while the bare arm is uncapped: any lower cap must be declared in
+        # qualification_mismatches, which the admission binds, and is warned.
+        for value, code in ((MAX_TOOL_CALLS - 1, "treatment_tool_cap_below_adapter_maximum"),
+                            (TOOL_CALL_WARNING_FLOOR, "treatment_tool_cap_below_adapter_maximum"),
+                            (TOOL_CALL_WARNING_FLOOR - 1, "treatment_tool_cap_may_bind_before_deadline"),
+                            (1, "treatment_tool_cap_may_bind_before_deadline")):
+            self.runtime["max_tool_calls"] = value
+            with self.subTest(max_tool_calls=value):
+                self.runtime["qualification_mismatches"] = []
+                with self.assertRaisesRegex(ValueError, "treatment_tool_cap_deviation_undeclared"):
+                    self.materializer()
+                self.runtime["qualification_mismatches"] = [{"code": "observed generic mismatch"},
+                                                            adapter_module.tool_cap_deviation(value)]
+                preflight = self.materializer().preflight
+                self.assertEqual(preflight["tool_budget"]["parity"], "declared_deviation")
+                self.assertEqual(self.tool_cap_warnings(preflight),
+                                 [{"code": code, "max_tool_calls": value, "adapter_maximum": 10000,
+                                   "warning_floor": 64}])
+        # A declaration for another value, or a stale one at parity, is rejected.
+        self.runtime["qualification_mismatches"] = [adapter_module.tool_cap_deviation(100)]
+        self.runtime["max_tool_calls"] = 99
+        with self.assertRaisesRegex(ValueError, "treatment_tool_cap_deviation_undeclared"):
+            self.materializer()
+        self.runtime["max_tool_calls"] = MAX_TOOL_CALLS
+        with self.assertRaisesRegex(ValueError, "treatment_tool_cap_deviation_stale"):
+            self.materializer()
+        self.runtime["qualification_mismatches"] = []
+        for value in (0, MAX_TOOL_CALLS + 1, True, 64.0):
+            self.runtime["max_tool_calls"] = value
+            with self.subTest(max_tool_calls=value), self.assertRaisesRegex(ValueError, "integer_range"):
+                self.materializer()
+        self.assertFalse((self.root / "dataset").exists())
+
+    def test_existing_context_preflight_weighs_the_shared_allowance_against_bootstraps(self):
+        preflight = self.materializer().preflight
+        self.assertEqual(preflight["decisions"],
+                         {"mode": "existing_context", "treatment_trials": 62, "max_submissions_at_most": 200,
+                          "min_bootstrap_submissions_per_ask": 2, "bootstrap_submissions": 124,
+                          "submissions_after_bootstraps_at_most": 76, "reservations": "shared_and_permanent"})
+        self.assertEqual(preflight["warnings"], [{"code": "decisions_shared_allowance_may_exhaust",
+                                                  "max_submissions": 200, "bootstrap_submissions": 124,
+                                                  "treatment_trials": 62}])
+        self.runtime["decisions_budget"] = write_pin(self.root / "decisions-budget.json", synthetic_budget(100))
+        preflight = self.materializer().preflight
+        self.assertEqual(preflight["warnings"][0]["code"], "decisions_shared_allowance_below_bootstrap_floor")
+        self.assertEqual(preflight["decisions"]["submissions_after_bootstraps_at_most"], 0)
+        # The pin must hold the product's budget contract joined to the mounted ledger.
+        for budget, code in (({**synthetic_budget(200), "ledger_path": "/elsewhere/decisions.json"},
+                              "decisions_budget_contract"),
+                             ({**synthetic_budget(200), "schema_version": "other"}, "decisions_budget_contract"),
+                             (synthetic_budget(0), "integer_range"), (synthetic_budget(201), "integer_range")):
+            self.runtime["decisions_budget"] = write_pin(self.root / "decisions-budget.json", budget)
+            with self.subTest(budget=budget), self.assertRaisesRegex(ValueError, code):
+                self.materializer()
+        self.runtime["decisions_budget"] = write_pin(self.root / "decisions-budget.json", synthetic_budget(200))
+        (self.root / "decisions-budget.json").write_bytes(canonical(synthetic_budget(199)))
+        with self.assertRaisesRegex(ValueError, "pin_mismatch"):
+            self.materializer()
+
+    def test_prepare_prints_budget_preflight_before_any_task_is_created(self):
+        from contextlib import redirect_stdout
+        import io
+        from gptgrep_harbor import main as cli
+        stdout, seen = io.StringIO(), []
+        adapter = self.materializer()
+        with patch.object(cli, "Full62Adapter", return_value=adapter), \
+             patch.object(adapter, "run", side_effect=lambda *args, **kwargs: seen.append(stdout.getvalue())), \
+             patch("sys.argv", ["gptgrep-harbor-full62", "prepare", "--manifest", "/synthetic/manifest.json",
+                                "--manifest-sha256", "a" * 64, "--output-dir", str(self.root / "dataset")]), \
+             redirect_stdout(stdout):
+            cli.main()
+        self.assertEqual(json.loads(seen[0]), {"preflight": adapter.preflight})
+        self.assertEqual(json.loads(seen[0])["preflight"]["warnings"][0]["code"],
+                         "decisions_shared_allowance_may_exhaust")
+
+    def test_frozen_judge_schema_must_be_strict_structured_output(self):
+        del self.judge["response_schema"]["additionalProperties"]
+        with self.assertRaisesRegex(ValueError, "strict_output_schema"):
+            self.materializer()
+        self.judge["response_schema"]["additionalProperties"] = False
+        self.judge["response_schema"]["properties"]["reason"] = {"type": "string"}
+        with self.assertRaisesRegex(ValueError, "strict_output_schema"):
+            self.materializer()
+        # `required` must list every property exactly once: it fixes their order.
+        self.judge["response_schema"]["required"] = ["equivalent", "reason", "reason"]
+        with self.assertRaisesRegex(ValueError, "strict_output_schema"):
+            self.materializer()
+        self.assertFalse((self.root / "dataset").exists())
+
+    def test_judge_schema_file_restores_the_frozen_property_order(self):
+        # The frozen-contract builder writes a key-sorted file, so only `required`
+        # keeps the upstream order that strict structured output generates in.
+        self.judge["response_schema"] = parse(canonical({
+            "type": "object", "additionalProperties": False, "required": ["equivalent", "abstained", "reason"],
+            "properties": {"equivalent": {"type": "boolean"}, "abstained": {"type": "boolean"},
+                           "reason": {"type": "string"}}}))
+        self.assertEqual(list(self.judge["response_schema"]["properties"]), ["abstained", "equivalent", "reason"])
+        adapter = self.materializer()
+        self.assertEqual(adapter_module.judge_contract(self.judge),
+                         output_schema_bytes(self.judge["response_schema"]))
+        row = adapter.rows[0]
+        document = next(d for d in self.runtime["documents"] if d["document_id"] == row["document_id"])
+        task = self.root / "single-task"
+        adapter._task(task, Path(adapter_module.__file__).parent, row, document,
+                      {"pair_id": row["pair_id"], "document_id": row["document_id"], "arm": "gptgrep"})
+        schema_file = task / "tests/judge-output-schema.json"
+        self.assertEqual(list(json.loads(schema_file.read_bytes())["properties"]), ["equivalent", "abstained", "reason"])
+        judge = json.loads((task / "tests/judge.json").read_text())
+        self.assertEqual(list(judge["contract"]["response_schema"]["properties"]), ["abstained", "equivalent", "reason"])
+        # The verifier recomputes the same bytes from its key-sorted judge.json.
+        pin = {**judge["output_schema"], "path": str(schema_file)}
+        with patch.object(verifier, "JUDGE_OUTPUT_SCHEMA", str(schema_file)):
+            self.assertEqual(verifier.output_schema({**judge, "output_schema": pin},
+                                                    judge["contract"]["response_schema"]), pin)
 
     def test_shared_native_reader_fields_are_required_before_materialization(self):
         for key, value in (("native_ptc", False), ("native_ptc", None), ("codex_permissions", "other")):
@@ -182,6 +394,46 @@ class HarborMaterializationTests(unittest.TestCase):
             with self.subTest(key=key, value=value), self.assertRaisesRegex(ValueError, "shared_native_reader_required"):
                 self.materializer()
             self.runtime[key] = original
+        self.assertFalse((self.root / "dataset").exists())
+
+    def test_index_must_come_from_the_pinned_documents_at_the_container_corpus_root(self):
+        self.assertEqual(self.materializer().preflight["index"],
+                         {"schema_version": "gptgrep.manifest.v2", "generation": "g1-synthetic",
+                          "root": "/data/corpus", "documents": 34,
+                          "manifest_sha256": self.indexes["rich_multimodal"][1]["pin"]["sha256"]})
+        self.runtime["reader_mode"] = "legacy_text"
+        self.assertEqual(self.materializer().preflight["index"]["schema_version"], "gptgrep.v1")
+        documents = self.runtime["documents"]
+        stale = [{**row, "pin": {**row["pin"], "sha256": "0" * 64}} if index == 0 else row
+                 for index, row in enumerate(documents)]
+        valid = synthetic_index(self.root / "valid", documents, "legacy_text")
+        extra = {"pin": valid[2]["pin"]}
+        cases = [
+            # Built on the host (or at any other root): the product would reject every Ask.
+            ("index_root_identity", synthetic_index(self.root / "host", documents, "legacy_text",
+                                                    root=str(self.root / "corpus"))),
+            ("index_sources", synthetic_index(self.root / "fewer", documents[:-1], "legacy_text")),
+            ("index_sources", synthetic_index(self.root / "stale", stale, "legacy_text")),
+            ("index_current_pointer", [row for row in valid if row["relative_path"] != ".gptgrep/CURRENT.json"]),
+            # A rich generation cannot serve a legacy_text reader.
+            ("index_current_pointer", synthetic_index(self.root / "rich", documents, "rich_multimodal")),
+            ("index_manifest_pin", [valid[0], {**valid[1], "pin": valid[2]["pin"]}, valid[2]]),
+            ("index_state_files_only", valid + [{"relative_path": ".gptgrep/host-attempts/a.json", **extra}]),
+            ("index_state_files_only", valid + [{"relative_path": "treatment-only-notes.txt", **extra}]),
+        ]
+        for code, rows in cases:
+            self.runtime["index_files"] = rows
+            with self.subTest(code=code), self.assertRaisesRegex(ValueError, code):
+                self.materializer()
+        self.assertFalse((self.root / "dataset").exists())
+
+    def test_external_tool_exclusion_needs_runtime_qualification(self):
+        # Disabled config features are requests; only the runtime review can
+        # attest that no connector, plugin, MCP or web-search tool is exposed.
+        for value in (False, None):
+            self.external_tools_excluded = value
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "external_tools_admission"):
+                self.materializer()
         self.assertFalse((self.root / "dataset").exists())
 
     def test_shared_base_and_pillow_identity_are_required(self):
@@ -310,10 +562,18 @@ class NativePolicyTests(unittest.TestCase):
         self.assertIsNone(response["failure"])
         self.assertEqual(response["stdout"], b"synthetic child\n")
 
+    def test_only_the_judge_requests_native_structured_output(self):
+        judge = codex_argv("/opt/codex", profile=PROFILE, role="judge", output_schema=JUDGE_OUTPUT_SCHEMA)
+        self.assertEqual(judge[-4:], ["--output-schema", JUDGE_OUTPUT_SCHEMA, "--", "-"])
+        self.assertEqual(codex_argv("/opt/codex", profile=PROFILE, role="judge")[:-2], judge[:-4])
+        with self.assertRaisesRegex(ValueError, "output_schema_argument"):
+            codex_argv("/opt/codex", output_schema=JUDGE_OUTPUT_SCHEMA)
+
     def test_named_permissions_have_no_legacy_sandbox_and_deny_private_paths(self):
         argv = codex_argv("/opt/codex")
         self.assertEqual(argv[-2:], ["--", "-"])
         self.assertNotIn("--sandbox", argv)
+        self.assertNotIn("--output-schema", argv)
         self.assertIn('default_permissions="full62_reader"', argv)
         self.assertIn('forced_login_method="chatgpt"', argv)
         config = tomllib.loads(model_config(PROFILE, "reader").decode())
@@ -323,17 +583,18 @@ class NativePolicyTests(unittest.TestCase):
         self.assertEqual(fs["/data/corpus"], "read")
         for path in (CODEX_HOME, "/tests", "/solution", "/logs", "/opt/full62-private"):
             self.assertEqual(fs[path], "deny")
-        self.assertTrue(config["permissions"]["full62_reader"]["network"]["enabled"])
-        self.assertEqual(config["web_search"], "live")
+        self.assertFalse(config["permissions"]["full62_reader"]["network"]["enabled"])
+        self.assertEqual(config["web_search"], "disabled")
         self.assertEqual(config["features"], {
             "shell_tool": True, "view_image": True, "unified_exec": True,
-            "multi_agent": True, "plugins": True, "apps": True,
-            "tool_suggest": True, "code_mode": {"enabled": True}, "code_mode_host": {"enabled": True}})
+            "multi_agent": True, "plugins": False, "apps": False,
+            "tool_suggest": False, "code_mode": {"enabled": True}, "code_mode_host": {"enabled": True}})
         judge = tomllib.loads(model_config(PROFILE, "judge").decode())
         self.assertEqual(judge["web_search"], "disabled")
         self.assertFalse(judge["permissions"]["full62_judge"]["network"]["enabled"])
         self.assertEqual(judge["features"], {
             "shell_tool": False, "view_image": False, "code_mode_only": False, "code_mode_prewarm": False,
+            "apps": False, "plugins": False, "tool_suggest": False,
             "code_mode": {"enabled": False, "direct_only_tool_namespaces": []},
             "code_mode_host": {"enabled": False, "disable_in_process_fallback": True}})
 

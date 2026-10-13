@@ -11,7 +11,14 @@ from .common import MAX_ANSWER, MAX_READER_QUESTION_BYTES, PROFILE, canonical, c
 from .native import codex_accounting, codex_argv, codex_result, prompt_bytes
 from .process import run
 from .runtime import CODEX_VERSION, DECISIONS_BUDGET, DECISIONS_LEDGER_DIR, check_config, native_environment
-from .decisions import TRIAL_BUDGET, acquire_writer, prepare as prepare_decisions
+from .decisions import (TRIAL_BUDGET, acquire_writer, claim_invocation, prepare as prepare_decisions,
+                        record_invocation, selected_mode)
+
+
+# A completed legacy report is a response. An insufficient_evidence report with
+# a non-empty answer is a completed intentional abstention, judged under the
+# frozen answerability rubric. Every other status is an operational failure.
+LEGACY_ANSWER_STATUSES = ("completed", "insufficient_evidence")
 
 
 def reader_argv(config, binding, question):
@@ -22,13 +29,23 @@ def reader_argv(config, binding, question):
                 "shared_native_reader_required")
         require(config["reader_mode"] in ("rich_multimodal", "legacy_text"), "explicit_reader_mode")
         mode_flags = ["--multimodal"] if config["reader_mode"] == "rich_multimodal" else []
-        preparing = config.get("decisions_preparation") is not None
-        if preparing:
+        decisions = selected_mode(config)
+        require((decisions == "preparation") == (config.get("decisions_preparation") is not None),
+                "decisions_mode")
+        if decisions == "preparation":
             require(config["reader_mode"] == "rich_multimodal"
                     and config["decisions_preparation"]["max_concurrent_batches"] == 1,
                     "decisions_preparation_mode")
             mode_flags += ["--max-concurrent-batches", "1"]
-        return [config["gptgrep_binary"], "--decisions-budget", TRIAL_BUDGET if preparing else DECISIONS_BUDGET,
+            budget = ["--decisions-budget", TRIAL_BUDGET]
+        elif decisions == "existing_context":
+            budget = ["--decisions-budget", DECISIONS_BUDGET]
+        else:
+            # invocation_bounded: no shared ledger or budget file. The Ask keeps
+            # the product's own single-invocation context (at most 200 submissions).
+            require(config["reader_mode"] == "legacy_text", "decisions_invocation_bounded_mode")
+            budget = []
+        return [config["gptgrep_binary"], *budget,
                 "ask", "--native-ptc", *mode_flags, "--document=" + config["source_relative_path"],
                 "--jev-model", config["jev_model"], "--codex-bin", "/opt/full62/codex-native",
                 "--codex-home", config["codex_home"], "--codex-permissions", config["codex_permissions"],
@@ -64,10 +81,11 @@ def shared_answer_rules(config):
 
 
 def raw_prompt(config, question):
+    # States the enforced reader policy: web search and model-tool network are disabled.
     rules = shared_answer_rules(config)
     return prompt_bytes("Answer the question using only the protocol-scoped raw document at "
               + config["raw_document"] + ". You may inspect that document with native tools. "
-              "Do not use external search. Give the complete answer and source locations "
+              "No external search or network access is available. Give the complete answer and source locations "
               "when available. " + (rules + " " if rules else "") + "Question:\n" + question)
 
 
@@ -108,9 +126,32 @@ def product_accounting(report):
             "reported_retrieval_cost_subtotal": sum(costs) if costs else None,
             "reported_retrieval_cost_receipts": len(costs),
             "reported_retrieval_cost_currency_verified": False,
+            "decisions_cost": decisions_cost(jev),
             "cost_usd": None, "cost_complete": False,
             "physical_provider_requests": None,
             "usage_scope": "final_reader_summary_not_additive_to_model_attempts"}
+
+
+def decisions_cost(jev):
+    """One trial's reported Decisions cost receipt, retained even for failed Asks.
+
+    The cost is known only when every attempted call returned a validated
+    response with a finite reported cost; otherwise it stays unknown (null).
+    """
+    counts = {key: jev.get(key) if isinstance(jev, dict) else None
+              for key in ("requests", "attempted_calls", "unobserved_attempts")}
+    usage = jev.get("usage") if isinstance(jev, dict) and isinstance(jev.get("usage"), list) else []
+    costs = [row["cost"] for row in usage if isinstance(row, dict) and finite_number(row.get("cost"))]
+    accounted = isinstance(jev, dict) and jev.get("accounting_complete") is True
+    complete = (accounted and all(type(value) is int and value >= 0 for value in counts.values())
+                and counts["unobserved_attempts"] == 0
+                and counts["attempted_calls"] == counts["requests"] == len(usage) == len(costs))
+    return {"schema": "gptgrep.harbor.decisions-cost.v1", "observed": isinstance(jev, dict),
+            "validated_requests": counts["requests"], "attempted_calls": counts["attempted_calls"],
+            "unobserved_attempts": counts["unobserved_attempts"], "usage_rows": len(usage),
+            "priced_rows": len(costs), "accounting_complete": accounted,
+            "reported_cost_usd": sum(costs) if complete else None, "cost_complete": complete,
+            "currency_verified": False}
 
 
 def product_result(data, reader_mode):
@@ -129,7 +170,8 @@ def product_result(data, reader_mode):
                 isinstance(report.get("initial_retrieval"), dict), "rich_product_fields")
     else:
         require(report.get("schema_version") != "gptgrep.rich_multimodal.host.v1" and
-                report.get("status") == "completed", "product_not_completed")
+                report.get("status") in LEGACY_ANSWER_STATUSES, "product_not_completed")
+    # An empty abstention is not a completed answer: it stays an operational failure.
     answer = report.get("answer")
     require(isinstance(answer, str) and answer.strip() and
             len(answer.encode()) <= MAX_ANSWER, "product_answer")
@@ -152,6 +194,8 @@ def product_result(data, reader_mode):
     attempts = report.get("model_attempts")
     require(attempts is None or isinstance(attempts, list), "attempts_shape")
     return answer, {**product_accounting(report),
+                    "product_status": report["status"],
+                    "insufficient_evidence": report["status"] == "insufficient_evidence",
                     "retrieval": report.get("retrieval"),
                     "cost_usd": None, "cost_complete": False,
                     "physical_provider_requests": None,
@@ -212,22 +256,31 @@ def main():
         require(version["return_code"] == 0 and version["failure"] is None and
                 version["stdout"].strip() == ("codex-cli " + CODEX_VERSION).encode(), "native_version_mismatch")
         operation["observed_native_version"] = version["stdout"].decode().strip()
+        decisions = None
+        if binding["arm"] == "gptgrep":
+            decisions = operation["decisions_mode"] = selected_mode(config)
         argv = reader_argv(config, binding, question)
         # Both arms record the same shared answer rules, or none, for the run.
         rules = shared_answer_rules(config)
         operation["shared_answer_rules_sha256"] = sha(rules.encode()) if rules else None
-        if binding["arm"] == "gptgrep" and config.get("decisions_preparation") is not None:
+        if decisions == "preparation":
             writer = acquire_writer()
             env, operation["decisions_preparation"] = prepare_decisions(
                 config, binding, question, argv, started=started,
                 deadline_unix_ms=deadline_unix_ms, environ=os.environ)
-        elif binding["arm"] == "gptgrep":
+        elif decisions == "existing_context":
             budget = parse(pinned(config["decisions_budget"], 16384))
             require(Path(budget["ledger_path"]).parent == Path(DECISIONS_LEDGER_DIR),
                     "decisions_ledger_mount_contract")
+        # invocation_bounded joins no ledger: the Ask creates its own context and
+        # its reported Decisions cost receipt is kept per trial below.
         native_input = raw_prompt(config, question) if binding["arm"] == "raw_only" else None
         remaining = config["deadline_seconds"] - (time.monotonic() - started)
         require(remaining > 0, "reader_deadline")
+        if decisions == "invocation_bounded":
+            # Create-new, immediately before the one Ask: a re-executed trial
+            # stops here as an operational failure with no Decisions spend.
+            operation["decisions_claim"] = claim_invocation(binding, deadline_unix_ms)
         result = run(argv, cwd="/data/corpus", timeout=remaining, env=env, input_bytes=native_input)
         attempt = {"ordinal": 0, "elapsed_ms": result["elapsed_ms"],
                    "return_code": result["return_code"], "failure": result["failure"],
@@ -254,10 +307,21 @@ def main():
                 attempt.update(codex_accounting(result["stdout"]))
         except (ValueError, TypeError, KeyError, AttributeError):
             attempt["accounting_projection_complete"] = False
+        if decisions == "invocation_bounded":
+            # Host-side copy beside the claim, outside the Harbor job directory.
+            # Evidence only: a failed write never changes the Ask's outcome.
+            try:
+                operation["decisions_receipt"] = record_invocation(binding, result["stdout"], attempt)
+            except (OSError, ValueError, TypeError):
+                operation["decisions_receipt"] = None
         require(result["failure"] is None and result["return_code"] == 0, "reader_process")
         answer, metadata = (product_result(result["stdout"], config["reader_mode"]) if binding["arm"] == "gptgrep"
                             else codex_result(result["stdout"]))
         attempt.update(metadata)
+        if binding["arm"] == "gptgrep":
+            # A completed intentional abstention crosses as an ordinary response
+            # for judging; the flag stays in the private operation record.
+            operation["insufficient_evidence"] = metadata["insufficient_evidence"]
         outcome.update(status="response", answer=answer)
     except Exception:
         # Redacted code only: exception text may contain task/provider/private data.
