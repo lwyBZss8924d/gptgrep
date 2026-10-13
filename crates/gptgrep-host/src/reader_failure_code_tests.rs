@@ -507,6 +507,78 @@ async fn every_scripted_reader_fault_reports_its_stable_code() {
     }
 }
 
+/// The app-server stops reading its input after thread/start, so turn/start is
+/// still being written when the reader deadline arrives. The attempt and the
+/// ask report the deadline, not a closed input transport.
+#[tokio::test]
+async fn deadline_during_a_stalled_turn_start_write_reports_the_deadline() {
+    let root = fixture().await;
+    let config = HostConfig {
+        timeout_secs: 1,
+        ..HostConfig::default()
+    };
+    let mut evidence = Evidence::open(root.path(), None).unwrap();
+    let accounting = Accounting::create(root.path(), &evidence.generation).unwrap();
+    accounting.bind_workflow("query", None).unwrap();
+    accounting.set_model_attempt_limit(1).unwrap();
+    let mut attempt = ModelAttemptTracker::reserve(&accounting, "final_reader", &config).unwrap();
+    attempt.observer().running().unwrap();
+    let (client, wire) = tokio::io::duplex(1024);
+    let (reader, writer) = tokio::io::split(client);
+    let (server_reader, mut server_writer) = tokio::io::split(wire);
+    let (client_failed, stalled) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let mut reader = BufReader::new(server_reader);
+        expect(&mut reader, "initialize").await;
+        send(&mut server_writer, json!({"id":1,"result":{}})).await;
+        expect(&mut reader, "initialized").await;
+        expect(&mut reader, "account/read").await;
+        let account = json!({"id":100,"result":{"account":{"type":"chatgpt"}}});
+        send(&mut server_writer, account).await;
+        expect(&mut reader, "config/read").await;
+        send(&mut server_writer, json!({"id":2,"result":{"config":{}}})).await;
+        expect(&mut reader, "thread/start").await;
+        let thread = json!({"thread":{"id":"thread-native"},"model":DEFAULT_MODEL,
+            "modelProvider":"openai","reasoningEffort":"max","serviceTier":"priority",
+            "approvalPolicy":"never","sandbox":{"type":"readOnly","networkAccess":false}});
+        send(&mut server_writer, json!({"id":3,"result":thread})).await;
+        // Keep the input open without reading it until the client has failed.
+        let _ = stalled.await;
+    });
+    // turn/start carries the question, so it exceeds the 1 KiB transport buffer.
+    let question = "q".repeat(6000);
+    let started = std::time::Instant::now();
+    let result = protocol::run_observed(
+        BufReader::new(reader),
+        writer,
+        root.path(),
+        &config,
+        protocol::Workflow::Retrieval {
+            question: &question,
+            node_id: None,
+            evidence: &mut evidence,
+        },
+        None,
+        protocol::RunOptions {
+            observer: Some(attempt.observer()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let Err(error) = result else {
+        panic!("the stalled reader turn completed");
+    };
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    // Classify the captured invocation as run_process_until does.
+    let transport = crate::transport::TransportBudget::new(protocol::MAX_TOTAL_BYTES);
+    let error = capture_invocation_result::<()>(Ok(Err(error)), &transport, true).unwrap_err();
+    attempt.finish(Some(&error)).unwrap();
+    drop(client_failed);
+    server.await.unwrap();
+    let attempts = accounting.model_attempts();
+    assert_coded(&error, &attempts[0], "codex", "host_deadline_exceeded");
+}
+
 async fn process_failure(root: &Path, config: &HostConfig) -> (anyhow::Error, ModelAttempt) {
     let mut evidence = Evidence::open(root, None).unwrap();
     let accounting = Accounting::create(root, &evidence.generation).unwrap();

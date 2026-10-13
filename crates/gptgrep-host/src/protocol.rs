@@ -1235,6 +1235,16 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CheckedWriter<'_, W> {
     }
 }
 
+/// A failed write or flush keeps the code of the deadline or transport failure
+/// that the checked writer observed, so a frame still pending at the deadline
+/// is a timeout. Any other write error means the app-server input closed.
+fn input_failure(error: std::io::Error) -> anyhow::Error {
+    match error.get_ref().map(ToString::to_string) {
+        Some(code) if crate::model_attempts::is_host_code(&code) => anyhow!(code),
+        _ => anyhow!("host_codex_input_transport_closed"),
+    }
+}
+
 struct Rpc<R, W> {
     reader: R,
     writer: Arc<AsyncMutex<W>>,
@@ -1313,14 +1323,8 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Rpc<R, W> {
                 deadline: self.deadline,
                 execution: self.startup.execution.as_ref(),
             };
-            writer
-                .write_all(&bytes)
-                .await
-                .map_err(|_| anyhow!("host_codex_input_transport_closed"))?;
-            writer
-                .flush()
-                .await
-                .map_err(|_| anyhow!("host_codex_input_transport_closed"))?;
+            writer.write_all(&bytes).await.map_err(input_failure)?;
+            writer.flush().await.map_err(input_failure)?;
             self.check()?;
             Ok::<(), anyhow::Error>(())
         };

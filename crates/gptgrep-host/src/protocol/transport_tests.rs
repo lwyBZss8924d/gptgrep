@@ -362,3 +362,93 @@ async fn expired_original_deadline_does_not_admit_a_frame() {
     assert_eq!(budget.used(), 0);
     assert!(rpc.writer.lock().await.is_empty());
 }
+
+/// Keeps every written byte but never completes a flush.
+struct PendingFlush {
+    bytes: Vec<u8>,
+}
+impl AsyncWrite for PendingFlush {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.bytes.extend_from_slice(bytes);
+        Poll::Ready(Ok(bytes.len()))
+    }
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Pending
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// A frame still being written or flushed when the invocation deadline arrives
+/// reports the deadline, not a closed input transport.
+#[tokio::test]
+async fn deadline_during_a_pending_write_or_flush_is_not_a_closed_transport() {
+    let value = json!({"id":1,"method":"initialize"});
+    let frame = crate::transport::encode_frame(&value, MAX_FRAME_BYTES).unwrap();
+    // The peer does not read the one-byte duplex, so the write stays pending.
+    let (writer, mut peer) = tokio::io::duplex(1);
+    let budget = TransportBudget::new(1024);
+    let deadline = Instant::now() + Duration::from_millis(250);
+    let mut stalled = rpc(&b""[..], writer, budget.clone(), deadline);
+    let error = stalled.send(value.clone()).await.unwrap_err();
+    assert!(Instant::now() >= deadline);
+    assert_eq!(format!("{error:#}"), "host_deadline_exceeded");
+    // The frame was admitted and its write had started before the deadline.
+    let mut delivered = [0u8; 1];
+    peer.read_exact(&mut delivered).await.unwrap();
+    assert_eq!(delivered, frame[..1]);
+    assert_eq!(budget.used(), frame.len());
+    assert_eq!(
+        budget.check_host().unwrap_err().to_string(),
+        "host_transport_unknown"
+    );
+    let budget = TransportBudget::new(1024);
+    let deadline = Instant::now() + Duration::from_millis(250);
+    let writer = PendingFlush { bytes: Vec::new() };
+    let mut unflushed = rpc(&b""[..], writer, budget.clone(), deadline);
+    let error = unflushed.send(value).await.unwrap_err();
+    assert!(Instant::now() >= deadline);
+    assert_eq!(format!("{error:#}"), "host_deadline_exceeded");
+    // The complete frame was written; only its flush was pending.
+    assert_eq!(unflushed.writer.lock().await.bytes, frame);
+    assert_eq!(
+        budget.check_host().unwrap_err().to_string(),
+        "host_transport_unknown"
+    );
+}
+
+/// A shared-meter failure observed by a pending write keeps its own code.
+#[tokio::test]
+async fn shared_transport_failure_during_a_pending_write_keeps_its_code() {
+    let (writer, mut peer) = tokio::io::duplex(1);
+    let budget = TransportBudget::new(1024);
+    let mut rpc = rpc(
+        &b""[..],
+        writer,
+        budget.clone(),
+        Instant::now() + Duration::from_secs(5),
+    );
+    let stderr = budget.clone();
+    // The send is polled first: it writes one byte and stays pending.
+    let (result, ()) = tokio::join!(
+        rpc.send(json!({"id":1,"method":"initialize"})),
+        async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            // stderr exceeds the shared meter while the frame is still pending.
+            assert!(stderr.admit(1024).is_err());
+            // Reading the written byte wakes the pending write.
+            let mut byte = [0u8; 1];
+            peer.read_exact(&mut byte).await.unwrap();
+            assert_eq!(byte, b"{"[..]);
+        }
+    );
+    assert_eq!(
+        format!("{:#}", result.unwrap_err()),
+        "host_total_transport_limit"
+    );
+}

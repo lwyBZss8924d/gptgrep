@@ -5,6 +5,7 @@ import fcntl
 import hashlib
 import json
 from pathlib import Path
+import re
 import sys
 import tempfile
 import unittest
@@ -45,7 +46,9 @@ def index_report(*, missing_tokens=True, missing_cost=False, model_complete=True
 
 
 class Fixture:
-    def __init__(self, root):
+    def __init__(self, root, failures=None):
+        # Optional {row: (code, stage)} replaces the failure code of rows 0-2 and 5-7.
+        failures = failures or {}
         self.root = root.resolve()
         self.origin = self.root / "synthetic-gpt6-origin"
         self.origin.mkdir()
@@ -127,6 +130,10 @@ class Fixture:
             else:
                 snapshots = []
                 code = stage = None
+            if row in failures:
+                code, stage = failures[row]
+                if stage == "navigation":
+                    snapshots = [[]]  # Navigation runs before any model attempt is reserved.
             if snapshots:
                 pid, began = 10000 + ordinal, 1_000_000 + ordinal * 1000
                 ledger = corpus / ".gptgrep/host-attempts" / f"attempt-{began + 10}-{pid}-0.jsonl"
@@ -224,6 +231,45 @@ class RecoveryPlanTests(unittest.TestCase):
         self.assertTrue(by_row[7]["cost_policy"]["exclude_from_experimental_comparison_cost"])
         self.assertFalse(by_row[2]["cost_policy"]["exclude_from_experimental_comparison_cost"])
         self.assertEqual(result["new_model_calls"], 0)
+
+    def audit_with(self, failures):
+        with tempfile.TemporaryDirectory() as temporary:
+            result = recovery.audit(Fixture(Path(temporary), failures).inputs)
+        return result, {item["source_row"]: item for item in result["attempt_decisions"]}
+
+    def test_stable_host_codes_keep_the_admission_of_the_fallback_they_replaced(self):
+        # Rows 0 and 1 failed before the final reader or before its thread was observed.
+        for failures in ({0: ("host_codex_app_server_closed", "query_plan"), 1: ("host_codex_spawn_failed", "codex")},
+                         {0: ("host_index_unavailable", "navigation"), 1: ("host_codex_chatgpt_login_required", "codex")},
+                         {0: ("host_trace_file_unavailable", "query_plan"), 1: ("host_navigation_overlay_unavailable", "codex")},
+                         {0: ("host_generation_changed", "navigation"), 1: ("host_codex_process_reap_failed", "codex")}):
+            with self.subTest(failures=failures):
+                result, by_row = self.audit_with(failures)
+                self.assertEqual([item["source_row"] for item in result["selected"]], [0, 1, 2, 7])
+                self.assertEqual(by_row[0]["reason"], "before_final_reader")
+                self.assertEqual(by_row[1]["reason"], "reader_before_observed_thread")
+
+    def test_stable_host_codes_are_not_admitted_where_no_admitted_fallback_existed(self):
+        for code, stage in (("host_search_failed", "initial_search"), ("host_navigation_overlay_unavailable", "query_plan_prepare"),
+                            ("host_index_unavailable", "query_plan"), ("host_codex_spawn_failed", "navigation"),
+                            ("host_codex_process_timeout", "query_plan"), ("host_deadline_exceeded", "query_plan"),
+                            ("host_model_attempt_timeout", "query_plan"), ("host_answer_invalid_json", "citation_validation")):
+            with self.subTest(code=code, stage=stage):
+                result, by_row = self.audit_with({0: (code, stage)})
+                self.assertEqual([item["source_row"] for item in result["selected"]], [1, 2, 7])
+                self.assertEqual(by_row[0]["reason"], "final_boundary_or_failure_category_not_admitted")
+
+    def test_every_documented_stable_code_has_an_admission_decision(self):
+        # A new code in the host README "Failure codes" table needs an explicit decision here.
+        readme = (ROOT / "crates/gptgrep-host/README.md").read_text()
+        rows = [line for line in readme.split("## Failure codes", 1)[1].split("\n## ", 1)[0].splitlines() if line.startswith("| `")]
+        documented = {code for line in rows for code in re.findall(r"`(host_[a-z_]+)`", line.split("|")[1])}
+        admitted = set().union(*recovery.STABLE_CODE_STAGES.values())
+        excluded = {code for code in documented if code.startswith("host_answer_")} | {"host_codex_process_timeout"}
+        self.assertLessEqual(admitted, documented)
+        self.assertFalse(admitted & excluded)
+        self.assertEqual(documented - admitted - excluded, set())
+        self.assertFalse(admitted & recovery.ALLOWED_CODES)
 
     def test_plan_is_atomic_idempotent_and_never_mutates_origin(self):
         before = recovery.retained.inventory(self.fixture.origin)

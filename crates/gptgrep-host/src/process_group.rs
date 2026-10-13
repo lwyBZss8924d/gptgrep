@@ -43,11 +43,7 @@ impl OwnedGroup {
         {
             let _ = child.start_kill();
         }
-        let reaped = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-        ensure!(
-            matches!(reaped, Ok(Ok(_))),
-            "host_codex_process_reap_timeout"
-        );
+        reap_outcome(tokio::time::timeout(Duration::from_secs(5), child.wait()).await)?;
         self.armed = false;
         Ok(())
     }
@@ -116,5 +112,48 @@ impl Drop for OwnedGroup {
             // the leader through Tokio's child lifecycle.
             let _ = self.signal(libc::SIGKILL);
         }
+    }
+}
+
+/// The owned leader must be reaped within the cleanup limit. A reap that is
+/// still pending at the limit and a wait that fails are reported apart; the
+/// group stays armed in both cases.
+fn reap_outcome<T>(
+    reaped: std::result::Result<std::io::Result<T>, tokio::time::error::Elapsed>,
+) -> Result<T> {
+    reaped
+        .map_err(|_| anyhow!("host_codex_process_reap_timeout"))?
+        .map_err(|_| anyhow!("host_codex_process_reap_failed"))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_failed_reap_wait_is_not_reported_as_a_reap_timeout() {
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let pid = child.id().unwrap() as libc::pid_t;
+        // Reap the child outside Tokio, so its owned wait fails at once.
+        // SAFETY: pid is this test's own child and is not yet reaped.
+        unsafe {
+            assert_eq!(libc::kill(pid, libc::SIGKILL), 0);
+            let mut status = 0;
+            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+        }
+        let reaped = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+        assert!(matches!(reaped, Ok(Err(_))));
+        assert_eq!(
+            format!("{:#}", reap_outcome(reaped).unwrap_err()),
+            "host_codex_process_reap_failed"
+        );
+        let elapsed = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            format!("{:#}", reap_outcome::<()>(Err(elapsed)).unwrap_err()),
+            "host_codex_process_reap_timeout"
+        );
+        assert_eq!(reap_outcome(Ok(Ok(7))).unwrap(), 7);
     }
 }
