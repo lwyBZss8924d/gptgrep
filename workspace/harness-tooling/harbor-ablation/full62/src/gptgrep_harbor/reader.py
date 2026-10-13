@@ -7,13 +7,14 @@ from pathlib import Path
 from .product_bundle import PRODUCT_PROVENANCE, PRODUCT_ROOT, check_product_bundle
 import time
 
-from .common import MAX_ANSWER, MAX_READER_QUESTION_BYTES, PROFILE, canonical, copy_asset, finite_number, parse, pinned, put, read, require, sha, validate_binding
+from .common import (MAX_ANSWER, MAX_READER_QUESTION_BYTES, PROFILE, canonical, copy_asset, field_at, finite_number,
+                     parse, pinned, put, read, require, sha, validate_binding)
 from .native import codex_accounting, codex_argv, codex_result, prompt_bytes
 from .process import run
 from .runtime import CODEX_VERSION, DECISIONS_BUDGET, DECISIONS_LEDGER_DIR, check_config, native_environment
 from .decisions import (TRIAL_BUDGET, acquire_writer, claim_invocation, init_trial_budget,
-                        prepare as prepare_decisions, record_invocation, selected_mode, trial_budget_status,
-                        trial_paths, trial_submission_limit)
+                        prepare as prepare_decisions, product_limits, record_invocation, selected_mode,
+                        trial_budget_status, trial_paths, trial_submission_limit)
 
 
 # A completed legacy report is a response. An insufficient_evidence report with
@@ -86,13 +87,8 @@ PRODUCT_SCHEMA_SECONDS = 5
 # Adapter-defined failure codes that an operation record may carry verbatim.
 # Every other exception stays the redacted generic failure.
 RECORDED_FAILURE_CODES = ("product_reader_contract_unavailable", "decisions_max_submissions_per_trial",
-                          "decisions_trial_budget_unavailable", "decisions_submission_limit_reached")
-
-
-def schema_field(value, path):
-    for key in path:
-        value = value.get(key) if type(value) is dict else None
-    return value
+                          "decisions_trial_budget_unavailable", "decisions_submission_limit_reached",
+                          "decisions_product_limits_mismatch", "decisions_claim_mount", "trial_already_claimed")
 
 
 def product_schema(config):
@@ -132,7 +128,7 @@ def reader_contract(config, binding, schema=None):
     if mode == "legacy_text":
         require(schema is not None, "product_reader_contract_unavailable")
         data, contract = schema
-        rules = schema_field(contract, ANSWER_RULES_FIELD)
+        rules = field_at(contract, ANSWER_RULES_FIELD)
         require(isinstance(rules, str) and rules.strip(), "product_reader_contract_unavailable")
         record.update(answer_rules_source="product_schema:" + ".".join(ANSWER_RULES_FIELD),
                       answer_rules_sha256=sha(rules.encode()), product_schema_sha256=sha(data))
@@ -140,15 +136,16 @@ def reader_contract(config, binding, schema=None):
 
 
 def observe_reader_contract(config, binding):
-    """(record, None) or (None, failure code); a treatment that cannot report its contract stops before its Ask."""
+    """(record, schema report, None), or (None, None, failure code): a treatment that
+    cannot report its contract stops before its Ask."""
     try:
         schema = None
         if binding["arm"] == "gptgrep" and config["reader_mode"] == "legacy_text":
             schema = product_schema(config)
-        return reader_contract(config, binding, schema), None
+        return reader_contract(config, binding, schema), schema, None
     except Exception:
         # Redacted code only: product output is never copied into the record.
-        return None, "product_reader_contract_unavailable"
+        return None, None, "product_reader_contract_unavailable"
 
 
 def product_accounting(report):
@@ -294,7 +291,15 @@ def main():
             "reader_outputs_already_exist")
     # Before the query timer: the treatment's identity comes from the verified
     # product's own report; a failure is recorded and stops the trial below.
-    contract, contract_failure = observe_reader_contract(config, binding)
+    contract, schema, contract_failure = observe_reader_contract(config, binding)
+    claimed = config.get("decisions_mode") == "invocation_bounded"
+    limits = None
+    if claimed and binding["arm"] == "gptgrep" and contract_failure is None:
+        # The admitted cost bound uses mirrored product limits: the pinned
+        # product's own report must confirm them before the claim.
+        limits = product_limits(schema[1]) if schema is not None else None
+        if limits is None or not limits["match"]:
+            contract_failure = "decisions_product_limits_mismatch"
     put("/logs/agent/attempt-start.json", {"binding": binding, "profile": PROFILE})
     started = time.monotonic()
     deadline_unix_ms = time.time_ns() // 1000000 + config["deadline_seconds"] * 1000
@@ -315,6 +320,8 @@ def main():
                  "budget_scope": config["budget_scope"],
                  "outer_retry_count": 0, "provider_internal_retry_count": None,
                  "index_excluded": True, "grounding": "unassessed"}
+    if limits is not None:
+        operation["decisions_product_limits"] = limits
     writer = None
     try:
         if contract_failure is not None:
@@ -343,10 +350,12 @@ def main():
         native_input = raw_prompt(config, question) if binding["arm"] == "raw_only" else None
         remaining = config["deadline_seconds"] - (time.monotonic() - started)
         require(remaining > 0, "reader_deadline")
+        if claimed:
+            # Create-new, immediately before this trial's one reader process,
+            # in both arms: a re-executed trial stops here as an operational
+            # failure (trial_already_claimed), the treatment with no Decisions spend.
+            claim = operation["trial_claim"] = claim_invocation(binding, deadline_unix_ms)
         if decisions == "invocation_bounded":
-            # Create-new, immediately before the one Ask: a re-executed trial
-            # stops here as an operational failure with no Decisions spend.
-            claim = operation["decisions_claim"] = claim_invocation(binding, deadline_unix_ms)
             # The product creates this trial's own ledger with the per-trial
             # submission limit; the Ask joins it and the product enforces it.
             operation["decisions_trial_budget"] = init_trial_budget(config, binding, claim, deadline_unix_ms,

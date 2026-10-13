@@ -46,7 +46,7 @@ class InvocationBoundedMaterializationTests(unittest.TestCase):
         finally:
             self.runtime = original
 
-    def test_treatment_mounts_only_its_own_claim_and_passes_no_budget_file(self):
+    def test_each_trial_mounts_only_its_own_claim_and_the_treatment_passes_its_trial_ledger(self):
         dataset = self.root / "dataset"
         result = self.materializer().run(dataset)
         preflight = result["preflight"]["decisions"]
@@ -65,6 +65,12 @@ class InvocationBoundedMaterializationTests(unittest.TestCase):
                                                            "submissions_per_trial": "product_trial_decisions_budget",
                                                            "request_bytes": "product"})
         self.assertIn("provider_prompt_tokens_beyond_one_per_request_byte", preflight["excluded"])
+        # The mirrored product limits are labelled and checked in every treatment trial.
+        self.assertEqual(preflight["product_limits"],
+                         {"max_submissions": 200, "max_request_bytes": 65536, "source": "mirrored_from_gptgrep_jev",
+                          "checked_against": "pinned_product_schema_in_every_treatment_trial_before_its_claim"})
+        self.assertEqual(preflight["price_plausibility"],
+                         {"usd_per_million_prompt_tokens": [0.001, 1000], "usd_per_request_at_most": 1})
         treatments, claims = 0, set()
         for record in result["tasks"]:
             task = dataset / record["task_name"]
@@ -77,10 +83,7 @@ class InvocationBoundedMaterializationTests(unittest.TestCase):
             # Only the treatment reader needs the per-trial limit.
             self.assertEqual(config.get("decisions_max_submissions_per_trial"),
                              LIMIT if record["binding"]["arm"] == "gptgrep" else None)
-            if record["binding"]["arm"] != "gptgrep":
-                self.assertEqual([mount["target"] for mount in mounts], [CODEX_HOME + "/auth.json"])
-                continue
-            treatments += 1
+            # Both arms identically: only this trial's own claim directory, read/write.
             self.assertEqual([mount["target"] for mount in mounts], [CODEX_HOME + "/auth.json", decisions.CLAIM_ROOT])
             claim = mounts[1]
             self.assertFalse(claim["read_only"])
@@ -88,14 +91,19 @@ class InvocationBoundedMaterializationTests(unittest.TestCase):
             self.assertEqual(Path(claim["source"]).parent, self.claims)
             self.assertEqual(list(Path(claim["source"]).iterdir()), [])
             claims.add(claim["source"])
+            if record["binding"]["arm"] != "gptgrep":
+                continue
+            treatments += 1
             argv = reader_argv(config, record["binding"], "synthetic request")
             # The Ask joins the trial's own ledger in its claim directory.
             self.assertEqual(argv[1:5], ["--decisions-budget", decisions.CLAIM_ROOT + "/decisions-budget.json",
                                          "ask", "--native-ptc"])
             for flag in ("--multimodal", "--max-concurrent-batches"):
                 self.assertNotIn(flag, argv)
-        self.assertEqual((treatments, len(claims)), (62, 62))
-        self.assertEqual(json.loads((self.claims / "cohort.json").read_text())["treatment_trials"], 62)
+        self.assertEqual((treatments, len(claims)), (62, 124))
+        cohort = json.loads((self.claims / "cohort.json").read_text())
+        self.assertEqual((cohort["schema"], cohort["claimed_arms"], cohort["trials"], cohort["treatment_trials"]),
+                         ("gptgrep.harbor.trial-claims.v1", ["gptgrep", "raw_only"], 124, 62))
         # A consumed claims root cannot be materialized again, even into a fresh output.
         with self.assertRaisesRegex(ValueError, "decisions_claims_not_fresh"):
             self.materializer().run(self.root / "repeat-dataset")
@@ -112,6 +120,29 @@ class InvocationBoundedMaterializationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "decisions_inside_task_output"):
             self.materializer().run(self.claims / "dataset")
         self.assertEqual(list(self.claims.iterdir()), [])
+
+    def test_claims_root_stays_fresh_when_the_output_root_cannot_be_created(self):
+        adapter = self.materializer()
+        with self.assertRaises(FileNotFoundError):
+            adapter.run(self.root / "missing-parent" / "dataset")
+        self.assertEqual(list(self.claims.iterdir()), [])
+        # The untouched claims root still materializes the cohort.
+        self.assertEqual(len(adapter.run(self.root / "dataset")["tasks"]), 124)
+        self.assertTrue((self.claims / "cohort.json").is_file())
+
+    def test_implausible_price_units_are_rejected(self):
+        price = self.runtime["decisions_prompt_price"]
+        # A per-token USD 0.10 per million price, other unit slips and an implausible fee.
+        for changes in ({"usd_per_million_prompt_tokens": 0.0000001}, {"usd_per_million_prompt_tokens": 0.0009},
+                        {"usd_per_million_prompt_tokens": 1000.5}, {"usd_per_request": 1.5}):
+            with self.subTest(changes=changes):
+                self.rejected("decisions_price_unit_implausible", decisions_prompt_price={**price, **changes},
+                              decisions_cost_cap_usd=10**8)
+        for changes in ({"usd_per_million_prompt_tokens": 0.001}, {"usd_per_million_prompt_tokens": 1000},
+                        {"usd_per_request": 1}):
+            with self.subTest(changes=changes):
+                self.runtime.update(decisions_prompt_price={**price, **changes}, decisions_cost_cap_usd=10**8)
+                self.assertEqual(self.materializer().preflight["decisions"]["price"], {**price, **changes})
 
     def test_reader_seccomp_change_after_validation_refuses_before_any_claim_or_task(self):
         adapter = self.materializer()

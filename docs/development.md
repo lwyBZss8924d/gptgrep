@@ -359,9 +359,10 @@ documents, such as a host-built index); qualify matching reader permissions and 
 the owner-approved reader seccomp profile that both reader containers need for Codex's
 bubblewrap sandbox (the adapter's `seccomp/` directory); supply
 the frozen private cohort and Judge contract; select one treatment Decisions mode
-(an existing shared ledger, per-trial preparation, or invocation-bounded trials,
-each with one create-new host claim and its own product-enforced Decisions
-submission limit, a pinned price and a cohort cost cap checked at admission); prepare all 124
+(an existing shared ledger, per-trial preparation, or invocation-bounded trials:
+one create-new host claim per trial in both arms, a product-enforced per-trial
+Decisions submission limit, a pinned and plausibility-checked price and a cohort
+cost cap checked at admission); prepare all 124
 tasks; build exact role images; run the generated Harbor job; aggregate all paired
 outcomes. Its `prepare`,
 `build-local-images` and `aggregate` commands require pinned manifests; `prepare`
@@ -373,7 +374,9 @@ Raw Codex receives only original documents and may extract/render during SEARCH.
 GPTgrep receives the same bytes plus a frozen index built before question access.
 Both readers use the same selected native binary and generic raw-document tools,
 with identical configuration bytes that disable hosted web search, the host-side
-connector, plugin and tool-suggestion features, and model-tool network access.
+connector, plugin, tool-suggestion and image-generation features, account cloud
+Skills and model-tool network access. Only treatment trials receive the
+Decisions provider key.
 Both reader containers run under the same seccomp profile, which adds only the
 namespace calls bubblewrap needs to Docker's default; the Judge keeps the default.
 GPTgrep's reader contract (base instructions, citation and abstention rules and

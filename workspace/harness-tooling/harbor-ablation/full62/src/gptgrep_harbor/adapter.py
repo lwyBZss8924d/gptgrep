@@ -431,11 +431,15 @@ class Full62Adapter:
             # One claims root per materialized cohort: a consumed root, whose
             # trials may already have spent, cannot be materialized again.
             require(not any(claims.iterdir()), "decisions_claims_not_fresh")
-            put(claims / "cohort.json", {"schema": "gptgrep.harbor.decisions-invocation-claims.v1",
+        root.mkdir(mode=0o700, parents=False)
+        if selected_mode(self.runtime) == "invocation_bounded":
+            # Only after the output root exists: a failed start leaves the
+            # claims root fresh for a retried materialization.
+            put(claims / "cohort.json", {"schema": "gptgrep.harbor.trial-claims.v1",
                                          "run_id": self.runtime["run_id"],
                                          "runtime_sha256": self.manifest["runtime"]["sha256"],
+                                         "claimed_arms": list(ARMS), "trials": len(ARMS) * len(self.rows),
                                          "treatment_trials": len(self.rows)})
-        root.mkdir(mode=0o700, parents=False)
         package = Path(__file__).parent
         exported = []
         for row in self.rows:
@@ -526,11 +530,13 @@ class Full62Adapter:
                 "seed": {**preparation["seed"], "path": CONTROL_ROOT + "/seed.json"},
                 # The unchanged financial guard caps each identifier at 96 bytes.
                 "run_id": runtime["run_id"][:63] + "-" + trial_id, "max_concurrent_batches": 1}
-        elif mode == "invocation_bounded" and arm == "gptgrep":
-            # One fresh claim directory per treatment trial, outside the job.
+        elif mode == "invocation_bounded":
+            # One fresh claim directory per trial of either arm, outside the job:
+            # a re-executed trial of either arm fails closed on its claim.
             trial_state = Path(runtime["decisions_claims_dir"]) / sha(canonical(binding))[:32]
             trial_state.mkdir(mode=0o700)
-            reader["decisions_max_submissions_per_trial"] = runtime["decisions_max_submissions_per_trial"]
+            if arm == "gptgrep":
+                reader["decisions_max_submissions_per_trial"] = runtime["decisions_max_submissions_per_trial"]
         put(task / "environment/reader.json", reader)
         # The frozen response schema enters only the Judge's private /tests area.
         schema_bytes = output_schema_bytes(self.judge["response_schema"])
@@ -584,24 +590,25 @@ class Full62Adapter:
                 # Both arms identically. The Judge/verifier compose keeps
                 # Docker's default profile and carries no security option.
                 compose["services"]["main"]["security_opt"] = list(reader_security)
-            if role == "reader" and arm == "gptgrep":
+            mounts = []
+            if role == "reader" and mode == "invocation_bounded":
+                # Both arms identically: no ledger or budget state leaves the
+                # host; only this trial's own claim directory is writable.
+                mounts = [(str(trial_state), CLAIM_ROOT, False)]
+            elif role == "reader" and arm == "gptgrep":
                 if mode == "preparation":
                     mounts = [(preparation["controls_directory"], CONTROL_ROOT, True),
                               (preparation["financial_family_directory"], FAMILY_ROOT, False),
                               (str(trial_state), TRIAL_ROOT, False),
                               (str(Path(preparation["trial_state_directory"]) / "sole-writer.lock"), WRITER_LOCK,
                                False)]
-                elif mode == "existing_context":
+                else:
                     mounts = [(runtime["decisions_budget"]["path"], DECISIONS_BUDGET, True),
                               (runtime["decisions_ledger_dir"], DECISIONS_LEDGER_DIR, False)]
-                else:
-                    # invocation_bounded: no ledger or budget state leaves the
-                    # host; only this trial's own claim directory is writable.
-                    mounts = [(str(trial_state), CLAIM_ROOT, False)]
-                for source, target, read_only in mounts:
-                    compose["services"]["main"]["volumes"].append({"type": "bind",
-                        "source": source, "target": target, "read_only": read_only,
-                        "bind": {"create_host_path": False}})
+            for source, target, read_only in mounts:
+                compose["services"]["main"]["volumes"].append({"type": "bind",
+                    "source": source, "target": target, "read_only": read_only,
+                    "bind": {"create_host_path": False}})
             put(task / directory / "docker-compose.yaml", compose)
             # Credentials and arbitrary sibling files cannot enter either image.
             allowed = ["gptgrep_harbor", "config.toml"] + (

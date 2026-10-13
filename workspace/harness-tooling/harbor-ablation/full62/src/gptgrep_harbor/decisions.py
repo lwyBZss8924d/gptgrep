@@ -10,7 +10,7 @@ import stat
 import time
 import unicodedata
 
-from .common import canonical, digest, integer, parse, pinned, put, read, require, sha
+from .common import canonical, digest, field_at, integer, parse, pinned, put, read, require, sha
 from .process import run
 from .runtime import DECISIONS_LEDGER_DIR, native_environment, validate_asset_path
 
@@ -20,7 +20,9 @@ TRIAL_ROOT = "/opt/full62-private/trial"
 TRIAL_BUDGET = TRIAL_ROOT + "/budget.json"
 WRITER_LOCK = "/opt/full62-private/sole-writer.lock"
 # invocation_bounded: this trial's own claim directory, mounted from the host
-# outside the Harbor job directory. It also holds the trial's own Decisions
+# outside the Harbor job directory in both arms, so a re-executed trial of
+# either arm fails closed on its claim. A treatment directory also holds the
+# trial's own Decisions
 # ledger, lock and control file: the product creates them right after the claim
 # with the per-trial submission limit, and the Ask joins them, so the product
 # itself refuses any submission beyond that limit.
@@ -37,15 +39,31 @@ MODE_FIELDS = {"existing_context": ("decisions_budget", "decisions_ledger_dir"),
                "preparation": ("decisions_preparation",),
                "invocation_bounded": ("decisions_cost_cap_usd", "decisions_prompt_price", "decisions_claims_dir",
                                       "decisions_max_submissions_per_trial")}
-# Product limits mirrored from gptgrep-jev: a context admits at most
+# Product limits MIRRORED from gptgrep-jev for the host-side admission bound,
+# where the Linux product cannot run: a Decisions context admits at most
 # MAX_SUBMISSIONS, which is also the range limit of `decisions-budget init
-# --max-submissions`, and one serialized request is at most MAX_REQUEST_BYTES.
+# --max-submissions`, and one serialized text request is at most
+# MAX_REQUEST_BYTES. Before its claim, every invocation_bounded treatment trial
+# checks both against the pinned product's own `--schema` report, so a product
+# change that would invalidate the admitted bound stops the trial before any
+# Decisions submission.
 INVOCATION_MAX_SUBMISSIONS = 200
 MAX_REQUEST_BYTES = 64 * 1024
+PRODUCT_LIMITS = {
+    "max_submissions": (("commands", "decisions-budget", "init_options", "max-submissions", "maximum"),
+                        INVOCATION_MAX_SUBMISSIONS),
+    "max_request_bytes": (("decisions", "limits", "text_envelope_bytes"), MAX_REQUEST_BYTES)}
 # The product accepts a Decisions model selector of at most 256 bytes.
 MAX_MODEL_BYTES = 256
 # Sanity bound for every USD amount and rate; keeps each bound a finite JSON number.
 MAX_USD = 10**9
+# Plausible prices. A per-token price given where a per-million price is
+# expected (0.0000001 for USD 0.10 per million tokens) falls far below the
+# floor; the ceilings catch other unit slips. A real price outside these bounds
+# needs a reviewed source change.
+MIN_USD_PER_MILLION_TOKENS = Fraction(1, 1000)
+MAX_USD_PER_MILLION_TOKENS = 1000
+MAX_USD_PER_REQUEST = 1
 BUDGET_CONTRACT_SCHEMA = "gptgrep.decisions-budget-contract.v1"
 # Every Ask first runs the product's mandatory retrieval pass: one document-routing
 # and at least one evidence-reranking submission, even with --document scope.
@@ -154,6 +172,8 @@ def invocation_cost_bound(runtime, treatment_trials):
     request_fee = decimal(price["usd_per_request"], "decisions_prompt_price", zero=True)
     completion_rate = decimal(price["usd_per_million_completion_tokens"], "decisions_prompt_price", zero=True)
     require(completion_rate == 0, "decisions_completion_price_unbounded")
+    require(MIN_USD_PER_MILLION_TOKENS <= prompt_rate <= MAX_USD_PER_MILLION_TOKENS and
+            request_fee <= MAX_USD_PER_REQUEST, "decisions_price_unit_implausible")
     # The price evidence is a host-side pin; it never enters a task context.
     pinned(price["provenance"])
     integer(treatment_trials, 1)
@@ -164,6 +184,12 @@ def invocation_cost_bound(runtime, treatment_trials):
     return {"mode": "invocation_bounded", "treatment_trials": treatment_trials, "asks_per_trial": 1,
             "max_submissions_per_trial": limit, "max_request_bytes": MAX_REQUEST_BYTES,
             "bound_formula": BOUND_FORMULA,
+            "product_limits": {**{name: value for name, (_, value) in PRODUCT_LIMITS.items()},
+                               "source": "mirrored_from_gptgrep_jev",
+                               "checked_against": "pinned_product_schema_in_every_treatment_trial_before_its_claim"},
+            "price_plausibility": {"usd_per_million_prompt_tokens": [float(MIN_USD_PER_MILLION_TOKENS),
+                                                                     MAX_USD_PER_MILLION_TOKENS],
+                                   "usd_per_request_at_most": MAX_USD_PER_REQUEST},
             "token_bound": "one_prompt_token_per_request_byte", "price": price,
             "submission_bound_usd": float(per_submission), "trial_bound_usd": float(per_trial),
             "cohort_bound_usd": float(bound), "cost_cap_usd": runtime["decisions_cost_cap_usd"],
@@ -178,19 +204,33 @@ def invocation_cost_bound(runtime, treatment_trials):
             "submission_limit_runtime_enforced": True, "cap_runtime_enforced": False}
 
 
+def product_limits(contract):
+    """Compare the mirrored product limits with the pinned product's own `--schema` report."""
+    reported = {name: field_at(contract, path) for name, (path, _) in PRODUCT_LIMITS.items()}
+    mirrored = {name: value for name, (_, value) in PRODUCT_LIMITS.items()}
+    return {"schema": "gptgrep.harbor.decisions-product-limits.v1", "source": "product_schema",
+            "mirrored": mirrored,
+            "product_reported": {name: value if type(value) is int else None for name, value in reported.items()},
+            "match": all(type(reported[name]) is int and reported[name] == value for name, value in mirrored.items())}
+
+
 def claim_invocation(binding, deadline_unix_ms):
-    """Claim this trial's one Ask before it starts.
+    """Claim this trial's one reader process before it starts, in either arm.
 
     The claim directory is a host mount outside the Harbor job directory.
     Create-new means a re-executed trial (for example in a resumed job) fails
-    closed before any Decisions submission, so the per-trial bound holds across
-    every execution of the materialized cohort.
+    closed before its reader process, and for the treatment before any
+    Decisions submission, so no pair silently mixes executions and the
+    per-trial bound holds across every execution of the materialized cohort.
     """
     root = Path(CLAIM_ROOT)
     require(root.is_dir() and root.resolve() == root, "decisions_claim_mount")
-    claim = {"schema": "gptgrep.harbor.decisions-invocation-claim.v1",
+    claim = {"schema": "gptgrep.harbor.trial-claim.v1",
              "binding_sha256": sha(canonical(binding)), "deadline_unix_ms": deadline_unix_ms}
-    put(root / "claim.json", claim)
+    try:
+        put(root / "claim.json", claim)
+    except FileExistsError:
+        raise ValueError("trial_already_claimed") from None
     data = canonical(claim) + b"\n"
     return {"path": str(root / "claim.json"), "bytes": len(data), "sha256": sha(data)}
 

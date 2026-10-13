@@ -55,6 +55,23 @@ def decisions_costs(rows, runtime):
             "currency_verified": False, "included_in_query_cost": False}
 
 
+def trial_claims(values, runtime):
+    """invocation_bounded: every trial of both arms claims once; flag re-executed trials.
+
+    A trial that found its claim already present (for example in a resumed job)
+    is an operational failure, and its pair may mix two executions.
+    """
+    if selected_mode(runtime) != "invocation_bounded":
+        return None
+    arms, pairs = {}, set()
+    for arm, rows in values.items():
+        repeated = [row for row in rows if row["failure_code"] == "trial_already_claimed"]
+        pairs.update(row["pair_id"] for row in repeated)
+        arms[arm] = {"claimed": sum(row["trial_claimed"] for row in rows), "pre_existing_claim": len(repeated),
+                     "unclaimed": sum(not row["trial_claimed"] for row in rows) - len(repeated)}
+    return {"claimed_arms": list(ARMS), "arms": arms, "pairs_with_pre_existing_claim": len(pairs)}
+
+
 def reader_contracts(contracts, runtime):
     """Check the operation records' reader contracts against the frozen declaration.
 
@@ -242,7 +259,8 @@ def summarize(export, records, runtime):
         known_cost = sum(a["cost_usd"] for a in attempts if finite_number(a.get("cost_usd")))
         complete_cost = bool(attempts) and all(a.get("cost_complete") is True and
                                                finite_number(a.get("cost_usd")) for a in attempts)
-        values[arm].append({"label": label, "status": status, "elapsed": elapsed,
+        values[arm].append({"pair_id": pair, "label": label, "status": status, "elapsed": elapsed,
+                            "trial_claimed": operation is not None and type(operation.get("trial_claim")) is dict,
                             "time_lower": low, "time_upper": high, "known_cost_usd": known_cost,
                             "cost_complete": complete_cost, "attempt_count": len(attempts),
                             "grounding_available": grounding is not None,
@@ -310,9 +328,16 @@ def summarize(export, records, runtime):
     profile = treatment_feature_profile(runtime)
     frozen = export.get("preflight", {}).get("treatment_feature_profile")
     require(frozen is None or frozen == profile, "treatment_profile_join")
+    claims = trial_claims(values, runtime)
+    reexecuted = []
+    if claims is not None and claims["pairs_with_pre_existing_claim"]:
+        reexecuted = [str(claims["pairs_with_pre_existing_claim"]) + " pairs include a trial that found its claim "
+                      "already present (a re-execution); that trial is an operational failure and its pair may "
+                      "mix two executions."]
     return {"schema": "gptgrep.harbor.paired-summary.v1", "search": summary, "paired": comparison,
             "decisions": decisions_costs(values["gptgrep"], runtime),
             "reader_contract": reader_contracts(contracts, runtime),
+            "trial_claims": claims,
             "judge": {"outer_attempts_observed": len(judge_attempts),
                       "observed_attempt_wall_ms_subtotal": sum(a["elapsed_ms"] for a in judge_attempts
                                                                if finite_number(a.get("elapsed_ms"))),
@@ -341,4 +366,4 @@ def summarize(export, records, runtime):
               "No full62 result establishes comprehensive INDEX quality.",
               "Answerable and unanswerable slices need evaluator-side answerability metadata, "
               "which the cohort projection does not carry; abstention counts are not those slices.",
-              "Source preparation and aggregation do not grant release or Goal acceptance."]}
+              "Source preparation and aggregation do not grant release or Goal acceptance."] + reexecuted}
