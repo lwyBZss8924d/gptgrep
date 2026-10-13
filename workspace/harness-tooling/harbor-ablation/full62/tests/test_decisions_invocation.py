@@ -6,7 +6,7 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-from gptgrep_harbor import decisions
+from gptgrep_harbor import adapter as adapter_module, decisions
 from gptgrep_harbor.aggregate import summarize
 from gptgrep_harbor.common import canonical, parse, sha
 from gptgrep_harbor.reader import decisions_cost, reader_argv
@@ -108,6 +108,36 @@ class InvocationBoundedMaterializationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "decisions_claims_not_fresh"):
             self.materializer().run(self.root / "repeat-dataset")
         self.assertFalse((self.root / "repeat-dataset").exists())
+
+    def test_frozen_profile_declares_the_trial_limit_its_enforcer_and_the_exact_commands(self):
+        adapter = self.materializer()
+        profile = adapter.preflight["treatment_feature_profile"]
+        control = decisions.CLAIM_ROOT + "/decisions-budget.json"
+        self.assertEqual(profile["command"], ["gptgrep", "--decisions-budget", control, "ask", "--native-ptc"])
+        self.assertEqual(profile["decisions"], {
+            "mode": "invocation_bounded", "model": self.runtime["jev_model"], "routing_and_reranking": "mandatory",
+            "max_submissions_per_trial": LIMIT, "enforced_by": "product_decisions_budget_ledger",
+            "trial_ledger_init": {
+                "command": ["gptgrep", "decisions-budget", "init", "--plan-file", decisions.CLAIM_ROOT + "/claim.json",
+                            "--max-submissions", str(LIMIT), "--ledger", decisions.CLAIM_ROOT + "/decisions-ledger.json",
+                            "--output", control],
+                "per_trial_options": ["--run-id", "--deadline-seconds"],
+                "runs": "after_the_trial_claim_before_the_ask"}})
+        # The declared command is the exact prefix a materialized treatment reader launches.
+        row = adapter.rows[0]
+        document = next(d for d in self.runtime["documents"] if d["document_id"] == row["document_id"])
+        binding = {"pair_id": row["pair_id"], "document_id": row["document_id"], "arm": "gptgrep"}
+        task = self.root / "single-treatment-task"
+        adapter._task(task, Path(adapter_module.__file__).parent, row, document, binding)
+        config = json.loads((task / "environment/reader.json").read_text())
+        argv = reader_argv(config, binding, "synthetic request")
+        self.assertEqual(argv[1:len(profile["command"])], profile["command"][1:])
+        # A run at another limit has another frozen profile.
+        self.runtime.update(decisions_max_submissions_per_trial=200, decisions_cost_cap_usd=406.3232)
+        other = self.materializer().preflight["treatment_feature_profile"]
+        self.assertNotEqual(other, profile)
+        self.assertEqual(other["decisions"]["max_submissions_per_trial"], 200)
+        self.assertEqual(other["decisions"]["trial_ledger_init"]["command"][5:7], ["--max-submissions", "200"])
 
     def test_claims_directory_is_physical_and_outside_the_jobs_and_task_output(self):
         self.rejected("decisions_directory", decisions_claims_dir=None)
@@ -388,6 +418,17 @@ class CostAggregationTests(unittest.TestCase):
                 self.assertIsNone(summary["total_within_cap"])
                 self.assertGreater(summary["reported_cost_usd_known_subtotal"], 0.6)
         self.assertFalse(summary["currency_verified"])
+
+    def test_summary_profile_join_tells_one_trial_limit_from_another(self):
+        export, records, runtime, blobs = test_contracts.synthetic_results()
+        runtime.update(decisions_mode="invocation_bounded", decisions_max_submissions_per_trial=LIMIT)
+        export["preflight"] = {"treatment_feature_profile": adapter_module.treatment_feature_profile(runtime)}
+        with patch("gptgrep_harbor.aggregate.pinned", side_effect=lambda pin, *args: blobs[pin]):
+            profile = summarize(export, records, runtime)["profile"]["treatment_feature_profile"]
+            self.assertEqual(profile["decisions"]["max_submissions_per_trial"], LIMIT)
+            runtime["decisions_max_submissions_per_trial"] = 200
+            with self.assertRaisesRegex(ValueError, "treatment_profile_join"):
+                summarize(export, records, runtime)
 
     def test_limit_bound_trials_are_judged_failures_visible_in_the_summary(self):
         known = {"cost_complete": True, "reported_cost_usd": 0.01, "priced_rows": 3}

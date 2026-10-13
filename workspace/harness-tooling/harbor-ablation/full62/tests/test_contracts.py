@@ -15,7 +15,7 @@ from gptgrep_harbor.aggregate import paired, summarize, time_bounds
 from gptgrep_harbor.common import MAX_ANSWER, MAX_NATIVE_PROMPT_BYTES, PROFILE, canonical, parse, sha
 from gptgrep_harbor.native import codex_accounting, codex_result, output_schema_bytes, prompt_bytes
 from gptgrep_harbor.reader import product_accounting
-from gptgrep_harbor import reader, verifier
+from gptgrep_harbor import decisions as decisions_module, reader, verifier
 from gptgrep_harbor.runtime import CODEX_VERSION, READER_SECCOMP_BYTES, READER_SECCOMP_SHA256
 from gptgrep_harbor.verifier import grade, transport_reward
 from gptgrep_harbor.process import run as bounded_process
@@ -901,6 +901,11 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
                           options["--output"]),
                          ("8", str(claim_root / "claim.json"), str(claim_root / "decisions-ledger.json"), str(control)))
         self.assertTrue(0 < int(options["--deadline-seconds"]) <= 20)
+        # Exactly the per-trial options and then the fixed ones the frozen profile declares.
+        with patch("gptgrep_harbor.decisions.CLAIM_ROOT", str(claim_root)):
+            declared = decisions_module.trial_budget_init_options(8)
+        self.assertEqual((init.args[0][1:3], init.args[0][3:7:2], init.args[0][7:]),
+                         (["decisions-budget", "init"], list(decisions_module.TRIAL_BUDGET_INIT_PER_TRIAL), declared))
         self.assertEqual(status.args[0][1:], ["decisions-budget", "status", "--control", str(control), "--json"])
         # Ledger commands are offline: no provider credential.
         for call in (init, status):

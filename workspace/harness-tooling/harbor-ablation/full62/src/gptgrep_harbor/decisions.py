@@ -71,6 +71,8 @@ MIN_BOOTSTRAP_SUBMISSIONS = 2
 PRICE_FIELDS = {"model", "usd_per_million_prompt_tokens", "usd_per_million_completion_tokens",
                 "usd_per_request", "provenance"}
 TRIAL_BUDGET_SCHEMA = "gptgrep.harbor.decisions-trial-budget.v1"
+# The component that enforces the per-trial submission limit at runtime.
+TRIAL_LIMIT_ENFORCER = "product_decisions_budget_ledger"
 BUDGET_INIT_SCHEMA = "gptgrep.decisions-budget-init.v1"
 BUDGET_STATUS_SCHEMA = "gptgrep.decisions-budget-status.v1"
 RESERVATION_COUNTS = ("total", "reserved", "in_flight", "unknown", "terminal")
@@ -148,6 +150,21 @@ def trial_paths():
     """This trial's claim, Decisions ledger and control file in its own claim directory."""
     root = Path(CLAIM_ROOT)
     return root / "claim.json", root / TRIAL_LEDGER_NAME, root / TRIAL_CONTROL_NAME
+
+
+# Options of the trial ledger's `decisions-budget init` that take a value per trial.
+TRIAL_BUDGET_INIT_PER_TRIAL = ("--run-id", "--deadline-seconds")
+
+
+def trial_budget_init_options(limit):
+    """The fixed `decisions-budget init` options that create a trial's own ledger.
+
+    The frozen treatment profile declares them, and every invocation_bounded
+    treatment trial passes them with its per-trial --run-id and --deadline-seconds.
+    """
+    claim, ledger, control = trial_paths()
+    return ["--plan-file", str(claim), "--max-submissions", str(trial_submission_limit(limit)),
+            "--ledger", str(ledger), "--output", str(control)]
 
 
 def invocation_cost_bound(runtime, treatment_trials):
@@ -247,13 +264,13 @@ def init_trial_budget(config, binding, claim, deadline_unix_ms, remaining, envir
     """
     try:
         limit = trial_submission_limit(config.get("decisions_max_submissions_per_trial"))
-        claim_path, ledger, control = trial_paths()
+        _, ledger, control = trial_paths()
         run_id = "gptgrep-full62-trial-" + sha(canonical(binding))[:32]
         seconds = math.ceil((deadline_unix_ms - time.time_ns() // 1000000) / 1000)
         require(0 < seconds <= 86400 and remaining > 0, "decisions_trial_budget_unavailable")
+        # The per-trial options (TRIAL_BUDGET_INIT_PER_TRIAL), then the declared fixed ones.
         result = run([config["gptgrep_binary"], "decisions-budget", "init", "--run-id", run_id,
-                      "--plan-file", str(claim_path), "--deadline-seconds", str(seconds),
-                      "--max-submissions", str(limit), "--ledger", str(ledger), "--output", str(control)],
+                      "--deadline-seconds", str(seconds), *trial_budget_init_options(limit)],
                      cwd="/data/corpus", timeout=min(BUDGET_COMMAND_SECONDS, remaining),
                      env=native_environment(environ))
         require(result["failure"] is None and result["return_code"] == 0, "decisions_trial_budget_unavailable")
@@ -274,7 +291,7 @@ def init_trial_budget(config, binding, claim, deadline_unix_ms, remaining, envir
         # Redacted code only: product output is never copied into the record.
         raise ValueError("decisions_trial_budget_unavailable") from None
     return {"schema": TRIAL_BUDGET_SCHEMA, "max_submissions": limit,
-            "enforced_by": "product_decisions_budget_ledger", "run_id": run_id, "plan_sha256": claim["sha256"],
+            "enforced_by": TRIAL_LIMIT_ENFORCER, "run_id": run_id, "plan_sha256": claim["sha256"],
             "deadline_unix_ms": budget["deadline_unix_ms"], "ledger_path": str(ledger),
             "control": {"path": str(control), "bytes": len(data), "sha256": sha(data)},
             "init_elapsed_ms": result["elapsed_ms"], "status_after_ask": None,

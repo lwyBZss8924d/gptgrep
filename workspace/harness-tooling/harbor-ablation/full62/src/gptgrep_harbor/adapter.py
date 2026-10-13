@@ -12,10 +12,11 @@ from .runtime import (API_ENV, BASE_CAPABILITIES, BASE_TOOLS_PATH, CODEX_HOME, D
                       base_tools_identity, model_config, native_identity, reader_seccomp_profile, reader_security_opt,
                       validate_asset_path)
 from .product_bundle import PRODUCT_ENTRYPOINT, PRODUCT_PROVENANCE, bundle_identity
-from .reader import ANSWER_RULES_DESCRIPTION_FIELD, TREATMENT_IDENTITY
-from .decisions import (CLAIM_ROOT, CONTROL_ROOT, FAMILY_ROOT, TRIAL_ROOT, WRITER_LOCK,
-                        control as decisions_control, decisions_model, directory as decisions_directory,
-                        invocation_cost_bound, selected_mode, shared_allowance)
+from .reader import ANSWER_RULES_DESCRIPTION_FIELD, TREATMENT_IDENTITY, treatment_command
+from .decisions import (CLAIM_ROOT, CONTROL_ROOT, FAMILY_ROOT, TRIAL_BUDGET_INIT_PER_TRIAL, TRIAL_LIMIT_ENFORCER,
+                        TRIAL_ROOT, WRITER_LOCK, control as decisions_control, decisions_model,
+                        directory as decisions_directory, invocation_cost_bound, selected_mode, shared_allowance,
+                        trial_budget_init_options, trial_submission_limit)
 from .trial_order import paired_order
 
 
@@ -59,18 +60,30 @@ def treatment_feature_profile(runtime):
 
     The admission binds every input through the runtime subject, so the profile
     cannot change after admission. It declares configured availability, not
-    observed use. GPTgrep's reader contract is part of the treatment: the bare
-    arm receives Codex's default base instructions and the common task prompt.
+    observed use. Its command is the exact product argument prefix that every
+    treatment reader launches for the selected reader and Decisions modes.
+    GPTgrep's reader contract is part of the treatment: the bare arm receives
+    Codex's default base instructions and the common task prompt.
     """
     mode = runtime["reader_mode"]
     require(mode in INDEX_SCHEMAS, "explicit_reader_mode")
     components = ["base_instructions", "answer_citation_insufficient_evidence_schema", "abstention_rule"]
+    decisions = {"mode": selected_mode(runtime), "model": runtime["jev_model"], "routing_and_reranking": "mandatory"}
+    if decisions["mode"] == "invocation_bounded":
+        # The product enforces the per-trial submission limit through the
+        # trial's own ledger, which this command creates after the trial's
+        # claim and before its one Ask; the Ask command joins that ledger.
+        limit = trial_submission_limit(runtime.get("decisions_max_submissions_per_trial"))
+        decisions.update(max_submissions_per_trial=limit, enforced_by=TRIAL_LIMIT_ENFORCER,
+                         trial_ledger_init={"command": ["gptgrep", "decisions-budget", "init",
+                                                        *trial_budget_init_options(limit)],
+                                            "per_trial_options": list(TRIAL_BUDGET_INIT_PER_TRIAL),
+                                            "runs": "after_the_trial_claim_before_the_ask"})
     return {"schema": TREATMENT_PROFILE_SCHEMA,
             "declared_differences": ["gptgrep_tools", "frozen_prebuilt_index", "reader_contract"],
             "reader_mode": mode, "index_schema": INDEX_SCHEMAS[mode],
-            "command": ["gptgrep", "ask", "--native-ptc"] + (["--multimodal"] if mode == "rich_multimodal" else []),
-            "decisions": {"mode": selected_mode(runtime), "model": runtime["jev_model"],
-                          "routing_and_reranking": "mandatory"},
+            "command": ["gptgrep", *treatment_command(runtime)],
+            "decisions": decisions,
             "treatment_max_tool_calls": runtime["max_tool_calls"],
             "reader_contract": {
                 "declared_treatment": True, "treatment": "gptgrep_reader_contract",

@@ -320,6 +320,13 @@ class HarborMaterializationTests(unittest.TestCase):
                 self.assertEqual(profile["declared_differences"],
                                  ["gptgrep_tools", "frozen_prebuilt_index", "reader_contract"])
                 self.assertEqual((profile["reader_mode"], profile["decisions"]["mode"]), (mode, "existing_context"))
+                # The declared command is the exact prefix the treatment reader launches.
+                argv = reader_argv({**self.runtime, "source_relative_path": "raw-0.txt"}, {"arm": "gptgrep"},
+                                   "generic question")
+                self.assertEqual(profile["command"], ["gptgrep", *argv[1:len(profile["command"])]])
+                self.assertEqual(profile["command"][1:3], ["--decisions-budget", DECISIONS_BUDGET])
+                self.assertEqual("--multimodal" in profile["command"], mode == "rich_multimodal")
+                self.assertNotIn("max_submissions_per_trial", profile["decisions"])
                 contract = profile["reader_contract"]
                 self.assertIs(contract["declared_treatment"], True)
                 self.assertIs(contract["baseline_receives_gptgrep_rules"], False)

@@ -23,34 +23,43 @@ from .decisions import (TRIAL_BUDGET, acquire_writer, claim_invocation, init_tri
 LEGACY_ANSWER_STATUSES = ("completed", "insufficient_evidence")
 
 
+def treatment_command(config):
+    """The product arguments for the selected reader and Decisions modes, before the per-task options.
+
+    Every treatment reader launches GPTgrep with exactly these arguments, and
+    the frozen treatment feature profile declares them.
+    """
+    require(config["reader_mode"] in ("rich_multimodal", "legacy_text"), "explicit_reader_mode")
+    mode_flags = ["--multimodal"] if config["reader_mode"] == "rich_multimodal" else []
+    decisions = selected_mode(config)
+    require((decisions == "preparation") == (config.get("decisions_preparation") is not None),
+            "decisions_mode")
+    if decisions == "preparation":
+        require(config["reader_mode"] == "rich_multimodal"
+                and config["decisions_preparation"]["max_concurrent_batches"] == 1,
+                "decisions_preparation_mode")
+        mode_flags += ["--max-concurrent-batches", "1"]
+        budget = ["--decisions-budget", TRIAL_BUDGET]
+    elif decisions == "existing_context":
+        budget = ["--decisions-budget", DECISIONS_BUDGET]
+    else:
+        # invocation_bounded: no shared ledger. The Ask joins this trial's own
+        # product ledger, created right after its claim with the per-trial
+        # submission limit, so the product enforces that limit.
+        require(config["reader_mode"] == "legacy_text", "decisions_invocation_bounded_mode")
+        trial_submission_limit(config.get("decisions_max_submissions_per_trial"))
+        budget = ["--decisions-budget", str(trial_paths()[2])]
+    return [*budget, "ask", "--native-ptc", *mode_flags]
+
+
 def reader_argv(config, binding, question):
     require(len(question.encode()) <= min(MAX_READER_QUESTION_BYTES, config["max_input_bytes"]),
             "instruction_bytes_limit")
     if binding["arm"] == "gptgrep":
         require(config.get("native_ptc") is True and config.get("codex_permissions") == "full62_reader",
                 "shared_native_reader_required")
-        require(config["reader_mode"] in ("rich_multimodal", "legacy_text"), "explicit_reader_mode")
-        mode_flags = ["--multimodal"] if config["reader_mode"] == "rich_multimodal" else []
-        decisions = selected_mode(config)
-        require((decisions == "preparation") == (config.get("decisions_preparation") is not None),
-                "decisions_mode")
-        if decisions == "preparation":
-            require(config["reader_mode"] == "rich_multimodal"
-                    and config["decisions_preparation"]["max_concurrent_batches"] == 1,
-                    "decisions_preparation_mode")
-            mode_flags += ["--max-concurrent-batches", "1"]
-            budget = ["--decisions-budget", TRIAL_BUDGET]
-        elif decisions == "existing_context":
-            budget = ["--decisions-budget", DECISIONS_BUDGET]
-        else:
-            # invocation_bounded: no shared ledger. The Ask joins this trial's own
-            # product ledger, created right after its claim with the per-trial
-            # submission limit, so the product enforces that limit.
-            require(config["reader_mode"] == "legacy_text", "decisions_invocation_bounded_mode")
-            trial_submission_limit(config.get("decisions_max_submissions_per_trial"))
-            budget = ["--decisions-budget", str(trial_paths()[2])]
-        return [config["gptgrep_binary"], *budget,
-                "ask", "--native-ptc", *mode_flags, "--document=" + config["source_relative_path"],
+        return [config["gptgrep_binary"], *treatment_command(config),
+                "--document=" + config["source_relative_path"],
                 "--jev-model", config["jev_model"], "--codex-bin", "/opt/full62/codex-native",
                 "--codex-home", config["codex_home"], "--codex-permissions", config["codex_permissions"],
                 "--model", PROFILE["model"],

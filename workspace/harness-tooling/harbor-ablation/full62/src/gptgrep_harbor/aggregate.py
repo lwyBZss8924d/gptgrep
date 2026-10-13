@@ -8,7 +8,7 @@ import statistics
 from .common import (ARMS, MAX_ANSWER, binding_equal, canonical, finite_number, integer, parse, pinned, require, sha,
                      tool_cap_parity, validate_binding)
 from .adapter import qualification, treatment_feature_profile
-from .decisions import selected_mode
+from .decisions import TRIAL_LIMIT_ENFORCER, selected_mode
 from .reader import TREATMENT_IDENTITY
 
 
@@ -38,7 +38,7 @@ def decisions_costs(rows, runtime):
         # no remaining submission is limit-bound (an operational failure).
         budgets = [row["trial_budget"] if type(row["trial_budget"]) is dict else {} for row in rows]
         limit = {"max_submissions_per_trial": runtime.get("decisions_max_submissions_per_trial"),
-                 "enforced_by": "product_decisions_budget_ledger",
+                 "enforced_by": TRIAL_LIMIT_ENFORCER,
                  "bound_trials": sum(budget.get("limit_bound") is True for budget in budgets),
                  "reached_trials": sum(budget.get("limit_reached") is True for budget in budgets),
                  "unobserved_trials": sum(type(budget.get("limit_reached")) is not bool for budget in budgets)}
