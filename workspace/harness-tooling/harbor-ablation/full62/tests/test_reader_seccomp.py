@@ -230,7 +230,8 @@ class ReaderSeccompProfileTests(unittest.TestCase):
 
 
 class ReaderSeccompReadmeTests(unittest.TestCase):
-    """The README's acceptance record never presents an amended probe as the approved one."""
+    """The README's acceptance record never presents an amended probe as the approved one,
+    and records which probes the owner has accepted."""
 
     def setUp(self):
         text = README.read_text(encoding="utf-8")
@@ -247,12 +248,17 @@ class ReaderSeccompReadmeTests(unittest.TestCase):
         self.assertIn("`%s`" % APPROVED_PROBE_1, first)
         self.assertIn("`%s`" % AMENDED_PROBE_1, first)
         self.assertIn("refuses", first)
-        # The owner's acknowledgement of the amended criterion is stated, whichever way it stands.
-        self.assertRegex(first, r"owner[^.]*acknowledg")
+        # The owner accepted the amended criterion (bwrap without --proc) on 2026-10-13.
+        self.assertRegex(first, r"owner accepted the amended criterion on 2026-10-13")
+        self.assertNotRegex(first, r"not yet")
         # The status never counts probe 1 among the probes that passed as approved.
         self.assertNotRegex(self.status, r"Probes 1\s*(?:[-–]|to)\s*\d passed")
         self.assertRegex(self.status, r"Probe 1 passed[^.]*\bamended form")
-        self.assertRegex(self.status, r"owner[^.]*acknowledg")
+        self.assertRegex(self.status, r"owner accepted the amended criterion on 2026-10-13")
+        # Probes 1-3 are accepted; probes 4 and 5 stay pending.
+        self.assertRegex(self.status, r"probes 1[–-]3 are therefore accepted")
+        self.assertRegex(self.status, r"Probes 4 and 5 stay pending")
+        self.assertNotRegex(self.status, r"acknowledg")
 
 
 class ReaderSeccompMaterializationTests(unittest.TestCase):
