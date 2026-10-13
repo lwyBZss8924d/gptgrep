@@ -1,6 +1,6 @@
 use super::*;
 #[path = "mandatory_tests.rs"]
-mod mandatory;
+pub(crate) mod mandatory;
 #[path = "protocol_error_tests.rs"]
 mod protocol_errors;
 #[path = "source_continuation_tests.rs"]

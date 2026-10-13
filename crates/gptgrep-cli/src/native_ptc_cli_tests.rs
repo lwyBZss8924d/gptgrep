@@ -48,3 +48,30 @@ fn native_ptc_is_not_a_shared_completion_parse_or_index_option() {
         assert!(Cli::try_parse_from(args).is_err());
     }
 }
+
+#[test]
+fn native_ptc_schema_describes_the_budget_soft_landing_and_native_hard_limit() {
+    let option = &contract()["commands"]["ask"]["options"]["native-ptc"];
+    let budget = option["budget"].as_str().unwrap();
+    for term in [
+        "max_tool_calls",
+        "tool_budget_exhausted",
+        "same turn",
+        "host_native_ptc_tool_budget_exhausted",
+        "native item",
+        "not a pre-execution guard",
+    ] {
+        assert!(budget.contains(term), "{term}");
+    }
+    let accounting = option["accounting"].as_str().unwrap();
+    for field in [
+        "model_attempts[].native_ptc",
+        "tool_budget",
+        "admitted_tool_calls",
+        "denied_tool_calls",
+        "max_denied_tool_calls",
+        "model_usage",
+    ] {
+        assert!(accounting.contains(field), "{field}");
+    }
+}

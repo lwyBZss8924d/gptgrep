@@ -652,9 +652,13 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
                 rpc.deny(id.clone()).await?;
                 return Err(anyhow!("host_native_task_unregistered_dynamic_tool"));
             }
+            // Set when the native retrieval reader must answer this request
+            // with the restricted reader's denial after the checks below.
+            let mut native_budget_denial = false;
             if let Some(native) = native_ptc.as_mut() {
+                let rich = workflow.rich().is_some();
                 let allowed = params["tool"].as_str().is_some_and(|tool| {
-                    if workflow.rich().is_some() {
+                    if rich {
                         crate::rich_text::allowed(tool)
                     } else {
                         retrieval::allowed(tool)
@@ -664,11 +668,24 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
                     params["namespace"] == "gptgrep" && allowed,
                     "host_native_ptc_dynamic_tool_not_allowed"
                 );
-                let charged = native.charge_dynamic(&params["callId"]);
+                // Rich readers keep the hard limit. Native items are never
+                // denied; their bound is enforced when they are observed.
+                let charged = if rich {
+                    native
+                        .charge_dynamic(&params["callId"])
+                        .map(|()| crate::native_ptc::DynamicCharge::Admit)
+                } else {
+                    native.charge_retrieval(&params["callId"])
+                };
                 native.publish(options.observer)?;
-                if let Err(error) = charged {
-                    rpc.deny(id.clone()).await?;
-                    return Err(error);
+                match charged {
+                    Ok(charge) => {
+                        native_budget_denial = charge == crate::native_ptc::DynamicCharge::Deny;
+                    }
+                    Err(error) => {
+                        rpc.deny(id.clone()).await?;
+                        return Err(error);
+                    }
                 }
             }
             if let Some(evidence) = workflow.rich_mut() {
@@ -788,30 +805,44 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
             );
             let result = match &mut workflow {
                 Workflow::Retrieval { evidence, .. } => {
-                    if calls.len() > config.max_tool_calls {
+                    let over_budget = if native_ptc.is_some() {
+                        native_budget_denial
+                    } else {
+                        calls.len() > config.max_tool_calls
+                    };
+                    if over_budget {
                         evidence.validate_budget_request(tool, &args)?;
                         // At most N denials tolerate parallel requests without
                         // admitting more retrieval. The original turn and enclosing
                         // deadline remain unchanged; no client retry is started.
-                        let budget = tool_budget.get_or_insert(ToolBudgetDiagnostics {
-                            max_tool_calls: config.max_tool_calls,
-                            admitted_tool_calls: config.max_tool_calls,
-                            denied_tool_calls: 0,
-                            max_denied_tool_calls: config.max_tool_calls,
-                        });
-                        if budget.denied_tool_calls == budget.max_denied_tool_calls {
-                            return Err(HostProtocolError::new(
-                                HostProtocolErrorKind::ToolBudgetExhausted,
-                                &ParsedError::default(),
-                                None,
-                                server_retry_notifications,
-                                usage.as_ref(),
-                                Some(*budget),
-                            )
-                            .into());
-                        }
-                        budget.denied_tool_calls += 1;
-                        evidence.deny_budget(&call_id, tool, args, *budget)?
+                        let budget = if let Some(native) = native_ptc.as_mut() {
+                            // The shared native tracker owns these counts and the
+                            // same bound; its next excess request fails the turn.
+                            let denied = native.deny_dynamic(&params["callId"]);
+                            native.publish(options.observer)?;
+                            *tool_budget.insert(denied?)
+                        } else {
+                            let budget = tool_budget.get_or_insert(ToolBudgetDiagnostics {
+                                max_tool_calls: config.max_tool_calls,
+                                admitted_tool_calls: config.max_tool_calls,
+                                denied_tool_calls: 0,
+                                max_denied_tool_calls: config.max_tool_calls,
+                            });
+                            if budget.denied_tool_calls == budget.max_denied_tool_calls {
+                                return Err(HostProtocolError::new(
+                                    HostProtocolErrorKind::ToolBudgetExhausted,
+                                    &ParsedError::default(),
+                                    None,
+                                    server_retry_notifications,
+                                    usage.as_ref(),
+                                    Some(*budget),
+                                )
+                                .into());
+                            }
+                            budget.denied_tool_calls += 1;
+                            *budget
+                        };
+                        evidence.deny_budget(&call_id, tool, args, budget)?
                     } else {
                         evidence.call(&call_id, tool, args).await?
                     }
@@ -1020,10 +1051,18 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
         warnings.push(format!("Codex reported {server_retry_notifications} transient retry notifications during this turn. This counts server events, not physical or billed requests."));
     }
     if let Some(budget) = tool_budget {
-        warnings.push(format!(
-            "The dynamic tool budget was exhausted after {} admitted calls; {} additional requests were denied without retrieval. The answer uses previously issued evidence.",
-            budget.admitted_tool_calls, budget.denied_tool_calls
-        ));
+        warnings.push(match native_ptc.as_ref() {
+            Some(native) => format!(
+                "The shared native tool budget was exhausted after {} admitted GPTgrep calls and {} observed native items; {} additional GPTgrep requests were denied without retrieval. The answer uses previously issued evidence.",
+                budget.admitted_tool_calls,
+                native.native_tool_calls(),
+                budget.denied_tool_calls
+            ),
+            None => format!(
+                "The dynamic tool budget was exhausted after {} admitted calls; {} additional requests were denied without retrieval. The answer uses previously issued evidence.",
+                budget.admitted_tool_calls, budget.denied_tool_calls
+            ),
+        });
     }
     Ok(Outcome {
         thread_id,

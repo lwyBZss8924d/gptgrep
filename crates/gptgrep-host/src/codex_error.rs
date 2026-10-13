@@ -55,6 +55,8 @@ pub enum HostProtocolErrorKind {
 /// Dynamic retrieval budget only; the required initial Jev pass is separate.
 /// Denied calls count recoverable responses, never additional tool execution.
 /// Admitted calls include handlers returning recoverable argument errors.
+/// The native PTC reader shares max_tool_calls with observed native items,
+/// which its native report counts separately; admitted counts GPTgrep calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolBudgetDiagnostics {
     pub max_tool_calls: usize,
