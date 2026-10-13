@@ -30,18 +30,26 @@ TOOL_CAP_DEVIATION = "treatment_tool_cap_below_adapter_maximum"
 
 # GPTgrep's reader contract is a declared treatment difference (owner
 # direction, 2026-10-13), not a parity mismatch. A runtime qualification that
-# observes the readers' different base instructions records this code; it is
-# classified as declared treatment and never carried as a mismatch.
+# observes the readers' different base instructions records exactly this entry,
+# once; that entry is classified as declared treatment and never carried as a
+# mismatch.
 READER_CONTRACT_DIFFERENCE = "reader_contract_differs"
+READER_CONTRACT_ENTRY = {"code": READER_CONTRACT_DIFFERENCE}
 TREATMENT_PROFILE_SCHEMA = "gptgrep.harbor.treatment-feature-profile.v1"
 
 
 def qualification(entries):
-    """Split observed qualification entries into parity mismatches and declared treatment differences."""
+    """Split observed qualification entries into parity mismatches and declared treatment differences.
+
+    Only the exact entry {"code": "reader_contract_differs"}, once, is the
+    declared difference. Every other entry stays a parity mismatch, including a
+    repeat of it and any entry that carries that code with other fields, such as
+    an observation about the bare arm.
+    """
     require(isinstance(entries, list), "qualification_observations")
     mismatches, declared = [], []
     for entry in entries:
-        treatment = type(entry) is dict and entry.get("code") == READER_CONTRACT_DIFFERENCE
+        treatment = type(entry) is dict and entry == READER_CONTRACT_ENTRY and not declared
         (declared if treatment else mismatches).append(entry)
     return {"mismatches": mismatches, "declared_treatment_differences": declared}
 

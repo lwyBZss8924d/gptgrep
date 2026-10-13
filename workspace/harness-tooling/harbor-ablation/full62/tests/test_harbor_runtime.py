@@ -307,7 +307,7 @@ class HarborMaterializationTests(unittest.TestCase):
 
     def test_treatment_profile_declares_the_reader_contract_as_treatment_not_a_mismatch(self):
         generic = {"code": "observed generic mismatch"}
-        declared = {"code": "reader_contract_differs", "observation": "synthetic different base instructions"}
+        declared = {"code": "reader_contract_differs"}
         self.runtime["qualification_mismatches"] = [generic, declared]
         for mode in ("rich_multimodal", "legacy_text"):
             self.runtime["reader_mode"] = mode
@@ -341,6 +341,21 @@ class HarborMaterializationTests(unittest.TestCase):
                     reader = json.loads((task / "environment/reader.json").read_text())
                     self.assertEqual(reader["qualification_mismatches"], [generic])
                     self.assertEqual(reader["declared_treatment_differences"], [declared])
+        # Only the exact entry, once, is declared: a repeat, or an entry with that code
+        # and other fields, stays a parity mismatch in the preflight and in reader.json.
+        shaped = {"code": "reader_contract_differs", "arm": "raw_only", "observation": "synthetic bare deviation"}
+        self.runtime["qualification_mismatches"] = [declared, shaped, declared]
+        adapter = self.materializer()
+        self.assertEqual(adapter.preflight["qualification"],
+                         {"mismatches": [shaped, declared], "declared_treatment_differences": [declared]})
+        row = adapter.rows[0]
+        document = next(d for d in self.runtime["documents"] if d["document_id"] == row["document_id"])
+        task = self.root / "single-shaped-entries"
+        adapter._task(task, Path(adapter_module.__file__).parent, row, document,
+                      {"pair_id": row["pair_id"], "document_id": row["document_id"], "arm": "raw_only"})
+        reader = json.loads((task / "environment/reader.json").read_text())
+        self.assertEqual((reader["qualification_mismatches"], reader["declared_treatment_differences"]),
+                         ([shaped, declared], [declared]))
         # The declared entry is not a tool-cap declaration and does not disturb it.
         self.runtime["max_tool_calls"] = 500
         with self.assertRaisesRegex(ValueError, "treatment_tool_cap_deviation_undeclared"):

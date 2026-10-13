@@ -255,6 +255,23 @@ class PairedTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "treatment_profile_join"):
             self.aggregate(export, records, runtime, blobs)
 
+    def test_only_the_exact_reader_contract_entry_once_is_a_declared_difference(self):
+        exact = {"code": "reader_contract_differs"}
+        shaped = {"code": "reader_contract_differs", "arm": "raw_only", "observation": "synthetic bare deviation"}
+        generic = {"code": "observed generic mismatch"}
+        listed = {"code": ["reader_contract_differs"]}
+        self.assertEqual(adapter_module.qualification([exact, shaped, generic, exact, "reader_contract_differs", listed]),
+                         {"mismatches": [shaped, generic, exact, "reader_contract_differs", listed],
+                          "declared_treatment_differences": [exact]})
+        self.assertEqual(adapter_module.qualification([shaped, exact]),
+                         {"mismatches": [shaped], "declared_treatment_differences": [exact]})
+        # Nothing but that one entry drops out of the summary's mismatches.
+        export, records, runtime, blobs = synthetic_results()
+        runtime["qualification_mismatches"] = [shaped, exact, exact]
+        profile = self.aggregate(export, records, runtime, blobs)["profile"]
+        self.assertEqual((profile["qualification_mismatches"], profile["declared_treatment_differences"]),
+                         ([shaped, exact], [exact]))
+
     def test_summary_checks_each_arm_reader_contract_against_the_declaration(self):
         export, records, runtime, blobs = synthetic_results()
         unobserved = self.aggregate(export, records, runtime, blobs)["reader_contract"]
