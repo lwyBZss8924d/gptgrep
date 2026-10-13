@@ -162,6 +162,22 @@ async fn planner_tool_call_is_denied_and_preserves_prior_usage() {
 }
 
 #[tokio::test]
+async fn planner_tool_item_reports_its_stable_code() {
+    let item = json!({"method":"item/completed","params":{
+        "threadId":"thread-native","turnId":"turn-native",
+        "item":{"type":"dynamicToolCall","namespace":"gptgrep","tool":"gptgrep_search"}}});
+    let (result, attempts, _) = protocol_attempt(vec![usage(), item], None, false).await;
+    assert_eq!(
+        result.err().unwrap().to_string(),
+        "host_codex_completion_tool_item"
+    );
+    assert_eq!(
+        attempts[0].error.as_ref().unwrap()["code"],
+        "host_codex_completion_tool_item"
+    );
+}
+
+#[tokio::test]
 async fn planner_raw_text_is_capped_before_json_parsing() {
     let text = format!("{}{{}}", " ".repeat(query_plan::MAX_PLAN_OUTPUT_BYTES));
     let (result, attempts, _) = protocol_attempt(

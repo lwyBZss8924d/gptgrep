@@ -755,6 +755,25 @@ fn typed_search_and_uncoded_errors_map_to_bounded_codes() {
     }
 }
 
+#[test]
+fn startup_override_shapes_report_stable_codes() {
+    assert_eq!(
+        protocol::toml_override(&json!({"path":"read"})).unwrap(),
+        r#"{ "path" = "read" }"#
+    );
+    for (value, code) in [
+        (
+            json!({"path":1}),
+            "host_codex_startup_override_table_unsupported",
+        ),
+        (json!([1]), "host_codex_startup_override_unsupported"),
+        (Value::Null, "host_codex_startup_override_unsupported"),
+    ] {
+        let error = protocol::toml_override(&value).unwrap_err();
+        assert_eq!(format!("{error:#}"), code);
+    }
+}
+
 /// Error literals in the reader process modules must be stable codes:
 /// `anyhow!`/`bail!` carry the message first and `ensure!` second. A
 /// non-literal message is checked by the runtime tests above.
