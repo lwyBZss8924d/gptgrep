@@ -285,7 +285,7 @@ async fn opt_in_exposes_direct_tools_without_fallback_and_preserves_the_permissi
     let original = default_thread["baseInstructions"].as_str().unwrap();
     assert_eq!(
         crate::retrieval::hash(original.as_bytes()),
-        "b9abf4054ecdb9d0c29afa1f2d9a2cab83703752cd9b91cab8cd0847b37a8c82"
+        "a65714ee9d695bdfab9ffbff94d7ae6747f1c6fe6575055dd8c0e978e2bb18e9"
     );
     assert!(original.contains("Do not run commands, access browsers"));
     assert!(!original.contains("Native PTC"));
@@ -293,6 +293,34 @@ async fn opt_in_exposes_direct_tools_without_fallback_and_preserves_the_permissi
     assert!(instructions.contains("installed Skills"));
     assert!(instructions.contains("does not create a GPTgrep citation"));
     assert!(!instructions.contains("Do not run commands, access browsers"));
+    // Both readers carry the generic answer rules exactly once, beside every
+    // unchanged evidence and citation rule.
+    for text in [original, instructions] {
+        assert_eq!(
+            text.matches(crate::protocol::READER_ANSWER_RULES).count(),
+            1
+        );
+        for rule in [
+            "Read evidence before citing it.",
+            "citations (unique node IDs that gptgrep_search or gptgrep_read actually returned as evidence)",
+            "A substantive answer requires citations.",
+            "If evidence is missing, say so and set insufficient_evidence=true.",
+            "Do not use external knowledge to fill evidence gaps.",
+            "A node may be truncated; do not claim unseen content.",
+        ] {
+            assert!(text.contains(rule), "{rule}");
+        }
+    }
+    assert!(instructions.contains("Never invent citations or infer unread evidence."));
+    // The native abstention rule is unchanged and shared by every reader workflow.
+    assert!(instructions.ends_with(
+        "Return insufficient_evidence=true when the available evidence cannot support the answer."
+    ));
+    // The answer rules only say when to commit; they never narrow abstention.
+    for text in [original, instructions] {
+        assert!(!text.contains("answer rules above"));
+        assert!(!text.contains("supports no reading"));
+    }
     let native = attempt.native_ptc.unwrap();
     assert_eq!(native.combined_tool_calls, 0);
     assert!(!native.pre_execution_guard);

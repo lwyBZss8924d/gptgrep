@@ -153,6 +153,17 @@ async fn publish(root: &Path, texts: &[&str]) -> Result<GenerationPin> {
     writer.publish()
 }
 
+/// `source.pdf` plus an unscoped companion, so routing makes a Decisions call.
+async fn publish_two(root: &Path, texts: &[&str]) -> Result<GenerationPin> {
+    let (other_staging, other) = candidate(root, &["unrelated companion text\n"]).await?;
+    fs::copy(root.join("source.pdf"), root.join("other.pdf"))?;
+    let (staging, parsed) = candidate(root, texts).await?;
+    let mut writer = RichGenerationWriter::begin(root, ResourceBudget::default())?;
+    writer.add_document("other.pdf", &other_staging.path().canonicalize()?, other)?;
+    writer.add_document("source.pdf", &staging.path().canonicalize()?, parsed)?;
+    writer.publish()
+}
+
 pub(crate) fn context(limit: u32) -> Result<ExecutionContext> {
     ExecutionContext::new(
         "ordinary-rich-rpc-fixture",
@@ -275,7 +286,8 @@ async fn prepared_fixture_with_scope(
     publish(&root, &["alpha\r\n中 tail\n"]).await?;
     let reader = RichGenerationReader::open(&root)?;
     let execution = context(2)?;
-    let (endpoint, server) = mock(2, Arc::new(|_| Ok(())), false).await?;
+    // One document: routing selects it without a call; only the rerank is sent.
+    let (endpoint, server) = mock(1, Arc::new(|_| Ok(())), false).await?;
     let document = if scoped {
         Some(reader.manifest()?.documents[0].document.path.clone())
     } else {
@@ -348,7 +360,7 @@ async fn prepared_rich_text_binds_workflow_and_reserves_final_reader_before_nati
     let root = dir.path().canonicalize()?;
     let generation = publish(&root, &["alpha\r\n中 tail\n"]).await?;
     let execution = context(2)?;
-    let (endpoint, server) = mock(2, Arc::new(|_| Ok(())), false).await?;
+    let (endpoint, server) = mock(1, Arc::new(|_| Ok(())), false).await?;
     let question = "Describe the source statement.";
     let config = HostConfig {
         document: Some("source.pdf".into()),
@@ -376,7 +388,7 @@ async fn prepared_rich_text_binds_workflow_and_reserves_final_reader_before_nati
         .await
         .err()
         .context("absent home")?;
-    assert_eq!(server.await??.len(), 2);
+    assert_eq!(server.await??.len(), 1);
     assert_eq!(error.code, "host_rich_reader_failed");
     assert_eq!(error.stage, "reader");
     assert_eq!(error.model_attempts.len(), 1);
@@ -385,7 +397,7 @@ async fn prepared_rich_text_binds_workflow_and_reserves_final_reader_before_nati
     assert!(error.model_attempts[0].thread_id.is_none());
     assert!(error.model_attempts[0].turn_id.is_none());
     assert!(!config.codex_home.exists());
-    assert_eq!(execution.snapshot()?.submission_observations, 2);
+    assert_eq!(execution.snapshot()?.submission_observations, 1);
     assert_final_reader_reservation(
         &root,
         &generation.generation,
@@ -760,7 +772,7 @@ async fn rich_document_discovery_thread_start_scoped_and_unscoped() -> Result<()
     for scoped in [false, true] {
         let (_dir, prepared, _execution, server) = prepared_fixture_with_scope(scoped).await?;
         let mut evidence = genuine(prepared).await?;
-        assert_eq!(server.await??.len(), 2);
+        assert_eq!(server.await??.len(), 1);
         let path = evidence.reader.manifest()?.documents[0]
             .document
             .path
@@ -776,7 +788,7 @@ async fn rich_document_discovery_thread_start_scoped_and_unscoped() -> Result<()
 async fn genuine_handle_actual_rpc_tool_before_ack_and_exact_unicode_citation() -> Result<()> {
     let (_dir, prepared, execution, server) = prepared_fixture().await?;
     let mut evidence = genuine(prepared).await?;
-    assert_eq!(server.await??.len(), 2);
+    assert_eq!(server.await??.len(), 1);
     let (outcome, frames) = drive_fixture(&mut evidence, NativeMode::Normal).await?;
     let final_value = evidence.finish(&outcome.answer)?;
     assert_eq!(outcome.turn_id, "ordinary-turn");
@@ -797,7 +809,7 @@ async fn genuine_handle_actual_rpc_tool_before_ack_and_exact_unicode_citation() 
     let mut bytes = serde_json::to_vec(frame)?;
     bytes.push(b'\n');
     assert_eq!(citation.host_send.frame_sha256, hash(&bytes));
-    assert_eq!(execution.snapshot()?.logical_reservations, 2);
+    assert_eq!(execution.snapshot()?.logical_reservations, 1);
     assert!(evidence.delivery.as_ref().unwrap().retained_bytes() >= 262144);
     let report = evidence.into_report(
         final_value,
@@ -809,7 +821,11 @@ async fn genuine_handle_actual_rpc_tool_before_ack_and_exact_unicode_citation() 
     let json = serde_json::to_vec(&report)?;
     assert!(json.len() <= MAX_OUTPUT);
     assert!(!std::str::from_utf8(&json)?.contains("unknown_detail"));
-    assert_eq!(report.initial_retrieval.validated_responses, 2);
+    assert_eq!(report.initial_retrieval.validated_responses, 1);
+    assert_eq!(
+        report.initial_retrieval.coverage.routing_status,
+        "skipped_single_document"
+    );
     assert_eq!(report.citations[0].quote, "中");
     Ok(())
 }
@@ -871,7 +887,7 @@ async fn invalid_tool_arguments_reply_then_correct_same_turn_and_preserve_citati
                 .count(),
             1
         );
-        assert_eq!(execution.snapshot()?.logical_reservations, 2); // Original bootstrap only.
+        assert_eq!(execution.snapshot()?.logical_reservations, 1); // Original bootstrap only.
         let final_value = evidence.finish(&outcome.answer)?;
         assert_eq!(final_value.citations.len(), 1);
         assert_eq!(final_value.citations[0].quote, "中");
@@ -1151,7 +1167,7 @@ async fn source_scope_closed_arguments_and_final_freshness_are_enforced() -> Res
     let dir = tempfile::tempdir()?;
     let root = dir.path().canonicalize()?;
     publish(&root, &["alpha\r\n中 tail\n"]).await?;
-    let (endpoint, server) = mock(2, Arc::new(|_| Ok(())), false).await?;
+    let (endpoint, server) = mock(1, Arc::new(|_| Ok(())), false).await?;
     let config = HostConfig {
         document: Some("source.pdf".into()),
         ..Default::default()
@@ -1222,7 +1238,7 @@ async fn final_cpu_gap_source_check_preserves_partial_usage_and_unknown_registry
         .err()
         .unwrap();
     assert_eq!(error.code, "host_rich_completion_rejected");
-    assert_eq!(error.initial_retrieval.unwrap().validated_responses, 2);
+    assert_eq!(error.initial_retrieval.unwrap().validated_responses, 1);
     assert!(error.retained_text_registry_bytes >= 262144);
     Ok(())
 }
@@ -1424,7 +1440,7 @@ async fn saved_ocr_text_delivery_retains_raw_crlf_regions_and_receipt_binding() 
         .artifact
         .id
         .clone();
-    let (endpoint, server) = mock(2, Arc::new(|_| Ok(())), false).await?;
+    let (endpoint, server) = mock(1, Arc::new(|_| Ok(())), false).await?;
     let prepared = prepare_rich_text_host(
         reader,
         client(&endpoint, context(2)?)?,
@@ -1503,7 +1519,7 @@ async fn scoped_read_never_widens_to_another_actual_document() -> Result<()> {
         .native_text
         .id
         .clone();
-    let (endpoint, server) = mock(2, Arc::new(|_| Ok(())), false).await?;
+    let (endpoint, server) = mock(1, Arc::new(|_| Ok(())), false).await?;
     let config = HostConfig {
         document: Some("source.pdf".into()),
         ..Default::default()
@@ -1583,7 +1599,7 @@ async fn deadline_fixture(
 )> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().canonicalize()?;
-    publish(&root, &["alpha\r\n中 tail\n"]).await?;
+    publish_two(&root, &["alpha\r\n中 tail\n"]).await?;
     let execution = context(2)?;
     let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let calls = observed.clone();
@@ -1750,7 +1766,7 @@ async fn native_metadata_evidence(
     scoped: bool,
 ) -> Result<(RichEvidence, ExecutionContext)> {
     let execution = context(2)?;
-    let (endpoint, server) = mock(2, Arc::new(|_| Ok(())), false).await?;
+    let (endpoint, server) = mock(1, Arc::new(|_| Ok(())), false).await?;
     let config = native_metadata_config(scoped);
     let mut options = RichTextHostOptions::default();
     options.retrieval.document = config.document.clone();
@@ -1762,7 +1778,7 @@ async fn native_metadata_evidence(
         &options,
     )?)
     .await?;
-    assert_eq!(server.await??.len(), 2);
+    assert_eq!(server.await??.len(), 1);
     Ok((evidence, execution))
 }
 
@@ -2094,7 +2110,7 @@ async fn native_metadata_actual_rpc_discovers_all_collections_and_pages_without_
     );
     assert_eq!(evidence.reader.native_metadata_retained_bytes(), 0);
     assert_eq!(evidence.delivery.as_ref().unwrap().retained_bytes(), 0);
-    assert_eq!(execution.snapshot()?.submission_observations, 2);
+    assert_eq!(execution.snapshot()?.submission_observations, 1);
     Ok(())
 }
 

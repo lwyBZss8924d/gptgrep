@@ -526,12 +526,15 @@ async fn keywordless_chart_uses_normal_images_two_stages_and_retained_context() 
     let pin = publish_charts(&root, 1, "")?;
     let execution = context(2)?;
     let (endpoint, server) = mock(2, None).await?;
+    // A retry-enabled caller client still submits each request exactly once.
     let prepared = prepare_rich_multimodal_search(
         RichGenerationReader::open(&root)?,
-        client(&endpoint, execution.clone())?,
+        client(&endpoint, execution.clone())?
+            .with_transient_retry(gptgrep_jev::TransientRetry::with_jitter(|| 0.0)),
         "Compare the bars",
         &Default::default(),
     )?;
+    assert!(prepared.client.transient_retry().is_none());
     assert_eq!(prepared.routing_requests().count(), 1);
     assert_eq!(prepared.rerank_pool_requests().count(), 1);
     assert_eq!(prepared.candidate_scope().count(), 1);

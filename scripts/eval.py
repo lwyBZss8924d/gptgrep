@@ -41,13 +41,21 @@ def decode_json(raw: str) -> dict[str, Any]:
 
 
 def summarize_provider_cost(metric_samples: list[dict[str, Any]]) -> dict[str, Any]:
-    """Sum explicit per-request provider costs only when every request is matched."""
+    """Sum explicit per-request provider costs only when every request is matched.
+
+    An attempted call without a validated response, such as a failed submission
+    repeated by the bounded transient retry, has unknown cost: the total stays
+    unavailable rather than counting it as zero.
+    """
     requests = missing = extra = 0
     costs: list[Decimal] = []
     for metrics in metric_samples:
         count = metrics.get("jev_requests", 0)
         count = count if type(count) is int and count > 0 else int(metrics.get("jev_used") is True)
         requests += count
+        attempted = metrics.get("jev_calls_attempted")
+        if type(attempted) is int and attempted > count:
+            missing += attempted - count
         usage = metrics.get("jev_usage", [])
         usage = usage if isinstance(usage, list) else []
         extra += max(0, len(usage) - count)
@@ -192,6 +200,9 @@ def matches(hit: dict[str, Any], expected: dict[str, Any]) -> bool:
 
 
 def quality(hits: list[dict[str, Any]], relevant: list[dict[str, Any]], exact: bool) -> dict[str, Any]:
+    # Low-confidence fallback hits did not pass the relevance floor; they are
+    # validated as evidence but never scored as retrieved answers.
+    hits = [hit for hit in hits if hit.get("below_threshold") is not True]
     if not relevant:
         return {
             "recall_at_k": None,

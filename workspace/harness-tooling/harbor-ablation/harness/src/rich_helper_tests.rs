@@ -149,6 +149,17 @@ fn publish(root: &Path, texts: &[&str]) -> Result<GenerationPin> {
     writer.publish()
 }
 
+/// Two documents, so the product sends a document routing call before reranking.
+fn publish_routed(root: &Path, texts: &[&str]) -> Result<GenerationPin> {
+    let (other_staging, other) = candidate(root, &["An unrelated companion statement.\n"])?;
+    fs::copy(root.join("source.pdf"), root.join("other.pdf"))?;
+    let (staging, parsed) = candidate(root, texts)?;
+    let mut writer = RichGenerationWriter::begin(root, ResourceBudget::default())?;
+    writer.add_document("other.pdf", &other_staging.path().canonicalize()?, other)?;
+    writer.add_document("source.pdf", &staging.path().canonicalize()?, parsed)?;
+    writer.publish()
+}
+
 struct Fixture {
     _dir: tempfile::TempDir,
     config: Config,
@@ -156,18 +167,31 @@ struct Fixture {
     config_sha: String,
 }
 impl Fixture {
+    /// One document: the product reranks without a routing call.
     fn new() -> Result<Self> {
         Self::with_lifetime(Duration::from_secs(30))
     }
     fn with_lifetime(lifetime: Duration) -> Result<Self> {
+        Self::build(lifetime, false)
+    }
+    /// Two documents: document routing, then evidence reranking.
+    fn routed() -> Result<Self> {
+        Self::routed_with_lifetime(Duration::from_secs(30))
+    }
+    fn routed_with_lifetime(lifetime: Duration) -> Result<Self> {
+        Self::build(lifetime, true)
+    }
+    fn build(lifetime: Duration, routed: bool) -> Result<Self> {
         let dir = tempfile::tempdir()?;
         let root = dir.path().canonicalize()?;
         let corpus = root.join("corpus");
         fs::create_dir(&corpus)?;
-        let generation = publish(
-            &corpus,
-            &["The workshop green cabinet holds a blue linen pouch.\n"],
-        )?;
+        let texts = ["The workshop green cabinet holds a blue linen pouch.\n"];
+        let generation = if routed {
+            publish_routed(&corpus, &texts)?
+        } else {
+            publish(&corpus, &texts)?
+        };
         let query_path = root.join("query.txt");
         fs::write(&query_path, b"What material is the pouch?")?;
         let deadline = SystemTime::now() + lifetime;
@@ -372,7 +396,7 @@ fn symlinks_output_overlap_and_bounded_options_are_rejected() -> Result<()> {
 #[tokio::test]
 async fn genuine_two_stage_pipeline_preserves_sources_usage_coverage_and_original_anchor()
 -> Result<()> {
-    let fixture = Fixture::new()?;
+    let fixture = Fixture::routed()?;
     let model = fixture.config.expected_actual_model.clone();
     let (endpoint, server) = mock(2, None, &model, Arc::new(|_| Ok(()))).await?;
     let result = run(&fixture, &endpoint).await?;
@@ -393,6 +417,8 @@ async fn genuine_two_stage_pipeline_preserves_sources_usage_coverage_and_origina
     assert_eq!(result["execution_after"]["logical_reservations"], 2);
     assert_eq!(result["execution_after"]["send_start_observations"], 2);
     assert_eq!(result["product"]["logical_calls_attempted"], 2);
+    assert_eq!(result["product"]["coverage"]["routing_status"], "routed");
+    assert_eq!(result["expected_product_calls"], 2);
     assert_eq!(result["product"]["accounting_complete"], true);
     assert_eq!(result["helper_logical_accounting_complete"], true);
     assert_eq!(result["logical_reservations_delta"], 2);
@@ -432,10 +458,45 @@ async fn genuine_two_stage_pipeline_preserves_sources_usage_coverage_and_origina
     Ok(())
 }
 #[tokio::test]
+async fn single_document_generation_completes_with_one_rerank_call() -> Result<()> {
+    // One routing candidate: the product selects it without a routing call.
+    let fixture = Fixture::new()?;
+    let model = fixture.config.expected_actual_model.clone();
+    let (endpoint, server) = mock(1, None, &model, Arc::new(|_| Ok(()))).await?;
+    let result = run(&fixture, &endpoint).await?;
+    let requests = server.await??;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(result["status"], "completed");
+    assert_eq!(result["code"], Value::Null);
+    assert_eq!(result["reader_must_not_start"], false);
+    assert_eq!(
+        result["product"]["coverage"]["routing_status"],
+        "skipped_single_document"
+    );
+    assert_eq!(result["expected_product_calls"], 1);
+    assert_eq!(result["max_product_calls"], 2);
+    assert_eq!(result["product"]["logical_calls_attempted"], 1);
+    assert_eq!(result["product"]["validated_responses"], 1);
+    assert_eq!(result["product"]["accounting_complete"], true);
+    assert_eq!(result["helper_logical_accounting_complete"], true);
+    assert_eq!(result["logical_reservations_delta"], 1);
+    assert_eq!(result["send_start_observations_delta"], 1);
+    assert_eq!(result["submission_observations_delta"], 1);
+    assert_eq!(result["terminal_submissions_delta"], 1);
+    let rows = result["validated_observations"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["stage"], "evidence_reranking");
+    assert_eq!(result["observed_validated_cost_sum"], 0.00001);
+    let evidence = fixture.read_output("reader-evidence.json")?;
+    assert_eq!(evidence["status"], "completed");
+    assert!(!evidence["hits"].as_array().unwrap().is_empty());
+    Ok(())
+}
+#[tokio::test]
 async fn required_stage_failures_keep_actual_counts_unknown_cost_and_no_reader_evidence()
 -> Result<()> {
     for ordinal in [0, 1] {
-        let fixture = Fixture::new()?;
+        let fixture = Fixture::routed()?;
         let (endpoint, server) = mock(
             ordinal + 1,
             Some(ordinal),
@@ -472,7 +533,7 @@ async fn original_deadline_expiry_at_publication_barriers_revokes_evidence_and_k
         FinalizationPoint::BeforeEvidence,
         FinalizationPoint::AfterAccounting,
     ] {
-        let fixture = Fixture::with_lifetime(Duration::from_secs(3))?;
+        let fixture = Fixture::routed_with_lifetime(Duration::from_secs(3))?;
         let original_lock = fs::read(lock_path(&fixture.config.context.ledger)?)?;
         let (endpoint, server) = mock(
             2,
@@ -569,7 +630,7 @@ async fn original_deadline_expiry_at_publication_barriers_revokes_evidence_and_k
 #[tokio::test]
 async fn model_mismatch_stops_after_one_submission_without_fallback_or_freeform_retention()
 -> Result<()> {
-    let fixture = Fixture::new()?;
+    let fixture = Fixture::routed()?;
     let (endpoint, server) = mock(1, None, "PRIVATE_WRONG_MODEL", Arc::new(|_| Ok(()))).await?;
     let result = run(&fixture, &endpoint).await?;
     let requests = server.await??;
@@ -609,7 +670,7 @@ async fn model_mismatch_stops_after_one_submission_without_fallback_or_freeform_
 }
 #[tokio::test]
 async fn source_change_after_route_preserves_observation_and_stops_second_stage() -> Result<()> {
-    let fixture = Fixture::new()?;
+    let fixture = Fixture::routed()?;
     let source = fixture.config.corpus_root.join("source.pdf");
     let (endpoint, server) = mock(
         1,
@@ -661,7 +722,7 @@ async fn preparation_output_bound_refuses_before_any_submission_and_consumed_out
 #[tokio::test]
 async fn oversized_numeric_cost_projection_stops_after_one_and_keeps_bounded_accounting()
 -> Result<()> {
-    let fixture = Fixture::new()?;
+    let fixture = Fixture::routed()?;
     let cost = format!("0.{}1", "0".repeat(100000));
     let (endpoint, server) = mock_with_cost(
         1,

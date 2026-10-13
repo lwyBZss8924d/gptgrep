@@ -242,7 +242,15 @@ The default context is zero, matching grep; callers request more with `-C`.
 
 **Lexical** finds query-token matches using the same index, groups evidence by
 tree node, and orders it by term coverage. This score is a local lexical measure,
-not an embedding distance or calibrated semantic probability.
+not an embedding distance or calibrated semantic probability. Lexical and hybrid
+queries use at most 16 terms: lowercase alphanumeric tokens, deduplicated, after
+dropping a small fixed English function-word list and ASCII-letter tokens shorter
+than three characters (tokens with digits and non-ASCII tokens are kept; a query
+of only dropped tokens keeps them). When more than 16 remain, the first 64 are
+ranked by document frequency in the scoped index, rarer first, terms absent from
+the scope last and ties in question order, using the same verified
+case-insensitive matching as search. The selection is deterministic for a
+snapshot and scope.
 
 **Hybrid** retains lexical candidates and adds a separate semantic tree lane.
 Jev first judges bounded document descriptions containing paths, headings and
@@ -251,6 +259,12 @@ query-token overlap. A second, per-candidate Score pass orders the bounded union
 **Semantic** uses that tree lane without a lexical seed. Initial routing examines
 at most 32 document descriptions and the final pass at most 24 candidates; this is
 an explicit development budget, not exhaustive semantic search over a large corpus.
+Routing selects the top-ranked documents regardless of score, so when exactly one
+document can be routed (for example an explicit `--document` scope or a single
+fresh indexed document) it is selected without a routing Decisions call. Its tree
+candidates and the rerank request are unchanged, and `coverage.routing_status`
+reports `skipped_single_document` instead of `routed`. The rich text initial pass
+applies the same rule.
 Coverage reports expose the inspected scope and truncation. Hierarchical corpus
 routing and resumable expansion are subsequent scalability work.
 
@@ -265,10 +279,55 @@ The initial explicit relevance floor is 0.5 of the ordered rubric, an operationa
 selection policy. In hybrid mode exact atomic-token matches remain available via
 the lexical lane and are marked `literal_anchor`; the model score is not rewritten.
 This avoids allowing an uncertain semantic judgment to erase a proven grep match.
+A delivered hit scoring below the requested floor carries `below_threshold: true`.
+When no reranked candidate passes the floor (and none is a literal anchor), the
+search does not return an empty set: it delivers the top three candidates by
+score, each flagged `below_threshold`, counts them in
+`coverage.below_threshold_fallback` (they remain in `filtered_candidates`) and
+adds a warning that they are low-confidence candidates. The count and warning
+describe the flagged hits actually returned after the result limit and the final
+freshness check. They never count as passing; a host seed reports `filtered_all`.
+Plain-text `search` prints them with grep's context separator (`PATH-LINE-TEXT`)
+instead of as `PATH:LINE:TEXT` matches, and the exit status is 0 because hits are
+returned. Evidence-role ordering applies the same fallback (eligibility
+`below_floor_fallback`); the rich text/multimodal paths keep their existing floor
+without it.
 No-answer cases, literal queries and natural-language questions are separate evals.
 
-Decisions uses `/api/alpha/decisions`, a 20-second request deadline, no automatic
-retry, no redirects or provider fallback, and at most 64 questions. Text requests
+Decisions uses `/api/alpha/decisions`, a 20-second request deadline, no redirects
+or provider fallback, and at most 64 questions. The default text retrieval client
+(search routing and evidence reranking, including ask/summarize initial and reader
+searches) admits one bounded transient retry: only after a received HTTP 429, 500,
+502, 503 or 504, at most once, with the identical request bytes. It waits a jittered
+250-1000 ms, or a longer `Retry-After` of one non-negative integer number of
+seconds (at most ten digits), and retries only if the original request deadline
+still leaves that wait plus 2 seconds; the deadline is never renewed. A
+`Retry-After` returned in any other form (an HTTP-date, a repeated field, or a
+negative, fractional or longer value) refuses the retry instead of being ignored,
+and the failure diagnostic records why (`retry_after_refusal`: `repeated`,
+`out_of_range` or `not_delta_seconds`). The retry is a separate reservation in
+the same execution context and is skipped when no submission remains; a later
+call that the exhausted budget refuses fails with `Decisions submission budget
+exhausted` before any send. Timeouts, connection or mid-body errors, parse and
+validation failures and other statuses are never retried. Both attempts are
+reported: the failed one keeps its HTTP status in `jev_retried_attempts` and counts
+in `jev_calls_attempted` without a usage entry, so its unknown cost keeps accounting
+incomplete. The retry counts as an attempt once admitted: a `before_retry`
+progress receipt that already records the failed attempt is emitted before the
+backoff, reservation and send, so cancelling the search during the retry cannot
+drop either submission from the host ledger, and a receipt that cannot be recorded
+stops the retry unsent. Planned query-view operations accept one such retry per
+logical call, and a failed operation receipt keeps the retried attempt. An error
+after the retry was sent (for example a failed local ledger record) is kind
+`retry_post_send`. When the retry's reply had already validated, the provider
+completed it with known usage: the failure diagnostic keeps that checked numeric
+usage and served model, and the search error, operation receipt and host ledger
+count it in `jev_requests`, `jev_models` and `jev_usage`; otherwise its usage stays
+unknown. Only a retry stopped before its send is `retry_admission`. Judge,
+enrichment support calls (their own explicit retry plan), navigation scans,
+evidence-role decisions, rich/multimodal searches, explicit rerank pools and
+batch submissions remain single-submission; the rich paths remove any retry
+policy attached to a caller-supplied client. Text requests
 and the escaped text/questions envelope retain a 64 KiB limit. Typed Luna image
 requests have an 8 MiB complete-body limit, with at most four PNG/JPEG images,
 1 MiB of compressed bytes and 8 million pixels per image, and 24 million pixels
@@ -310,6 +369,18 @@ Jev coverage and usage alongside Codex usage, and the overall deadline includes
 initial retrieval. Empty or stale scopes do not establish successful reranking.
 Summary and retrieval use actual source evidence; model-produced citations must
 resolve to evidence issued during that run and remain fresh at completion.
+The retrieval reader's instructions (restricted and native) add two generic
+answer rules: lead with the direct answer in the form the question asks for, and
+commit to it, citing it, when the evidence read answers the question as asked;
+and, when the question depends on a specific passage, resolve the in-text
+references it relies on (footnote or endnote markers, citation numbers, see-table
+or see-section pointers) by reading the referenced note or section before
+answering. The rules say when to commit, never when to stop abstaining: every
+evidence, citation and abstention rule is unchanged, including
+`insufficient_evidence: true` when evidence is missing or cannot support the
+answer. Rich text and multimodal readers do not receive these rules. In the
+full62 paired comparison, the raw-only arm of a `legacy_text` run receives the
+same rule text.
 
 `HostConfig.native_ptc` (default false) and `--native-ptc` select native
 execution for the final retrieval reader. An existing named permission profile
@@ -447,7 +518,9 @@ and 65,536 encoded request bytes. Shared role definitions are bounded to 2,048
 bytes. Admission measures the complete request, including escaping and metadata,
 and rejects overflow explicitly.
 
-Eligibility and the original literal-anchor bypass are unchanged. Eligible
+Eligibility and the original literal-anchor bypass are unchanged. When no window
+is eligible, the three highest-scoring windows become `below_floor_fallback`
+candidates, flagged `below_threshold` as in the ordinary relevance path. Eligible
 windows sort by original anchor group, role (`direct_support`,
 `source_local_incomplete`, `background`, `no_support`), descending relevance, then
 stable source coordinates. Direct support covers at least one requested fact;

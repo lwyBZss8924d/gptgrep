@@ -108,7 +108,8 @@ fn ledger_events(path: &Path) -> Vec<Value> {
 #[tokio::test]
 async fn first_excess_request_can_finalize_seed_evidence_without_more_jev_calls() {
     let root = corpus().await;
-    let (client, server, requests) = mock_jev(vec![(200, 3.0), (200, 3.0)]).await;
+    // One scoped document: the seed needs only the rerank call.
+    let (client, server, requests) = mock_jev(vec![(200, 3.0)]).await;
     let config = HostConfig {
         max_tool_calls: 1,
         document: Some("pipeline-notes.md".into()),
@@ -190,9 +191,9 @@ async fn first_excess_request_can_finalize_seed_evidence_without_more_jev_calls(
     let (_, citations, insufficient) = evidence.finish(&outcome.answer).unwrap();
     assert!(!insufficient);
     assert!(!citations.is_empty());
-    assert_eq!(requests.load(Ordering::SeqCst), 2);
-    assert_eq!(accounting.summary().requests, 2);
-    assert_eq!(accounting.summary().attempted_calls, 2);
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    assert_eq!(accounting.summary().requests, 1);
+    assert_eq!(accounting.summary().attempted_calls, 1);
     assert_eq!(accounting.summary().searches.len(), 1);
     assert_eq!(evidence.receipts.len(), 3);
     assert!(evidence.receipts[0].required_initial);
@@ -226,7 +227,7 @@ async fn first_excess_request_can_finalize_seed_evidence_without_more_jev_calls(
 #[tokio::test]
 async fn initial_jev_pass_is_query_bound_scoped_and_delivered_to_codex() {
     let root = corpus().await;
-    let (client, server, _) = mock_jev(vec![(200, 3.0), (200, 3.0)]).await;
+    let (client, server, _) = mock_jev(vec![(200, 3.0)]).await;
     let mut evidence = Evidence::open(root.path(), None).unwrap();
     let accounting = Accounting::create(root.path(), &evidence.generation).unwrap();
     let config = HostConfig {
@@ -238,10 +239,18 @@ async fn initial_jev_pass_is_query_bound_scoped_and_delivered_to_codex() {
         .unwrap();
     let question = "Which transformation removes blank records before assembly?";
     evidence.bootstrap(question).await.unwrap();
+    // The scope leaves one routing candidate, selected without a routing call.
     let requests = server.await.unwrap();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 1);
     assert_eq!(requests[0]["state"]["query"], question);
-    assert_eq!(requests[0]["questions"].as_object().unwrap().len(), 1);
+    let candidates = requests[0]["questions"].as_object().unwrap();
+    assert!(!candidates.is_empty());
+    assert!(candidates.values().all(|question| {
+        question["instructions"]["candidate"]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("Document: pipeline-notes.md\n")
+    }));
     let seed = evidence.initial_payload.as_ref().unwrap();
     assert_eq!(seed["query"], question);
     assert_eq!(seed["document_scope"], "pipeline-notes.md");
@@ -284,15 +293,17 @@ async fn initial_jev_pass_is_query_bound_scoped_and_delivered_to_codex() {
     assert_eq!(evidence.receipts.len(), 1);
     assert!(evidence.receipts[0].required_initial);
     let summary = accounting.summary();
-    assert_eq!(summary.requests, 2);
-    assert_eq!(summary.attempted_calls, 2);
+    assert_eq!(summary.requests, 1);
+    assert_eq!(summary.attempted_calls, 1);
     assert_eq!(summary.unobserved_attempts, 0);
-    assert_eq!(summary.usage.len(), 2);
+    assert_eq!(summary.usage.len(), 1);
     assert_eq!(summary.initial_status, "reranked");
     assert!(summary.accounting_complete);
+    let coverage = summary.searches[0].coverage.as_ref().unwrap();
+    assert_eq!(coverage.scoped_files, 1);
     assert_eq!(
-        summary.searches[0].coverage.as_ref().unwrap().scoped_files,
-        1
+        coverage.routing_status.as_deref(),
+        Some("skipped_single_document")
     );
     let catalog = evidence
         .call("catalog", "gptgrep_catalog", json!({}))
@@ -315,14 +326,101 @@ async fn initial_jev_pass_is_query_bound_scoped_and_delivered_to_codex() {
 }
 
 #[tokio::test]
+async fn initial_pass_retries_one_transient_status_and_keeps_its_unknown_cost() {
+    let root = corpus().await;
+    // Unscoped two-document corpus: routing, a 502 rerank, then its retry.
+    let (client, server, requests) = mock_jev(vec![(200, 3.0), (502, 0.0), (200, 3.0)]).await;
+    let client = client.with_transient_retry(gptgrep_jev::TransientRetry::with_jitter(|| 0.0));
+    let mut evidence = Evidence::open(root.path(), None).unwrap();
+    let accounting = Accounting::create(root.path(), &evidence.generation).unwrap();
+    evidence
+        .configure(&HostConfig::default(), accounting.clone(), Some(client))
+        .unwrap();
+    evidence
+        .bootstrap("Which transformation removes blank records before assembly?")
+        .await
+        .unwrap();
+    let bodies = server.await.unwrap();
+    assert_eq!(requests.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        bodies[1], bodies[2],
+        "the retry repeats the identical rerank"
+    );
+    assert!(
+        !evidence.initial_payload.as_ref().unwrap()["hits"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let summary = accounting.summary();
+    assert_eq!(summary.initial_status, "reranked");
+    assert_eq!(summary.requests, 2);
+    assert_eq!(summary.attempted_calls, 3);
+    assert_eq!(summary.unobserved_attempts, 1);
+    // Only validated replies carry cost; the failed attempt keeps unknown cost.
+    assert_eq!(summary.usage.len(), 2);
+    assert!(!summary.accounting_complete);
+    let retried = &summary.searches[0].metrics.jev_retried_attempts;
+    assert_eq!(retried.len(), 1);
+    assert_eq!(retried[0].stage, "evidence_reranking");
+    assert_eq!(retried[0].attempt.http_status, Some(502));
+    assert!(retried[0].attempt.reported_usage.is_none());
+    let ledger = std::fs::read_to_string(accounting.path()).unwrap();
+    assert!(ledger.contains("jev_retried_attempts"));
+    assert!(!ledger.contains("private-provider-body-sentinel"));
+}
+
+#[tokio::test]
+async fn seed_below_floor_delivers_flagged_low_confidence_candidates() {
+    let root = corpus().await;
+    // Every reranked candidate scores 0 of 3, below the 0.5 relevance floor.
+    let (client, server, _) = mock_jev(vec![(200, 0.0)]).await;
+    let config = HostConfig {
+        document: Some("pipeline-notes.md".into()),
+        ..HostConfig::default()
+    };
+    let mut evidence = Evidence::open(root.path(), None).unwrap();
+    let accounting = Accounting::create(root.path(), &evidence.generation).unwrap();
+    evidence
+        .configure(&config, accounting.clone(), Some(client))
+        .unwrap();
+    evidence
+        .bootstrap("Which transformation removes blank records before assembly?")
+        .await
+        .unwrap();
+    server.await.unwrap();
+    let seed = evidence.initial_payload.as_ref().unwrap();
+    let hits = seed["hits"].as_array().unwrap();
+    assert!(!hits.is_empty() && hits.len() <= 3);
+    assert!(hits.iter().all(|hit| hit["below_threshold"] == true));
+    assert_eq!(
+        seed["coverage"]["below_threshold_fallback"]
+            .as_u64()
+            .unwrap() as usize,
+        hits.len()
+    );
+    assert!(seed["warnings"].as_array().unwrap().iter().any(|warning| {
+        warning
+            .as_str()
+            .unwrap()
+            .contains("low-confidence candidates")
+    }));
+    // Delivered fallback windows are real issued evidence, never a passing status.
+    assert_eq!(evidence.receipts[0].evidence.len(), hits.len());
+    let summary = accounting.summary();
+    assert_eq!(summary.initial_status, "filtered_all");
+    assert_eq!(summary.searches[0].delivered_hits, hits.len());
+}
+
+#[tokio::test]
 async fn partial_rerank_failure_preserves_routing_usage_in_typed_error_and_ledger() {
     let root = corpus().await;
     let (client, server, _) = mock_jev(vec![(200, 3.0), (503, 0.0)]).await;
     let home = tempfile::tempdir().unwrap();
+    // Unscoped two-document corpus: routing replies before the rerank fails.
     let config = HostConfig {
         codex_home: home.path().to_owned(),
         codex_bin: "/missing/mock-codex".into(),
-        document: Some("pipeline-notes.md".into()),
         ..HostConfig::default()
     };
     let error = execute_with_client(
@@ -354,9 +452,74 @@ async fn partial_rerank_failure_preserves_routing_usage_in_typed_error_and_ledge
 }
 
 #[tokio::test]
+async fn validated_retry_reply_keeps_its_usage_in_the_typed_error_and_ledger() {
+    let root = corpus().await;
+    // One scoped document: the rerank gets HTTP 502; its retry is sent and
+    // validated, then a local observer step rejects the reply.
+    let (client, server, requests) = mock_jev(vec![(502, 0.0), (200, 3.0)]).await;
+    let client = client
+        .with_transient_retry(gptgrep_jev::TransientRetry::with_jitter(|| 0.0))
+        .with_decision_observer(Arc::new(crate::query_plan::tests::RejectValidated));
+    let home = tempfile::tempdir().unwrap();
+    let config = HostConfig {
+        codex_home: home.path().to_owned(),
+        codex_bin: "/missing/mock-codex".into(),
+        document: Some("pipeline-notes.md".into()),
+        ..HostConfig::default()
+    };
+    let error = execute_with_client(
+        root.path(),
+        "Describe the transformation.",
+        None,
+        &config,
+        Some(client),
+    )
+    .await
+    .unwrap_err();
+    server.await.unwrap();
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    let error = error.downcast_ref::<HostRetrievalError>().unwrap();
+    assert_eq!(error.stage, "initial_search");
+    assert_eq!((error.jev.attempted_calls, error.jev.requests), (2, 1));
+    assert_eq!(error.jev.unobserved_attempts, 1);
+    // The validated retry keeps its usage; the failed attempt stays unknown.
+    assert_eq!(
+        error.jev.usage,
+        [json!({"input_tokens":101,"output_tokens":2,"cost":0.002})]
+    );
+    assert!(!error.jev.accounting_complete);
+    let retried = &error.jev.searches[0].metrics.jev_retried_attempts;
+    assert_eq!(retried.len(), 1);
+    assert_eq!(retried[0].attempt.http_status, Some(502));
+    assert!(retried[0].attempt.reported_usage.is_none());
+    let cause = error.cause.as_ref().unwrap();
+    assert_eq!(cause["stage"], "evidence_reranking");
+    assert!(
+        cause["cause"]
+            .as_str()
+            .unwrap()
+            .contains("attempt 2: sent and validated")
+    );
+    let events = ledger_events(&error.ledger_path);
+    let last = events.last().unwrap();
+    assert_eq!(
+        (last["attempted_calls"].as_u64(), last["requests"].as_u64()),
+        (Some(2), Some(1))
+    );
+    assert!(events.iter().any(|event| {
+        event["search"]["metrics"]["jev_usage"]
+            .as_array()
+            .is_some_and(|usage| usage.len() == 1)
+    }));
+    let raw = std::fs::read_to_string(&error.ledger_path).unwrap();
+    assert!(!raw.contains("synthetic-local-ledger-failure"));
+    assert!(!raw.contains("private-provider-body-sentinel"));
+}
+
+#[tokio::test]
 async fn codex_startup_failure_retains_successful_initial_accounting() {
     let root = corpus().await;
-    let (client, server, _) = mock_jev(vec![(200, 3.0), (200, 3.0)]).await;
+    let (client, server, _) = mock_jev(vec![(200, 3.0)]).await;
     let home = tempfile::tempdir().unwrap();
     let config = HostConfig {
         codex_home: home.path().to_owned(),
@@ -376,9 +539,9 @@ async fn codex_startup_failure_retains_successful_initial_accounting() {
     server.await.unwrap();
     let error = error.downcast_ref::<HostRetrievalError>().unwrap();
     assert_eq!(error.stage, "codex");
-    assert_eq!(error.jev.requests, 2);
-    assert_eq!(error.jev.attempted_calls, 2);
-    assert_eq!(error.jev.usage.len(), 2);
+    assert_eq!(error.jev.requests, 1);
+    assert_eq!(error.jev.attempted_calls, 1);
+    assert_eq!(error.jev.usage.len(), 1);
     assert_eq!(error.receipts.len(), 1);
     assert!(error.receipts[0].required_initial);
     assert_eq!(
@@ -393,9 +556,9 @@ async fn cancellation_retains_prior_reply_and_unobserved_attempt() {
     let (client, server, received) = mock_jev(vec![(200, 3.0), (0, 0.0)]).await;
     let root_path = root.path().to_owned();
     let home = tempfile::tempdir().unwrap();
+    // Unscoped: routing replies, then the rerank stays pending.
     let config = HostConfig {
         codex_home: home.path().to_owned(),
-        document: Some("pipeline-notes.md".into()),
         ..HostConfig::default()
     };
     let task = tokio::spawn(async move {
@@ -439,6 +602,64 @@ async fn cancellation_retains_prior_reply_and_unobserved_attempt() {
 }
 
 #[tokio::test]
+async fn cancellation_during_a_bounded_retry_keeps_every_submission_in_the_ledger() {
+    let root = corpus().await;
+    // Unscoped: routing replies, the rerank gets HTTP 502, its retry hangs.
+    let (client, server, received) = mock_jev(vec![(200, 3.0), (502, 0.0), (0, 0.0)]).await;
+    let client = client.with_transient_retry(gptgrep_jev::TransientRetry::with_jitter(|| 0.0));
+    let root_path = root.path().to_owned();
+    let home = tempfile::tempdir().unwrap();
+    let config = HostConfig {
+        codex_home: home.path().to_owned(),
+        ..HostConfig::default()
+    };
+    let task = tokio::spawn(async move {
+        execute_with_client(
+            &root_path,
+            "Describe the transformation.",
+            None,
+            &config,
+            Some(client),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while received.load(Ordering::SeqCst) < 3 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    server.abort();
+    let path = std::fs::read_dir(root.path().join(".gptgrep/host-attempts"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let events = ledger_events(&path);
+    assert!(events.iter().any(|event| event["event"] == "before_retry"));
+    let last = events.last().unwrap();
+    assert_eq!(last["event"], "interrupted");
+    // Three submissions: one validated reply and two with unknown cost.
+    assert_eq!(last["requests"], 1);
+    assert_eq!(last["attempted_calls"], 3);
+    assert_eq!(last["unobserved_attempts"], 2);
+    assert_eq!(last["accounting_complete"], false);
+    let retried = events
+        .iter()
+        .rev()
+        .find_map(|event| event["search"]["metrics"]["jev_retried_attempts"].as_array())
+        .unwrap();
+    assert_eq!(retried.len(), 1);
+    assert_eq!(retried[0]["stage"], "evidence_reranking");
+    assert_eq!(retried[0]["http_status"], 502);
+    assert!(retried[0]["reported_usage"].is_null());
+}
+
+#[tokio::test]
 async fn all_stale_candidates_are_fatal_without_claiming_reranking() {
     let root = corpus().await;
     std::fs::remove_file(root.path().join("pipeline-notes.md")).unwrap();
@@ -470,7 +691,7 @@ async fn summary_scope_is_derived_and_conflicts_are_rejected() {
         tree["document"]["id"].as_str().unwrap(),
         tree["document"]["nodes"][0]["id"].as_str().unwrap()
     );
-    let (client, server, _) = mock_jev(vec![(200, 3.0), (200, 3.0)]).await;
+    let (client, server, _) = mock_jev(vec![(200, 3.0)]).await;
     let mut evidence = Evidence::open(root.path(), Some(&id)).unwrap();
     let accounting = Accounting::create(root.path(), &evidence.generation).unwrap();
     evidence

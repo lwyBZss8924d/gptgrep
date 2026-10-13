@@ -37,6 +37,18 @@ class PageIndexMetricTests(unittest.TestCase):
         self.assertEqual(result["physical_page_recall_at_k"], 0.0)
         self.assertEqual(result["document_mrr_at_k"], 0.0)
 
+    def test_below_threshold_fallback_hits_are_not_scored_as_retrieved_pages(self):
+        flagged = {"path": "right.pdf", "page_start": 2, "page_end": 2, "below_threshold": True}
+        result = external.page_quality([flagged], "right.pdf", {2})
+        self.assertEqual(result["document_recall_at_k"], 0.0)
+        self.assertEqual(result["physical_page_recall_at_k"], 0.0)
+        self.assertEqual(result["recovered_gold_pages"], [])
+        passing = {"path": "right.pdf", "page_start": 2, "page_end": 2, "below_threshold": False}
+        result = external.page_quality([flagged, passing], "right.pdf", {2})
+        # Ranks count only scored hits, as in scripts/eval.py.
+        self.assertEqual(result["physical_page_mrr_at_k"], 1.0)
+        self.assertEqual(result["physical_page_recall_at_k"], 1.0)
+
     def test_duplicate_hits_do_not_inflate_page_recall(self):
         hits = [{"path": "right.pdf", "page_start": 1, "page_end": 1}] * 2
         result = external.page_quality(hits, "right.pdf", {1, 2})

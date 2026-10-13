@@ -420,6 +420,45 @@ fn reused_session_rejects_root_and_artifact_symlinks_and_replaced_postings() {
 }
 
 #[test]
+fn document_frequencies_count_verified_documents_per_term_and_scope() {
+    let (_temp, root, index) = fixture(&[
+        ("a.txt", "Alpha beta\ngamma ALPHA\n"),
+        ("b.txt", "alpha beta\n"),
+        ("nested/c.txt", "\u{feff}alpha\nKelvin sign\n"),
+        ("d.txt", "unrelated\n"),
+    ]);
+    let session = IndexSession::open(&index).unwrap();
+    let terms: Vec<String> = ["alpha", "beta", "gamma", "delta", "kelvin", "42", "a"]
+        .map(String::from)
+        .to_vec();
+    // Case-insensitive presence per document, verified against the BOM-bearing text.
+    assert_eq!(
+        session.document_frequencies(&terms, None).unwrap(),
+        [3, 2, 1, 0, 1, 0, 4]
+    );
+    assert_eq!(
+        session
+            .document_frequencies(&terms, Some(Path::new("b.txt")))
+            .unwrap(),
+        [1, 1, 0, 0, 0, 0, 1]
+    );
+    assert!(
+        session
+            .document_frequencies(&terms, Some(Path::new("missing.txt")))
+            .is_err()
+    );
+    assert!(session.document_frequencies(&[], None).unwrap().is_empty());
+    // The counts are deterministic for one snapshot.
+    assert_eq!(
+        session.document_frequencies(&terms, None).unwrap(),
+        session.document_frequencies(&terms, None).unwrap()
+    );
+    // Changed candidate text fails exactly like search.
+    fs::write(root.join("b.txt"), "alpha changed\n").unwrap();
+    assert!(session.document_frequencies(&terms, None).is_err());
+}
+
+#[test]
 fn literal_is_verified_and_regex_matches_all_fallback() {
     let (_temp, _root, index) = fixture(&[
         ("a.txt", "alpha.beta\nalphaXbeta\nx\n"),

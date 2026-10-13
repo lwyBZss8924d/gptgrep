@@ -168,6 +168,8 @@ fn event_sink(
 #[tokio::test]
 async fn three_views_have_four_calls_two_routes_and_stable_union_in_reverse_completion_order()
 -> Result<()> {
+    // Routing-call mechanics: keep the one-document routing request.
+    let _route = crate::RouteSingleDocument::enable();
     let question = " \tcobalt  ";
     let queries = [question, "黄鹂", "zephyr"];
     let (directory, generation, text) = fixture("目录/notes.txt", "\r\n", false).await?;
@@ -351,13 +353,97 @@ async fn zero_alternatives_preserves_default_candidates_and_scoring() -> Result<
         serde_json::to_value(default_report.hits)?,
         serde_json::to_value(planned_report.hits)?
     );
-    assert_eq!(default_report.metrics.jev_requests, 2);
-    assert_eq!(planned_report.metrics.jev_requests, 2);
+    // One scoped document: neither path sends a routing call.
+    assert_eq!(default_report.metrics.jev_requests, 1);
+    assert_eq!(planned_report.metrics.jev_requests, 1);
     assert_eq!(
         *plain.requests.lock().unwrap(),
         *planned.requests.lock().unwrap()
     );
     assert_eq!(planned_report.coverage.views.len(), 1);
+    assert_eq!(
+        planned_report.coverage.views[0]
+            .coverage
+            .routing_status
+            .as_deref(),
+        Some("skipped_single_document")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn single_document_views_skip_routing_and_keep_the_union_request() -> Result<()> {
+    let queries = ["cobalt", "黄鹂", "zephyr"];
+    let (directory, generation, _) = fixture("notes.txt", "\n", false).await?;
+    let alternatives = ["黄鹂".to_owned(), "zephyr".to_owned()];
+    let routed_mock = mock(&queries, [0; 3], [200; 4], 3.0, false).await?;
+    let route = crate::RouteSingleDocument::enable();
+    let routed = search_planned_with_client_and_observer(
+        directory.path(),
+        "cobalt",
+        &alternatives,
+        &options("notes.txt"),
+        &generation,
+        &routed_mock.client,
+        &|_| Ok(()),
+    )
+    .await;
+    drop(route);
+    let routed = routed?;
+    let skipped_mock = mock(&queries, [0; 3], [200; 4], 3.0, false).await?;
+    let skipped = search_planned_with_client_and_observer(
+        directory.path(),
+        "cobalt",
+        &alternatives,
+        &options("notes.txt"),
+        &generation,
+        &skipped_mock.client,
+        &|_| Ok(()),
+    )
+    .await?;
+    // Three views skip three one-candidate routing calls; one union rerank remains.
+    assert_eq!(routed_mock.requests.lock().unwrap().len(), 4);
+    let skipped_requests = skipped_mock.requests.lock().unwrap().clone();
+    assert_eq!(skipped_requests.len(), 1);
+    assert!(evidence_request(&skipped_requests[0]));
+    let routed_union = routed_mock
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|body| evidence_request(body))
+        .unwrap()
+        .clone();
+    assert_eq!(skipped_requests[0], routed_union);
+    assert_eq!(
+        (
+            skipped.metrics.jev_calls_attempted,
+            skipped.metrics.jev_requests
+        ),
+        (1, 1)
+    );
+    assert_eq!(
+        (
+            routed.metrics.jev_calls_attempted,
+            routed.metrics.jev_requests
+        ),
+        (4, 4)
+    );
+    assert_eq!(
+        serde_json::to_value(&skipped.hits)?,
+        serde_json::to_value(&routed.hits)?
+    );
+    assert_eq!(
+        skipped.coverage.selected_spans,
+        routed.coverage.selected_spans
+    );
+    assert!(
+        skipped
+            .coverage
+            .views
+            .iter()
+            .all(|view| view.coverage.routing_status.as_deref() == Some("skipped_single_document"))
+    );
     Ok(())
 }
 
@@ -384,6 +470,7 @@ fn span(offset: usize) -> Hit {
         score: 1.0,
         confidence: None,
         literal_anchor: true,
+        below_threshold: false,
         source_sha256: digest(b"invented-source"),
         source_fresh: true,
         citation: "invented.txt:L1-L1".into(),
@@ -533,6 +620,8 @@ fn same_view_duplicate_spans_count_once_and_do_not_become_cap_omissions() -> Res
 #[tokio::test]
 async fn route_failure_retains_completed_sibling_usage_and_interrupts_pending_sibling() -> Result<()>
 {
+    // Routing-call mechanics: keep the one-document routing request.
+    let _route = crate::RouteSingleDocument::enable();
     let (directory, generation, _) = fixture("notes.txt", "\n", false).await?;
     let mock = mock(
         &["cobalt", "黄鹂", "zephyr"],
@@ -600,6 +689,8 @@ async fn route_failure_retains_completed_sibling_usage_and_interrupts_pending_si
 
 #[tokio::test]
 async fn observer_failure_keeps_reply_and_prevents_fusion_admission() -> Result<()> {
+    // Routing-call mechanics: keep the one-document routing request.
+    let _route = crate::RouteSingleDocument::enable();
     let (directory, generation, _) = fixture("notes.txt", "\n", false).await?;
     let mock = mock(&["cobalt", "黄鹂", "zephyr"], [0; 3], [200; 4], 3.0, false).await?;
     let observer = |event: &PlannedSearchEvent| {
@@ -637,6 +728,8 @@ async fn observer_failure_keeps_reply_and_prevents_fusion_admission() -> Result<
 #[tokio::test]
 async fn caller_cancellation_records_all_admitted_pending_operations_and_prior_usage() -> Result<()>
 {
+    // Routing-call mechanics: keep the one-document routing request.
+    let _route = crate::RouteSingleDocument::enable();
     let (directory, generation, _) = fixture("notes.txt", "\n", false).await?;
     let mock = mock(
         &["cobalt", "黄鹂", "zephyr"],
@@ -692,6 +785,8 @@ async fn caller_cancellation_records_all_admitted_pending_operations_and_prior_u
 
 #[tokio::test]
 async fn generation_is_checked_before_candidates_after_routes_and_before_delivery() -> Result<()> {
+    // Routing-call mechanics: keep the one-document routing request.
+    let _route = crate::RouteSingleDocument::enable();
     for trigger in ["initial", "q0.route", "union.rerank"] {
         let (directory, original_generation, _) = fixture("notes.txt", "\n", false).await?;
         let pointer = directory.path().join(STATE).join("CURRENT.json");
@@ -739,6 +834,8 @@ async fn generation_is_checked_before_candidates_after_routes_and_before_deliver
 
 #[tokio::test]
 async fn stale_source_is_excluded_at_start_and_rechecked_after_final_reply() -> Result<()> {
+    // Routing-call mechanics: keep the one-document routing request.
+    let _route = crate::RouteSingleDocument::enable();
     for trigger in ["initial", "union.rerank"] {
         let (directory, generation, _) = fixture("notes.txt", "\n", false).await?;
         let source = directory.path().join("notes.txt");
@@ -831,6 +928,8 @@ async fn invalid_plan_bounds_are_rejected_without_call_admission() -> Result<()>
 
 #[tokio::test]
 async fn escaped_union_payload_obeys_jev_byte_cap_and_keeps_route_usage() -> Result<()> {
+    // Routing-call mechanics: keep the one-document routing request.
+    let _route = crate::RouteSingleDocument::enable();
     let directory = tempfile::tempdir()?;
     let text: String = (0..24)
         .map(|index| format!("# Invented Section {index}\n{}\n", "\"\\".repeat(750)))
@@ -873,6 +972,8 @@ async fn escaped_union_payload_obeys_jev_byte_cap_and_keeps_route_usage() -> Res
 
 #[tokio::test]
 async fn final_rerank_failure_and_cancellation_retain_all_route_receipts_once() -> Result<()> {
+    // Routing-call mechanics: keep the one-document routing request.
+    let _route = crate::RouteSingleDocument::enable();
     for status in [503, 0] {
         let (directory, generation, _) = fixture("notes.txt", "\n", false).await?;
         let mock = mock(
@@ -975,6 +1076,8 @@ async fn final_rerank_failure_and_cancellation_retain_all_route_receipts_once() 
 #[tokio::test]
 async fn before_call_observer_failure_counts_admission_without_claiming_a_provider_reply()
 -> Result<()> {
+    // Routing-call mechanics: keep the one-document routing request.
+    let _route = crate::RouteSingleDocument::enable();
     let (directory, generation, _) = fixture("notes.txt", "\n", false).await?;
     let mock = mock(&["cobalt"], [0; 3], [200; 4], 3.0, false).await?;
     let observer = |event: &PlannedSearchEvent| {
@@ -1007,5 +1110,208 @@ async fn before_call_observer_failure_counts_admission_without_claiming_a_provid
     assert!(failure.metrics.jev_usage.is_empty());
     assert!(mock.requests.lock().unwrap().is_empty());
     assert!(!failure.accounting_complete);
+    Ok(())
+}
+
+#[tokio::test]
+async fn bounded_retry_of_the_union_rerank_keeps_both_attempts_in_operation_receipts() -> Result<()>
+{
+    // One scoped document: views skip routing, so the union rerank and its
+    // bounded retry are the only Decisions submissions.
+    let (directory, generation, _) = fixture("notes.txt", "\n", false).await?;
+    for (statuses, succeeds) in [(vec![502, 200], true), (vec![502, 503], false)] {
+        let (client, server) = crate::tests::mock_jev(statuses).await?;
+        let client = client.with_transient_retry(gptgrep_jev::TransientRetry::with_jitter(|| 0.0));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let result = search_planned_with_client_and_observer(
+            directory.path(),
+            "cobalt",
+            &[],
+            &options("notes.txt"),
+            &generation,
+            &client,
+            &event_sink(events.clone()),
+        )
+        .await;
+        assert_eq!(server.await?.len(), 2);
+        let events = events.lock().unwrap().clone();
+        let union: Vec<_> = events
+            .iter()
+            .filter(|event| event.operation_id == "union.rerank")
+            .collect();
+        // The retry is a durable operation receipt before it is sent.
+        let retry = union
+            .iter()
+            .find(|event| event.event == "before_retry")
+            .unwrap();
+        assert_eq!(
+            (
+                retry.metrics.jev_calls_attempted,
+                retry.metrics.jev_requests,
+                retry.metrics.jev_retried_attempts.len()
+            ),
+            (2, 0, 1)
+        );
+        let last = union.last().unwrap();
+        assert!(!last.accounting_complete);
+        if succeeds {
+            let report = result?;
+            assert_eq!(last.event, "finished");
+            assert_eq!(
+                (
+                    report.metrics.jev_calls_attempted,
+                    report.metrics.jev_requests
+                ),
+                (2, 1)
+            );
+            assert_eq!(report.metrics.jev_usage.len(), 1);
+            assert_eq!(report.metrics.jev_retried_attempts.len(), 1);
+            assert_eq!(
+                report.metrics.jev_retried_attempts[0].stage,
+                "evidence_reranking"
+            );
+            assert!(!report.hits.is_empty());
+        } else {
+            let error = result.unwrap_err();
+            let failure = error.downcast_ref::<PlannedSearchError>().unwrap();
+            // The failed receipt keeps the retried attempt, not the pre-call snapshot.
+            assert_eq!(last.event, "failed");
+            assert_eq!(
+                (
+                    last.metrics.jev_calls_attempted,
+                    last.metrics.jev_retried_attempts.len()
+                ),
+                (2, 1)
+            );
+            assert_eq!(
+                (
+                    failure.metrics.jev_calls_attempted,
+                    failure.metrics.jev_requests
+                ),
+                (2, 0)
+            );
+            assert_eq!(failure.metrics.jev_retried_attempts.len(), 1);
+            assert_eq!(
+                failure.metrics.jev_retried_attempts[0].attempt.http_status,
+                Some(502)
+            );
+            assert!(failure.cause.contains("attempt 2: HTTP 503"));
+            assert!(failure.metrics.jev_usage.is_empty());
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn validated_union_retry_reply_keeps_its_usage_when_a_local_step_fails() -> Result<()> {
+    // One scoped document: the union rerank and its bounded retry are the only
+    // submissions. The retry validates, then a local observer step rejects it.
+    let (directory, generation, _) = fixture("notes.txt", "\n", false).await?;
+    let (client, server) = crate::tests::mock_jev(vec![502, 200]).await?;
+    let client = client
+        .with_transient_retry(gptgrep_jev::TransientRetry::with_jitter(|| 0.0))
+        .with_decision_observer(Arc::new(crate::tests::RejectValidated));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let error = search_planned_with_client_and_observer(
+        directory.path(),
+        "cobalt",
+        &[],
+        &options("notes.txt"),
+        &generation,
+        &client,
+        &event_sink(events.clone()),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(server.await?.len(), 2);
+    let failure = error.downcast_ref::<PlannedSearchError>().unwrap();
+    assert_eq!(failure.stage, "union.rerank");
+    assert_eq!(
+        (
+            failure.metrics.jev_calls_attempted,
+            failure.metrics.jev_requests
+        ),
+        (2, 1)
+    );
+    let usage = json!({"input_tokens":101,"output_tokens":2,"cost":0.002});
+    assert_eq!(failure.metrics.jev_usage, std::slice::from_ref(&usage));
+    assert_eq!(
+        failure.metrics.jev_models,
+        ["openai/gpt-6-luna-decisions-20261006"]
+    );
+    assert_eq!(failure.metrics.jev_retried_attempts.len(), 1);
+    assert!(
+        failure.metrics.jev_retried_attempts[0]
+            .attempt
+            .reported_usage
+            .is_none()
+    );
+    assert!(
+        failure.cause.contains("attempt 2: sent and validated"),
+        "{}",
+        failure.cause
+    );
+    assert!(!failure.accounting_complete);
+    // The failed operation receipt carries the same retained usage.
+    let events = events.lock().unwrap();
+    let last = events
+        .iter()
+        .rev()
+        .find(|event| event.operation_id == "union.rerank")
+        .unwrap();
+    assert_eq!(last.event, "failed");
+    assert_eq!(
+        (
+            last.metrics.jev_calls_attempted,
+            last.metrics.jev_requests,
+            last.metrics.jev_retried_attempts.len()
+        ),
+        (2, 1, 1)
+    );
+    assert_eq!(last.metrics.jev_usage, [usage]);
+    assert!(!last.accounting_complete);
+    Ok(())
+}
+
+#[tokio::test]
+async fn exhausted_submission_budget_mid_plan_is_reported_as_such() -> Result<()> {
+    // Routing-call mechanics: the one-document route uses the only submission,
+    // so the union rerank is refused at reservation, before any send.
+    let _route = crate::RouteSingleDocument::enable();
+    let (directory, generation, _) = fixture("notes.txt", "\n", false).await?;
+    let mock = mock(&["cobalt"], [0; 3], [200; 4], 3.0, false).await?;
+    let context = gptgrep_jev::ExecutionContext::new(
+        "planned-budget-exhaustion",
+        &"f".repeat(64),
+        std::time::SystemTime::now() + Duration::from_secs(30),
+        1,
+    )?;
+    let client = mock.client.clone().with_execution_context(context.clone());
+    let error = search_planned_with_client_and_observer(
+        directory.path(),
+        "cobalt",
+        &[],
+        &options("notes.txt"),
+        &generation,
+        &client,
+        &|_: &PlannedSearchEvent| -> Result<()> { Ok(()) },
+    )
+    .await
+    .unwrap_err();
+    let failure = error.downcast_ref::<PlannedSearchError>().unwrap();
+    assert_eq!(failure.stage, "union.rerank");
+    assert_eq!(
+        failure.cause,
+        "Decisions submission budget exhausted; the call was not sent; no local fallback"
+    );
+    assert_eq!(
+        (
+            failure.metrics.jev_calls_attempted,
+            failure.metrics.jev_requests
+        ),
+        (2, 1)
+    );
+    assert_eq!(mock.requests.lock().unwrap().len(), 1);
+    assert_eq!(context.snapshot()?.logical_reservations, 1);
     Ok(())
 }

@@ -183,17 +183,28 @@ Jev uses OpenRouter's typed **Decisions API**, not chat completions. It supplies
 dynamic Choice/Noul/Score judgments; application code retains parsing, offsets,
 arithmetic and workflow execution. The response records the actual returned
 model, available usage and cost. Unknown metrics remain null. Network/schema
-errors are explicit; there is no silent fallback, redirect or automatic retry.
+errors are explicit; there is no silent fallback or redirect. Default retrieval
+routing/reranking retries a received HTTP 429/500/502/503/504 at most once,
+inside the original request deadline and submission budget; the failed attempt
+stays reported with unknown cost. Timeouts and other failures are not retried.
 
 Hybrid search combines lexical candidates with semantically routed tree nodes.
 The initial policy routes at most 32 document descriptions and reranks at most
-24 evidence candidates. Check `coverage` before treating a result as exhaustive.
+24 evidence candidates. A single routable document, such as a `--document`
+scope, is selected without a routing call (`coverage.routing_status`).
+Check `coverage` before treating a result as exhaustive.
 `--min-score 0.5` is a relevance-rubric floor, **not calibrated confidence**;
 `--min-score 0` exposes low-score candidates for exploration. Large-corpus
 hierarchical semantic routing remains an explicit scalability task.
 For an exact single-token query, the hybrid lexical lane retains verified token
 matches even if Jev assigns a low score. Results expose `literal_anchor` and the
 count retained below the floor; their model scores are preserved unchanged.
+If no candidate meets the floor, the top three are still returned as
+low-confidence candidates flagged `below_threshold: true`, with
+`coverage.below_threshold_fallback` and a warning; they never count as passing.
+Such a search exits 0 because hits are returned; plain-text output prints these
+candidates as grep context lines (`PATH-LINE-TEXT`), never as `PATH:LINE:TEXT`
+matches, so check `below_threshold` in `--json` output.
 
 ## Local Codex host
 

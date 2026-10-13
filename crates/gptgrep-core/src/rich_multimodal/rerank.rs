@@ -297,6 +297,9 @@ pub(crate) fn prepare_with_working_limit(
     working_limit: u64,
 ) -> Result<PreparedRichRerank, Box<RichRerankFailure>> {
     let pin = reader.pin();
+    // Each batch is submitted exactly once; its attempt receipt counts one
+    // submission, so an attached bounded transient retry is removed.
+    let client = client.without_transient_retry();
     prepare_inner(reader, client, request, working_limit).map_err(|e| {
         let code = if e.to_string().contains("finite_context_required")
             || e.to_string().contains("luna_model_required")

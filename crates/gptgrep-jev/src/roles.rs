@@ -152,13 +152,14 @@ impl JevClient {
         })
     }
 
-    /// Exactly one request using the prepared, byte-checked body; no retries,
-    /// response dropping, candidate reduction, or automatic batching.
+    /// Exactly one request using the prepared, byte-checked body; no retries
+    /// (an attached [`TransientRetry`] is not applied), response dropping,
+    /// candidate reduction, or automatic batching.
     pub async fn decide_evidence_roles(
         &self,
         prepared: PreparedEvidenceRoles,
     ) -> Result<EvidenceRoleResponse> {
-        let response = self.submit_prepared(prepared.request).await?;
+        let response = self.submit_prepared_once(prepared.request).await?;
         let mut candidates = Vec::with_capacity(prepared.ids.len());
         for (index, id) in prepared.ids.into_iter().enumerate() {
             let Some(DecisionAnswer::Score {

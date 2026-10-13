@@ -78,6 +78,12 @@ fn rerank_actual_prepared_body_has_only_source_content_and_score_questions() -> 
     let r = request(&reader)?;
     let p = prepare_rich_rerank(reader.clone(), c.clone(), r.clone())?;
     assert_eq!(p.generation(), &reader.pin());
+    // Each batch is submitted once even when the caller's client may retry.
+    let retrying = c
+        .clone()
+        .with_transient_retry(gptgrep_jev::TransientRetry::with_jitter(|| 0.0));
+    let single = prepare_rich_rerank(reader.clone(), retrying, r.clone())?;
+    assert!(single.client.transient_retry().is_none());
     assert_eq!(p.reserved_calls(), 1);
     let wire = p.requests().next().unwrap();
     assert_eq!(wire.body_bytes(), wire.canonical_body().len());

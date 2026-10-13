@@ -116,6 +116,10 @@ def work_directory(requested: Path | None):
 
 
 def page_quality(hits: list[dict[str, Any]], doc_id: str, gold_pages: set[int]) -> dict[str, Any]:
+    # Low-confidence fallback hits did not pass the relevance floor. They are
+    # still validated as evidence, but never scored as retrieved pages, the
+    # same rule as scripts/eval.py quality().
+    hits = [hit for hit in hits if hit.get("below_threshold") is not True]
     recovered: set[int] = set()
     first_doc, first_page = None, None
     for rank, hit in enumerate(hits, 1):
@@ -265,10 +269,12 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                         index_used=response["index_used"], generation=response.get("generation"),
                         coverage=response.get("coverage"), warnings=response.get("warnings", []),
                         citation_checks=len(hits), returned_text_bytes=sum(len(hit["text"].encode()) for hit in hits),
+                        below_threshold_hits=sum(hit.get("below_threshold") is True for hit in hits),
                         hits=[{
                             key: hit.get(key) for key in (
                                 "path", "node_id", "line_start", "line_end", "page_start", "page_end",
                                 "byte_start", "byte_end", "source_sha256", "source_fresh", "text_truncated",
+                                "below_threshold",
                             )
                         } for hit in hits],
                     )

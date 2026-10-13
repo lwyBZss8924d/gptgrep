@@ -834,6 +834,16 @@ impl ExecutionContext {
         );
         Ok(remaining)
     }
+    /// Whether the immutable submission cap still admits another reservation.
+    /// It reserves nothing and does not wait for a concurrency slot; an
+    /// unavailable or unreadable budget counts as no remaining submission.
+    pub(crate) async fn submission_available(&self) -> bool {
+        self.wait_access(|state| {
+            Ok(state.reservations.len() < state.header.max_submissions as usize)
+        })
+        .await
+        .unwrap_or(false)
+    }
     pub(crate) async fn observe_submission(&self) -> Result<()> {
         self.remaining()?;
         self.wait_access(|s| {

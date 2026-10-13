@@ -253,6 +253,13 @@ impl Evidence {
             .accounting
             .as_ref()
             .ok_or_else(|| anyhow!("host_navigation_accounting_required"))?;
+        // Navigation scans keep their declared per-batch submission budget:
+        // the bounded transient retry of retrieval calls is not applied.
+        let client = self
+            .client
+            .clone()
+            .expect("initialized client")
+            .without_transient_retry();
         self.navigation = Some(
             crate::navigation::run(
                 crate::navigation::NavigationRequest {
@@ -263,7 +270,7 @@ impl Evidence {
                     config,
                     deadline,
                 },
-                self.client.as_ref().expect("initialized client"),
+                &client,
                 accounting,
             )
             .await?,
@@ -298,11 +305,15 @@ impl Evidence {
 
     fn ensure_jev_client(&mut self) -> Result<()> {
         if self.client.is_none() {
-            let client = JevClient::from_env(self.jev_model.as_deref()).map_err(|error| {
-                anyhow!(crate::jev_accounting::InitializationError {
-                    cause: error.to_string()
-                })
-            })?;
+            // Retrieval routing and reranking admit one bounded retry of a
+            // transient provider status; each attempt is separately accounted.
+            let client = JevClient::from_env(self.jev_model.as_deref())
+                .map(|client| client.with_transient_retry(gptgrep_jev::TransientRetry::standard()))
+                .map_err(|error| {
+                    anyhow!(crate::jev_accounting::InitializationError {
+                        cause: error.to_string()
+                    })
+                })?;
             self.client = Some(match &self.decisions_execution {
                 Some(context) => client.with_execution_context(context.clone()),
                 None => client,
@@ -391,6 +402,14 @@ impl Evidence {
                 }
                 ensure!(!found.hits.is_empty(), "host_jev_seed_delivery_failed");
                 found.hits.pop();
+                // The reader's fallback count describes only the hits it receives.
+                if found.coverage.below_threshold_fallback > 0 {
+                    found.coverage.below_threshold_fallback = found
+                        .hits
+                        .iter()
+                        .filter(|hit| hit.is_below_threshold_fallback())
+                        .count();
+                }
             };
             ensure!(original_hits == 0 || !found.hits.is_empty(), "host_jev_seed_delivery_failed");
             if let Some(diagnostics) = &mut found.evidence_roles {
@@ -855,6 +874,14 @@ impl Evidence {
                 }
                 ensure!(!found.hits.is_empty(), "host_jev_seed_delivery_failed");
                 found.hits.pop();
+                // The reader's fallback count describes only the hits it receives.
+                if found.coverage.below_threshold_fallback > 0 {
+                    found.coverage.below_threshold_fallback = found
+                        .hits
+                        .iter()
+                        .filter(|hit| hit.is_below_threshold_fallback())
+                        .count();
+                }
             }
             ensure!(
                 original_hits == 0 || !found.hits.is_empty(),

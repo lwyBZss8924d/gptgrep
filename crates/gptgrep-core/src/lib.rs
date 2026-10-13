@@ -1,7 +1,10 @@
 //! Source-bound document snapshots and vectorless retrieval orchestration.
 use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
-use gptgrep_jev::{Candidate, JevClient, RerankResponse};
+use gptgrep_jev::{
+    Candidate, DecisionFailure, DecisionFailureKind, DecisionRetriedAttempt, FailedResponseUsage,
+    JevClient, RerankResponse, TransientRetry, UsageObservation, UsagePresence,
+};
 
 pub mod batch;
 mod custody;
@@ -270,9 +273,24 @@ pub struct Hit {
     pub confidence: Option<f64>,
     /// A verified exact token query match retained by the hybrid lexical lane.
     pub literal_anchor: bool,
+    /// The model relevance score is below the search's `minimum_relevance_score`.
+    /// Such a hit is delivered only as a retained literal anchor or, when no
+    /// reranked candidate met the floor, as one of at most three flagged
+    /// low-confidence fallback candidates; it never passed the floor. Local
+    /// regex/lexical hits apply no floor and are never flagged.
+    #[serde(default)]
+    pub below_threshold: bool,
     pub source_sha256: String,
     pub source_fresh: bool,
     pub citation: String,
+}
+
+impl Hit {
+    /// A delivered low-confidence fallback candidate: below the relevance floor
+    /// and not a retained literal anchor. It never counts as a passing match.
+    pub fn is_below_threshold_fallback(&self) -> bool {
+        self.below_threshold && !self.literal_anchor
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -286,18 +304,47 @@ pub struct Coverage {
     pub reranked_candidates: usize,
     pub filtered_candidates: usize,
     pub retained_literal_anchors: usize,
+    /// Below-floor candidates delivered, flagged `below_threshold`, because no
+    /// reranked candidate met the relevance floor (at most three; otherwise 0).
+    /// Counted after the result limit and the final freshness check, so it
+    /// equals the flagged hits actually returned. They are also counted in
+    /// `filtered_candidates`.
+    #[serde(default)]
+    pub below_threshold_fallback: usize,
     pub stale_files: Vec<String>,
     pub truncated: bool,
     pub semantic_scope_complete: bool,
+    /// Model-assisted document routing: `routed` (one Decisions call),
+    /// `skipped_single_document` (exactly one routing candidate is selected
+    /// without a call; tree candidates are unchanged) or `no_candidates`.
+    /// Absent for local regex/lexical searches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_status: Option<String>,
+}
+
+/// One failed Jev submission that the bounded transient retry repeated. The
+/// failed attempt keeps its HTTP status; its usage stays unknown unless the
+/// provider reported it, and is never counted as zero.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JevRetriedAttempt {
+    /// `document_routing` or `evidence_reranking`.
+    pub stage: String,
+    #[serde(flatten)]
+    pub attempt: DecisionRetriedAttempt,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Metrics {
     pub elapsed_ms: u128,
     /// Logical Jev call attempts, including a pre-call observer that may stop
-    /// before network I/O. Never a claim of physical provider requests.
+    /// before network I/O. An admitted bounded transient retry counts as its own
+    /// attempt from its `before_retry` receipt, before its backoff and send, so
+    /// it too may stop before network I/O. Never a claim of physical provider
+    /// requests.
     pub jev_calls_attempted: usize,
-    /// Successful validated Jev responses observed by this search.
+    /// Successful validated Jev responses observed by this search, including a
+    /// bounded retry's reply that validated before a later local accounting or
+    /// observer step failed (failure kind `retry_post_send`).
     pub jev_requests: usize,
     /// Served (provider-returned) model of each validated response.
     pub jev_models: Vec<String>,
@@ -306,8 +353,197 @@ pub struct Metrics {
     /// `~` aliases; both are reported so neither is inferred from the other.
     #[serde(default)]
     pub jev_requested_models: Vec<String>,
+    /// Provider usage of each validated response, parallel to `jev_models`;
+    /// null when none was reported, never zero-filled. A `retry_post_send`
+    /// reply keeps only its checked numeric fields.
     pub jev_usage: Vec<Value>,
     pub jev_candidate_bytes: usize,
+    /// Failed submissions repeated by the bounded transient retry, in attempt
+    /// order. They are counted in `jev_calls_attempted` but have no `jev_usage`
+    /// entry: their usage and cost remain unknown, so accounting is incomplete.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jev_retried_attempts: Vec<JevRetriedAttempt>,
+}
+
+/// Count each failed submission that a logical Jev call retried as its own
+/// attempt with the same requested selector. No usage entry is invented.
+fn record_retried_attempts(
+    metrics: &mut Metrics,
+    stage: &str,
+    requested_model: &str,
+    attempts: &[DecisionRetriedAttempt],
+) {
+    for attempt in attempts {
+        metrics.jev_calls_attempted += 1;
+        metrics
+            .jev_requested_models
+            .push(requested_model.to_owned());
+        metrics.jev_retried_attempts.push(JevRetriedAttempt {
+            stage: stage.into(),
+            attempt: attempt.clone(),
+        });
+    }
+}
+
+/// Earlier failed submissions carried by a failure after a bounded retry.
+fn retried_attempts_of(error: &anyhow::Error) -> &[DecisionRetriedAttempt] {
+    error
+        .downcast_ref::<DecisionFailure>()
+        .map_or(&[], |failure| &failure.diagnostic().prior_attempts)
+}
+
+/// A bounded retry whose reply validated before a later local accounting or
+/// observer step failed (`retry_post_send`) was completed by the provider with
+/// known usage. Count it as an observed validated response, with its served
+/// model and checked usage, instead of dropping it. Any other failure, and a
+/// retry sent without a validated reply, adds nothing: its usage stays unknown.
+fn record_validated_retry_reply(metrics: &mut Metrics, error: &anyhow::Error) {
+    let Some(diagnostic) = error
+        .downcast_ref::<DecisionFailure>()
+        .map(DecisionFailure::diagnostic)
+        .filter(|diagnostic| diagnostic.kind == DecisionFailureKind::RetryPostSend)
+    else {
+        return;
+    };
+    let served = diagnostic
+        .response_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.model.value.as_ref());
+    if let (Some(usage), Some(served)) = (&diagnostic.reported_usage, served) {
+        metrics.jev_requests += 1;
+        metrics.jev_models.push(served.clone());
+        metrics.jev_usage.push(checked_usage(usage));
+    }
+}
+
+/// Checked numeric usage of a validated reply as a Decisions `usage` value:
+/// reported numbers, explicit nulls, absent fields omitted, and `null` when the
+/// reply reported no usage at all. Nothing unknown becomes zero.
+fn checked_usage(usage: &FailedResponseUsage) -> Value {
+    fn field<T: Serialize>(
+        object: &mut serde_json::Map<String, Value>,
+        name: &str,
+        observation: &UsageObservation<T>,
+    ) {
+        match (observation.presence, &observation.value) {
+            (UsagePresence::Absent, _) => {}
+            (UsagePresence::Reported, Some(value)) => {
+                object.insert(name.into(), json!(value));
+            }
+            _ => {
+                object.insert(name.into(), Value::Null);
+            }
+        }
+    }
+    if [
+        usage.input_tokens.presence,
+        usage.output_tokens.presence,
+        usage.cost.presence,
+    ]
+    .iter()
+    .all(|presence| *presence == UsagePresence::Null)
+    {
+        return Value::Null;
+    }
+    let mut object = serde_json::Map::new();
+    field(&mut object, "input_tokens", &usage.input_tokens);
+    field(&mut object, "output_tokens", &usage.output_tokens);
+    field(&mut object, "cost", &usage.cost);
+    Value::Object(object)
+}
+
+/// Submit one logical relevance call for `stage`. When the client's bounded
+/// transient retry is admitted, the retry is counted as its own logical attempt
+/// and its failed predecessor is recorded in `metrics` before the retry's
+/// backoff, reservation and send, and a `before_retry` progress receipt makes
+/// both durable first; a failed receipt stops the retry. A failure returns a
+/// typed [`JevSearchError`] whose metrics include every attempt.
+#[allow(clippy::too_many_arguments)]
+async fn rerank_call(
+    client: &JevClient,
+    query: &str,
+    candidates: &[Candidate],
+    stage: &str,
+    observer: Option<&JevSearchObserver<'_>>,
+    metrics: &mut Metrics,
+    coverage: &Coverage,
+    options: &SearchOptions,
+    generation: &str,
+    started: Instant,
+) -> Result<RerankResponse> {
+    let base = metrics.clone();
+    let noticed = std::sync::Mutex::new(None::<Metrics>);
+    let notice = |failed: &DecisionRetriedAttempt| -> Result<()> {
+        let mut retried = base.clone();
+        record_retried_attempts(
+            &mut retried,
+            stage,
+            client.requested_model(),
+            std::slice::from_ref(failed),
+        );
+        *noticed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(retried.clone());
+        observe_jev(
+            observer,
+            stage,
+            "before_retry",
+            &retried,
+            coverage,
+            options,
+            generation,
+            started,
+            None,
+        )
+    };
+    let result = client
+        .rerank_with_retry_notice(query, candidates, &notice)
+        .await;
+    let noticed = noticed
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match noticed {
+        Some(retried) => *metrics = retried,
+        // Defensive: a retry reported without its notice is still counted.
+        None => {
+            let attempts = match &result {
+                Ok(ranked) => ranked.retried_attempts.as_slice(),
+                Err(error) => retried_attempts_of(error),
+            };
+            record_retried_attempts(metrics, stage, client.requested_model(), attempts);
+        }
+    }
+    result.map_err(|error| {
+        if error.is::<JevSearchError>() {
+            // The `before_retry` receipt failed; its typed error already
+            // carries these metrics and a fixed cause.
+            error
+        } else {
+            // A retry reply that validated before a local step failed keeps
+            // its usage beside the failed attempt it repeated.
+            record_validated_retry_reply(metrics, &error);
+            jev_search_error(
+                stage,
+                error,
+                metrics,
+                coverage,
+                options.document.as_deref(),
+                Some(generation),
+                started,
+            )
+            .into()
+        }
+    })
+}
+
+/// The default retrieval client: one bounded retry of transient provider
+/// statuses. Callers that supply their own client keep its configuration.
+fn default_retrieval_client(client: JevClient) -> JevClient {
+    if client.transient_retry().is_some() {
+        client
+    } else {
+        client.with_transient_retry(TransientRetry::standard())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -388,14 +624,16 @@ impl std::fmt::Display for JevSearchError {
 
 impl std::error::Error for JevSearchError {}
 
-/// Nonterminal metadata receipt emitted before a logical call attempt and after
-/// each validated reply. A caller can persist these before the next await so
-/// cancellation does not discard already observed usage. No source text, request
-/// payload, credential or raw provider body is included.
+/// Nonterminal metadata receipt emitted before a logical call attempt, before
+/// an admitted bounded transient retry, and after each validated reply. A caller
+/// can persist these before the next await so cancellation does not discard
+/// already observed usage or an attempt that may have been sent. No source text,
+/// request payload, credential or raw provider body is included.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JevSearchProgress {
     pub stage: String,
-    /// `before_call` or `after_reply`.
+    /// `before_call`, `before_retry` (the retry already counts as an attempt
+    /// and its failed predecessor is in `jev_retried_attempts`) or `after_reply`.
     pub event: String,
     pub metrics: Metrics,
     pub coverage: Coverage,
@@ -421,8 +659,22 @@ fn jev_search_error(
     started: Instant,
 ) -> JevSearchError {
     let message = error.to_string();
-    let cause = if message == "OPENROUTER_API_KEY is not available" {
+    // A failure after a bounded retry, or a transient status whose retry its
+    // Retry-After refused, keeps the client's own rendering.
+    let retried = error.downcast_ref::<DecisionFailure>().filter(|failure| {
+        let diagnostic = failure.diagnostic();
+        !diagnostic.prior_attempts.is_empty() || diagnostic.retry_after_refusal.is_some()
+    });
+    let cause = if let Some(failure) = retried {
+        // Fixed wording plus numeric statuses, validation codes and fixed
+        // refusal reasons only.
+        failure.to_string()
+    } else if message == "OPENROUTER_API_KEY is not available" {
         message
+    } else if message == "Decisions submission budget exhausted" {
+        // The shared submission budget refused this call at reservation,
+        // before anything was sent.
+        "Decisions submission budget exhausted; the call was not sent; no local fallback".into()
     } else if message.contains("API key") {
         "Jev credentials are missing or invalid".into()
     } else if let Some(status) = message
@@ -486,11 +738,18 @@ fn observe_jev(
     };
     observer(&progress).map_err(|error| {
         let mut failure = jev_search_error(stage, error, metrics, coverage, options.document.as_deref(), Some(generation), started);
-        failure.cause = if event == "before_call" {
-            "Jev progress observer failed before the call; no provider call was started".into()
-        } else {
-            "Jev progress observer failed after a validated reply; no further provider call was started".into()
-        };
+        failure.cause = match event {
+            "before_call" => {
+                "Jev progress observer failed before the call; no provider call was started"
+            }
+            "before_retry" => {
+                "Jev progress observer failed before the bounded retry; the retry was not sent"
+            }
+            _ => {
+                "Jev progress observer failed after a validated reply; no further provider call was started"
+            }
+        }
+        .into();
         anyhow::Error::new(failure)
     })
 }
@@ -1637,6 +1896,7 @@ fn hit_from_bytes(
         score,
         confidence: None,
         literal_anchor: false,
+        below_threshold: false,
         source_sha256: doc.source_sha256.clone(),
         source_fresh: true,
         citation,
@@ -1655,15 +1915,90 @@ fn node_at(doc: &Document, line: usize) -> Option<&TreeNode> {
         })
 }
 
-fn tokens(query: &str) -> Vec<String> {
+/// Maximum lexical query terms used by one lexical/hybrid search.
+const MAX_LEXICAL_TERMS: usize = 16;
+/// Candidate terms ranked by scoped document frequency, in first-occurrence
+/// order; later candidates are not considered. Bounds the frequency pass.
+const MAX_RANKED_LEXICAL_TERMS: usize = 64;
+/// A small fixed list of English function words. Each has at least three
+/// letters; shorter ASCII-letter tokens are dropped by length instead.
+const LEXICAL_STOPWORDS: &[&str] = &[
+    "about", "above", "across", "after", "against", "all", "also", "although", "among", "and",
+    "any", "are", "because", "been", "before", "being", "below", "between", "both", "but", "can",
+    "could", "did", "does", "doing", "done", "during", "each", "either", "else", "every", "for",
+    "from", "had", "has", "have", "having", "her", "here", "hers", "him", "his", "how", "into",
+    "its", "itself", "may", "might", "mine", "must", "neither", "nor", "not", "off", "onto", "our",
+    "ours", "out", "over", "per", "shall", "she", "should", "some", "such", "than", "that", "the",
+    "their", "theirs", "them", "then", "there", "these", "they", "this", "those", "though",
+    "through", "too", "toward", "towards", "under", "upon", "very", "via", "was", "were", "what",
+    "when", "where", "whether", "which", "while", "who", "whom", "whose", "why", "will", "with",
+    "within", "without", "would", "yet", "you", "your", "yours",
+];
+
+/// Lowercase alphanumeric/underscore tokens, deduplicated in first-occurrence order.
+fn query_tokens(query: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     query
         .split(|c: char| !c.is_alphanumeric() && c != '_')
         .map(str::to_lowercase)
         .filter(|s| !s.is_empty() && seen.insert(s.clone()))
-        .take(16)
         .collect()
 }
+
+/// Candidate lexical terms before the 16-term cap. Fixed English function
+/// words and ASCII-letter tokens shorter than three characters are dropped;
+/// tokens containing a digit and non-ASCII tokens (for example CJK words) are
+/// kept. A query made only of dropped tokens keeps all of its tokens.
+fn candidate_terms(query: &str) -> Vec<String> {
+    let tokens = query_tokens(query);
+    let kept: Vec<String> = tokens
+        .iter()
+        .filter(|token| {
+            token.chars().any(|c| c.is_ascii_digit())
+                || !token.is_ascii()
+                || (token.chars().count() >= 3 && !LEXICAL_STOPWORDS.contains(&token.as_str()))
+        })
+        .cloned()
+        .collect();
+    if kept.is_empty() { tokens } else { kept }
+}
+
+/// Order candidate terms for the cap: lower document frequency in the scoped
+/// index first, terms absent from the scope last, ties by first occurrence.
+/// `frequencies` is parallel to `terms`. Deterministic for a fixed snapshot.
+fn rank_terms(terms: Vec<String>, frequencies: &[usize]) -> Vec<String> {
+    let mut ranked: Vec<(usize, String)> = terms.into_iter().enumerate().collect();
+    ranked.sort_by_key(|(index, _)| {
+        let frequency = frequencies[*index];
+        (frequency == 0, frequency, *index)
+    });
+    ranked
+        .into_iter()
+        .take(MAX_LEXICAL_TERMS)
+        .map(|(_, term)| term)
+        .collect()
+}
+
+/// Seed lexical terms for one search scope. At most 16 terms are kept; when
+/// more candidates remain, the rarest in the scoped index are kept.
+fn lexical_terms(
+    snapshot: &Snapshot,
+    query: &str,
+    indexed_document: Option<&Path>,
+) -> Result<Vec<String>> {
+    let mut terms = candidate_terms(query);
+    if terms.len() <= MAX_LEXICAL_TERMS {
+        return Ok(terms);
+    }
+    terms.truncate(MAX_RANKED_LEXICAL_TERMS);
+    let frequencies = snapshot
+        .index_session()?
+        .document_frequencies(&terms, indexed_document)?;
+    Ok(rank_terms(terms, &frequencies))
+}
+
+/// Below-floor candidates delivered when no reranked candidate meets the floor.
+const BELOW_THRESHOLD_FALLBACK: usize = 3;
 
 fn lexical_score(text: &str, terms: &[String]) -> f64 {
     if terms.is_empty() {
@@ -1779,17 +2114,19 @@ async fn search_reader_using_client(
     let client = if model_assisted {
         Some(match supplied_client {
             Some(client) => client.clone(),
-            None => JevClient::from_env(options.model.as_deref()).map_err(|error| {
-                jev_search_error(
-                    "initialization",
-                    error,
-                    &metrics,
-                    &coverage,
-                    options.document.as_deref(),
-                    Some(&snapshot.manifest.generation),
-                    started,
-                )
-            })?,
+            None => JevClient::from_env(options.model.as_deref())
+                .map(default_retrieval_client)
+                .map_err(|error| {
+                    jev_search_error(
+                        "initialization",
+                        error,
+                        &metrics,
+                        &coverage,
+                        options.document.as_deref(),
+                        Some(&snapshot.manifest.generation),
+                        started,
+                    )
+                })?,
         })
     } else {
         None
@@ -1870,7 +2207,11 @@ async fn collect_candidate_view(
     let mut freshness = HashMap::new();
     let mut texts = HashMap::new();
     let mut hits = Vec::new();
-    let terms = tokens(query);
+    let terms = if options.mode == "regex" || options.mode == "semantic" {
+        Vec::new()
+    } else {
+        lexical_terms(snapshot, query, indexed_document.as_deref())?
+    };
     if options.mode != "semantic" {
         let pattern = if options.mode == "regex" {
             query.to_owned()
@@ -2040,7 +2381,27 @@ async fn collect_candidate_view(
         if !coverage.semantic_scope_complete {
             warnings.push("Semantic routing covers a bounded document prefix; increase --routing-docs up to 32, select --document, or search narrower roots. Lexical retrieval uses the same explicit document scope.".into());
         }
-        if !routing.is_empty() {
+        let skip_single = routing.len() == 1 && skip_single_document_routing();
+        coverage.routing_status = Some(
+            match routing.len() {
+                0 => "no_candidates",
+                _ if skip_single => "skipped_single_document",
+                _ => "routed",
+            }
+            .into(),
+        );
+        if skip_single {
+            // Routing selects the top-ranked documents regardless of score, so
+            // one candidate is always selected. Its tree candidates, and thus
+            // the rerank request, are identical without a Decisions call.
+            let only = routing.pop().expect("one routing candidate");
+            hits.truncate(options.max_candidates / 2);
+            let document = docs
+                .get(only.id.as_str())
+                .copied()
+                .context("routing document missing from scope")?;
+            add_tree_candidates(&mut hits, &[document], &texts, options, &mut coverage);
+        } else if !routing.is_empty() {
             metrics.jev_candidate_bytes += routing.iter().map(|c| c.text.len()).sum::<usize>();
             metrics.jev_calls_attempted += 1;
             metrics
@@ -2057,17 +2418,19 @@ async fn collect_candidate_view(
                 started,
                 None,
             )?;
-            let ranked = client.rerank(query, &routing).await.map_err(|error| {
-                jev_search_error(
-                    "document_routing",
-                    error,
-                    metrics,
-                    &coverage,
-                    options.document.as_deref(),
-                    Some(&snapshot.manifest.generation),
-                    started,
-                )
-            })?;
+            let ranked = rerank_call(
+                client,
+                query,
+                &routing,
+                "document_routing",
+                observer,
+                metrics,
+                &coverage,
+                options,
+                &snapshot.manifest.generation,
+                started,
+            )
+            .await?;
             metrics.jev_requests += 1;
             metrics.jev_models.push(ranked.model.clone());
             metrics.jev_usage.push(ranked.usage.clone());
@@ -2086,48 +2449,12 @@ async fn collect_candidate_view(
             ranks.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
             // Reserve half the final budget for tree candidates, protecting no-keyword recall.
             hits.truncate(options.max_candidates / 2);
-            let mut seen: HashSet<_> = hits.iter().map(|h| h.node_id.clone()).collect();
             let selected: Vec<_> = ranks
                 .iter()
                 .take(8)
                 .filter_map(|r| docs.get(r.id.as_str()).copied())
-                .map(|document| (document, leaf_nodes(&document.nodes)))
                 .collect();
-            let max_depth = selected
-                .iter()
-                .map(|(_, leaves)| leaves.len())
-                .max()
-                .unwrap_or(0);
-            for offset in 0..max_depth {
-                for (doc, leaves) in &selected {
-                    if let Some(node) = leaves.get(offset) {
-                        let h = hit(
-                            doc,
-                            node,
-                            &texts[&doc.id],
-                            node.line_start,
-                            node.line_end,
-                            None,
-                            0.0,
-                            1400,
-                        );
-                        if seen.insert(h.node_id.clone()) {
-                            hits.push(h);
-                        }
-                    }
-                    if hits.len() >= options.max_candidates {
-                        break;
-                    }
-                }
-                if hits.len() >= options.max_candidates {
-                    break;
-                }
-            }
-            coverage.truncated |= selected
-                .iter()
-                .map(|(doc, _)| doc.nodes.len())
-                .sum::<usize>()
-                > hits.len();
+            add_tree_candidates(&mut hits, &selected, &texts, options, &mut coverage);
         }
         coverage.truncated |= hits.len() > options.max_candidates;
         hits.truncate(options.max_candidates);
@@ -2183,17 +2510,19 @@ async fn score_candidates(
             started,
             None,
         )?;
-        let ranked = client.rerank(query, &candidates).await.map_err(|error| {
-            jev_search_error(
-                "evidence_reranking",
-                error,
-                metrics,
-                coverage,
-                options.document.as_deref(),
-                Some(&snapshot.manifest.generation),
-                started,
-            )
-        })?;
+        let ranked = rerank_call(
+            client,
+            query,
+            &candidates,
+            "evidence_reranking",
+            observer,
+            metrics,
+            coverage,
+            options,
+            &snapshot.manifest.generation,
+            started,
+        )
+        .await?;
         metrics.jev_requests += 1;
         metrics.jev_models.push(ranked.model.clone());
         metrics.jev_usage.push(ranked.usage.clone());
@@ -2230,12 +2559,34 @@ async fn score_candidates(
             h.confidence = rank.confidence;
         }
         let before_filter = hits.len();
+        for h in hits.iter_mut() {
+            h.below_threshold = h.score < options.min_score;
+        }
         coverage.retained_literal_anchors = hits
             .iter()
-            .filter(|h| h.literal_anchor && h.score < options.min_score)
+            .filter(|h| h.literal_anchor && h.below_threshold)
             .count();
-        hits.retain(|h| h.literal_anchor || h.score >= options.min_score);
-        coverage.filtered_candidates = before_filter - hits.len();
+        let passing = hits
+            .iter()
+            .filter(|h| h.literal_anchor || !h.below_threshold)
+            .count();
+        coverage.filtered_candidates = before_filter - passing;
+        if passing == 0 {
+            // Never deliver an empty seed when candidates exist: keep the best
+            // few by score, each flagged as below the floor. They never count
+            // as passing. finish_candidate_batch counts the ones actually
+            // delivered and tells the reader they are low confidence.
+            hits.sort_by(|a, b| {
+                b.score
+                    .total_cmp(&a.score)
+                    .then(a.path.cmp(&b.path))
+                    .then(a.line_start.cmp(&b.line_start))
+            });
+            hits.truncate(BELOW_THRESHOLD_FALLBACK);
+            coverage.below_threshold_fallback = hits.len();
+        } else {
+            hits.retain(|h| h.literal_anchor || !h.below_threshold);
+        }
         hits.sort_by(|a, b| {
             b.literal_anchor.cmp(&a.literal_anchor).then_with(|| {
                 b.score
@@ -2253,7 +2604,11 @@ fn finish_candidate_batch(
     options: &SearchOptions,
     batch: &mut CandidateBatch,
 ) {
-    let CandidateBatch { hits, coverage, .. } = batch;
+    let CandidateBatch {
+        hits,
+        coverage,
+        warnings,
+    } = batch;
     coverage.truncated |= hits.len() > options.limit;
     hits.truncate(options.limit);
     // Recheck selected originals after potentially slow remote inference.
@@ -2277,6 +2632,109 @@ fn finish_candidate_batch(
             false
         }
     });
+    if coverage.below_threshold_fallback > 0 {
+        // Report the fallback candidates actually delivered after the result
+        // limit and the final freshness check, not those first selected.
+        coverage.below_threshold_fallback = hits
+            .iter()
+            .filter(|hit| hit.is_below_threshold_fallback())
+            .count();
+        if coverage.below_threshold_fallback > 0 {
+            warnings.push(format!(
+                "No reranked candidate met the relevance floor {}; the hits flagged below_threshold=true are the highest-scoring low-confidence candidates (at most {BELOW_THRESHOLD_FALLBACK}), counted in coverage.below_threshold_fallback. They did not pass the floor; verify them before relying on them.",
+                options.min_score
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override that still sends the single-candidate routing call,
+    /// so tests can compare the skipped path with the routed one and keep
+    /// exercising routing-call mechanics with one-document fixtures.
+    static ROUTE_SINGLE_DOCUMENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only guard: while alive on this thread, a single routing candidate is
+/// still sent to Decisions (the former behavior).
+#[cfg(test)]
+pub(crate) struct RouteSingleDocument;
+#[cfg(test)]
+impl RouteSingleDocument {
+    pub(crate) fn enable() -> Self {
+        ROUTE_SINGLE_DOCUMENT.with(|flag| flag.set(true));
+        Self
+    }
+}
+#[cfg(test)]
+impl Drop for RouteSingleDocument {
+    fn drop(&mut self) {
+        ROUTE_SINGLE_DOCUMENT.with(|flag| flag.set(false));
+    }
+}
+
+/// Exactly one routing candidate is selected without a Decisions call.
+fn skip_single_document_routing() -> bool {
+    #[cfg(test)]
+    {
+        !ROUTE_SINGLE_DOCUMENT.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
+/// Add selected documents' leaf nodes round-robin in their routed order until
+/// the candidate budget is full. Shared by routed and single-document scopes.
+fn add_tree_candidates(
+    hits: &mut Vec<Hit>,
+    selected: &[&Document],
+    texts: &HashMap<String, TextView>,
+    options: &SearchOptions,
+    coverage: &mut Coverage,
+) {
+    let mut seen: HashSet<_> = hits.iter().map(|h| h.node_id.clone()).collect();
+    let selected: Vec<_> = selected
+        .iter()
+        .map(|document| (*document, leaf_nodes(&document.nodes)))
+        .collect();
+    let max_depth = selected
+        .iter()
+        .map(|(_, leaves)| leaves.len())
+        .max()
+        .unwrap_or(0);
+    for offset in 0..max_depth {
+        for (doc, leaves) in &selected {
+            if let Some(node) = leaves.get(offset) {
+                let h = hit(
+                    doc,
+                    node,
+                    &texts[&doc.id],
+                    node.line_start,
+                    node.line_end,
+                    None,
+                    0.0,
+                    1400,
+                );
+                if seen.insert(h.node_id.clone()) {
+                    hits.push(h);
+                }
+            }
+            if hits.len() >= options.max_candidates {
+                break;
+            }
+        }
+        if hits.len() >= options.max_candidates {
+            break;
+        }
+    }
+    coverage.truncated |= selected
+        .iter()
+        .map(|(doc, _)| doc.nodes.len())
+        .sum::<usize>()
+        > hits.len();
 }
 
 /// Two linear passes preserve source/preorder while removing parents. Compute
@@ -2818,15 +3276,32 @@ mod tests {
         Ok(())
     }
 
-    async fn mock_jev(
+    pub(crate) async fn mock_jev(
         statuses: Vec<u16>,
+    ) -> Result<(JevClient, tokio::task::JoinHandle<Vec<Value>>)> {
+        mock_jev_scored(statuses, Arc::new(|_| 3.0)).await
+    }
+
+    /// Like `mock_jev`, with a rubric score (0..3) chosen from each candidate's text.
+    async fn mock_jev_scored(
+        statuses: Vec<u16>,
+        scorer: Arc<dyn Fn(&str) -> f64 + Send + Sync>,
+    ) -> Result<(JevClient, tokio::task::JoinHandle<Vec<Value>>)> {
+        let replies = statuses.into_iter().map(|status| (status, "")).collect();
+        mock_jev_replies(replies, scorer).await
+    }
+
+    /// Scripted statuses, each with extra raw response header lines (CRLF-terminated).
+    async fn mock_jev_replies(
+        replies: Vec<(u16, &'static str)>,
+        scorer: Arc<dyn Fn(&str) -> f64 + Send + Sync>,
     ) -> Result<(JevClient, tokio::task::JoinHandle<Vec<Value>>)> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("http://{}/api/alpha/decisions", listener.local_addr()?);
         let client = JevClient::with_endpoint("synthetic-core-test-key", None, &endpoint)?;
         let server = tokio::spawn(async move {
             let mut bodies = Vec::new();
-            for (ordinal, status) in statuses.into_iter().enumerate() {
+            for (ordinal, (status, headers)) in replies.into_iter().enumerate() {
                 let (mut socket, _) =
                     tokio::time::timeout(Duration::from_secs(5), listener.accept())
                         .await
@@ -2870,11 +3345,14 @@ mod tests {
                     let answers: serde_json::Map<String, Value> = body["questions"]
                         .as_object()
                         .unwrap()
-                        .keys()
-                        .map(|id| {
+                        .iter()
+                        .map(|(id, question)| {
+                            let text = question["instructions"]["candidate"]["text"]
+                                .as_str()
+                                .unwrap_or_default();
                             (
                                 id.clone(),
-                                json!({"type":"score","score":3.0,"confidence":0.9}),
+                                json!({"type":"score","score":scorer(text),"confidence":0.9}),
                             )
                         })
                         .collect();
@@ -2889,7 +3367,7 @@ mod tests {
                     "Service Unavailable"
                 };
                 let wire = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{headers}Connection: close\r\n\r\n{response}",
                     response.len()
                 );
                 socket.write_all(wire.as_bytes()).await.unwrap();
@@ -2897,6 +3375,26 @@ mod tests {
             bodies
         });
         Ok((client, server))
+    }
+
+    /// Rejects every validated reply, as a failed local ledger record or
+    /// caller observer would after the provider completed the submission.
+    pub(crate) struct RejectValidated;
+
+    impl gptgrep_jev::DecisionObserver for RejectValidated {
+        fn send_started(&self, _: &gptgrep_jev::DecisionRequestObservation<'_>) -> Result<()> {
+            Ok(())
+        }
+        fn validated_response(
+            &self,
+            _: &gptgrep_jev::DecisionRequestObservation<'_>,
+            _: &gptgrep_jev::DecisionResponse,
+        ) -> Result<()> {
+            bail!("synthetic-local-ledger-failure")
+        }
+        fn failed(&self, _: &gptgrep_jev::DecisionRequestObservation<'_>) -> Result<()> {
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -3241,7 +3739,7 @@ mod tests {
             "# Scope\nDistinct source evidence.\n",
         )?;
         let indexed = index(directory.path(), unrelated_count + 1).await?;
-        let (client, server) = mock_jev(vec![200, 200]).await?;
+        let (client, server) = mock_jev(vec![200]).await?;
         let events: Arc<Mutex<Vec<JevSearchProgress>>> = Arc::new(Mutex::new(Vec::new()));
         let recorded = events.clone();
         let observer = move |progress: &JevSearchProgress| {
@@ -3259,19 +3757,28 @@ mod tests {
             &observer,
         )
         .await?;
+        // The scope leaves one routing candidate: it is selected without a
+        // routing call, and only the scoped evidence is reranked.
         let requests = server.await?;
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0]["questions"].as_object().unwrap().len(), 1);
-        let route = requests[0]["questions"]["candidate_0"]["instructions"]["candidate"]["text"]
-            .as_str()
-            .unwrap();
-        assert!(route.contains(selected));
-        assert!(!route.contains("unrelated-"));
+        assert_eq!(requests.len(), 1);
+        let candidates = requests[0]["questions"].as_object().unwrap();
+        assert!(!candidates.is_empty());
+        for question in candidates.values() {
+            let text = question["instructions"]["candidate"]["text"]
+                .as_str()
+                .unwrap();
+            assert!(text.starts_with(&format!("Document: {selected}\n")));
+            assert!(!text.contains("unrelated-"));
+        }
         assert!(report.hits.iter().all(|hit| hit.path == selected));
         assert_eq!(report.hits.len(), 1);
         assert_eq!(report.coverage.indexed_files, unrelated_count + 1);
         assert_eq!(report.coverage.scoped_files, 1);
         assert_eq!(report.coverage.routed_documents, 1);
+        assert_eq!(
+            report.coverage.routing_status.as_deref(),
+            Some("skipped_single_document")
+        );
         assert!(report.coverage.semantic_scope_complete);
         assert_eq!(report.document_scope.as_deref(), Some(selected));
         assert_eq!(
@@ -3279,45 +3786,166 @@ mod tests {
                 report.metrics.jev_calls_attempted,
                 report.metrics.jev_requests
             ),
-            (2, 2)
+            (1, 1)
         );
         assert_eq!(
             report.metrics.jev_models,
-            [
-                "openai/gpt-6-luna-decisions-20261006",
-                "openai/gpt-6-luna-decisions-20261006"
-            ]
+            ["openai/gpt-6-luna-decisions-20261006"]
         );
         // The requested selector and the served canonical build stay separate.
         assert_eq!(
             report.metrics.jev_requested_models,
-            [gptgrep_jev::DEFAULT_MODEL, gptgrep_jev::DEFAULT_MODEL]
+            [gptgrep_jev::DEFAULT_MODEL]
         );
         let events = events.lock().unwrap();
-        assert_eq!(events.len(), 4);
         assert_eq!(
             events
                 .iter()
                 .map(|event| (event.stage.as_str(), event.event.as_str()))
                 .collect::<Vec<_>>(),
             [
-                ("document_routing", "before_call"),
-                ("document_routing", "after_reply"),
                 ("evidence_reranking", "before_call"),
                 ("evidence_reranking", "after_reply")
             ]
         );
         assert_eq!(
             (
-                events[2].metrics.jev_calls_attempted,
-                events[2].metrics.jev_requests
+                events[1].metrics.jev_calls_attempted,
+                events[1].metrics.jev_requests
             ),
-            (2, 1)
+            (1, 1)
         );
-        assert_eq!(events[2].metrics.jev_usage[0]["cost"], json!(0.001));
+        assert_eq!(events[1].metrics.jev_usage[0]["cost"], json!(0.001));
         assert!(events.iter().all(|event| event.generation.as_deref()
             == Some(indexed.generation.as_str())
             && !event.accounting_complete));
+        Ok(())
+    }
+
+    /// Two indexed documents; `first.md` is the scoped one.
+    async fn two_document_corpus() -> Result<tempfile::TempDir> {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("first.md"),
+            "# Intake\nneedle intake evidence\n# Storage\nshelf storage notes\n# Review\nreview cadence notes\n",
+        )?;
+        fs::write(
+            directory.path().join("second.md"),
+            "# Other\nneedle other evidence\n",
+        )?;
+        index(directory.path(), 10).await?;
+        Ok(directory)
+    }
+
+    #[tokio::test]
+    async fn single_document_routing_is_skipped_with_identical_rerank_input() -> Result<()> {
+        let directory = two_document_corpus().await?;
+        for mode in ["hybrid", "semantic"] {
+            let options = SearchOptions {
+                mode: mode.into(),
+                document: Some("first.md".into()),
+                ..Default::default()
+            };
+            // Reference: the former path, which sent the one-candidate routing call.
+            let route = RouteSingleDocument::enable();
+            let (client, server) = mock_jev(vec![200, 200]).await?;
+            let routed = search_with_client(directory.path(), "needle", &options, &client).await;
+            drop(route);
+            let routed = routed?;
+            let routed_requests = server.await?;
+            assert_eq!(routed_requests.len(), 2, "{mode}");
+            assert_eq!(
+                routed.coverage.routing_status.as_deref(),
+                Some("routed"),
+                "{mode}"
+            );
+            // Default: no routing call; one request fewer.
+            let (client, server) = mock_jev(vec![200]).await?;
+            let skipped = search_with_client(directory.path(), "needle", &options, &client).await?;
+            let skipped_requests = server.await?;
+            assert_eq!(skipped_requests.len(), 1, "{mode}");
+            // The rerank request is identical to the routed path's second request.
+            assert_eq!(
+                serde_json::to_vec(&skipped_requests[0])?,
+                serde_json::to_vec(&routed_requests[1])?,
+                "{mode}"
+            );
+            assert_eq!(
+                skipped.coverage.routing_status.as_deref(),
+                Some("skipped_single_document")
+            );
+            assert_eq!(
+                (
+                    skipped.metrics.jev_calls_attempted,
+                    skipped.metrics.jev_requests
+                ),
+                (1, 1)
+            );
+            assert_eq!(
+                (
+                    routed.metrics.jev_calls_attempted,
+                    routed.metrics.jev_requests
+                ),
+                (2, 2)
+            );
+            // Outputs are otherwise unchanged.
+            let mut skipped_coverage = serde_json::to_value(&skipped.coverage)?;
+            let mut routed_coverage = serde_json::to_value(&routed.coverage)?;
+            skipped_coverage
+                .as_object_mut()
+                .unwrap()
+                .remove("routing_status");
+            routed_coverage
+                .as_object_mut()
+                .unwrap()
+                .remove("routing_status");
+            assert_eq!(skipped_coverage, routed_coverage, "{mode}");
+            assert_eq!(
+                serde_json::to_value(&skipped.hits)?,
+                serde_json::to_value(&routed.hits)?,
+                "{mode}"
+            );
+            assert!(!skipped.hits.is_empty());
+            assert_eq!(skipped.warnings, routed.warnings);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn two_document_scope_still_routes() -> Result<()> {
+        let directory = two_document_corpus().await?;
+        let (client, server) = mock_jev(vec![200, 200]).await?;
+        let report = search_with_client(
+            directory.path(),
+            "needle",
+            &SearchOptions::default(),
+            &client,
+        )
+        .await?;
+        let requests = server.await?;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["questions"].as_object().unwrap().len(), 2);
+        assert_eq!(report.coverage.routed_documents, 2);
+        assert_eq!(report.coverage.routing_status.as_deref(), Some("routed"));
+        assert_eq!(
+            (
+                report.metrics.jev_calls_attempted,
+                report.metrics.jev_requests
+            ),
+            (2, 2)
+        );
+        // Local primitives carry no routing status.
+        let lexical = search(
+            directory.path(),
+            "needle",
+            &SearchOptions {
+                mode: "lexical".into(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(lexical.coverage.routing_status, None);
+        assert!(!serde_json::to_string(&lexical.coverage)?.contains("routing_status"));
         Ok(())
     }
 
@@ -3328,6 +3956,7 @@ mod tests {
             directory.path().join("subject.txt"),
             "needle source evidence",
         )?;
+        fs::write(directory.path().join("other.txt"), "other background")?;
         index(directory.path(), 10).await?;
         let (client, server) = mock_jev(vec![200, 200]).await?;
         let context = gptgrep_jev::ExecutionContext::new(
@@ -3337,10 +3966,7 @@ mod tests {
             2,
         )?;
         let client = client.with_execution_context(context.clone());
-        let options = SearchOptions {
-            document: Some("subject.txt".into()),
-            ..Default::default()
-        };
+        let options = SearchOptions::default();
         let report =
             search_with_client(directory.path(), "needle", &options, &client.clone()).await?;
         assert_eq!(report.metrics.jev_requests, 2);
@@ -3372,15 +3998,13 @@ mod tests {
             directory.path().join("subject.txt"),
             "needle source evidence",
         )?;
+        fs::write(directory.path().join("other.txt"), "other background")?;
         let indexed = index(directory.path(), 10).await?;
         let (client, server) = mock_jev(vec![200, 503]).await?;
         let error = search_with_client(
             directory.path(),
             "needle",
-            &SearchOptions {
-                document: Some("subject.txt".into()),
-                ..Default::default()
-            },
+            &SearchOptions::default(),
             &client,
         )
         .await
@@ -3408,8 +4032,8 @@ mod tests {
             [gptgrep_jev::DEFAULT_MODEL, gptgrep_jev::DEFAULT_MODEL]
         );
         assert_eq!(failure.metrics.jev_usage[0]["cost"], json!(0.001));
-        assert_eq!(failure.coverage.scoped_files, 1);
-        assert_eq!(failure.document_scope.as_deref(), Some("subject.txt"));
+        assert_eq!(failure.coverage.scoped_files, 2);
+        assert_eq!(failure.document_scope, None);
         assert_eq!(
             failure.generation.as_deref(),
             Some(indexed.generation.as_str())
@@ -3428,6 +4052,7 @@ mod tests {
     async fn failed_first_stage_has_an_attempt_and_unknown_accounting() -> Result<()> {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("subject.txt"), "source evidence")?;
+        fs::write(directory.path().join("other.txt"), "other background")?;
         index(directory.path(), 10).await?;
         let (client, server) = mock_jev(vec![503]).await?;
         let error = search_with_client(
@@ -3454,9 +4079,731 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transient_status_is_retried_once_and_both_attempts_are_accounted() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("first.txt"), "needle first evidence")?;
+        fs::write(
+            directory.path().join("second.txt"),
+            "needle second evidence",
+        )?;
+        index(directory.path(), 10).await?;
+        let (client, server) = mock_jev(vec![502, 200, 200]).await?;
+        let client = client.with_transient_retry(TransientRetry::with_jitter(|| 0.0));
+        let events: Arc<Mutex<Vec<JevSearchProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = events.clone();
+        let observer = move |progress: &JevSearchProgress| {
+            recorded.lock().unwrap().push(progress.clone());
+            Ok(())
+        };
+        let report = search_with_client_and_observer(
+            directory.path(),
+            "needle",
+            &SearchOptions::default(),
+            &client,
+            &observer,
+        )
+        .await?;
+        let requests = server.await?;
+        assert_eq!(requests.len(), 3);
+        // The retry repeats the identical routing request.
+        assert_eq!(requests[0], requests[1]);
+        assert_eq!(
+            (
+                report.metrics.jev_calls_attempted,
+                report.metrics.jev_requests
+            ),
+            (3, 2)
+        );
+        assert_eq!(report.metrics.jev_requested_models.len(), 3);
+        // Only validated replies carry usage; the failed attempt stays unknown.
+        assert_eq!(report.metrics.jev_usage.len(), 2);
+        assert_eq!(report.metrics.jev_retried_attempts.len(), 1);
+        let retried = &report.metrics.jev_retried_attempts[0];
+        assert_eq!(retried.stage, "document_routing");
+        assert_eq!(retried.attempt.attempt, 1);
+        assert_eq!(retried.attempt.http_status, Some(502));
+        assert!(retried.attempt.reported_usage.is_none());
+        let metrics = serde_json::to_value(&report.metrics)?;
+        assert_eq!(
+            metrics["jev_retried_attempts"][0]["reported_usage"],
+            Value::Null
+        );
+        assert_eq!(
+            metrics["jev_retried_attempts"][0]["stage"],
+            "document_routing"
+        );
+        let roundtrip: Metrics = serde_json::from_value(metrics)?;
+        assert_eq!(
+            roundtrip.jev_retried_attempts,
+            report.metrics.jev_retried_attempts
+        );
+        assert!(!report.hits.is_empty());
+        let events = events.lock().unwrap();
+        let routing: Vec<_> = events
+            .iter()
+            .filter(|event| event.stage == "document_routing")
+            .map(|event| event.event.as_str())
+            .collect();
+        assert_eq!(routing, ["before_call", "before_retry", "after_reply"]);
+        // The retry is counted, with its failed predecessor, before it is sent.
+        let retry = events
+            .iter()
+            .find(|event| event.event == "before_retry")
+            .unwrap();
+        assert_eq!(
+            (
+                retry.metrics.jev_calls_attempted,
+                retry.metrics.jev_requests,
+                retry.metrics.jev_retried_attempts.len()
+            ),
+            (2, 0, 1)
+        );
+        let routed = events
+            .iter()
+            .find(|event| event.stage == "document_routing" && event.event == "after_reply")
+            .unwrap();
+        assert_eq!(routed.metrics.jev_retried_attempts.len(), 1);
+        assert_eq!(
+            (
+                routed.metrics.jev_calls_attempted,
+                routed.metrics.jev_requests
+            ),
+            (2, 1)
+        );
+        Ok(())
+    }
+
+    /// One document, so the rerank is the only logical call.
+    async fn one_document_corpus() -> Result<tempfile::TempDir> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("only.txt"), "needle only evidence")?;
+        index(directory.path(), 10).await?;
+        Ok(directory)
+    }
+
+    #[tokio::test]
+    async fn admitted_retry_is_recorded_before_it_is_sent_and_survives_cancellation() -> Result<()>
+    {
+        let directory = one_document_corpus().await?;
+        // The rerank gets HTTP 502, then its admitted retry hangs in flight.
+        let (client, server) = mock_jev(vec![502, 0]).await?;
+        let context = gptgrep_jev::ExecutionContext::new(
+            "synthetic-retry-cancellation",
+            &"c".repeat(64),
+            std::time::SystemTime::now() + Duration::from_secs(60),
+            4,
+        )?;
+        let client = client
+            .with_execution_context(context.clone())
+            .with_transient_retry(TransientRetry::with_jitter(|| 0.0));
+        let events: Arc<Mutex<Vec<JevSearchProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = events.clone();
+        let observer = move |progress: &JevSearchProgress| {
+            recorded.lock().unwrap().push(progress.clone());
+            Ok(())
+        };
+        let options = SearchOptions::default();
+        let mut search = Box::pin(search_with_client_and_observer(
+            directory.path(),
+            "needle",
+            &options,
+            &client,
+            &observer,
+        ));
+        // Drive the search until the retry has been sent, then cancel it.
+        let started = tokio::time::Instant::now();
+        while context.snapshot()?.send_start_observations < 2 {
+            tokio::select! {
+                _ = &mut search => panic!("a hanging retry cannot complete"),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "retry never sent"
+            );
+        }
+        drop(search);
+        server.abort();
+        let snapshot = context.snapshot()?;
+        assert_eq!(snapshot.logical_reservations, 2);
+        let events = events.lock().unwrap();
+        let last = events.last().unwrap();
+        assert_eq!(
+            (last.stage.as_str(), last.event.as_str()),
+            ("evidence_reranking", "before_retry")
+        );
+        // Both submissions are on record although the logical call never returned.
+        assert_eq!(
+            (last.metrics.jev_calls_attempted, last.metrics.jev_requests),
+            (2, 0)
+        );
+        assert_eq!(last.metrics.jev_requested_models.len(), 2);
+        assert!(last.metrics.jev_usage.is_empty());
+        let retried = &last.metrics.jev_retried_attempts;
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0].stage, "evidence_reranking");
+        assert_eq!(retried[0].attempt.http_status, Some(502));
+        assert!(retried[0].attempt.reported_usage.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refused_before_retry_receipt_stops_the_retry_and_keeps_its_attempt() -> Result<()> {
+        let directory = one_document_corpus().await?;
+        let (client, server) = mock_jev(vec![502]).await?;
+        let client = client.with_transient_retry(TransientRetry::with_jitter(|| 0.0));
+        let observer = |progress: &JevSearchProgress| {
+            anyhow::ensure!(progress.event != "before_retry", "synthetic-ledger-refusal");
+            Ok(())
+        };
+        let error = search_with_client_and_observer(
+            directory.path(),
+            "needle",
+            &SearchOptions::default(),
+            &client,
+            &observer,
+        )
+        .await
+        .unwrap_err();
+        // No retry is sent when its receipt cannot be recorded.
+        assert_eq!(server.await?.len(), 1);
+        let failure = error
+            .downcast_ref::<JevSearchError>()
+            .context("missing typed Jev error")?;
+        assert_eq!(failure.stage, "evidence_reranking");
+        assert_eq!(
+            failure.cause,
+            "Jev progress observer failed before the bounded retry; the retry was not sent"
+        );
+        // The stopped retry stays a logical attempt; no usage is invented.
+        assert_eq!(
+            (
+                failure.metrics.jev_calls_attempted,
+                failure.metrics.jev_requests
+            ),
+            (2, 0)
+        );
+        assert!(failure.metrics.jev_usage.is_empty());
+        assert_eq!(failure.metrics.jev_retried_attempts.len(), 1);
+        assert_eq!(
+            failure.metrics.jev_retried_attempts[0].attempt.http_status,
+            Some(502)
+        );
+        assert!(!format!("{error:#}").contains("synthetic-ledger-refusal"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repeated_transient_failure_keeps_both_attempts_in_typed_error() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("first.txt"), "needle first evidence")?;
+        fs::write(
+            directory.path().join("second.txt"),
+            "needle second evidence",
+        )?;
+        index(directory.path(), 10).await?;
+        let (client, server) = mock_jev(vec![200, 503, 503]).await?;
+        let client = client.with_transient_retry(TransientRetry::with_jitter(|| 0.0));
+        let error = search_with_client(
+            directory.path(),
+            "needle",
+            &SearchOptions::default(),
+            &client,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(server.await?.len(), 3);
+        let failure = error
+            .downcast_ref::<JevSearchError>()
+            .context("missing typed Jev error")?;
+        assert_eq!(failure.stage, "evidence_reranking");
+        assert_eq!(
+            (
+                failure.metrics.jev_calls_attempted,
+                failure.metrics.jev_requests
+            ),
+            (3, 1)
+        );
+        assert_eq!(failure.metrics.jev_usage.len(), 1);
+        assert_eq!(failure.metrics.jev_retried_attempts.len(), 1);
+        assert_eq!(
+            failure.metrics.jev_retried_attempts[0].stage,
+            "evidence_reranking"
+        );
+        assert_eq!(
+            failure.metrics.jev_retried_attempts[0].attempt.http_status,
+            Some(503)
+        );
+        assert!(failure.cause.contains("after one bounded retry"));
+        assert!(failure.cause.contains("attempt 2: HTTP 503"));
+        assert!(!failure.accounting_complete);
+        let serialized = serde_json::to_string(failure)?;
+        assert!(!serialized.contains("secret-provider-body-sentinel"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn validated_retry_reply_keeps_its_usage_when_a_local_step_fails() -> Result<()> {
+        let directory = one_document_corpus().await?;
+        // The rerank gets HTTP 502; its retry is sent and validated, then a
+        // local observer step rejects the reply.
+        let (client, server) = mock_jev(vec![502, 200]).await?;
+        let client = client
+            .with_transient_retry(TransientRetry::with_jitter(|| 0.0))
+            .with_decision_observer(Arc::new(RejectValidated));
+        let events: Arc<Mutex<Vec<JevSearchProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = events.clone();
+        let observer = move |progress: &JevSearchProgress| {
+            recorded.lock().unwrap().push(progress.clone());
+            Ok(())
+        };
+        let error = search_with_client_and_observer(
+            directory.path(),
+            "needle",
+            &SearchOptions::default(),
+            &client,
+            &observer,
+        )
+        .await
+        .unwrap_err();
+        // Both submissions were sent.
+        assert_eq!(server.await?.len(), 2);
+        let failure = error
+            .downcast_ref::<JevSearchError>()
+            .context("missing typed Jev error")?;
+        assert_eq!(failure.stage, "evidence_reranking");
+        assert_eq!(
+            (
+                failure.metrics.jev_calls_attempted,
+                failure.metrics.jev_requests
+            ),
+            (2, 1)
+        );
+        // The validated retry's served model and checked usage are kept; the
+        // failed first attempt stays unknown, never zero.
+        assert_eq!(
+            failure.metrics.jev_models,
+            ["openai/gpt-6-luna-decisions-20261006"]
+        );
+        assert_eq!(
+            failure.metrics.jev_usage,
+            [json!({"input_tokens":101,"output_tokens":2,"cost":0.002})]
+        );
+        assert_eq!(failure.metrics.jev_requested_models.len(), 2);
+        let retried = &failure.metrics.jev_retried_attempts;
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0].attempt.http_status, Some(502));
+        assert!(retried[0].attempt.reported_usage.is_none());
+        assert!(
+            failure.cause.contains("attempt 2: sent and validated"),
+            "{}",
+            failure.cause
+        );
+        assert!(failure.cause.contains("its reported usage is retained"));
+        assert!(!failure.accounting_complete);
+        assert!(!format!("{error:#}").contains("synthetic-local-ledger-failure"));
+        let roundtrip: JevSearchError = serde_json::from_str(&serde_json::to_string(failure)?)?;
+        assert_eq!(roundtrip.metrics.jev_usage, failure.metrics.jev_usage);
+        // The retry was on record before it was sent.
+        let events = events.lock().unwrap();
+        let retry = events
+            .iter()
+            .find(|event| event.event == "before_retry")
+            .unwrap();
+        assert_eq!(
+            (
+                retry.metrics.jev_calls_attempted,
+                retry.metrics.jev_requests
+            ),
+            (2, 0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn checked_usage_keeps_reported_fields_and_never_invents_zero() {
+        use UsagePresence::{Absent, Invalid, Null, Reported};
+        fn observation<T>(presence: UsagePresence, value: Option<T>) -> UsageObservation<T> {
+            UsageObservation { presence, value }
+        }
+        let usage = |input_tokens, output_tokens, cost| FailedResponseUsage {
+            input_tokens,
+            output_tokens,
+            cost,
+        };
+        assert_eq!(
+            checked_usage(&usage(
+                observation(Reported, Some(7)),
+                observation(Reported, Some(1)),
+                observation(Reported, Some(0.0002)),
+            )),
+            json!({"input_tokens":7,"output_tokens":1,"cost":0.0002})
+        );
+        // A reply without usage (or with only null fields) has unknown usage.
+        assert_eq!(
+            checked_usage(&usage(
+                observation(Null, None),
+                observation(Null, None),
+                observation(Null, None),
+            )),
+            Value::Null
+        );
+        assert_eq!(
+            checked_usage(&usage(
+                observation(Absent, None),
+                observation(Null, None),
+                observation(Invalid, None),
+            )),
+            json!({"output_tokens":null,"cost":null})
+        );
+        assert_eq!(
+            checked_usage(&usage(
+                observation(Absent, None),
+                observation(Absent, None),
+                observation(Reported, Some(0.001)),
+            )),
+            json!({"cost":0.001})
+        );
+    }
+
+    #[tokio::test]
+    async fn unusable_retry_after_is_named_in_the_search_failure() -> Result<()> {
+        let directory = one_document_corpus().await?;
+        let (client, server) = mock_jev_replies(
+            vec![(503, "Retry-After: Wed, 21 Oct 2099 07:28:00 GMT\r\n")],
+            Arc::new(|_| 3.0),
+        )
+        .await?;
+        let client = client.with_transient_retry(TransientRetry::with_jitter(|| 0.0));
+        let error = search_with_client(
+            directory.path(),
+            "needle",
+            &SearchOptions::default(),
+            &client,
+        )
+        .await
+        .unwrap_err();
+        // The unusable wait refuses the retry: exactly one submission.
+        assert_eq!(server.await?.len(), 1);
+        let failure = error
+            .downcast_ref::<JevSearchError>()
+            .context("missing typed Jev error")?;
+        assert_eq!(
+            failure.cause,
+            "Jev provider returned HTTP 503; request was not retried because its Retry-After was not a non-negative integer number of seconds"
+        );
+        assert_eq!(
+            (
+                failure.metrics.jev_calls_attempted,
+                failure.metrics.jev_requests
+            ),
+            (1, 0)
+        );
+        assert!(failure.metrics.jev_retried_attempts.is_empty());
+        assert!(failure.metrics.jev_usage.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exhausted_submission_budget_is_reported_as_such() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("first.txt"), "needle first evidence")?;
+        fs::write(
+            directory.path().join("second.txt"),
+            "needle second evidence",
+        )?;
+        index(directory.path(), 10).await?;
+        // Routing uses the only submission; the rerank cannot be reserved.
+        let (client, server) = mock_jev(vec![200]).await?;
+        let context = gptgrep_jev::ExecutionContext::new(
+            "synthetic-budget-exhaustion",
+            &"e".repeat(64),
+            std::time::SystemTime::now() + Duration::from_secs(30),
+            1,
+        )?;
+        let client = client
+            .with_execution_context(context.clone())
+            .with_transient_retry(TransientRetry::with_jitter(|| 0.0));
+        let error = search_with_client(
+            directory.path(),
+            "needle",
+            &SearchOptions::default(),
+            &client,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(server.await?.len(), 1);
+        let failure = error
+            .downcast_ref::<JevSearchError>()
+            .context("missing typed Jev error")?;
+        assert_eq!(failure.stage, "evidence_reranking");
+        assert_eq!(
+            failure.cause,
+            "Decisions submission budget exhausted; the call was not sent; no local fallback"
+        );
+        assert_eq!(
+            (
+                failure.metrics.jev_calls_attempted,
+                failure.metrics.jev_requests
+            ),
+            (2, 1)
+        );
+        assert_eq!(context.snapshot()?.logical_reservations, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn default_search_client_uses_the_bounded_retry_but_keeps_supplied_policy() {
+        let endpoint = "http://127.0.0.1:9/api/alpha/decisions";
+        let plain = JevClient::with_endpoint("synthetic-core-test-key", None, endpoint).unwrap();
+        assert!(plain.transient_retry().is_none());
+        assert!(default_retrieval_client(plain).transient_retry().is_some());
+        let supplied = JevClient::with_endpoint("synthetic-core-test-key", None, endpoint)
+            .unwrap()
+            .with_transient_retry(TransientRetry::with_jitter(|| 1.0));
+        assert_eq!(
+            default_retrieval_client(supplied)
+                .transient_retry()
+                .unwrap()
+                .backoff(),
+            Duration::from_millis(1000)
+        );
+    }
+
+    /// One document whose leaf sections carry distinct synthetic markers.
+    async fn floor_corpus() -> Result<tempfile::TempDir> {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("notes.md"),
+            "# Alpha\nmarker-a quartz entry\n# Beta\nmarker-b slate entry\n# Gamma\nmarker-c basalt entry\n# Delta\nmarker-d marble entry\n# Epsilon\nmarker-e chalk entry\n",
+        )?;
+        index(directory.path(), 10).await?;
+        Ok(directory)
+    }
+
+    /// Rubric scores below the 0.5 floor (1.5 of 3), distinct per section.
+    fn below_floor_score(text: &str) -> f64 {
+        [
+            ("marker-a", 0.3),
+            ("marker-b", 1.2),
+            ("marker-c", 0.0),
+            ("marker-d", 0.9),
+            ("marker-e", 0.6),
+        ]
+        .iter()
+        .find(|(marker, _)| text.contains(marker))
+        .map_or(0.0, |(_, score)| *score)
+    }
+
+    #[tokio::test]
+    async fn all_candidates_below_floor_deliver_top_three_flagged_low_confidence() -> Result<()> {
+        let directory = floor_corpus().await?;
+        let (client, server) = mock_jev_scored(vec![200], Arc::new(below_floor_score)).await?;
+        let report = search_with_client(
+            directory.path(),
+            "unrelated survey question",
+            &SearchOptions {
+                mode: "semantic".into(),
+                ..Default::default()
+            },
+            &client,
+        )
+        .await?;
+        assert_eq!(server.await?.len(), 1);
+        assert_eq!(report.coverage.reranked_candidates, 5);
+        // None passed the floor; the best three by score are delivered, flagged.
+        assert_eq!(report.coverage.filtered_candidates, 5);
+        assert_eq!(report.coverage.below_threshold_fallback, 3);
+        assert_eq!(report.minimum_relevance_score, Some(0.5));
+        let delivered: Vec<_> = report.hits.iter().map(|hit| hit.title.as_str()).collect();
+        assert_eq!(delivered, ["Beta", "Delta", "Epsilon"]);
+        assert!(
+            report
+                .hits
+                .windows(2)
+                .all(|pair| pair[0].score > pair[1].score)
+        );
+        assert!(
+            report
+                .hits
+                .iter()
+                .all(|hit| hit.below_threshold && hit.score < 0.5 && !hit.literal_anchor)
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("low-confidence candidates"))
+        );
+        let value = serde_json::to_value(&report)?;
+        assert_eq!(value["hits"][0]["below_threshold"], true);
+        assert_eq!(value["coverage"]["below_threshold_fallback"], 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fallback_count_and_warning_describe_only_delivered_hits() -> Result<()> {
+        let directory = floor_corpus().await?;
+        let (client, server) = mock_jev_scored(vec![200], Arc::new(below_floor_score)).await?;
+        let limited = search_with_client(
+            directory.path(),
+            "unrelated survey question",
+            &SearchOptions {
+                mode: "semantic".into(),
+                limit: 1,
+                ..Default::default()
+            },
+            &client,
+        )
+        .await?;
+        server.await?;
+        // The result limit keeps one flagged candidate; the count matches it.
+        assert_eq!(limited.hits.len(), 1);
+        assert_eq!(limited.hits[0].title, "Beta");
+        assert!(limited.hits[0].is_below_threshold_fallback());
+        assert_eq!(limited.coverage.below_threshold_fallback, 1);
+        assert!(limited.coverage.truncated);
+        let warnings: Vec<_> = limited
+            .warnings
+            .iter()
+            .filter(|warning| warning.contains("low-confidence candidates"))
+            .collect();
+        assert_eq!(warnings.len(), 1);
+        assert!(!warnings[0].contains("top 3"));
+        // A fallback candidate whose source changes before delivery is neither
+        // delivered nor counted, and no low-confidence delivery is announced.
+        let changed = directory.path().join("notes.md");
+        let (client, server) = mock_jev_scored(
+            vec![200],
+            Arc::new(move |text: &str| {
+                fs::write(&changed, "# Alpha\nchanged after reranking\n").unwrap();
+                below_floor_score(text)
+            }),
+        )
+        .await?;
+        let stale = search_with_client(
+            directory.path(),
+            "unrelated survey question",
+            &SearchOptions {
+                mode: "semantic".into(),
+                ..Default::default()
+            },
+            &client,
+        )
+        .await?;
+        server.await?;
+        assert!(stale.hits.is_empty());
+        assert_eq!(stale.coverage.below_threshold_fallback, 0);
+        assert_eq!(stale.coverage.stale_files, ["notes.md"]);
+        assert!(
+            !stale
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("low-confidence"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_passing_candidate_keeps_the_floor_without_fallback() -> Result<()> {
+        let directory = floor_corpus().await?;
+        let (client, server) = mock_jev_scored(
+            vec![200],
+            Arc::new(|text: &str| {
+                if text.contains("marker-c") {
+                    2.4
+                } else {
+                    below_floor_score(text)
+                }
+            }),
+        )
+        .await?;
+        let report = search_with_client(
+            directory.path(),
+            "unrelated survey question",
+            &SearchOptions {
+                mode: "semantic".into(),
+                ..Default::default()
+            },
+            &client,
+        )
+        .await?;
+        server.await?;
+        assert_eq!(report.hits.len(), 1);
+        assert_eq!(report.hits[0].title, "Gamma");
+        assert!(!report.hits[0].below_threshold);
+        assert_eq!(report.coverage.filtered_candidates, 4);
+        assert_eq!(report.coverage.below_threshold_fallback, 0);
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("low-confidence"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_floor_and_literal_anchor_stay_truthful() -> Result<()> {
+        let directory = floor_corpus().await?;
+        // A literal anchor below the floor passes as an anchor: no fallback,
+        // but its score is still flagged as below the floor.
+        let (client, server) = mock_jev_scored(vec![200], Arc::new(below_floor_score)).await?;
+        let anchored = search_with_client(
+            directory.path(),
+            "quartz",
+            &SearchOptions::default(),
+            &client,
+        )
+        .await?;
+        server.await?;
+        assert_eq!(anchored.coverage.below_threshold_fallback, 0);
+        assert_eq!(anchored.coverage.retained_literal_anchors, 1);
+        assert_eq!(anchored.hits.len(), 1);
+        assert!(anchored.hits[0].literal_anchor && anchored.hits[0].below_threshold);
+        // An explicit stricter floor: every candidate scores 2/3, so the
+        // fallback is flagged against the requested floor, never as passing.
+        let (client, server) = mock_jev_scored(vec![200], Arc::new(|_| 2.0)).await?;
+        let strict = search_with_client(
+            directory.path(),
+            "unrelated survey question",
+            &SearchOptions {
+                mode: "semantic".into(),
+                min_score: 0.9,
+                ..Default::default()
+            },
+            &client,
+        )
+        .await?;
+        server.await?;
+        assert_eq!(strict.minimum_relevance_score, Some(0.9));
+        assert_eq!(strict.coverage.below_threshold_fallback, 3);
+        assert!(strict.hits.iter().all(|hit| hit.below_threshold));
+        assert!(
+            strict
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("relevance floor 0.9"))
+        );
+        // Local modes apply no floor and never flag hits.
+        let lexical = search(
+            directory.path(),
+            "quartz",
+            &SearchOptions {
+                mode: "lexical".into(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert!(lexical.hits.iter().all(|hit| !hit.below_threshold));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn observer_failure_after_routing_stops_before_next_provider_call() -> Result<()> {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("subject.txt"), "source evidence")?;
+        fs::write(directory.path().join("other.txt"), "other background")?;
         index(directory.path(), 10).await?;
         let (client, server) = mock_jev(vec![200]).await?;
         let observer = |progress: &JevSearchProgress| {
@@ -3497,6 +4844,7 @@ mod tests {
     async fn cancellation_retains_prior_reply_in_progress_receipts() -> Result<()> {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("subject.txt"), "source evidence")?;
+        fs::write(directory.path().join("other.txt"), "other background")?;
         index(directory.path(), 10).await?;
         let (client, server) = mock_jev(vec![200, 0]).await?;
         let events: Arc<Mutex<Vec<JevSearchProgress>>> = Arc::new(Mutex::new(Vec::new()));
@@ -3541,6 +4889,107 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn candidate_terms_drop_function_words_and_short_ascii_tokens() {
+        assert_eq!(
+            candidate_terms("What is the role of a Q3 2019 report in 杭州, per the report?"),
+            ["role", "q3", "2019", "report", "杭州"]
+        );
+        // Tokens with digits are kept at any length; other short ASCII tokens drop.
+        assert_eq!(candidate_terms("Is 7 of 12 ok"), ["7", "12"]);
+        // A query of only dropped tokens keeps its tokens.
+        assert_eq!(candidate_terms("is it on"), ["is", "it", "on"]);
+        assert_eq!(
+            candidate_terms("Ledger LEDGER ledger_2"),
+            ["ledger", "ledger_2"]
+        );
+    }
+
+    #[test]
+    fn rarer_terms_rank_first_absent_last_and_ties_keep_question_order() {
+        let terms: Vec<String> = (0..20).map(|i| format!("term{i:02}")).collect();
+        let mut frequencies = vec![5; 20];
+        frequencies[17] = 1;
+        frequencies[19] = 1;
+        frequencies[3] = 0;
+        frequencies[2] = 2;
+        let ranked = rank_terms(terms, &frequencies);
+        assert_eq!(ranked.len(), MAX_LEXICAL_TERMS);
+        assert_eq!(ranked[..3], ["term17", "term19", "term02"]);
+        // Equal frequencies keep first occurrence; the absent term sorts last.
+        assert_eq!(ranked[3..6], ["term00", "term01", "term04"]);
+        assert!(!ranked.contains(&"term03".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn long_question_keeps_distinctive_terms_after_position_sixteen() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let common = [
+            "ledger", "archive", "record", "entry", "update", "review", "status", "note", "budget",
+            "office", "region", "quarter", "metric", "policy", "summary", "filler",
+        ];
+        for index in 0..4 {
+            fs::write(
+                directory.path().join(format!("common-{index}.txt")),
+                format!("{}\nroutine page {index}\n", common.join(" ")),
+            )?;
+        }
+        fs::write(
+            directory.path().join("rare.txt"),
+            format!("{}\nThe zirconium flask holds quinoa.\n", common.join(" ")),
+        )?;
+        index(directory.path(), 10).await?;
+        // Sixteen shared terms come first; the distinctive ones follow them.
+        let question = format!(
+            "Which of the {} lines also mention zirconium and quinoa?",
+            common.join(" ")
+        );
+        let snapshot = Snapshot::open(directory.path())?;
+        let selected = lexical_terms(&snapshot, &question, None)?;
+        assert_eq!(selected.len(), MAX_LEXICAL_TERMS);
+        assert_eq!(selected[..2], ["zirconium", "quinoa"]);
+        // Equal document frequencies keep question order; the last two drop.
+        assert_eq!(selected[2..], common[..14]);
+        // Deterministic across runs and fresh snapshots.
+        assert_eq!(selected, lexical_terms(&snapshot, &question, None)?);
+        assert_eq!(
+            selected,
+            lexical_terms(&Snapshot::open(directory.path())?, &question, None)?
+        );
+        // Previously the first sixteen tokens filled the cap and no lexical
+        // candidate reached the distinctive line.
+        let report = search(
+            directory.path(),
+            &question,
+            &SearchOptions {
+                mode: "lexical".into(),
+                limit: 1,
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(report.hits[0].path, "rare.txt");
+        assert!(report.hits[0].text.contains("zirconium"));
+        // Scoped frequencies use only the selected document.
+        let scoped = lexical_terms(
+            &snapshot,
+            &question,
+            Some(Path::new(&format!(
+                "{}.txt",
+                snapshot
+                    .manifest
+                    .documents
+                    .iter()
+                    .find(|document| document.path == "common-0.txt")
+                    .unwrap()
+                    .id
+            ))),
+        )?;
+        // Absent distinctive terms sort last within one common document.
+        assert_eq!(scoped[..], common[..]);
+        Ok(())
+    }
+
+    #[test]
     fn unicode_boundaries() {
         assert_eq!(truncate("文档abc", 4), ("文", true));
     }
@@ -3553,7 +5002,7 @@ mod tests {
     #[test]
     fn lexical_is_not_semantic() {
         assert_eq!(
-            lexical_score("car speed", &tokens("automobile velocity")),
+            lexical_score("car speed", &candidate_terms("automobile velocity")),
             0.0
         );
     }
@@ -3699,13 +5148,14 @@ mod tests {
                 ..Default::default()
             };
             let report = if mode == "hybrid" {
-                let (client, server) = mock_jev(vec![200, 200]).await?;
+                // One indexed document: routing selects it without a call.
+                let (client, server) = mock_jev(vec![200]).await?;
                 let report =
                     search_with_client(directory.path(), "saffron capacitor", &options, &client)
                         .await?;
                 let requests = server.await?;
-                assert_eq!(requests.len(), 2);
-                let candidates = requests[1]["questions"].as_object().unwrap();
+                assert_eq!(requests.len(), 1);
+                let candidates = requests[0]["questions"].as_object().unwrap();
                 assert_eq!(candidates.len(), 1); // Same-node semantic dedup keeps the winning lexical window.
                 assert!(
                     candidates["candidate_0"]["instructions"]["candidate"]["text"]
@@ -3714,7 +5164,11 @@ mod tests {
                         .contains("threshold is 17 units")
                 );
                 assert_eq!(report.coverage.reranked_candidates, 1);
-                assert_eq!(report.metrics.jev_requests, 2);
+                assert_eq!(
+                    report.coverage.routing_status.as_deref(),
+                    Some("skipped_single_document")
+                );
+                assert_eq!(report.metrics.jev_requests, 1);
                 report
             } else {
                 search(directory.path(), "saffron capacitor", &options).await?
