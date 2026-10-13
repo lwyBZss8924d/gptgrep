@@ -102,7 +102,9 @@ pub struct NativePtcReport {
     pub failure_snapshot_accounting: Option<String>,
     /// Retrieval reader only, after its first recoverable denial: the restricted
     /// reader's diagnostics for this shared budget. admitted_tool_calls counts
-    /// charged GPTgrep requests; observed native items stay in native_tool_calls.
+    /// observed native items plus charged GPTgrep requests, so it equals
+    /// max_tool_calls as in the restricted reader; dynamic_requests_charged and
+    /// native_tool_calls keep the split.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_budget: Option<ToolBudgetDiagnostics>,
     /// At most max_tool_calls + 1 entries; the excess observation stops the host.
@@ -286,15 +288,24 @@ impl Tracker {
         Err(anyhow!("host_native_ptc_tool_budget_exhausted"))
     }
 
-    /// The restricted reader's diagnostics: the same limit and denial bound,
-    /// with admitted counting charged GPTgrep requests only.
+    /// The restricted reader's diagnostics: the same limit and denial bound, and
+    /// admitted counts every call admitted to the shared budget, observed native
+    /// items included. A denial requires a used budget, so admitted equals
+    /// max_tool_calls at every denial, as in the restricted reader. The native
+    /// observation past the budget that stops the host is reported in
+    /// native_tool_calls, never admitted.
     fn diagnostics(&self) -> ToolBudgetDiagnostics {
         ToolBudgetDiagnostics {
             max_tool_calls: self.maximum,
-            admitted_tool_calls: self.dynamic_ids.len(),
+            admitted_tool_calls: (self.dynamic_ids.len() + self.native.len()).min(self.maximum),
             denied_tool_calls: self.denied_ids.len(),
             max_denied_tool_calls: self.maximum,
         }
+    }
+
+    /// GPTgrep requests charged to the shared budget; denials are excluded.
+    pub(crate) fn charged_dynamic_calls(&self) -> usize {
+        self.dynamic_ids.len()
     }
 
     pub(crate) fn native_tool_calls(&self) -> usize {

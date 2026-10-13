@@ -1052,9 +1052,11 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
     }
     if let Some(budget) = tool_budget {
         warnings.push(match native_ptc.as_ref() {
+            // The diagnostics' admitted count includes native items; the
+            // warning keeps the split.
             Some(native) => format!(
                 "The shared native tool budget was exhausted after {} admitted GPTgrep calls and {} observed native items; {} additional GPTgrep requests were denied without retrieval. The answer uses previously issued evidence.",
-                budget.admitted_tool_calls,
+                native.charged_dynamic_calls(),
                 native.native_tool_calls(),
                 budget.denied_tool_calls
             ),

@@ -36,6 +36,12 @@ fn finalize(answer: &Value) -> Value {
     ]}}})
 }
 
+fn failed_turn() -> Value {
+    json!({"method":"turn/completed","params":{"threadId":"ptc-thread",
+        "turn":{"id":"ptc-turn","status":"failed","items":[],
+            "error":{"message":"private-error-sentinel","codexErrorInfo":"contextWindowExceeded"}}}})
+}
+
 fn budget(maximum: usize, admitted: usize, denied: usize) -> ToolBudgetDiagnostics {
     ToolBudgetDiagnostics {
         max_tool_calls: maximum,
@@ -62,6 +68,8 @@ fn reply(frames: &[Value], id: u64) -> &Value {
 
 /// Exactly the restricted reader's denial: same message, shape and diagnostics.
 fn assert_restricted_denial(root: &Path, frame: &Value, expected: ToolBudgetDiagnostics) {
+    // The restricted reader denies only after admitting max_tool_calls calls.
+    assert_eq!(expected.admitted_tool_calls, expected.max_tool_calls);
     let mut restricted = Evidence::open(root, None).unwrap();
     let payload = restricted
         .deny_budget("restricted", "gptgrep_search", json!({}), expected)
@@ -282,10 +290,16 @@ async fn a_native_item_counted_before_exhaustion_may_finish_after_denials() {
         ],
     )
     .await;
-    assert!(result.is_ok(), "{:?}", result.err());
-    assert_restricted_denial(root.path(), reply(&frames, 11), budget(1, 0, 1));
+    let outcome = result.expect("the denied reader finalizes after its native item");
+    // The native item was admitted to the shared budget, so the model reads
+    // the restricted reader's diagnostics: the budget is used, not 0 of 1.
+    assert_restricted_denial(root.path(), reply(&frames, 11), budget(1, 1, 1));
     assert_eq!(evidence.receipts.len(), 1);
-    assert_denial_receipt(&evidence.receipts[0], budget(1, 0, 1));
+    assert_denial_receipt(&evidence.receipts[0], budget(1, 1, 1));
+    // The warning keeps the split: no GPTgrep call was charged.
+    assert!(outcome.warnings.iter().any(|warning| warning.contains(
+        "after 0 admitted GPTgrep calls and 1 observed native items; 1 additional GPTgrep requests were denied without retrieval"
+    )));
     let report = attempt.native_ptc.unwrap();
     assert_eq!(report.dynamic_requests_charged, 0);
     assert_eq!(report.dynamic_requests_denied, 1);
@@ -297,14 +311,88 @@ async fn a_native_item_counted_before_exhaustion_may_finish_after_denials() {
         report.items[0].completed_observed
             && report.items[0].status == Some(NativeCommandStatus::Completed)
     );
+    assert_eq!(report.tool_budget, Some(budget(1, 1, 1)));
+}
+
+/// Whatever mix of observed native items and charged GPTgrep calls used the
+/// shared budget, the model-visible denial, its receipt and a later typed turn
+/// failure are byte-identical to a restricted run that used the same budget.
+#[tokio::test]
+async fn native_denials_are_byte_identical_to_the_restricted_readers() {
+    // (max_tool_calls, observed native items): native-first, a mix that charged
+    // one GPTgrep call, and the default budget with four GPTgrep calls. Each
+    // run takes the full denial bound.
+    for (maximum, native_items) in [(1, 1), (3, 2), (12, 8)] {
+        let (root, mut native_evidence) = fixture().await;
+        let mut restricted_evidence = Evidence::open(root.path(), None).unwrap();
+        let excess_ids: Vec<u64> = (200..).take(maximum).collect();
+        // The restricted reader can use its budget only with GPTgrep calls.
+        let mut restricted_script: Vec<Value> = (100..).take(maximum).map(lexical).collect();
+        let mut native_script: Vec<Value> = (0..native_items)
+            .map(|index| event("item/completed", image(&format!("native-{index}"))))
+            .collect();
+        native_script.extend((100..).take(maximum - native_items).map(lexical));
+        for script in [&mut restricted_script, &mut native_script] {
+            script.extend(excess_ids.iter().copied().map(excess));
+            script.push(failed_turn());
+        }
+        let (restricted, restricted_frames, _) = exchange(
+            root.path(),
+            &mut restricted_evidence,
+            &config(false, maximum),
+            restricted_script,
+        )
+        .await;
+        let (native, native_frames, attempt) = exchange(
+            root.path(),
+            &mut native_evidence,
+            &config(true, maximum),
+            native_script,
+        )
+        .await;
+        for id in &excess_ids {
+            let expected = reply(&restricted_frames, *id);
+            let actual = reply(&native_frames, *id);
+            // The exact text the model reads, then the complete reply frame.
+            assert_eq!(
+                actual["result"]["contentItems"][0]["text"].as_str(),
+                expected["result"]["contentItems"][0]["text"].as_str(),
+                "max {maximum}, native {native_items}, request {id}"
+            );
+            assert_eq!(actual, expected);
+        }
+        let restricted_denials = &restricted_evidence.receipts[maximum..];
+        let native_denials = &native_evidence.receipts[maximum - native_items..];
+        assert_eq!(restricted_denials.len(), maximum);
+        assert_eq!(
+            serde_json::to_string(native_denials).unwrap(),
+            serde_json::to_string(restricted_denials).unwrap()
+        );
+        let restricted = restricted.err().expect("the restricted turn failed");
+        let native = native.err().expect("the native turn failed");
+        let restricted = restricted.downcast_ref::<HostProtocolError>().unwrap();
+        let native = native.downcast_ref::<HostProtocolError>().unwrap();
+        assert_eq!(native.kind, HostProtocolErrorKind::FailedTurn);
+        assert_eq!(
+            serde_json::to_string(native).unwrap(),
+            serde_json::to_string(restricted).unwrap()
+        );
+        let expected = budget(maximum, maximum, maximum);
+        assert_eq!(restricted.tool_budget, Some(expected));
+        // The native report keeps the split behind the shared admitted count.
+        let report = attempt.native_ptc.unwrap();
+        assert_eq!(report.tool_budget, Some(expected));
+        assert_eq!(report.dynamic_requests_charged, maximum - native_items);
+        assert_eq!(report.native_tool_calls, native_items);
+        assert_eq!(report.combined_tool_calls, maximum);
+        assert_eq!(report.dynamic_requests_denied, maximum);
+        assert!(!report.budget_exceeded);
+    }
 }
 
 #[tokio::test]
 async fn failed_turn_after_a_native_denial_keeps_typed_budget_diagnostics() {
     let (root, mut evidence) = fixture().await;
-    let failed = json!({"method":"turn/completed","params":{"threadId":"ptc-thread",
-        "turn":{"id":"ptc-turn","status":"failed","items":[],
-            "error":{"message":"private-error-sentinel","codexErrorInfo":"contextWindowExceeded"}}}});
     let (result, _, attempt) = exchange(
         root.path(),
         &mut evidence,
@@ -312,7 +400,7 @@ async fn failed_turn_after_a_native_denial_keeps_typed_budget_diagnostics() {
         vec![
             tool_call(11, "gptgrep_catalog", json!({})),
             excess(12),
-            failed,
+            failed_turn(),
         ],
     )
     .await;
@@ -492,7 +580,7 @@ fn retrieval_denials_are_bounded_never_charged_and_keep_identities() {
         );
         assert_eq!(
             tracker.deny_dynamic(&json!(id)).unwrap(),
-            budget(2, 1, index + 1)
+            budget(2, 2, index + 1)
         );
         let report = tracker.report();
         assert_eq!(report.dynamic_requests_charged, 1);
@@ -500,7 +588,7 @@ fn retrieval_denials_are_bounded_never_charged_and_keep_identities() {
         assert_eq!(report.combined_tool_calls, 2);
         assert_eq!(report.dynamic_requests_denied, index + 1);
         assert!(!report.budget_exceeded);
-        assert_eq!(report.tool_budget, Some(budget(2, 1, index + 1)));
+        assert_eq!(report.tool_budget, Some(budget(2, 2, index + 1)));
     }
     // Denied identities stay bound: replays and kind changes remain fatal
     // without changing any count.
@@ -522,7 +610,7 @@ fn retrieval_denials_are_bounded_never_charged_and_keep_identities() {
     let report = tracker.report();
     assert_eq!(report.dynamic_requests_denied, 3);
     assert!(report.budget_exceeded);
-    assert_eq!(report.tool_budget, Some(budget(2, 1, 2)));
+    assert_eq!(report.tool_budget, Some(budget(2, 2, 2)));
     assert!(tracker.charge_retrieval(&json!("after")).is_err());
     assert!(tracker.deny_dynamic(&json!("after")).is_err());
 }
@@ -550,6 +638,8 @@ fn denials_never_widen_the_native_bound_and_hard_limit_callers_are_unchanged() {
     assert_eq!(report.combined_tool_calls, 2);
     assert_eq!(report.items.len(), 1);
     assert!(report.budget_exceeded);
+    // The native item that stopped the host is counted, never admitted: the
+    // diagnostics keep admitted at the limit, as at the denial.
     assert_eq!(report.tool_budget, Some(budget(1, 1, 1)));
     // Rich readers and the Document driver keep failing on the first excess.
     let mut hard = Tracker::new(1).unwrap();

@@ -363,20 +363,23 @@ The runtime must acknowledge the profile before the turn, and legacy sandbox
 overrides are omitted. The reader inherits the selected Codex capabilities and
 Skills, with shell and image viewing enabled. Observed native items and admitted
 GPTgrep calls share `--max-tool-calls` (default 12). Once that budget is used, a
-further GPTgrep request gets the restricted reader's denial (described below):
-it issues no evidence, does no Jev work and adds nothing to the shared count, so
-the reader can still finalize with an answer or `insufficient_evidence` in the
-same turn and original deadline. After `--max-tool-calls` such denials, the next
-request fails `ask` with `host_native_ptc_tool_budget_exhausted` and no answer.
-Native item notifications can arrive after execution starts, so native items
-cannot be denied: this budget is accounting, not a pre-execution guard, and an
-observed native item beyond it fails `ask` with the same code. After the first
-denial, `model_attempts[].native_ptc.tool_budget` reports the limit, admitted
-GPTgrep calls, denials and the denial limit; native items are counted separately.
-The restricted reader's caps of 900 seconds for `--timeout` and 64 for
-`--max-tool-calls` do not apply in this mode. Native output creates no citation:
-answers still cite delivered GPTgrep evidence. Query planners and `host-complete`
-stay tool-free.
+further valid GPTgrep request gets the restricted reader's denial (described
+below): it issues no evidence, does no Jev work and adds nothing to the shared
+count, so the reader can still finalize with an answer or `insufficient_evidence`
+in the same turn and original deadline. After `--max-tool-calls` such denials,
+the next request fails `ask` with `host_native_ptc_tool_budget_exhausted` and no
+answer. `ask --multimodal --native-ptc` has no such denial: its first GPTgrep
+request past the budget fails with that code. Native item notifications can
+arrive after execution starts, so native items cannot be denied: this budget is
+accounting, not a pre-execution guard, and an observed native item beyond it
+fails `ask` with the same code. After the first denial,
+`model_attempts[].native_ptc.tool_budget` reports the restricted reader's
+diagnostics: the limit, admitted calls (native items plus GPTgrep calls, equal
+to the limit), denials and the denial limit; `dynamic_requests_charged` and
+`native_tool_calls` keep the split. The restricted reader's caps of 900 seconds
+for `--timeout` and 64 for `--max-tool-calls` do not apply in this mode. Native
+output creates no citation: answers still cite delivered GPTgrep evidence. Query
+planners and `host-complete` stay tool-free.
 
 The ask-only `--experimental-query-plan` option first runs a separate no-tools
 `gpt-6-luna` / caller-selected effort / `fast` planner by default (the normal
