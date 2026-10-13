@@ -395,12 +395,16 @@ planners clear the flag and pure completion rejects native execution.
 `native_ptc::Tracker` counts native command, image, file-change, MCP, collaborator,
 web, generation and sleep items after thread/turn binding. Lifecycle events and
 one final snapshot for an ID count once; changed kinds or inconsistent statuses
-fail. These observations and direct GPTgrep request IDs share the job's configured
-`max_tool_calls`. A dynamic excess is denied before dispatch; an observed native
-excess stops the host after execution may already have started. Reports retain
-hashed IDs and lifecycle/status metadata without commands, output, image paths,
-cwd or process IDs. GPTgrep tool receipts and citation validation retain their
-existing meaning.
+fail. These observations and admitted GPTgrep request IDs share the job's
+configured `max_tool_calls`. A dynamic excess is denied before dispatch. The
+retrieval reader answers it with the restricted reader's recoverable denial, at
+most `max_tool_calls` times, and then fails; rich readers and the Document driver
+fail on the first dynamic excess. Denials are never charged, so they cannot widen
+the native bound. An observed native excess stops the host after execution may
+already have started. Reports retain hashed IDs and lifecycle/status metadata
+without commands, output, image paths, cwd or process IDs, plus the restricted
+reader's tool-budget diagnostics after a denial. GPTgrep tool receipts and
+citation validation retain their existing meaning.
 
 `run_native_task` provides structured native work with caller instructions,
 state, JSON schema, working directory and original deadline. It validates the

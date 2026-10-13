@@ -438,38 +438,35 @@ async fn wrong_thread_or_turn_is_refused_before_charging_native_metadata() {
 }
 
 #[tokio::test]
-async fn native_first_exhausts_dynamic_admission_before_retrieval() {
+async fn native_first_exhausts_dynamic_admission_and_denies_without_retrieval() {
     let (root, mut evidence) = fixture().await;
     let (result, frames, attempt) = exchange(
         root.path(),
         &mut evidence,
         &config(true, 1),
-        vec![event("item/completed", image("image")), dynamic("dynamic")],
+        vec![
+            event("item/completed", image("image")),
+            dynamic("dynamic"),
+            completed(vec![image("image")]),
+        ],
     )
     .await;
-    assert_eq!(
-        result.err().unwrap().to_string(),
-        "host_native_ptc_tool_budget_exhausted"
-    );
+    assert!(result.is_ok(), "{:?}", result.err());
+    // The restricted reader's recoverable denial, not a JSON-RPC refusal.
+    let denial = frames.iter().find(|frame| frame["id"] == 91).unwrap();
+    assert!(denial.get("error").is_none());
+    assert_eq!(denial["result"]["success"], false);
+    assert_eq!(evidence.receipts.len(), 1);
     assert!(
-        evidence.receipts.is_empty(),
+        evidence.receipts[0].evidence.is_empty() && evidence.receipts[0].search.is_none(),
         "denied request performed retrieval"
     );
-    assert!(
-        frames
-            .iter()
-            .any(|frame| frame["id"] == 91 && frame["error"]["code"] == -32601)
-    );
-    assert_eq!(attempt.status, "failed");
-    assert_eq!(
-        attempt.error.unwrap()["code"],
-        "host_native_ptc_tool_budget_exhausted"
-    );
+    assert_eq!(attempt.status, "completed");
     let report = attempt.native_ptc.unwrap();
     assert_eq!(report.dynamic_requests_charged, 0);
     assert_eq!(report.dynamic_requests_denied, 1);
     assert_eq!(report.combined_tool_calls, 1);
-    assert!(report.budget_exceeded);
+    assert!(!report.budget_exceeded);
 }
 
 #[tokio::test]
@@ -931,3 +928,6 @@ async fn terminal_failure_snapshots_keep_primary_error_and_bounded_native_accoun
         assert!(!encoded.contains("uninspected-third"), "{label}");
     }
 }
+
+#[path = "native_ptc_budget_tests.rs"]
+mod budget;

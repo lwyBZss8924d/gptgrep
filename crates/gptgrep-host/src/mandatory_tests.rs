@@ -7,7 +7,7 @@ use std::sync::{
 };
 use tokio::io::AsyncReadExt;
 
-async fn corpus() -> tempfile::TempDir {
+pub(crate) async fn corpus() -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("pipeline-notes.md"),"# Token pipeline\n\n## Assembly\nEmpty records are removed before the remaining tokens are joined.\n").unwrap();
     std::fs::write(
@@ -19,7 +19,7 @@ async fn corpus() -> tempfile::TempDir {
     root
 }
 
-async fn mock_jev(
+pub(crate) async fn mock_jev(
     plan: Vec<(u16, f64)>,
 ) -> (
     JevClient,
