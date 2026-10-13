@@ -443,11 +443,9 @@ async fn malformed_excess_requests_remain_fatal_without_a_denial() {
         )
         .await;
         let error = result.err().expect("a malformed excess request is fatal");
-        // The restricted reader's shape check fails before any denial is counted.
-        assert_eq!(
-            error.to_string(),
-            "Invalid dynamic tool arguments after tool-budget exhaustion"
-        );
+        // The restricted reader's shape check fails before any denial is counted,
+        // with the stable Opt-2b failure code for that path.
+        assert_eq!(error.to_string(), "host_tool_budget_invalid_arguments");
         assert!(!format!("{error:?}").contains("private-"));
         assert!(
             frames
