@@ -42,16 +42,30 @@ def account_name():
         return None
 
 
+def account_name_patterns(name):
+    """Where an account name leaks into text: a path component, a home shorthand or an identity.
+
+    A bare word is no leak. Common account names such as "user", "docker",
+    "owner", "github", "harbor" or "default" are ordinary words in the vendored
+    upstream profile, its provenance and the derived rule comment.
+    """
+    escaped = re.escape(name)
+    return (r"[/\\]" + escaped + r"(?![A-Za-z0-9_.-])",   # /srv/NAME/profile.json, C:\Users\NAME\, /x/NAME
+            r"~" + escaped + r"(?![A-Za-z0-9_.-])",       # ~NAME/profile.json
+            r"(?<![A-Za-z0-9_.+-])" + escaped + r"@")     # NAME@host, NAME@example.org
+
+
 def assert_no_private_markers(case, text):
     """Fail on a machine path marker or the current account name, without echoing the name."""
     for marker in MACHINE_PATH_MARKERS:
         case.assertNotIn(marker, text)
     name = account_name()
-    # Shorter names would match ordinary words. The name counts only as a whole
-    # identifier, so an account such as "root" does not match the syscall pivot_root.
+    # Shorter names would also match ordinary path segments. The name counts only
+    # in a path, home or identity shape, so an account such as "root" does not
+    # match the syscall pivot_root and "user" does not match "user namespaces".
     if name and len(name) >= 4:
-        found = re.search(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"(?![A-Za-z0-9_])", text)
-        case.assertFalse(found is not None, "the current account name appears in public source")
+        found = any(re.search(pattern, text) for pattern in account_name_patterns(name))
+        case.assertFalse(found, "the current account name appears in public source")
 
 
 def load_derive():
@@ -218,7 +232,7 @@ class ReaderSeccompProfileTests(unittest.TestCase):
         name = account_name()
         if not name or len(name) < 4:
             self.skipTest("the current account name is unavailable or shorter than four characters")
-        # A path or a standalone identifier with the name fails; the failure message omits it.
+        # A path or an identity with the name fails; the failure message omits it.
         for text in ("synthetic /srv/" + name + "/profile.json", name + "@synthetic-host"):
             with self.assertRaises(AssertionError) as caught:
                 assert_no_private_markers(self, text)
@@ -227,6 +241,21 @@ class ReaderSeccompProfileTests(unittest.TestCase):
         for marker in MACHINE_PATH_MARKERS:
             with self.assertRaises(AssertionError):
                 assert_no_private_markers(self, "synthetic " + marker + "x")
+
+    def test_private_marker_guard_passes_clean_files_under_common_account_names(self):
+        # Ordinary words in the committed public files are no leak, whatever the
+        # account is called; the same names in a path, home or identity shape still fail.
+        public = (json.dumps(self.provenance), self.derived_bytes.decode())
+        for name in ("user", "docker", "owner", "github", "harbor", "default"):
+            with self.subTest(name=name), patch(__name__ + ".account_name", return_value=name):
+                for text in public:
+                    assert_no_private_markers(self, text)
+                assert_no_private_markers(self, "unprivileged " + name + "/mount namespaces, " + name + ".json")
+                for leak in ("/srv/" + name + "/profile.json", "C:\\Users\\" + name + "\\profile.json",
+                             "/srv/" + name, "~" + name + "/profile.json", name + "@synthetic-host",
+                             "contact " + name + "@example.org"):
+                    with self.assertRaises(AssertionError, msg=leak):
+                        assert_no_private_markers(self, leak)
 
 
 class ReaderSeccompReadmeTests(unittest.TestCase):
