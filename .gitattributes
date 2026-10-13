@@ -2,3 +2,5 @@
 licenses/** -text -whitespace
 crates/gptgrep-parse/licenses/** -text -whitespace
 evals/fixtures/** -text -whitespace
+workspace/harness-tooling/harbor-ablation/full62/seccomp/upstream/** -text -whitespace
+workspace/harness-tooling/harbor-ablation/full62/seccomp/gptgrep-reader-seccomp.json -text -whitespace
