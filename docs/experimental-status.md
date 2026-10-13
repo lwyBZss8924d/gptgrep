@@ -18,10 +18,12 @@ reported separately. Whole-document parsing, native PTC OCR, document trees,
 tgrep and Decisions routing/reranking support this comparison; component
 completion does not complete the goal.
 
-The current cursor is **rebuild the reader images and the in-image Linux text
-index → integrate the approved reader sandbox setting → remove the bare-arm copy of
-GPTgrep's answer rules and apply the adapter's open review fixes → paired smoke → complete
-full62 paired SEARCH → Judge → analyze failures → next Opt**. The first paired run
+The reader images are rebuilt, the zero-model Linux text index is built and pinned
+inside the treatment image, and the adapter carries the approved reader-only sandbox
+setting. The current cursor is **remove the bare-arm copy of GPTgrep's answer rules,
+bound Decisions submissions per trial and apply the adapter's open review fixes →
+freeze the inputs on a published commit → Judge-container check and paired smoke →
+complete full62 paired SEARCH → Judge → analyze failures → next Opt**. The first paired run
 is prepared in the adapter's `legacy_text` mode with a frozen zero-model text
 index, built inside the Linux treatment image before question exposure. Native
 PTC parsing/OCR (D3) continues in parallel for later rich generations.
@@ -77,11 +79,12 @@ no tag or binary release was created.
 
 ### Current cursor
 
-Rebuild the common and treatment images from this source → build and pin the
-zero-model text index inside the Linux treatment image before any question
-exposure → integrate the approved reader sandbox setting and check the
-Judge/verifier containers → remove the raw-only answer-rules copy and apply the
-adapter's open review fixes → paired smoke → complete full62 paired SEARCH in the
+Done in this round: common and treatment images rebuilt, the zero-model text index
+built and pinned inside the Linux treatment image before any question exposure, and
+the approved reader sandbox setting integrated. Next: remove the raw-only
+answer-rules copy, bound Decisions submissions per trial and apply the adapter's
+open review fixes → freeze inputs on a published commit → check the Judge/verifier
+containers → paired smoke → complete full62 paired SEARCH in the
 adapter's `legacy_text` mode → Judge → failure analysis → next Opt. In parallel,
 Opt-1b removes or conditions the answer-commitment rule and re-measures all three
 cohorts, and native PTC parsing/OCR (D3) continues.
@@ -243,6 +246,7 @@ historical verdicts. This compact projection records their aggregate outcomes.
 | 2026-10-12, development cohorts | H-text 60/98 and H-unans 97/152 on 107 text-ingestible MMLongBench-Doc-V2 documents; 27 of 134 need OCR | Question-level holdouts that share some full62 documents; development material |
 | 2026-10-13, Opt-1 measured | full62 59/62 (+0), H-text 62/98 (+2), H-unans 87/152 (−10; over-commitments 31 → 46); failed runs fell in every cohort | Regression retained; Opt-1b next |
 | 2026-10-13, merged source | 1,109 Rust tests (0 failed, 4 ignored), 145 evaluator tests, 11 offline cases and 90 full62 wrapper tests passed; at lower load the incur wrapper passed and 2 harness-workspace deadline tests failed, as they also do on the published base on this host | Paired full62 SEARCH not run; images, Linux index and reader sandbox integration pending; G5 HOLD |
+| 2026-10-13, I0 enablement merged | Common and treatment images rebuilt credential-free (no Codex state in any layer; product binary pinned); the 34-document zero-model text index built inside the Linux treatment image, identical in pages and text to the earlier dry build; the reader-only seccomp profile (Docker 29.4.0 default plus the seven namespace calls bubblewrap needs) vendored, derived and pinned for both reader roles; acceptance probes 1–3 accepted, probe 1 in the owner-accepted form without `--proc`; full62 adapter 141 tests passed | Probes 4 (Judge/verifier default profile) and 5 (paired smoke) pending; the Decisions cost bound needs a per-trial submission limit; paired SEARCH not run |
 
 The 2026-10-12 unified runtime round unified native Document/OCR execution, configuration,
 the [runtime package](../runtime/codex/STAGING.md), the
