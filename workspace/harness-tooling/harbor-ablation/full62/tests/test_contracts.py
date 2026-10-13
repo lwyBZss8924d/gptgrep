@@ -47,7 +47,8 @@ def assert_no_gptgrep_rule_text(case, prompt):
 def synthetic_results():
     rows, inputs, blobs = [], [], {}
     runtime = {"deadline_seconds": 20, "bootstrap_seed": 19, "profile": PROFILE,
-               "primary_metric": "answer_equivalence_delta"}
+               "primary_metric": "answer_equivalence_delta", "reader_mode": "legacy_text",
+               "jev_model": "synthetic-decisions", "max_tool_calls": 10000, "qualification_mismatches": []}
     export = {"expected_pairs": 62, "expected_documents": 34,
               "cohort": {"sha256": "a" * 64}, "runtime": {"sha256": "b" * 64},
               "judge_contract": {"sha256": "c" * 64}, "tasks": rows}
@@ -234,6 +235,62 @@ class PairedTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "judge_verdict_binding"):
                     self.aggregate(export, records, runtime, blobs)
                 blobs[by_arm["gptgrep"][0]["judgment"]] = original
+
+    def test_summary_keeps_the_declared_reader_contract_out_of_qualification_mismatches(self):
+        export, records, runtime, blobs = synthetic_results()
+        generic, declared = {"code": "observed generic mismatch"}, {"code": "reader_contract_differs"}
+        runtime["qualification_mismatches"] = [generic, declared]
+        profile = self.aggregate(export, records, runtime, blobs)["profile"]
+        self.assertEqual(profile["qualification_mismatches"], [generic])
+        self.assertEqual(profile["declared_treatment_differences"], [declared])
+        contract = profile["treatment_feature_profile"]["reader_contract"]
+        self.assertIs(contract["declared_treatment"], True)
+        self.assertIn("answer_rules", contract["components"])
+        self.assertIs(contract["baseline_receives_gptgrep_rules"], False)
+        # The export's frozen profile must be the one the admitted runtime declares.
+        export["preflight"] = {"treatment_feature_profile": profile["treatment_feature_profile"]}
+        self.aggregate(export, records, runtime, blobs)
+        export["preflight"]["treatment_feature_profile"] = {**profile["treatment_feature_profile"],
+                                                            "reader_mode": "rich_multimodal"}
+        with self.assertRaisesRegex(ValueError, "treatment_profile_join"):
+            self.aggregate(export, records, runtime, blobs)
+
+    def test_summary_checks_each_arm_reader_contract_against_the_declaration(self):
+        export, records, runtime, blobs = synthetic_results()
+        unobserved = self.aggregate(export, records, runtime, blobs)["reader_contract"]
+        self.assertEqual((unobserved["raw_only_records_unobserved"], unobserved["treatment_records_without_identity"],
+                          unobserved["treatment_answer_rules_sha256"]), (62, 62, []))
+        treatment = {"schema": "gptgrep.harbor.reader-contract.v1", "arm": "gptgrep",
+                     "base_instructions": "gptgrep_reader_contract", "reader_mode": "legacy_text",
+                     "answer_rules_received": True, "answer_rules_sha256": "1" * 64}
+
+        def stamp(index, arm, contract):
+            record = [r for r, row in zip(records, export["tasks"]) if row["binding"]["arm"] == arm][index]
+            operation = parse(blobs[record["operation"]])
+            operation["reader_contract"] = contract
+            blobs[record["operation"]] = canonical(operation)
+        for index in range(62):
+            stamp(index, "gptgrep", treatment)
+            stamp(index, "raw_only", RAW_READER_CONTRACT)
+        summary = self.aggregate(export, records, runtime, blobs)["reader_contract"]
+        self.assertEqual(summary, {"declared_treatment": True, "treatment_answer_rules_expected": True,
+                                   "treatment_answer_rules_sha256": ["1" * 64],
+                                   "treatment_identity_consistent": True, "treatment_records_without_identity": 0,
+                                   "raw_only_records_without_gptgrep_contract": 62,
+                                   "raw_only_records_reporting_gptgrep_contract": 0,
+                                   "raw_only_records_unobserved": 0})
+        # A second identity or a raw-only record that reports the contract is visible.
+        stamp(0, "gptgrep", {**treatment, "answer_rules_sha256": "2" * 64})
+        stamp(0, "raw_only", {**RAW_READER_CONTRACT, "gptgrep_contract_received": True})
+        summary = self.aggregate(export, records, runtime, blobs)["reader_contract"]
+        self.assertIs(summary["treatment_identity_consistent"], False)
+        self.assertEqual(summary["treatment_answer_rules_sha256"], ["1" * 64, "2" * 64])
+        self.assertEqual((summary["raw_only_records_reporting_gptgrep_contract"],
+                          summary["raw_only_records_without_gptgrep_contract"]), (1, 61))
+        # rich_multimodal treatment trials have no answer-rules identity by design.
+        runtime["reader_mode"] = "rich_multimodal"
+        self.assertEqual(self.aggregate(export, records, runtime, blobs)["reader_contract"]
+                         ["treatment_records_without_identity"], 0)
 
     def test_unknown_cost_is_not_free(self):
         export, records, runtime, blobs = synthetic_results()
@@ -754,6 +811,14 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
         changed, _ = self.run_reader(legacy_report(), schema={"stdout": product_schema_report("Changed rules.")})
         self.assertEqual(changed["/logs/agent/operational.json"]["reader_contract"]["answer_rules_sha256"],
                          sha(b"Changed rules."))
+        # The materialized split travels unchanged: the declared contract difference is no mismatch.
+        declared = [{"code": "reader_contract_differs"}]
+        config = {**self.config(), "qualification_mismatches": [{"code": "observed generic mismatch"}],
+                  "declared_treatment_differences": declared}
+        split, _ = self.run_reader(legacy_report(), config=config)
+        operation = split["/logs/agent/operational.json"]
+        self.assertEqual((operation["qualification_mismatches"], operation["declared_treatment_differences"]),
+                         ([{"code": "observed generic mismatch"}], declared))
 
     def test_treatment_without_a_reported_contract_stops_before_the_ask(self):
         cases = {"process_failure": {"return_code": 2},

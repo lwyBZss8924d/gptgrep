@@ -305,6 +305,7 @@ def main():
                  "permitted_tools": config["permitted_tools"],
                  "generic_capabilities": config["generic_capabilities"],
                  "qualification_mismatches": config["qualification_mismatches"],
+                 "declared_treatment_differences": config.get("declared_treatment_differences", []),
                  "budget_scope": config["budget_scope"],
                  "outer_retry_count": 0, "provider_internal_retry_count": None,
                  "index_excluded": True, "grounding": "unassessed"}

@@ -7,6 +7,7 @@ import statistics
 
 from .common import (ARMS, MAX_ANSWER, binding_equal, canonical, finite_number, integer, parse, pinned, require, sha,
                      tool_cap_parity, validate_binding)
+from .adapter import qualification, treatment_feature_profile
 from .decisions import selected_mode
 
 
@@ -40,6 +41,30 @@ def decisions_costs(rows, runtime):
             "reported_cost_usd_total": total, "cost_cap_usd": cap,
             "total_within_cap": total <= cap if total is not None and finite_number(cap) else None,
             "currency_verified": False, "included_in_query_cost": False}
+
+
+def reader_contracts(contracts, runtime):
+    """Check the operation records' reader contracts against the frozen declaration.
+
+    The raw-only arm must report that it received none of GPTgrep's contract;
+    legacy_text treatment trials report the answer-rules identity of their
+    pinned product, and one cohort is expected to share one identity.
+    """
+    def identity(contract):
+        return contract.get("answer_rules_sha256") if type(contract) is dict else None
+    expected = runtime.get("reader_mode") == "legacy_text"
+    treatment, raw = contracts["gptgrep"], contracts["raw_only"]
+    identities = sorted({identity(c) for c in treatment if isinstance(identity(c), str)})
+    return {"declared_treatment": True, "treatment_answer_rules_expected": expected,
+            "treatment_answer_rules_sha256": identities,
+            "treatment_identity_consistent": len(identities) <= 1,
+            "treatment_records_without_identity": (sum(not isinstance(identity(c), str) for c in treatment)
+                                                   if expected else 0),
+            "raw_only_records_without_gptgrep_contract": sum(type(c) is dict and c.get("gptgrep_contract_received")
+                                                             is False for c in raw),
+            "raw_only_records_reporting_gptgrep_contract": sum(type(c) is dict and c.get("gptgrep_contract_received")
+                                                               is not False for c in raw),
+            "raw_only_records_unobserved": sum(type(c) is not dict for c in raw)}
 
 
 def judge_abstained(judgment, status):
@@ -139,6 +164,7 @@ def summarize(export, records, runtime):
             {row["task_name"] for row in records} == names, "missing_or_duplicate_result_binding")
     by_name = {row["task_name"]: row for row in records}
     values, pairs = {arm: [] for arm in ARMS}, {}
+    contracts = {arm: [] for arm in ARMS}
     judge_attempts = []
     for item in expected:
         binding = validate_binding(item["binding"])
@@ -194,6 +220,7 @@ def summarize(export, records, runtime):
                     len({a["ordinal"] for a in attempts}) == len(attempts), "unique_outer_attempts")
         else:
             attempts = []
+        contracts[arm].append(operation.get("reader_contract") if operation is not None else None)
         if grounding is not None:
             require(grounding["schema"] == "gptgrep.harbor.grounding.v1" and
                     grounding["primary_label_modified"] is False and
@@ -259,8 +286,13 @@ def summarize(export, records, runtime):
                             retrieval_cost_denomination_verified=False,
                             usage_subsets_not_added_twice=True)
     comparison = paired(list(pairs.values()), runtime["bootstrap_seed"])
+    checked = qualification(runtime.get("qualification_mismatches", []))
+    profile = treatment_feature_profile(runtime)
+    frozen = export.get("preflight", {}).get("treatment_feature_profile")
+    require(frozen is None or frozen == profile, "treatment_profile_join")
     return {"schema": "gptgrep.harbor.paired-summary.v1", "search": summary, "paired": comparison,
             "decisions": decisions_costs(values["gptgrep"], runtime),
+            "reader_contract": reader_contracts(contracts, runtime),
             "judge": {"outer_attempts_observed": len(judge_attempts),
                       "observed_attempt_wall_ms_subtotal": sum(a["elapsed_ms"] for a in judge_attempts
                                                                if finite_number(a.get("elapsed_ms"))),
@@ -273,7 +305,9 @@ def summarize(export, records, runtime):
                         "actually_served_verified": False, "reader_base_binary": runtime.get("reader_base_binary"),
                         "permitted_tools": runtime.get("permitted_tools"),
                         "generic_capabilities": runtime.get("generic_capabilities"),
-                        "qualification_mismatches": runtime.get("qualification_mismatches"),
+                        "qualification_mismatches": checked["mismatches"],
+                        "declared_treatment_differences": checked["declared_treatment_differences"],
+                        "treatment_feature_profile": profile,
                         "budget_scope": {"query_deadline": "shared", "instruction_bytes": "shared_local_cap",
                             "tool_calls": "treatment_enforced_raw_observed_only",
                             "treatment_max_tool_calls": runtime.get("max_tool_calls"), "raw_tool_call_cap": "none",

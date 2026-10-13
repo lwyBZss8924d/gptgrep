@@ -305,6 +305,45 @@ class HarborMaterializationTests(unittest.TestCase):
                 self.materializer()
         self.assertFalse((self.root / "dataset").exists())
 
+    def test_treatment_profile_declares_the_reader_contract_as_treatment_not_a_mismatch(self):
+        generic = {"code": "observed generic mismatch"}
+        declared = {"code": "reader_contract_differs", "observation": "synthetic different base instructions"}
+        self.runtime["qualification_mismatches"] = [generic, declared]
+        for mode in ("rich_multimodal", "legacy_text"):
+            self.runtime["reader_mode"] = mode
+            with self.subTest(reader_mode=mode):
+                adapter = self.materializer()
+                self.assertEqual(adapter.preflight["qualification"],
+                                 {"mismatches": [generic], "declared_treatment_differences": [declared]})
+                profile = adapter.preflight["treatment_feature_profile"]
+                self.assertEqual(profile["schema"], "gptgrep.harbor.treatment-feature-profile.v1")
+                self.assertEqual(profile["declared_differences"],
+                                 ["gptgrep_tools", "frozen_prebuilt_index", "reader_contract"])
+                self.assertEqual((profile["reader_mode"], profile["decisions"]["mode"]), (mode, "existing_context"))
+                contract = profile["reader_contract"]
+                self.assertIs(contract["declared_treatment"], True)
+                self.assertIs(contract["baseline_receives_gptgrep_rules"], False)
+                self.assertEqual(contract["qualification_code"], "reader_contract_differs")
+                # Only the text reader receives the answer rules and reports their identity.
+                self.assertEqual("answer_rules" in contract["components"], mode == "legacy_text")
+                self.assertEqual(contract["answer_rules_identity"] is None, mode == "rich_multimodal")
+                row = adapter.rows[0]
+                document = next(d for d in self.runtime["documents"] if d["document_id"] == row["document_id"])
+                for arm in ("gptgrep", "raw_only"):
+                    task = self.root / ("single-" + mode + "-" + arm)
+                    adapter._task(task, Path(adapter_module.__file__).parent, row, document,
+                                  {"pair_id": row["pair_id"], "document_id": row["document_id"], "arm": arm})
+                    reader = json.loads((task / "environment/reader.json").read_text())
+                    self.assertEqual(reader["qualification_mismatches"], [generic])
+                    self.assertEqual(reader["declared_treatment_differences"], [declared])
+        # The declared entry is not a tool-cap declaration and does not disturb it.
+        self.runtime["max_tool_calls"] = 500
+        with self.assertRaisesRegex(ValueError, "treatment_tool_cap_deviation_undeclared"):
+            self.materializer()
+        self.runtime["qualification_mismatches"] = [declared, adapter_module.tool_cap_deviation(500)]
+        self.assertEqual(self.materializer().preflight["qualification"]["mismatches"],
+                         [adapter_module.tool_cap_deviation(500)])
+
     def test_existing_context_preflight_weighs_the_shared_allowance_against_bootstraps(self):
         preflight = self.materializer().preflight
         self.assertEqual(preflight["decisions"],

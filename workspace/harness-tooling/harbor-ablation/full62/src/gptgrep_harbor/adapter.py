@@ -27,6 +27,54 @@ TOOL_CALL_WARNING_FLOOR = 64
 TOOL_CAP_DEVIATION = "treatment_tool_cap_below_adapter_maximum"
 
 
+# GPTgrep's reader contract is a declared treatment difference (owner
+# direction, 2026-10-13), not a parity mismatch. A runtime qualification that
+# observes the readers' different base instructions records this code; it is
+# classified as declared treatment and never carried as a mismatch.
+READER_CONTRACT_DIFFERENCE = "reader_contract_differs"
+TREATMENT_PROFILE_SCHEMA = "gptgrep.harbor.treatment-feature-profile.v1"
+
+
+def qualification(entries):
+    """Split observed qualification entries into parity mismatches and declared treatment differences."""
+    require(isinstance(entries, list), "qualification_observations")
+    mismatches, declared = [], []
+    for entry in entries:
+        treatment = type(entry) is dict and entry.get("code") == READER_CONTRACT_DIFFERENCE
+        (declared if treatment else mismatches).append(entry)
+    return {"mismatches": mismatches, "declared_treatment_differences": declared}
+
+
+def treatment_feature_profile(runtime):
+    """The frozen treatment declaration, derived from the admitted runtime.
+
+    The admission binds every input through the runtime subject, so the profile
+    cannot change after admission. It declares configured availability, not
+    observed use. GPTgrep's reader contract is part of the treatment: the bare
+    arm receives Codex's default base instructions and the common task prompt.
+    """
+    mode = runtime["reader_mode"]
+    require(mode in INDEX_SCHEMAS, "explicit_reader_mode")
+    components = ["base_instructions", "answer_citation_insufficient_evidence_schema", "abstention_rule"]
+    return {"schema": TREATMENT_PROFILE_SCHEMA,
+            "declared_differences": ["gptgrep_tools", "frozen_prebuilt_index", "reader_contract"],
+            "reader_mode": mode, "index_schema": INDEX_SCHEMAS[mode],
+            "command": ["gptgrep", "ask", "--native-ptc"] + (["--multimodal"] if mode == "rich_multimodal" else []),
+            "decisions": {"mode": selected_mode(runtime), "model": runtime["jev_model"],
+                          "routing_and_reranking": "mandatory"},
+            "treatment_max_tool_calls": runtime["max_tool_calls"],
+            "reader_contract": {
+                "declared_treatment": True, "treatment": "gptgrep_reader_contract",
+                "components": components + (["answer_rules"] if mode == "legacy_text" else []),
+                "answer_rules_identity": ("per treatment trial: product_schema:commands.ask.reader_answer_rules"
+                                          if mode == "legacy_text" else None),
+                "baseline": "codex_default_base_instructions_and_common_task_prompt",
+                "baseline_receives_gptgrep_rules": False,
+                "qualification_code": READER_CONTRACT_DIFFERENCE,
+                "diagnostic_arm": "bare_codex_plus_answer_rules_optional_not_materialized_not_primary"},
+            "observation": "configured_availability_not_observed_use"}
+
+
 def tool_cap_deviation(value):
     """The exact qualification_mismatches entry that declares a treatment cap below the maximum."""
     return {"code": TOOL_CAP_DEVIATION, "treatment_max_tool_calls": value, "raw_tool_call_cap": "none"}
@@ -285,8 +333,8 @@ class Full62Adapter:
                     0 < len(runtime["permitted_tools"][arm]) <= 64 and
                     all(isinstance(tool, str) and 0 < len(tool) <= 128
                         for tool in runtime["permitted_tools"][arm]) for arm in ARMS), "finite_permitted_tools")
-        require(isinstance(runtime["generic_capabilities"], list) and
-                isinstance(runtime["qualification_mismatches"], list), "qualification_observations")
+        require(isinstance(runtime["generic_capabilities"], list), "qualification_observations")
+        checked = self.preflight["qualification"] = qualification(runtime["qualification_mismatches"])
         for role in ("gptgrep", "raw_only", "judge"):
             image(runtime["images"][role])
         base = runtime["base_tool_environment"]
@@ -318,9 +366,9 @@ class Full62Adapter:
         integer(runtime["max_asset_bytes"], 1, 2**40)
         for key in ("deadline_seconds", "judge_deadline_seconds"):
             integer(runtime[key], 1, 3600)
-        self.preflight["tool_budget"], warnings = tool_budget(runtime["max_tool_calls"],
-                                                              runtime["qualification_mismatches"])
+        self.preflight["tool_budget"], warnings = tool_budget(runtime["max_tool_calls"], checked["mismatches"])
         self.preflight["warnings"] += warnings
+        self.preflight["treatment_feature_profile"] = treatment_feature_profile(runtime)
         integer(runtime["max_input_bytes"], 1024, 1048576)
         # Validate every selected row before run() can create either arm. The
         # broad private row parser is not the product question capacity.
@@ -433,6 +481,7 @@ class Full62Adapter:
 
     def _task(self, task, package, row, document, binding):
         runtime, arm = self.runtime, binding["arm"]
+        checked = qualification(runtime["qualification_mismatches"])
         # Every task materializes a reader role: refuse a missing pin before writing.
         reader_security = reader_security_opt(runtime.get("reader_seccomp_profile"))
         template = package / "task-template"
@@ -451,7 +500,8 @@ class Full62Adapter:
                                                       "path": PRODUCT_PROVENANCE}},
                   "permitted_tools": runtime["permitted_tools"][arm],
                   "generic_capabilities": runtime["generic_capabilities"],
-                  "qualification_mismatches": runtime["qualification_mismatches"],
+                  "qualification_mismatches": checked["mismatches"],
+                  "declared_treatment_differences": checked["declared_treatment_differences"],
                   "budget_scope": {"query_deadline": "shared", "instruction_bytes": "shared_local_cap",
                       "reader_question_max_bytes": min(MAX_READER_QUESTION_BYTES, runtime["max_input_bytes"]),
                       "tool_calls": "treatment_enforced_raw_observed_only",
