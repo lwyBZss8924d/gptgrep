@@ -516,14 +516,15 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
                 "decisions_budget": {"path": "/opt/full62-private/decisions-budget.json", "bytes": 1,
                                      "sha256": "f" * 64}}
 
-    def run_reader(self, stdout, environ=None, config=None):
+    def run_reader(self, stdout, environ=None, config=None, claim_root="/synthetic/unmounted-claim"):
         outputs = {}
         version = {"stdout": ("codex-cli " + CODEX_VERSION).encode(), "stderr": b"", "elapsed_ms": 1,
                    "return_code": 0, "failure": None, "stdin_bytes": 0, "stdin_bytes_sent": 0, "stdin_complete": True}
         product = {**version, "stdout": stdout, "elapsed_ms": 10}
         budget = canonical({"ledger_path": "/opt/full62-private/ledger/decisions.json"})
         config = self.config() if config is None else config
-        with patch.object(reader, "read", side_effect=[canonical(config), self.question.encode()]), \
+        with patch("gptgrep_harbor.decisions.CLAIM_ROOT", str(claim_root)), \
+             patch.object(reader, "read", side_effect=[canonical(config), self.question.encode()]), \
              patch.object(reader, "check_config"), patch.object(reader, "copy_asset"), \
              patch.object(reader, "check_product_bundle"), \
              patch.object(reader, "pinned", return_value=budget) as budget_read, \
@@ -601,7 +602,12 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
                          ["--decisions-budget", "/opt/full62-private/decisions-budget.json", "ask"])
         self.assertEqual(outputs["/logs/agent/operational.json"]["decisions_mode"], "existing_context")
 
-    def test_invocation_bounded_ask_joins_no_budget_and_keeps_its_cost_receipt(self):
+    def claim_root(self):
+        directory = tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"])
+        self.addCleanup(directory.cleanup)
+        return Path(directory.name).resolve()
+
+    def test_invocation_bounded_ask_claims_once_and_keeps_its_cost_receipt(self):
         config = {**self.config(), "decisions_mode": "invocation_bounded"}
         del config["decisions_budget"]
         jev = {"requests": 2, "attempted_calls": 2, "unobserved_attempts": 0, "accounting_complete": True,
@@ -612,7 +618,8 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
                 if status == "failed":
                     # A failed Ask reports its Decisions accounting under error.
                     report = canonical({"status": "failed", "error": {"jev": jev}})
-                outputs, child = self.run_reader(report, config=config)
+                claim_root = self.claim_root()
+                outputs, child = self.run_reader(report, config=config, claim_root=claim_root)
                 self.assertEqual(self.budget_reads, 0)
                 argv = child.call_args_list[1].args[0]
                 self.assertEqual(argv[:2], ["/synthetic/gptgrep", "ask"])
@@ -624,6 +631,33 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
                 self.assertTrue(receipt["cost_complete"])
                 self.assertAlmostEqual(receipt["reported_cost_usd"], 0.02)
                 self.assertEqual((receipt["validated_requests"], receipt["priced_rows"]), (2, 2))
+                # The create-new claim and the host copy of the receipt live in the
+                # trial's own host directory, outside the Harbor job directory.
+                claim = (claim_root / "claim.json").read_bytes()
+                self.assertEqual(json.loads(claim)["binding_sha256"], sha(canonical(self.binding())))
+                self.assertEqual(operation["decisions_claim"]["sha256"], sha(claim))
+                host = (claim_root / "decisions-cost.json").read_bytes()
+                self.assertEqual(json.loads(host)["decisions_cost"], receipt)
+                self.assertEqual(json.loads(host)["product_report_sha256"], sha(report))
+                self.assertEqual(operation["decisions_receipt"]["sha256"], sha(host))
+                # A re-executed trial (for example in a resumed Harbor job) finds
+                # the claim and fails closed before the Ask: no Decisions spend.
+                again, child = self.run_reader(report, config=config, claim_root=claim_root)
+                self.assertEqual(child.call_count, 1)
+                self.assertEqual(again["/answer/answer.json"]["status"], "operational_failure")
+                repeated = again["/logs/agent/operational.json"]
+                self.assertEqual((repeated["failure"], repeated["attempts"]), ("reader_failed", []))
+                self.assertNotIn("decisions_receipt", repeated)
+                self.assertEqual((claim_root / "claim.json").read_bytes(), claim)
+
+    def test_invocation_bounded_ask_requires_its_claim_mount(self):
+        config = {**self.config(), "decisions_mode": "invocation_bounded"}
+        del config["decisions_budget"]
+        missing = self.claim_root() / "not-mounted"
+        outputs, child = self.run_reader(legacy_report(), config=config, claim_root=missing)
+        self.assertEqual(child.call_count, 1)
+        self.assertEqual(outputs["/answer/answer.json"]["status"], "operational_failure")
+        self.assertFalse(missing.exists())
 
     def test_bare_prompt_states_the_enforced_no_external_search_policy(self):
         prompt = reader.raw_prompt({"raw_document": "/data/corpus/synthetic.txt"}, self.question).decode()

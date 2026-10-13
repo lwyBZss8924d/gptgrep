@@ -10,8 +10,9 @@ from .native import JUDGE_OUTPUT_SCHEMA, output_schema_bytes
 from .runtime import (API_ENV, BASE_CAPABILITIES, BASE_TOOLS_PATH, CODEX_HOME, DECISIONS_BUDGET, DECISIONS_LEDGER_DIR, PASS_ENV, WORK_DIR, auth_compose, auth_paths,
                       base_tools_identity, model_config, native_identity, validate_asset_path)
 from .product_bundle import PRODUCT_ENTRYPOINT, PRODUCT_PROVENANCE, bundle_identity
-from .decisions import (CONTROL_ROOT, FAMILY_ROOT, TRIAL_ROOT, WRITER_LOCK,
-                        control as decisions_control, invocation_cost_bound, selected_mode)
+from .decisions import (CLAIM_ROOT, CONTROL_ROOT, FAMILY_ROOT, TRIAL_ROOT, WRITER_LOCK,
+                        control as decisions_control, decisions_model, directory as decisions_directory,
+                        invocation_cost_bound, selected_mode)
 from .trial_order import paired_order
 
 
@@ -133,6 +134,9 @@ class Full62Adapter:
         if runtime["reader_mode"] == "rich_multimodal":
             require(runtime["jev_model"] in ("openai/gpt-6-luna-decisions", "openai/gpt-6-luna-decisions-20261006"),
                     "rich_decisions_model")
+        else:
+            # Every treatment Ask passes this value as one --jev-model argument.
+            decisions_model(runtime.get("jev_model"))
         # runtime.template.json keeps every unselected mode field null; null and
         # absent both mean unselected, and any value is a mode conflict.
         mode = selected_mode(runtime)
@@ -144,8 +148,10 @@ class Full62Adapter:
                     "decisions_preparation_mode_conflict")
         elif mode == "invocation_bounded":
             # No shared ledger or budget file: each legacy Ask keeps the product's
-            # own single-invocation context. The cohort's worst case must fit the cap.
+            # own single-invocation context, and a per-trial host claim allows one
+            # Ask per trial. The cohort's bound must fit the cap.
             require(runtime["reader_mode"] == "legacy_text", "decisions_invocation_bounded_mode_conflict")
+            decisions_directory(runtime.get("decisions_claims_dir"))
             self.preflight["decisions"] = invocation_cost_bound(runtime, len(self.rows))
         else:
             budget = runtime["decisions_budget"]
@@ -225,6 +231,12 @@ class Full62Adapter:
         integer(runtime["trial_order_seed"])
         require(re.fullmatch(r"[a-z0-9][a-z0-9-]{0,79}", runtime["run_id"]), "run_id")
         require(Path(runtime["jobs_dir"]).is_absolute(), "explicit_jobs_directory")
+        if mode == "invocation_bounded":
+            # Harbor deletes unfinished trial directories when it resumes a job;
+            # the claims must survive that, so they never share jobs_dir.
+            claims, jobs = Path(runtime["decisions_claims_dir"]), Path(runtime["jobs_dir"]).resolve()
+            require(not claims.is_relative_to(jobs) and not jobs.is_relative_to(claims),
+                    "decisions_claims_inside_jobs_dir")
         integer(runtime["max_asset_bytes"], 1, 2**40)
         for key in ("deadline_seconds", "judge_deadline_seconds"):
             integer(runtime[key], 1, 3600)
@@ -280,6 +292,17 @@ class Full62Adapter:
             for key in ("controls_directory", "financial_family_directory", "trial_state_directory"):
                 require(not Path(preparation[key]).is_relative_to(root), "decisions_inside_task_output")
             put(Path(preparation["trial_state_directory"]) / "sole-writer.lock", b"")
+        if selected_mode(self.runtime) == "invocation_bounded":
+            claims = Path(self.runtime["decisions_claims_dir"])
+            require(not claims.is_relative_to(root) and not root.is_relative_to(claims),
+                    "decisions_inside_task_output")
+            # One claims root per materialized cohort: a consumed root, whose
+            # trials may already have spent, cannot be materialized again.
+            require(not any(claims.iterdir()), "decisions_claims_not_fresh")
+            put(claims / "cohort.json", {"schema": "gptgrep.harbor.decisions-invocation-claims.v1",
+                                         "run_id": self.runtime["run_id"],
+                                         "runtime_sha256": self.manifest["runtime"]["sha256"],
+                                         "treatment_trials": len(self.rows)})
         root.mkdir(mode=0o700, parents=False)
         package = Path(__file__).parent
         exported = []
@@ -366,6 +389,10 @@ class Full62Adapter:
                 "seed": {**preparation["seed"], "path": CONTROL_ROOT + "/seed.json"},
                 # The unchanged financial guard caps each identifier at 96 bytes.
                 "run_id": runtime["run_id"][:63] + "-" + trial_id, "max_concurrent_batches": 1}
+        elif mode == "invocation_bounded" and arm == "gptgrep":
+            # One fresh claim directory per treatment trial, outside the job.
+            trial_state = Path(runtime["decisions_claims_dir"]) / sha(canonical(binding))[:32]
+            trial_state.mkdir(mode=0o700)
         put(task / "environment/reader.json", reader)
         # The frozen response schema enters only the Judge's private /tests area.
         schema_bytes = output_schema_bytes(self.judge["response_schema"])
@@ -426,8 +453,9 @@ class Full62Adapter:
                     mounts = [(runtime["decisions_budget"]["path"], DECISIONS_BUDGET, True),
                               (runtime["decisions_ledger_dir"], DECISIONS_LEDGER_DIR, False)]
                 else:
-                    # invocation_bounded: no ledger or budget state leaves the host.
-                    mounts = []
+                    # invocation_bounded: no ledger or budget state leaves the
+                    # host; only this trial's own claim directory is writable.
+                    mounts = [(str(trial_state), CLAIM_ROOT, False)]
                 for source, target, read_only in mounts:
                     compose["services"]["main"]["volumes"].append({"type": "bind",
                         "source": source, "target": target, "read_only": read_only,

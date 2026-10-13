@@ -16,7 +16,8 @@ def main():
         "prepare", help="Validate the admitted runtime, print its budget preflight, then write all 124 tasks",
         description="Validate the pinned manifest and its admitted runtime, print the budget preflight "
                     "(treatment tool cap against the uncapped bare arm, selected Decisions mode and, for "
-                    "invocation_bounded, the worst-case cost bound against decisions_cost_cap_usd, advisory "
+                    "invocation_bounded, the cohort bound of one claimed Ask per trial against "
+                    "decisions_cost_cap_usd, which is an admission check rather than a runtime stop; advisory "
                     "warnings) as one JSON line before any task is created, then materialize the complete "
                     "124-task cohort. No Docker, Harbor or model calls.")
     prepare.add_argument("--manifest", required=True)

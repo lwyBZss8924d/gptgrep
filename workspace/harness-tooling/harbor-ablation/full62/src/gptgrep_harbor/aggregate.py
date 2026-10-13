@@ -17,6 +17,11 @@ def trial_decisions_cost(attempts):
     return sum(receipt["reported_cost_usd"] for receipt in receipts) if complete else None
 
 
+def decisions_receipts(attempts):
+    """The decisions-cost receipts that a trial's attempts carry."""
+    return [attempt["decisions_cost"] for attempt in attempts if isinstance(attempt.get("decisions_cost"), dict)]
+
+
 def decisions_costs(rows, runtime):
     """Aggregate treatment receipts; one unknown trial keeps the cohort total unknown."""
     known = [row["decisions_cost_usd"] for row in rows if row["decisions_cost_usd"] is not None]
@@ -25,7 +30,11 @@ def decisions_costs(rows, runtime):
     cap = runtime.get("decisions_cost_cap_usd")
     return {"mode": selected_mode(runtime), "treatment_trials": len(rows),
             "cost_complete_trials": len(known), "cost_unknown_trials": len(rows) - len(known),
-            "reported_cost_receipts": sum(row["retrieval_receipts"] for row in rows),
+            # Trials whose attempts carry a decisions-cost receipt, and the priced
+            # Jev usage rows inside those receipts (one Ask has many rows).
+            "trials_with_cost_receipt": sum(bool(row["decisions_receipts"]) for row in rows),
+            "priced_usage_rows": sum(receipt["priced_rows"] for row in rows for receipt in row["decisions_receipts"]
+                                     if type(receipt.get("priced_rows")) is int and receipt["priced_rows"] >= 0),
             "reported_cost_usd_known_subtotal": sum(partial) if partial else None,
             "reported_cost_usd_total": total, "cost_cap_usd": cap,
             "total_within_cap": total <= cap if total is not None and finite_number(cap) else None,
@@ -199,8 +208,7 @@ def summarize(export, records, runtime):
                             "grounding_available": grounding is not None,
                             "retrieval_known": [a["reported_retrieval_cost_subtotal"] for a in attempts
                                                 if finite_number(a.get("reported_retrieval_cost_subtotal"))],
-                            "retrieval_receipts": sum(a["reported_retrieval_cost_receipts"] for a in attempts
-                                                      if type(a.get("reported_retrieval_cost_receipts")) is int),
+                            "decisions_receipts": decisions_receipts(attempts),
                             "decisions_cost_usd": trial_decisions_cost(attempts),
                             "judge_abstained": abstained,
                             # A completed legacy abstention keeps this flag in the private operation record.

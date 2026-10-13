@@ -11,7 +11,8 @@ from .common import MAX_ANSWER, MAX_READER_QUESTION_BYTES, PROFILE, canonical, c
 from .native import codex_accounting, codex_argv, codex_result, prompt_bytes
 from .process import run
 from .runtime import CODEX_VERSION, DECISIONS_BUDGET, DECISIONS_LEDGER_DIR, check_config, native_environment
-from .decisions import TRIAL_BUDGET, acquire_writer, prepare as prepare_decisions, selected_mode
+from .decisions import (TRIAL_BUDGET, acquire_writer, claim_invocation, prepare as prepare_decisions,
+                        record_invocation, selected_mode)
 
 
 # A completed legacy report is a response. An insufficient_evidence report with
@@ -246,11 +247,15 @@ def main():
             budget = parse(pinned(config["decisions_budget"], 16384))
             require(Path(budget["ledger_path"]).parent == Path(DECISIONS_LEDGER_DIR),
                     "decisions_ledger_mount_contract")
-        # invocation_bounded joins nothing: the Ask creates its own context and
+        # invocation_bounded joins no ledger: the Ask creates its own context and
         # its reported Decisions cost receipt is kept per trial below.
         native_input = raw_prompt(config, question) if binding["arm"] == "raw_only" else None
         remaining = config["deadline_seconds"] - (time.monotonic() - started)
         require(remaining > 0, "reader_deadline")
+        if decisions == "invocation_bounded":
+            # Create-new, immediately before the one Ask: a re-executed trial
+            # stops here as an operational failure with no Decisions spend.
+            operation["decisions_claim"] = claim_invocation(binding, deadline_unix_ms)
         result = run(argv, cwd="/data/corpus", timeout=remaining, env=env, input_bytes=native_input)
         attempt = {"ordinal": 0, "elapsed_ms": result["elapsed_ms"],
                    "return_code": result["return_code"], "failure": result["failure"],
@@ -277,6 +282,13 @@ def main():
                 attempt.update(codex_accounting(result["stdout"]))
         except (ValueError, TypeError, KeyError, AttributeError):
             attempt["accounting_projection_complete"] = False
+        if decisions == "invocation_bounded":
+            # Host-side copy beside the claim, outside the Harbor job directory.
+            # Evidence only: a failed write never changes the Ask's outcome.
+            try:
+                operation["decisions_receipt"] = record_invocation(binding, result["stdout"], attempt)
+            except (OSError, ValueError, TypeError):
+                operation["decisions_receipt"] = None
         require(result["failure"] is None and result["return_code"] == 0, "reader_process")
         answer, metadata = (product_result(result["stdout"], config["reader_mode"]) if binding["arm"] == "gptgrep"
                             else codex_result(result["stdout"]))
