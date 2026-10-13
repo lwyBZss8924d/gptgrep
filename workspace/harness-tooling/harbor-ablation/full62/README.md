@@ -43,7 +43,7 @@ datasets/gptgrep-full62/
     environment/
       Dockerfile
       .dockerignore                # Explicit image input allowlist
-      docker-compose.yaml          # Runtime-only auth, treatment Decisions mounts, reader seccomp option
+      docker-compose.yaml          # Runtime-only auth, trial claim/Decisions mounts, reader seccomp option
       config.toml                  # Identical named permissions for both readers
       codex-native                 # Pinned native CLI environment wrapper
       reader.json                  # Reader bindings, never reference answer
@@ -80,7 +80,7 @@ After accepted materialization produces a job file and root separately admits th
 harbor run -c /admitted/external/datasets/gptgrep-full62.job.json
 ```
 
-The generated job selects `gptgrep_harbor.agent:PairedNativeAgent`, Docker, one concurrent trial, `n_attempts=1`, and `retry.max_retries=0`. Do not override the selected agent/model, add MCP servers/skills, resume trajectories, append instructions, change environment overlays, or resume a consumed job. Running the same job file again resumes it: Harbor 0.24 deletes every trial directory without a `result.json` and runs that trial again. A re-executed treatment trial still cannot exceed its Decisions mode's spend bound while that mode's host state survives: preparation and invocation-bounded trials fail closed on their create-new host files, and existing-context joins stay within the one shared ledger's permanent allowance (see the Decisions modes below). Keep every such directory outside `jobs_dir`; materialization enforces this for invocation-bounded claims. No third arm is required. Environment variable maps contain `${NAME}` references only; values are supplied privately at invocation and are never serialized by the adapter.
+The generated job selects `gptgrep_harbor.agent:PairedNativeAgent`, Docker, one concurrent trial, `n_attempts=1`, and `retry.max_retries=0`. Do not override the selected agent/model, add MCP servers/skills, resume trajectories, append instructions, change environment overlays, or resume a consumed job. Running the same job file again resumes it: Harbor 0.24 deletes every trial directory without a `result.json` and runs that trial again. A re-executed treatment trial still cannot exceed its Decisions mode's spend bound while that mode's host state survives: preparation and invocation-bounded trials fail closed on their create-new host files, and existing-context joins stay within the one shared ledger's permanent allowance (see the Decisions modes below). In invocation-bounded mode a re-executed trial of either arm fails closed on its claim, so no pair silently mixes executions. Keep every such directory outside `jobs_dir`; materialization enforces this for invocation-bounded claims. No third arm is required. Environment variable maps contain `${NAME}` references only; values are supplied privately at invocation and are never serialized by the adapter.
 
 ### Build the common native-tool foundation
 

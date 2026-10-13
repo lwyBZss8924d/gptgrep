@@ -223,7 +223,8 @@ each operation record identifies the reader contract its arm received; the
 treatment's answer-rules identity comes from the pinned product's own report.
 The adapter's open review fixes are applied in source; the runtime qualification
 must be repeated on the changed reader and Judge configuration bytes. An optional
-bare-Codex-plus-answer-rules arm can later separate prompt-contract effects.
+bare-Codex-plus-answer-rules arm can later separate prompt-contract effects; it is
+not part of the primary claim.
 
 ## Public SELF-PM checkpoint log
 
