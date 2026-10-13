@@ -196,11 +196,17 @@ partial costs are unknown.
 - The runtime staging regression passed.
 - The full62 Python wrapper passed **all 90 tests**.
 
-Two suites are not green, and their failures are retained. The separate
-harbor-ablation harness Cargo workspace had 208 passed and 3 failed
+Under heavy host load two suites were not green; their failures are retained.
+The separate harbor-ablation harness Cargo workspace had 208 passed and 3 failed
 timing/deadline-sensitive tests. The incur wrapper had 36 passed, 1 failed and
-1 skipped: a 1,200 ms timing assertion took about 1.9 to 2.1 seconds on this host
-and failed again on rerun. Earlier intermediate merges in this round recorded
+1 skipped: a 1,200 ms timing assertion took about 1.9 to 2.1 seconds. Rerun at
+lower load on the final source, the incur wrapper passed 37 tests with 1 skipped
+(the timing assertion took 1.18 seconds, a narrow margin), and the harness
+workspace had 209 passed and 2 failed. Both remaining failures also fail on the
+published `codex/gptgrep-unified-runtime-20261012` base on this host: one test
+gives admission a 30 ms deadline, and the other's large generation fixture
+outlasts its 10-second phase deadline. (The base's harness lock file is stale;
+this branch updates it.) Earlier intermediate merges in this round recorded
 1,050 Rust tests and 87 full62 wrapper tests.
 
 **Paired comparison.** Not run. By owner direction, GPTgrep's reader contract is
@@ -236,7 +242,7 @@ historical verdicts. This compact projection records their aggregate outcomes.
 | 2026-10-12, host development pilot | Treatment arm only: full62 59/62 under a frozen MMLongBench-Doc-V2 judge (2 incorrect; 1 failed run from a provider HTTP 502); 182 Decisions requests, $0.0696 known cost | Development evidence only: no bare arm, not the paired comparison or G5 |
 | 2026-10-12, development cohorts | H-text 60/98 and H-unans 97/152 on 107 text-ingestible MMLongBench-Doc-V2 documents; 27 of 134 need OCR | Question-level holdouts that share some full62 documents; development material |
 | 2026-10-13, Opt-1 measured | full62 59/62 (+0), H-text 62/98 (+2), H-unans 87/152 (−10; over-commitments 31 → 46); failed runs fell in every cohort | Regression retained; Opt-1b next |
-| 2026-10-13, merged source | 1,109 Rust tests (0 failed, 4 ignored), 145 evaluator tests, 11 offline cases and 90 full62 wrapper tests passed; 3 harness-workspace failures and 1 incur-wrapper failure (timing-sensitive) retained | Paired full62 SEARCH not run; images, Linux index and reader sandbox integration pending; G5 HOLD |
+| 2026-10-13, merged source | 1,109 Rust tests (0 failed, 4 ignored), 145 evaluator tests, 11 offline cases and 90 full62 wrapper tests passed; at lower load the incur wrapper passed and 2 harness-workspace deadline tests failed, as they also do on the published base on this host | Paired full62 SEARCH not run; images, Linux index and reader sandbox integration pending; G5 HOLD |
 
 The 2026-10-12 unified runtime round unified native Document/OCR execution, configuration,
 the [runtime package](../runtime/codex/STAGING.md), the
