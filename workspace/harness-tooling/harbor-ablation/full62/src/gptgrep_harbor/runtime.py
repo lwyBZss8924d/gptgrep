@@ -44,6 +44,14 @@ LOOPBACK_NO_PROXY = ("127.0.0.1", "localhost", "::1")
 AUTH_JOB_LABEL = "gptgrep.auth-job"
 # Codex 0.162.1 enables these by default; every role disables them explicitly.
 EXTERNAL_TOOL_FEATURES = ("apps", "plugins", "tool_suggest")
+# The owner-approved (2026-10-13) seccomp profile of the two reader roles only:
+# Docker 29.4.0's default profile plus one unconditional allow for exactly
+# unshare, clone, clone3, setns, mount, umount2 and pivot_root, which Codex's
+# bundled bubblewrap needs for its user, mount and PID namespaces. The source
+# tree's seccomp/ directory derives these exact bytes from the vendored
+# upstream profile. Judge and verifier containers keep Docker's default.
+READER_SECCOMP_BYTES = 12447
+READER_SECCOMP_SHA256 = "769a5dbb42b7b10edb07b516be7077e4a602a214a4c55ec892abd6d323bab48b"
 
 
 def native_identity(value):
@@ -258,6 +266,35 @@ def auth_compose(auth_file, platform, job_id):
         "type": "bind", "source": auth_file, "target": CODEX_HOME + "/auth.json",
         "read_only": True, "bind": {"create_host_path": False},
     }]}}}
+
+
+def reader_seccomp_profile(value):
+    """Validate the strict host pin of the approved reader profile; reads no file.
+
+    Any other profile, even with a self-consistent pin, needs a new owner
+    approval and a reviewed source change.
+    """
+    require(value is not None, "reader_seccomp_profile_required")
+    require(type(value) is dict and set(value) == {"path", "bytes", "sha256"}, "reader_seccomp_profile_pin")
+    path = value["path"]
+    # Compose would interpolate "$"; the path must be literal and normalized.
+    require(isinstance(path, str) and path.startswith("/") and PurePosixPath(path).as_posix() == path and
+            ".." not in PurePosixPath(path).parts and
+            not any(c in path for c in ("$", "\n", "\r", "\x00")), "reader_seccomp_profile_path")
+    integer(value["bytes"], 1, 2**20)
+    digest(value["sha256"])
+    require(value["bytes"] == READER_SECCOMP_BYTES and value["sha256"] == READER_SECCOMP_SHA256,
+            "reader_seccomp_profile_not_approved")
+    return value
+
+
+def reader_security_opt(value):
+    """The reader roles' only Docker security option, identical in both arms.
+
+    Docker Compose reads the profile from this absolute host path when it
+    creates the container. The Judge/verifier compose never carries it.
+    """
+    return ["seccomp=" + reader_seccomp_profile(value)["path"]]
 
 
 def native_environment(environ, *, product=False):

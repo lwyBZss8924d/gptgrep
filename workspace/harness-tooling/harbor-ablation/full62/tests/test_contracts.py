@@ -16,7 +16,7 @@ from gptgrep_harbor.common import MAX_ANSWER, MAX_NATIVE_PROMPT_BYTES, PROFILE, 
 from gptgrep_harbor.native import codex_accounting, codex_result, output_schema_bytes, prompt_bytes
 from gptgrep_harbor.reader import product_accounting
 from gptgrep_harbor import reader, verifier
-from gptgrep_harbor.runtime import CODEX_VERSION
+from gptgrep_harbor.runtime import CODEX_VERSION, READER_SECCOMP_BYTES, READER_SECCOMP_SHA256
 from gptgrep_harbor.verifier import grade, transport_reward
 from gptgrep_harbor.process import run as bounded_process
 
@@ -710,6 +710,8 @@ class MaterializationIsolationTests(unittest.TestCase):
                            "provenance": {"path": "/synthetic/base-tools.json", "bytes": 1, "sha256": "f" * 64}},
                        "codex_binary": "/opt/codex", "gptgrep_binary": "/opt/gptgrep", "codex_home": "/opt/full62-home",
                        "native_ptc": True, "codex_permissions": "full62_reader",
+                       "reader_seccomp_profile": {"path": "/synthetic/reader-seccomp.json",
+                                                  "bytes": READER_SECCOMP_BYTES, "sha256": READER_SECCOMP_SHA256},
                        "platform": "linux/amd64", "run_id": "synthetic-full62",
                        "native_cli": {"version": "0.162.1", "release_tag": "rust-v0.162.1", "source_commit": "a" * 40},
                        "auth": {"method": "chatgpt_device_file", "reader_file": "/synthetic/reader/auth.json",
@@ -730,11 +732,20 @@ class MaterializationIsolationTests(unittest.TestCase):
                    "answer_format": "text"}
             binding = {"arm": "raw_only", "pair_id": row["pair_id"], "document_id": row["document_id"]}
             destination = root / "generated-raw-task"
+            # No reader role is materialized without the approved seccomp pin.
+            owner.runtime = {key: value for key, value in runtime.items() if key != "reader_seccomp_profile"}
+            with self.assertRaisesRegex(ValueError, "reader_seccomp_profile_required"):
+                owner._task(destination, Path(adapter_module.__file__).parent, row, document, binding)
+            self.assertFalse(destination.exists())
+            owner.runtime = runtime
             owner._task(destination, Path(adapter_module.__file__).parent, row, document, binding)
             self.assertFalse((destination / "environment/corpus/.gptgrep/index.bin").exists())
             for directory in ("environment", "tests"):
                 compose = json.loads((destination / directory / "docker-compose.yaml").read_text())
                 self.assertEqual(compose["services"]["main"]["labels"], {"gptgrep.auth-job": "synthetic-full62"})
+                # Only the reader role carries the approved seccomp profile.
+                self.assertEqual(compose["services"]["main"].get("security_opt"),
+                                 ["seccomp=/synthetic/reader-seccomp.json"] if directory == "environment" else None)
             self.assertEqual((destination / "environment/corpus/arbitrary-document.txt").read_bytes(), raw.read_bytes())
             reader = (destination / "environment/reader.json").read_text()
             self.assertNotIn(row["reference"], reader)

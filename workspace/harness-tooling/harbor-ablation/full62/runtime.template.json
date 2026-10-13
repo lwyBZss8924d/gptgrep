@@ -32,6 +32,7 @@
   "reader_mode": null,
   "native_ptc": true,
   "codex_permissions": "full62_reader",
+  "reader_seccomp_profile": null,
   "deadline_seconds": null,
   "judge_deadline_seconds": null,
   "max_tool_calls": null,

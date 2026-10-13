@@ -9,7 +9,8 @@ from .common import (ARMS, MAX_READER_QUESTION_BYTES, MAX_TOOL_CALLS, PROFILE, c
                      parse, pinned, put, relative, require, sha, tool_cap_parity)
 from .native import JUDGE_OUTPUT_SCHEMA, output_schema_bytes
 from .runtime import (API_ENV, BASE_CAPABILITIES, BASE_TOOLS_PATH, CODEX_HOME, DECISIONS_BUDGET, DECISIONS_LEDGER_DIR, PASS_ENV, WORK_DIR, auth_compose, auth_paths,
-                      base_tools_identity, model_config, native_identity, validate_asset_path)
+                      base_tools_identity, model_config, native_identity, reader_seccomp_profile, reader_security_opt,
+                      validate_asset_path)
 from .product_bundle import PRODUCT_ENTRYPOINT, PRODUCT_PROVENANCE, bundle_identity
 from .decisions import (CLAIM_ROOT, CONTROL_ROOT, FAMILY_ROOT, TRIAL_ROOT, WRITER_LOCK,
                         control as decisions_control, decisions_model, directory as decisions_directory,
@@ -199,6 +200,11 @@ class Full62Adapter:
         require(runtime["codex_home"] == CODEX_HOME, "isolated_codex_home")
         require(runtime.get("native_ptc") is True and runtime.get("codex_permissions") == "full62_reader",
                 "shared_native_reader_required")
+        # Both reader roles run Codex's bubblewrap under the one owner-approved
+        # seccomp profile. A missing, malformed, other or changed profile stops
+        # here, before the preflight and before any task exists. It is a small
+        # control pin, read like the admission, not a streamed task asset.
+        pinned(reader_seccomp_profile(runtime.get("reader_seccomp_profile")))
         require(runtime["reader_mode"] in ("rich_multimodal", "legacy_text"), "explicit_reader_mode")
         if runtime["reader_mode"] == "rich_multimodal":
             require(runtime["jev_model"] in ("openai/gpt-6-luna-decisions", "openai/gpt-6-luna-decisions-20261006"),
@@ -360,6 +366,9 @@ class Full62Adapter:
         assets = self.runtime["documents"] + self.runtime["index_files"]
         for asset in assets:
             copy_asset(asset["pin"], self.runtime["max_asset_bytes"])
+        # Docker Compose reads the reader seccomp profile from its host path when
+        # it creates each reader container; recheck the approved bytes first.
+        pinned(reader_seccomp_profile(self.runtime.get("reader_seccomp_profile")))
         require(not (root.parent / (root.name + ".export.json")).exists() and
                 not (root.parent / (root.name + ".job.json")).exists(), "fresh_companion_outputs")
         preparation = self.runtime.get("decisions_preparation")
@@ -424,6 +433,8 @@ class Full62Adapter:
 
     def _task(self, task, package, row, document, binding):
         runtime, arm = self.runtime, binding["arm"]
+        # Every task materializes a reader role: refuse a missing pin before writing.
+        reader_security = reader_security_opt(runtime.get("reader_seccomp_profile"))
         template = package / "task-template"
         # Templates are finite source members, not a task-data discovery surface.
         for name in ("solution/solve.sh", "tests/test.sh"):
@@ -518,6 +529,10 @@ class Full62Adapter:
             profile = PROFILE if role == "reader" else runtime["judge_profile"]
             put(task / directory / "config.toml", model_config(profile, role))
             compose = auth_compose(runtime["auth"][auth_key], runtime["platform"], runtime["run_id"])
+            if role == "reader":
+                # Both arms identically. The Judge/verifier compose keeps
+                # Docker's default profile and carries no security option.
+                compose["services"]["main"]["security_opt"] = list(reader_security)
             if role == "reader" and arm == "gptgrep":
                 if mode == "preparation":
                     mounts = [(preparation["controls_directory"], CONTROL_ROOT, True),

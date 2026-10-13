@@ -33,6 +33,8 @@ from gptgrep_harbor.runtime import (
     validate_asset_path,
 )
 
+SECCOMP_SOURCE = Path(__file__).resolve().parents[1] / "seccomp"
+
 
 def write_pin(path, value):
     data = value if isinstance(value, bytes) else canonical(value)
@@ -102,6 +104,9 @@ class HarborMaterializationTests(unittest.TestCase):
             "deadline_seconds": 20, "judge_deadline_seconds": 20, "max_tool_calls": MAX_TOOL_CALLS,
             "max_input_bytes": 8192,
             "documents": documents, "resources": {"cpus": 1, "memory_mb": 512, "storage_mb": 512}}
+        # The owner-approved reader seccomp profile, copied to a fresh physical host path.
+        self.runtime["reader_seccomp_profile"] = write_pin(
+            self.root / "reader-seccomp.json", (SECCOMP_SOURCE / "gptgrep-reader-seccomp.json").read_bytes())
         # One synthetic index per reader mode; materializer() follows reader_mode
         # unless a test pins its own index_files.
         self.indexes = {mode: synthetic_index(self.root / "index", documents, mode)

@@ -103,6 +103,19 @@ class InvocationBoundedMaterializationTests(unittest.TestCase):
             self.materializer().run(self.claims / "dataset")
         self.assertEqual(list(self.claims.iterdir()), [])
 
+    def test_reader_seccomp_change_after_validation_refuses_before_any_claim_or_task(self):
+        adapter = self.materializer()
+        profile = Path(self.runtime["reader_seccomp_profile"]["path"])
+        # Same length, so only the digest catches it: the default action would allow every call.
+        profile.write_bytes(profile.read_bytes().replace(b'"SCMP_ACT_ERRNO"', b'"SCMP_ACT_ALLOW"', 1))
+        dataset = self.root / "dataset"
+        with self.assertRaisesRegex(ValueError, "pin_mismatch"):
+            adapter.run(dataset)
+        self.assertFalse(dataset.exists())
+        self.assertEqual(list(self.claims.iterdir()), [])
+        for suffix in (".export.json", ".job.json"):
+            self.assertFalse((self.root / ("dataset" + suffix)).exists())
+
     def test_preflight_requires_trials_times_200_times_the_submission_bound_within_cap(self):
         self.assertEqual(self.materializer().preflight["decisions"]["cohort_bound_usd"], BOUND)
         self.rejected("decisions_cost_cap_preflight", decisions_cost_cap_usd=406.3231)
