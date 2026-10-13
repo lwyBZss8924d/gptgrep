@@ -58,8 +58,8 @@ def duplicate_free(pairs):
     return result
 
 
-def parse(data):
-    require(len(data) <= MAX_JSON, "json_size")
+def parse(data, cap=MAX_JSON):
+    require(len(data) <= cap, "json_size")
     return json.loads(data, object_pairs_hook=duplicate_free,
                       parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite")))
 

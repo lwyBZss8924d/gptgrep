@@ -40,6 +40,25 @@ def write_pin(path, value):
     return {"path": str(path), "bytes": len(data), "sha256": sha(data)}
 
 
+def synthetic_index(directory, documents, reader_mode, root="/data/corpus"):
+    """Synthetic pinned .gptgrep pointer and manifest rows; no product index is built."""
+    directory.mkdir(parents=True, exist_ok=True)
+    schema = {"legacy_text": "gptgrep.v1", "rich_multimodal": "gptgrep.manifest.v2"}[reader_mode]
+    generation = "g1-synthetic"
+    sources = [{"path": row["relative_path"], "source_sha256": row["pin"]["sha256"]} for row in documents]
+    if reader_mode == "rich_multimodal":
+        sources = [{"document": source} for source in sources]
+    manifest = write_pin(directory / (reader_mode + "-manifest.json"),
+                         {"schema_version": schema, "generation": generation, "root": root, "documents": sources})
+    pointer = write_pin(directory / (reader_mode + "-current.json"),
+                        {"schema_version": schema, "generation": generation, "manifest_sha256": manifest["sha256"]})
+    data = write_pin(directory / (reader_mode + "-index.bin"), b"generic synthetic index")
+    prefix = ".gptgrep/generations/" + generation + "/"
+    return [{"relative_path": ".gptgrep/CURRENT.json", "pin": pointer},
+            {"relative_path": prefix + "manifest.json", "pin": manifest},
+            {"relative_path": prefix + "trigram/index.bin", "pin": data}]
+
+
 def synthetic_budget(max_submissions):
     """A synthetic existing-context budget control; no finance owner or ledger behind it."""
     return {"schema_version": "gptgrep.decisions-budget-contract.v1", "run_id": "synthetic-run",
@@ -82,9 +101,12 @@ class HarborMaterializationTests(unittest.TestCase):
             "max_asset_bytes": 1048576, "max_assets_total_bytes": 1048576,
             "deadline_seconds": 20, "judge_deadline_seconds": 20, "max_tool_calls": MAX_TOOL_CALLS,
             "max_input_bytes": 8192,
-            "documents": documents, "index_files": [{"relative_path": ".gptgrep/index.bin",
-                "pin": write_pin(self.root / "index.bin", b"generic synthetic index")}],
-            "resources": {"cpus": 1, "memory_mb": 512, "storage_mb": 512}}
+            "documents": documents, "resources": {"cpus": 1, "memory_mb": 512, "storage_mb": 512}}
+        # One synthetic index per reader mode; materializer() follows reader_mode
+        # unless a test pins its own index_files.
+        self.indexes = {mode: synthetic_index(self.root / "index", documents, mode)
+                        for mode in ("legacy_text", "rich_multimodal")}
+        self.runtime["index_files"] = self.indexes["rich_multimodal"]
         self.runtime["images"]["judge"] = self.runtime["images"]["raw_only"]
         tools = {"schema": "gptgrep.harbor.base-tools.v1", "build_inputs": {"platform": "linux/amd64"},
                  "pillow_version": "12.3.0", "native_cli_version": "0.162.1",
@@ -113,6 +135,8 @@ class HarborMaterializationTests(unittest.TestCase):
         self.external_tools_excluded = True
 
     def materializer(self):
+        if self.runtime.get("index_files") in self.indexes.values():
+            self.runtime["index_files"] = self.indexes.get(self.runtime["reader_mode"], self.runtime["index_files"])
         cohort = write_pin(self.root / "cohort.json", self.cohort)
         judge = write_pin(self.root / "judge-contract.json", self.judge)
         approval = {"accepted": True, "scope": "harbor_full62_paired_once", "run_id": self.runtime["run_id"],
@@ -181,7 +205,9 @@ class HarborMaterializationTests(unittest.TestCase):
             self.assertEqual(reader["codex_permissions"], "full62_reader")
             self.assertEqual(len(list((task / "environment/corpus").glob("raw-*.txt"))), 34)
             treatment = record["binding"]["arm"] == "gptgrep"
-            self.assertEqual((task / "environment/corpus/.gptgrep/index.bin").exists(), treatment)
+            self.assertEqual((task / "environment/corpus/.gptgrep/CURRENT.json").exists(), treatment)
+            self.assertEqual((task / "environment/corpus/.gptgrep/generations/g1-synthetic/manifest.json").exists(),
+                             treatment)
             reader_policies.add((task / "environment/config.toml").read_bytes())
             pair_policies.setdefault(record["binding"]["pair_id"], {})[record["binding"]["arm"]] = (
                 task / "environment/config.toml").read_bytes()
@@ -363,6 +389,37 @@ class HarborMaterializationTests(unittest.TestCase):
             with self.subTest(key=key, value=value), self.assertRaisesRegex(ValueError, "shared_native_reader_required"):
                 self.materializer()
             self.runtime[key] = original
+        self.assertFalse((self.root / "dataset").exists())
+
+    def test_index_must_come_from_the_pinned_documents_at_the_container_corpus_root(self):
+        self.assertEqual(self.materializer().preflight["index"],
+                         {"schema_version": "gptgrep.manifest.v2", "generation": "g1-synthetic",
+                          "root": "/data/corpus", "documents": 34,
+                          "manifest_sha256": self.indexes["rich_multimodal"][1]["pin"]["sha256"]})
+        self.runtime["reader_mode"] = "legacy_text"
+        self.assertEqual(self.materializer().preflight["index"]["schema_version"], "gptgrep.v1")
+        documents = self.runtime["documents"]
+        stale = [{**row, "pin": {**row["pin"], "sha256": "0" * 64}} if index == 0 else row
+                 for index, row in enumerate(documents)]
+        valid = synthetic_index(self.root / "valid", documents, "legacy_text")
+        extra = {"pin": valid[2]["pin"]}
+        cases = [
+            # Built on the host (or at any other root): the product would reject every Ask.
+            ("index_root_identity", synthetic_index(self.root / "host", documents, "legacy_text",
+                                                    root=str(self.root / "corpus"))),
+            ("index_sources", synthetic_index(self.root / "fewer", documents[:-1], "legacy_text")),
+            ("index_sources", synthetic_index(self.root / "stale", stale, "legacy_text")),
+            ("index_current_pointer", [row for row in valid if row["relative_path"] != ".gptgrep/CURRENT.json"]),
+            # A rich generation cannot serve a legacy_text reader.
+            ("index_current_pointer", synthetic_index(self.root / "rich", documents, "rich_multimodal")),
+            ("index_manifest_pin", [valid[0], {**valid[1], "pin": valid[2]["pin"]}, valid[2]]),
+            ("index_state_files_only", valid + [{"relative_path": ".gptgrep/host-attempts/a.json", **extra}]),
+            ("index_state_files_only", valid + [{"relative_path": "treatment-only-notes.txt", **extra}]),
+        ]
+        for code, rows in cases:
+            self.runtime["index_files"] = rows
+            with self.subTest(code=code), self.assertRaisesRegex(ValueError, code):
+                self.materializer()
         self.assertFalse((self.root / "dataset").exists())
 
     def test_external_tool_exclusion_needs_runtime_qualification(self):

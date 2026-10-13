@@ -99,6 +99,53 @@ def toml_string(value):
     return json.dumps(value, ensure_ascii=True)
 
 
+# The in-container corpus root and the product's index identity (gptgrep-core):
+# .gptgrep/CURRENT.json points to one generation whose manifest records its
+# canonical root and every source digest. Legacy text and rich multimodal
+# readers open different manifest schemas.
+CORPUS_ROOT = "/data/corpus"
+INDEX_SCHEMAS = {"legacy_text": "gptgrep.v1", "rich_multimodal": "gptgrep.manifest.v2"}
+MAX_INDEX_POINTER_BYTES = 4096
+MAX_INDEX_MANIFEST_BYTES = 128 * 1024 * 1024
+
+
+def index_identity(runtime):
+    """Check that the pinned index was built at the container corpus root from the pinned documents.
+
+    The product binds a generation to its canonical root, so an index built on
+    the host or at another root would fail every treatment Ask at query time
+    ("index identity mismatch"). Only build state under .gptgrep/ is an index
+    file; query-time host-attempts ledgers never are. Reads only index files.
+    """
+    rows = {row["relative_path"]: row["pin"] for row in runtime["index_files"]}
+    require(all(path.startswith(".gptgrep/") and "host-attempts" not in PurePosixPath(path).parts for path in rows),
+            "index_state_files_only")
+    schema = INDEX_SCHEMAS[runtime["reader_mode"]]
+    require(".gptgrep/CURRENT.json" in rows, "index_current_pointer")
+    pointer = parse(pinned(rows[".gptgrep/CURRENT.json"], MAX_INDEX_POINTER_BYTES))
+    require(type(pointer) is dict and pointer.get("schema_version") == schema and
+            isinstance(pointer.get("generation"), str) and
+            re.fullmatch(r"[A-Za-z0-9-]{1,128}", pointer["generation"]), "index_current_pointer")
+    digest(pointer.get("manifest_sha256"))
+    manifest_path = ".gptgrep/generations/" + pointer["generation"] + "/manifest.json"
+    require(manifest_path in rows and rows[manifest_path]["sha256"] == pointer["manifest_sha256"], "index_manifest_pin")
+    manifest = parse(pinned(rows[manifest_path], MAX_INDEX_MANIFEST_BYTES), MAX_INDEX_MANIFEST_BYTES)
+    require(type(manifest) is dict and manifest.get("schema_version") == schema and
+            manifest.get("generation") == pointer["generation"] and manifest.get("root") == CORPUS_ROOT,
+            "index_root_identity")
+    require(isinstance(manifest.get("documents"), list), "index_sources")
+    sources = {}
+    for entry in manifest["documents"]:
+        source = entry.get("document") if schema == INDEX_SCHEMAS["rich_multimodal"] and type(entry) is dict else entry
+        require(type(source) is dict and isinstance(source.get("path"), str) and source["path"] not in sources,
+                "index_sources")
+        sources[source["path"]] = source.get("source_sha256")
+    # Exactly the pinned raw documents, byte for byte: nothing more, nothing stale.
+    require(sources == {row["relative_path"]: row["pin"]["sha256"] for row in runtime["documents"]}, "index_sources")
+    return {"schema_version": schema, "generation": pointer["generation"], "root": CORPUS_ROOT,
+            "documents": len(sources), "manifest_sha256": pointer["manifest_sha256"]}
+
+
 def judge_contract(judge):
     """Validate the frozen primary judge contract; return the Judge's exact schema-file bytes.
 
@@ -294,6 +341,8 @@ class Full62Adapter:
                 integer(runtime["max_assets_total_bytes"], 1), "asset_total_bound")
         require(approval.get("assets_sha256") == sha(canonical(documents + runtime["index_files"])) and
                 approval.get("judge_sha256") == self.manifest["judge_contract"]["sha256"], "assets_judge_admission")
+        # Fail before any task exists rather than in every treatment Ask.
+        self.preflight["index"] = index_identity(runtime)
 
     def run(self, output_dir, *, limit=None, task_ids=None, overwrite=False):
         # No destructive overwrite: an interrupted or consumed output is retained.

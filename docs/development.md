@@ -315,8 +315,9 @@ For a real run, follow the adapter's sequence: build and verify the common
 Python/Pillow/Poppler/native-Codex foundation; add the complete Linux GPTgrep plus
 PDFium bundle to the treatment derivative; build the treatment index inside that
 Linux image at `/data/corpus` with its product binary, from the raw documents only
-and before any question is exposed (a host-built index, or one built at another
-root, is rejected); qualify matching reader permissions and account mounts; supply
+and before any question is exposed (materialization rejects an index whose pinned
+manifest root is not `/data/corpus` or whose sources differ from the pinned
+documents, such as a host-built index); qualify matching reader permissions and account mounts; supply
 the frozen private cohort and Judge contract; select one treatment Decisions mode
 (an existing shared ledger, per-trial preparation, or invocation-bounded contexts
 with one create-new host claim per treatment trial, a pinned price and a cohort
