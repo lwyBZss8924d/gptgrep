@@ -318,12 +318,18 @@ reader には与えません。これらは GPTgrep の reader 契約の一部�
 `ask --native-ptc --codex-permissions PROFILE` は、既存の名前付き Codex 権限 profile のもとで、
 最終の検索 reader をネイティブ実行で動かします。ランタイムはターンの前にその profile を確認する必要があり、
 旧来のサンドボックス上書きは省略します。reader は選択された Codex の機能と Skill を継承し、シェルと
-画像表示を有効にします。観測されたネイティブ項目と GPTgrep の呼び出しは `--max-tool-calls`（既定 12）を
-共有します。ネイティブ項目の通知は実行開始後に届くことがあるため、この予算は計数であって実行前の防護では
-ありません。予算を超えた要求や観測項目があると、`ask` は `host_native_ptc_tool_budget_exhausted` で
-失敗し、回答を返しません。制限付き reader の `--timeout` 900 秒と `--max-tool-calls` 64 回の上限は、
-このモードには適用されません。ネイティブ出力は引用を生まず、回答は GPTgrep が実際に提供した根拠を
-引用する必要があります。クエリ計画器と `host-complete` はツールを使いません。
+画像表示を有効にします。観測されたネイティブ項目と受け付けた GPTgrep の呼び出しは
+`--max-tool-calls`（既定 12）を共有します。予算を使い切った後の GPTgrep の要求には、制限付き reader と
+同じ拒否（後述）を返します。拒否した要求は新しい根拠を発行せず、Jev も実行せず、共有の計数にも加えない
+ため、reader は同じターンと元の期限内で、回答または `insufficient_evidence` を返して完了できます。
+この拒否が `--max-tool-calls` 回に達すると、次の要求で `ask` は `host_native_ptc_tool_budget_exhausted`
+で失敗し、回答を返しません。ネイティブ項目の通知は実行開始後に届くことがあるため、ネイティブ項目は
+拒否できません。この予算は計数であって実行前の防護ではなく、予算を超えて観測されたネイティブ項目は同じ
+コードで `ask` を失敗させます。最初の拒否の後、`model_attempts[].native_ptc.tool_budget` は上限、
+受け付けた GPTgrep の呼び出し数、拒否数、拒否の上限を報告し、ネイティブ項目は別に数えます。制限付き
+reader の `--timeout` 900 秒と `--max-tool-calls` 64 回の上限は、このモードには適用されません。
+ネイティブ出力は引用を生まず、回答は GPTgrep が実際に提供した根拠を引用する必要があります。クエリ計画器と
+`host-complete` はツールを使いません。
 
 `ask` 専用の `--experimental-query-plan` は、ツールを持たない独立した
 `gpt-6-luna` / 呼び出し側が選んだ推論強度 / `fast` の計画器を標準で先に実行します

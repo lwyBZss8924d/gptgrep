@@ -273,12 +273,16 @@ Codex 子进程无法访问 Jev 凭据。
 
 `ask --native-ptc --codex-permissions PROFILE` 则在一个已存在的命名 Codex 权限 profile 下，
 以原生执行方式运行最终检索 reader。运行时必须在 turn 开始前确认该 profile，并省略旧版沙箱覆盖设置。
-reader 继承所选 Codex 的能力和 Skill，并启用 shell 和图像查看。观察到的原生条目与 GPTgrep 调用
-共享 `--max-tool-calls`（默认 12）。原生条目通知可能在执行开始后才到达，因此该预算是计量，
-而非执行前的拦截；超出预算的请求或观察到的条目会使 `ask` 以
-`host_native_ptc_tool_budget_exhausted` 失败，且不给出答案。受限 reader 对 `--timeout` 的 900 秒
-上限和对 `--max-tool-calls` 的 64 次上限在此模式下不适用。原生输出不会产生引用：答案仍须引用
-GPTgrep 实际交付的证据。查询规划器和 `host-complete` 仍不使用工具。
+reader 继承所选 Codex 的能力和 Skill，并启用 shell 和图像查看。观察到的原生条目与已准入的
+GPTgrep 调用共享 `--max-tool-calls`（默认 12）。预算用尽后，后续的 GPTgrep 请求会收到与受限 reader
+相同的拒绝（见下文）：不提供新证据，不执行 Jev，也不计入共享计数，因此 reader 仍可在同一轮次和原截止
+时间内给出答案或 `insufficient_evidence`。此类拒绝达到 `--max-tool-calls` 次后，下一次请求会使 `ask`
+以 `host_native_ptc_tool_budget_exhausted` 失败，且不给出答案。原生条目通知可能在执行开始后才到达，
+因此原生条目无法被拒绝：该预算是计量，而非执行前的拦截，超出预算后观察到的原生条目同样会使 `ask`
+以该代码失败。首次拒绝后，`model_attempts[].native_ptc.tool_budget` 会报告上限、已准入的 GPTgrep
+调用数、拒绝数和拒绝上限；原生条目另行计数。受限 reader 对 `--timeout` 的 900 秒上限和对
+`--max-tool-calls` 的 64 次上限在此模式下不适用。原生输出不会产生引用：答案仍须引用 GPTgrep 实际
+交付的证据。查询规划器和 `host-complete` 仍不使用工具。
 
 仅 `ask` 支持的 `--experimental-query-plan` 默认会先运行一个独立、无工具的
 `gpt-6-luna` / 与调用方一致的推理强度 / `fast` 规划器（默认推理强度仍为 `max`）。
