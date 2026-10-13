@@ -4,7 +4,6 @@ from __future__ import annotations
 import copy
 import json
 import os
-import re
 from pathlib import Path
 import tempfile
 import unittest
@@ -27,6 +26,22 @@ def synthetic_cohort():
             "tasks": [{"pair_id": f"synthetic-{i}", "document_id": f"generated-{i % 34}.txt",
                        "question": f"What number is printed in synthetic record {i}?",
                        "reference": str(i * 17), "answer_format": "integer"} for i in range(62)]}
+
+
+# Generic markers of GPTgrep's reader contract (answer rules, citation and
+# abstention schema). None may reach the raw-only prompt in any reader mode.
+GPTGREP_RULE_MARKERS = ("Answer rules", "answer rules", "Lead with the direct answer", "commit to",
+                        "in-text references", "footnote", "hedging", "insufficient_evidence",
+                        "citation", "GPTgrep", "gptgrep")
+RAW_READER_CONTRACT = {"schema": "gptgrep.harbor.reader-contract.v1", "arm": "raw_only",
+                       "base_instructions": "codex_default", "prompt": "common_task_prompt",
+                       "gptgrep_contract_received": False, "answer_rules_received": False,
+                       "answer_rules_sha256": None}
+
+
+def assert_no_gptgrep_rule_text(case, prompt):
+    for marker in GPTGREP_RULE_MARKERS:
+        case.assertNotIn(marker, prompt)
 
 
 def synthetic_results():
@@ -318,10 +333,11 @@ class NativeAccountingTests(unittest.TestCase):
         self.assertEqual(argv[-2:], ["--", "-"])
         self.assertNotIn("synthetic question", argv)
         self.assertTrue(child.call_args.kwargs["input_bytes"].endswith(b"synthetic question"))
-        # A legacy_text run gives the raw-only arm the reader's generic answer rules.
-        self.assertIn(reader.READER_ANSWER_RULES.encode(), child.call_args.kwargs["input_bytes"])
-        self.assertEqual(outputs["/logs/agent/operational.json"]["shared_answer_rules_sha256"],
-                         sha(reader.READER_ANSWER_RULES.encode()))
+        # Even in a legacy_text run, the raw-only arm receives only the common
+        # task prompt: none of GPTgrep's reader contract, and it says so.
+        self.assertEqual(child.call_args.kwargs["input_bytes"], reader.raw_prompt(config, "synthetic question"))
+        assert_no_gptgrep_rule_text(self, child.call_args.kwargs["input_bytes"].decode())
+        self.assertEqual(outputs["/logs/agent/operational.json"]["reader_contract"], RAW_READER_CONTRACT)
         self.assertLess(child.call_args.kwargs["timeout"], config["deadline_seconds"])
         return outputs
 
@@ -503,6 +519,19 @@ def legacy_report(**changes):
     return canonical(report)
 
 
+SYNTHETIC_ANSWER_RULES = "Synthetic answer rules that the pinned product reports for its text reader."
+
+
+def product_schema_report(rules=SYNTHETIC_ANSWER_RULES):
+    """A synthetic `gptgrep --schema` report carrying only the field the reader identifies."""
+    return canonical({"schema_version": "gptgrep.cli.v1", "commands": {"ask": {"reader_answer_rules": rules}}})
+
+
+def ask_calls(child):
+    """The product Ask launches among a mocked reader's child processes."""
+    return [call for call in child.call_args_list if "ask" in call.args[0]]
+
+
 class LegacyTreatmentReaderTests(unittest.TestCase):
     """The treatment entrypoint and primary Judge for reader_mode=legacy_text."""
     question = "synthetic question"
@@ -516,6 +545,8 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
     def config(self):
         return {"binding": self.binding(), "profile": PROFILE, "codex_binary": "/synthetic/codex",
                 "gptgrep_binary": "/synthetic/gptgrep", "codex_home": "/opt/full62-home",
+                "gptgrep_bundle": {"provenance": {"path": "/synthetic/provenance.json", "bytes": 1,
+                                                  "sha256": "9" * 64}},
                 "reader_base_binary": {"path": "/synthetic/codex"}, "max_input_bytes": 8192, "max_tool_calls": 8,
                 "native_cli": {}, "native_config_sha256": "e" * 64, "deadline_seconds": 20,
                 "base_tool_environment": {}, "permitted_tools": [], "generic_capabilities": [],
@@ -525,13 +556,22 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
                 "decisions_budget": {"path": "/opt/full62-private/decisions-budget.json", "bytes": 1,
                                      "sha256": "f" * 64}}
 
-    def run_reader(self, stdout, environ=None, config=None, claim_root="/synthetic/unmounted-claim"):
+    def run_reader(self, stdout, environ=None, config=None, claim_root="/synthetic/unmounted-claim",
+                   schema=None):
         outputs = {}
         version = {"stdout": ("codex-cli " + CODEX_VERSION).encode(), "stderr": b"", "elapsed_ms": 1,
                    "return_code": 0, "failure": None, "stdin_bytes": 0, "stdin_bytes_sent": 0, "stdin_complete": True}
         product = {**version, "stdout": stdout, "elapsed_ms": 10}
+        report = {**version, "stdout": product_schema_report(), **(schema or {})}
         budget = canonical({"ledger_path": "/opt/full62-private/ledger/decisions.json"})
         config = self.config() if config is None else config
+
+        def child(argv, **_kwargs):
+            # The pinned product's offline contract report, the native version
+            # check, then the one Ask.
+            if argv[1:] == ["--schema"]:
+                return report
+            return version if argv[1:] == ["--version"] else product
         with patch("gptgrep_harbor.decisions.CLAIM_ROOT", str(claim_root)), \
              patch.object(reader, "read", side_effect=[canonical(config), self.question.encode()]), \
              patch.object(reader, "check_config"), patch.object(reader, "copy_asset"), \
@@ -541,10 +581,10 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
              patch.object(reader, "put", side_effect=lambda path, value: outputs.update({path: value})), \
              patch.dict(os.environ, environ or {"PATH": "/usr/bin"}, clear=True), \
              patch("sys.argv", ["reader", "--instruction", "/synthetic/instruction.txt"]), \
-             patch.object(reader, "run", side_effect=[version, product]) as child:
+             patch.object(reader, "run", side_effect=child) as process:
             reader.main()
         self.budget_reads = budget_read.call_count
-        return outputs, child
+        return outputs, process
 
     def judge_config(self):
         return {"binding": self.binding(), "question": self.question, "reference": "synthetic reference",
@@ -593,12 +633,16 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
         from gptgrep_harbor.runtime import model_config
         outputs, child = self.run_reader(legacy_report(),
                                          environ={"PATH": "/usr/bin", "OPENROUTER_API_KEY": "synthetic-only"})
-        version_call, product_call = child.call_args_list
+        schema_call, version_call, product_call = child.call_args_list
         # Decisions requests come from the GPTgrep host process, outside the
         # Codex tool sandbox whose network the shared reader policy disables.
+        self.assertEqual(product_call, ask_calls(child)[0])
         self.assertEqual(product_call.args[0][0], "/synthetic/gptgrep")
         self.assertEqual(product_call.kwargs["env"]["OPENROUTER_API_KEY"], "synthetic-only")
         self.assertNotIn("OPENROUTER_API_KEY", version_call.kwargs["env"])
+        # The offline contract report needs no credential.
+        self.assertEqual(schema_call.args[0], ["/synthetic/gptgrep", "--schema"])
+        self.assertNotIn("OPENROUTER_API_KEY", schema_call.kwargs["env"])
         self.assertEqual(outputs["/answer/answer.json"]["status"], "response")
         policy = tomllib.loads(model_config(PROFILE, "reader").decode())
         self.assertEqual(policy["web_search"], "disabled")
@@ -607,7 +651,7 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
     def test_existing_context_ask_still_joins_the_mounted_budget(self):
         outputs, child = self.run_reader(legacy_report())
         self.assertEqual(self.budget_reads, 1)
-        self.assertEqual(child.call_args_list[1].args[0][1:4],
+        self.assertEqual(ask_calls(child)[0].args[0][1:4],
                          ["--decisions-budget", "/opt/full62-private/decisions-budget.json", "ask"])
         self.assertEqual(outputs["/logs/agent/operational.json"]["decisions_mode"], "existing_context")
 
@@ -630,7 +674,7 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
                 claim_root = self.claim_root()
                 outputs, child = self.run_reader(report, config=config, claim_root=claim_root)
                 self.assertEqual(self.budget_reads, 0)
-                argv = child.call_args_list[1].args[0]
+                argv = ask_calls(child)[0].args[0]
                 self.assertEqual(argv[:2], ["/synthetic/gptgrep", "ask"])
                 self.assertNotIn("--decisions-budget", argv)
                 self.assertEqual(outputs["/answer/answer.json"]["status"], expected)
@@ -652,7 +696,7 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
                 # A re-executed trial (for example in a resumed Harbor job) finds
                 # the claim and fails closed before the Ask: no Decisions spend.
                 again, child = self.run_reader(report, config=config, claim_root=claim_root)
-                self.assertEqual(child.call_count, 1)
+                self.assertEqual(ask_calls(child), [])
                 self.assertEqual(again["/answer/answer.json"]["status"], "operational_failure")
                 repeated = again["/logs/agent/operational.json"]
                 self.assertEqual((repeated["failure"], repeated["attempts"]), ("reader_failed", []))
@@ -664,13 +708,12 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
         del config["decisions_budget"]
         missing = self.claim_root() / "not-mounted"
         outputs, child = self.run_reader(legacy_report(), config=config, claim_root=missing)
-        self.assertEqual(child.call_count, 1)
+        self.assertEqual(ask_calls(child), [])
         self.assertEqual(outputs["/answer/answer.json"]["status"], "operational_failure")
         self.assertFalse(missing.exists())
 
     def test_bare_prompt_states_the_enforced_no_external_search_policy(self):
-        # raw_prompt requires an explicit reader_mode (explicit_reader_mode), so the
-        # policy wording is checked in both modes.
+        # The bare prompt is the same common task prompt in every reader mode.
         for mode in ("legacy_text", "rich_multimodal"):
             with self.subTest(reader_mode=mode):
                 prompt = reader.raw_prompt({"raw_document": "/data/corpus/synthetic.txt", "reader_mode": mode},
@@ -692,6 +735,42 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
                 result = grade(self.judge_config(), envelope, lambda *_: self.fail("Judge called"))
                 self.assertEqual((result["status"], result["label"]), ("operational_failure", 0))
                 self.assertEqual(transport_reward(result)["answer_equivalence"], 0)
+
+    def test_treatment_records_the_answer_rules_identity_from_the_product_schema(self):
+        outputs, child = self.run_reader(legacy_report())
+        operation = outputs["/logs/agent/operational.json"]
+        contract = operation["reader_contract"]
+        self.assertEqual(contract["answer_rules_sha256"], sha(SYNTHETIC_ANSWER_RULES.encode()))
+        self.assertEqual(contract["product_schema_sha256"], sha(product_schema_report()))
+        self.assertEqual(contract["answer_rules_source"], "product_schema:commands.ask.reader_answer_rules")
+        self.assertEqual((contract["arm"], contract["base_instructions"], contract["answer_rules_received"]),
+                         ("gptgrep", "gptgrep_reader_contract", True))
+        self.assertEqual(contract["product_provenance_sha256"], "9" * 64)
+        self.assertEqual(outputs["/answer/answer.json"]["status"], "response")
+        # Observed once, before the query timer and the Ask.
+        self.assertEqual(child.call_args_list[0].args[0], ["/synthetic/gptgrep", "--schema"])
+        self.assertEqual(len(ask_calls(child)), 1)
+        # A product change to the rules changes the identity with no adapter edit.
+        changed, _ = self.run_reader(legacy_report(), schema={"stdout": product_schema_report("Changed rules.")})
+        self.assertEqual(changed["/logs/agent/operational.json"]["reader_contract"]["answer_rules_sha256"],
+                         sha(b"Changed rules."))
+
+    def test_treatment_without_a_reported_contract_stops_before_the_ask(self):
+        cases = {"process_failure": {"return_code": 2},
+                 "child_failure": {"failure": "child_failed_or_limit"},
+                 "not_json": {"stdout": b"not a schema"},
+                 "missing_field": {"stdout": canonical({"schema_version": "gptgrep.cli.v1", "commands": {"ask": {}}})},
+                 "empty_rules": {"stdout": product_schema_report("  ")},
+                 "not_text": {"stdout": product_schema_report(["rules"])}}
+        for name, schema in cases.items():
+            with self.subTest(case=name):
+                outputs, child = self.run_reader(legacy_report(), schema=schema)
+                self.assertEqual(ask_calls(child), [])
+                self.assertEqual(outputs["/answer/answer.json"]["status"], "operational_failure")
+                operation = outputs["/logs/agent/operational.json"]
+                self.assertIsNone(operation["reader_contract"])
+                self.assertEqual((operation["failure"], operation["failure_code"]),
+                                 ("reader_failed", "product_reader_contract_unavailable"))
 
 
 class MaterializationIsolationTests(unittest.TestCase):
@@ -809,26 +888,43 @@ class NativeDirectToolPolicyTests(unittest.TestCase):
                          config["permissions"]["full62_judge"]["filesystem"])
 
 
+class ReaderContractTests(unittest.TestCase):
+    """GPTgrep's reader contract is the treatment's; the raw-only arm receives none of it."""
 
-class SharedAnswerRuleTests(unittest.TestCase):
-    def test_legacy_text_raw_prompt_carries_the_reader_answer_rules_verbatim(self):
-        # The constant must stay byte-identical to the product reader's rules.
-        protocol = Path(__file__).resolve().parents[5] / "crates/gptgrep-host/src/protocol.rs"
-        match = re.search(r'pub\(crate\) const READER_ANSWER_RULES: &str = "((?:[^"\\]|\\.)*)";',
-                          protocol.read_text(encoding="utf-8"))
-        self.assertIsNotNone(match)
-        self.assertEqual(json.loads('"' + match.group(1) + '"'), reader.READER_ANSWER_RULES)
+    COMMON_TASK_PROMPT = ("Answer the question using only the protocol-scoped raw document at "
+                          "/data/corpus/generic.txt. You may inspect that document with native tools. "
+                          "No external search or network access is available. Give the complete answer "
+                          "and source locations when available. Question:\nGeneric question?")
+
+    def test_raw_only_prompt_is_the_common_task_prompt_in_every_reader_mode(self):
         config = {"raw_document": "/data/corpus/generic.txt"}
-        legacy = reader.raw_prompt({**config, "reader_mode": "legacy_text"}, "Generic question?").decode()
-        rich = reader.raw_prompt({**config, "reader_mode": "rich_multimodal"}, "Generic question?").decode()
-        self.assertEqual(legacy.count(reader.READER_ANSWER_RULES), 1)
-        self.assertTrue(legacy.endswith("Question:\nGeneric question?"))
-        # The rich_multimodal reader has no answer rules, so neither arm gets them.
-        self.assertNotIn("Answer rules:", rich)
-        self.assertEqual(legacy.replace(reader.READER_ANSWER_RULES + " ", ""), rich)
-        self.assertIsNone(reader.shared_answer_rules({"reader_mode": "rich_multimodal"}))
-        with self.assertRaisesRegex(ValueError, "explicit_reader_mode"):
-            reader.raw_prompt(config, "Generic question?")
+        for mode in ("legacy_text", "rich_multimodal", None):
+            with self.subTest(reader_mode=mode):
+                prompt = reader.raw_prompt({**config, "reader_mode": mode}, "Generic question?").decode()
+                self.assertEqual(prompt, self.COMMON_TASK_PROMPT)
+                assert_no_gptgrep_rule_text(self, prompt)
+        # The adapter keeps no mirrored copy of the product's rule text.
+        for name in ("READER_ANSWER_RULES", "shared_answer_rules"):
+            self.assertFalse(hasattr(reader, name), name)
+
+    def test_raw_only_record_states_that_it_received_no_gptgrep_contract(self):
+        with patch.object(reader, "run", side_effect=AssertionError("no product call for the bare arm")):
+            for mode in ("legacy_text", "rich_multimodal"):
+                with self.subTest(reader_mode=mode):
+                    record, failure = reader.observe_reader_contract({"reader_mode": mode}, {"arm": "raw_only"})
+                    self.assertIsNone(failure)
+                    self.assertEqual(record, RAW_READER_CONTRACT)
+
+    def test_rich_treatment_receives_no_answer_rules_and_needs_no_schema_report(self):
+        config = {"reader_mode": "rich_multimodal",
+                  "gptgrep_bundle": {"provenance": {"path": "/synthetic/p.json", "bytes": 1, "sha256": "9" * 64}}}
+        with patch.object(reader, "run", side_effect=AssertionError("no schema report in rich_multimodal")):
+            record, failure = reader.observe_reader_contract(config, {"arm": "gptgrep"})
+        self.assertIsNone(failure)
+        self.assertEqual(record, {"schema": "gptgrep.harbor.reader-contract.v1", "arm": "gptgrep",
+                                  "base_instructions": "gptgrep_reader_contract", "reader_mode": "rich_multimodal",
+                                  "answer_rules_received": False, "answer_rules_sha256": None,
+                                  "product_provenance_sha256": "9" * 64})
 
 
 if __name__ == "__main__":

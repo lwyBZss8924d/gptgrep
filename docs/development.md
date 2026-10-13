@@ -377,10 +377,11 @@ connector, plugin and tool-suggestion features, and model-tool network access.
 Both reader containers run under the same seccomp profile, which adds only the
 namespace calls bubblewrap needs to Docker's default; the Judge keeps the default.
 GPTgrep's reader contract (base instructions, citation and abstention rules and
-answer rules) is part of the treatment; the raw-only reader receives the common
-task prompt with Codex's default base instructions. In this source the adapter's
-`legacy_text` mode still copies the answer rules into the raw-only prompt; that
-copy is to be removed before the paired run.
+answer rules) is part of the treatment; the raw-only reader receives only the
+common task prompt with Codex's default base instructions and no GPTgrep rule
+text, in every reader mode. Each operation record identifies the reader contract
+its arm received; the treatment's answer-rules identity comes from the pinned
+product's own `--schema` report.
 The Judge runs in a separate environment with the complete answer and frozen
 reference, not the reader's history. Task failures stay in the denominator;
 unavailable judging stays unknown. INDEX and Judge costs are separate from

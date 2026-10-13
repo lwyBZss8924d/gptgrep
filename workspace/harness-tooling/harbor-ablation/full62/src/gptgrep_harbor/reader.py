@@ -59,34 +59,90 @@ def reader_argv(config, binding, question):
     return codex_argv(config["codex_binary"])
 
 
-# Generic answer rules, byte-identical to READER_ANSWER_RULES in
-# crates/gptgrep-host/src/protocol.rs. The legacy_text GPTgrep reader receives
-# them in its base instructions, so the raw-only arm of a legacy_text run
-# receives the same text: answer strategy is matched between the arms and is
-# not credited to retrieval. The rich_multimodal reader has no such rules, so
-# neither arm receives them in that mode.
-READER_ANSWER_RULES = (
-    "Answer rules: Lead with the direct answer in the form the question asks for. "
-    "When the evidence you have read answers the question as asked, commit to that "
-    "answer and cite it rather than hedging. When the question depends on a specific "
-    "passage, resolve the in-text references it relies on before answering by reading "
-    "the referenced note or section, for example footnote or endnote markers, citation "
-    "numbers, and see Table or see Section pointers.")
-
-
-def shared_answer_rules(config):
-    """The answer rules both arms receive for the run's reader mode, if any."""
-    require(config.get("reader_mode") in ("rich_multimodal", "legacy_text"), "explicit_reader_mode")
-    return READER_ANSWER_RULES if config["reader_mode"] == "legacy_text" else None
-
-
+# GPTgrep's reader contract (its base instructions, answer/citation/
+# insufficient_evidence schema, abstention rule and, in legacy_text, its generic
+# answer rules) is part of the treatment under test (owner direction,
+# 2026-10-13). The raw-only arm receives only this common task prompt with
+# Codex's default base instructions, in every reader mode, and no GPTgrep rule text.
 def raw_prompt(config, question):
     # States the enforced reader policy: web search and model-tool network are disabled.
-    rules = shared_answer_rules(config)
     return prompt_bytes("Answer the question using only the protocol-scoped raw document at "
               + config["raw_document"] + ". You may inspect that document with native tools. "
               "No external search or network access is available. Give the complete answer and source locations "
-              "when available. " + (rules + " " if rules else "") + "Question:\n" + question)
+              "when available. Question:\n" + question)
+
+
+READER_CONTRACT_SCHEMA = "gptgrep.harbor.reader-contract.v1"
+# The pinned product describes the answer rules its legacy_text reader receives
+# in its own offline `--schema` report. The digest of that field identifies the
+# treatment's rules, so a later product change to them needs no adapter edit.
+ANSWER_RULES_FIELD = ("commands", "ask", "reader_answer_rules")
+PRODUCT_SCHEMA_SECONDS = 30
+# Adapter-defined failure codes that an operation record may carry verbatim.
+# Every other exception stays the redacted generic failure.
+RECORDED_FAILURE_CODES = ("product_reader_contract_unavailable",)
+
+
+def schema_field(value, path):
+    for key in path:
+        value = value.get(key) if type(value) is dict else None
+    return value
+
+
+def product_schema(config):
+    """Run the pinned product's offline `--schema`; return its report bytes and parsed contract.
+
+    Called only after the installed bundle matches its pins. No model, network or
+    credential is involved, and the call precedes the query timer.
+    """
+    result = run([config["gptgrep_binary"], "--schema"], cwd="/data/corpus",
+                 timeout=PRODUCT_SCHEMA_SECONDS, env=native_environment(os.environ))
+    require(result["failure"] is None and result["return_code"] == 0, "product_reader_contract_unavailable")
+    contract = parse(result["stdout"])
+    require(type(contract) is dict, "product_reader_contract_unavailable")
+    return result["stdout"], contract
+
+
+def reader_contract(config, binding, schema=None):
+    """This arm's reader-contract record for its operation record.
+
+    The raw-only arm records that it received none of GPTgrep's contract. The
+    treatment records its contract and, in legacy_text, the identity of the
+    answer rules that the pinned product itself reports; rich_multimodal readers
+    receive no answer rules, so that identity stays null.
+    """
+    if binding["arm"] == "raw_only":
+        return {"schema": READER_CONTRACT_SCHEMA, "arm": "raw_only",
+                "base_instructions": "codex_default", "prompt": "common_task_prompt",
+                "gptgrep_contract_received": False, "answer_rules_received": False,
+                "answer_rules_sha256": None}
+    require(binding["arm"] == "gptgrep", "arm")
+    mode = config["reader_mode"]
+    require(mode in ("rich_multimodal", "legacy_text"), "explicit_reader_mode")
+    record = {"schema": READER_CONTRACT_SCHEMA, "arm": "gptgrep",
+              "base_instructions": "gptgrep_reader_contract", "reader_mode": mode,
+              "answer_rules_received": mode == "legacy_text", "answer_rules_sha256": None,
+              "product_provenance_sha256": config["gptgrep_bundle"]["provenance"]["sha256"]}
+    if mode == "legacy_text":
+        require(schema is not None, "product_reader_contract_unavailable")
+        data, contract = schema
+        rules = schema_field(contract, ANSWER_RULES_FIELD)
+        require(isinstance(rules, str) and rules.strip(), "product_reader_contract_unavailable")
+        record.update(answer_rules_source="product_schema:" + ".".join(ANSWER_RULES_FIELD),
+                      answer_rules_sha256=sha(rules.encode()), product_schema_sha256=sha(data))
+    return record
+
+
+def observe_reader_contract(config, binding):
+    """(record, None) or (None, failure code); a treatment that cannot report its contract stops before its Ask."""
+    try:
+        schema = None
+        if binding["arm"] == "gptgrep" and config["reader_mode"] == "legacy_text":
+            schema = product_schema(config)
+        return reader_contract(config, binding, schema), None
+    except Exception:
+        # Redacted code only: product output is never copied into the record.
+        return None, "product_reader_contract_unavailable"
 
 
 def product_accounting(report):
@@ -230,6 +286,9 @@ def main():
         check_product_bundle(config)
     require(not Path("/answer/answer.json").exists() and not Path("/logs/agent/operational.json").exists(),
             "reader_outputs_already_exist")
+    # Before the query timer: the treatment's identity comes from the verified
+    # product's own report; a failure is recorded and stops the trial below.
+    contract, contract_failure = observe_reader_contract(config, binding)
     put("/logs/agent/attempt-start.json", {"binding": binding, "profile": PROFILE})
     started = time.monotonic()
     deadline_unix_ms = time.time_ns() // 1000000 + config["deadline_seconds"] * 1000
@@ -241,6 +300,7 @@ def main():
                  "native_cli": config["native_cli"], "native_config_sha256": config["native_config_sha256"],
                  "base_tool_environment": config["base_tool_environment"],
                  "reader_mode": config["reader_mode"] if binding["arm"] == "gptgrep" else "raw_only",
+                 "reader_contract": contract,
                  "effective_permissions_verified": False,
                  "permitted_tools": config["permitted_tools"],
                  "generic_capabilities": config["generic_capabilities"],
@@ -250,6 +310,8 @@ def main():
                  "index_excluded": True, "grounding": "unassessed"}
     writer = None
     try:
+        if contract_failure is not None:
+            raise ValueError(contract_failure)
         env = native_environment(os.environ, product=binding["arm"] == "gptgrep")
         version = run([config["codex_binary"], "--version"], cwd="/data/corpus",
                       timeout=min(5, config["deadline_seconds"]), env=native_environment(os.environ))
@@ -260,9 +322,6 @@ def main():
         if binding["arm"] == "gptgrep":
             decisions = operation["decisions_mode"] = selected_mode(config)
         argv = reader_argv(config, binding, question)
-        # Both arms record the same shared answer rules, or none, for the run.
-        rules = shared_answer_rules(config)
-        operation["shared_answer_rules_sha256"] = sha(rules.encode()) if rules else None
         if decisions == "preparation":
             writer = acquire_writer()
             env, operation["decisions_preparation"] = prepare_decisions(
@@ -323,9 +382,12 @@ def main():
             # for judging; the flag stays in the private operation record.
             operation["insufficient_evidence"] = metadata["insufficient_evidence"]
         outcome.update(status="response", answer=answer)
-    except Exception:
+    except Exception as error:
         # Redacted code only: exception text may contain task/provider/private data.
         operation["failure"] = "reader_failed"
+        code = error.args[0] if type(error) is ValueError and len(error.args) == 1 else None
+        if code in RECORDED_FAILURE_CODES:
+            operation["failure_code"] = code
     finally:
         if writer is not None:
             os.close(writer)

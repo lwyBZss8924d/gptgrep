@@ -20,8 +20,9 @@ completion does not complete the goal.
 
 The reader images are rebuilt, the zero-model Linux text index is built and pinned
 inside the treatment image, and the adapter carries the approved reader-only sandbox
-setting. The current cursor is **remove the bare-arm copy of GPTgrep's answer rules,
-bound Decisions submissions per trial and apply the adapter's open review fixes →
+setting. The bare arm receives none of GPTgrep's reader contract, including its
+answer rules, in any reader mode. The current cursor is **bound Decisions
+submissions per trial and apply the adapter's open review fixes →
 freeze the inputs on a published commit → Judge-container check and paired smoke →
 complete full62 paired SEARCH → Judge → analyze failures → next Opt**. The first paired run
 is prepared in the adapter's `legacy_text` mode with a frozen zero-model text
@@ -81,8 +82,8 @@ no tag or binary release was created.
 
 Done in this round: common and treatment images rebuilt, the zero-model text index
 built and pinned inside the Linux treatment image before any question exposure, and
-the approved reader sandbox setting integrated. Next: remove the raw-only
-answer-rules copy, bound Decisions submissions per trial and apply the adapter's
+the approved reader sandbox setting integrated, and the raw-only answer-rules copy
+removed. Next: bound Decisions submissions per trial and apply the adapter's
 open review fixes → freeze inputs on a published commit → check the Judge/verifier
 containers → paired smoke → complete full62 paired SEARCH in the
 adapter's `legacy_text` mode → Judge → failure analysis → next Opt. In parallel,
@@ -215,10 +216,11 @@ this branch updates it.) Earlier intermediate merges in this round recorded
 **Paired comparison.** Not run. By owner direction, GPTgrep's reader contract is
 part of the declared treatment. That contract covers its base instructions, its
 citation and abstention rules, and its answer rules. The comparison therefore
-measures the GPTgrep harness against bare Codex, not retrieval alone. In this
-source, the full62 adapter still copies the two answer rules into the raw-only
-prompt in `legacy_text` mode. Removing that copy before the paired run is pending,
-together with the adapter's open review fixes. An optional
+measures the GPTgrep harness against bare Codex, not retrieval alone. The full62
+adapter gives the raw-only arm none of GPTgrep's rule text in any reader mode, and
+each operation record identifies the reader contract its arm received; the
+treatment's answer-rules identity comes from the pinned product's own report.
+The adapter's open review fixes are pending. An optional
 bare-Codex-plus-answer-rules arm can later separate prompt-contract effects.
 
 ## Public SELF-PM checkpoint log
