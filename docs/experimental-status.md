@@ -2,8 +2,8 @@
 
 Updated **2026-10-13 UTC**. This is a public, aggregate development checkpoint for
 the experimental source branch that contains this file in
-[`lwyBZss8924d/gptgrep`](https://github.com/lwyBZss8924d/gptgrep); the current
-integration branch is `claude/gptgrep-unified-runtime-20261012`. The earlier
+[`lwyBZss8924d/gptgrep`](https://github.com/lwyBZss8924d/gptgrep); Claude's
+experimental Opt-loop branch is `claude/exp-ablation-opt-loop-20261013`. The earlier
 `codex/gptgrep-unified-runtime-20261012` branch is the previous source cursor.
 Use the checked-out commit and its validation results when comparing changes.
 The branch is a collaboration snapshot, not an accepted first release.

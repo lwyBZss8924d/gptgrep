@@ -8,8 +8,8 @@ native parse/OCR path and the full62 Harbor adapter. Read the
 
 ## Checkout and storage
 
-Set `GPTGREP_BRANCH` to the experimental branch you are reviewing, for example the
-current integration branch `claude/gptgrep-unified-runtime-20261012`. Each branch's
+Set `GPTGREP_BRANCH` to the experimental branch you are reviewing, for example Claude's
+experimental Opt-loop branch `claude/exp-ablation-opt-loop-20261013`. Each branch's
 dated [status](experimental-status.md) describes the source that contains it; the
 earlier `codex/gptgrep-unified-runtime-20261012` branch predates the shared
 Decisions budget commands, the credential supervisor and alias admission
