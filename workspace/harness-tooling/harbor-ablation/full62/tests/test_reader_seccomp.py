@@ -10,6 +10,7 @@ import io
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import subprocess
 import tempfile
@@ -27,6 +28,30 @@ ENGINE_COMMIT = "daa0cb7f23594cdbcce5002e370027d3fd36ffd7"
 # bubblewrap's fresh /proc mount inside a reader container.
 APPROVED_PROBE_1 = "bwrap --unshare-user --unshare-pid --ro-bind / / --proc /proc --dev /dev true"
 AMENDED_PROBE_1 = "bwrap --unshare-user --unshare-pid --ro-bind / / --dev /dev true"
+
+
+# Generic workstation path markers that no public source may carry.
+MACHINE_PATH_MARKERS = ("/Users/", "/home/", "/private/")
+
+
+def account_name():
+    """The current account name, read at run time; no name is ever written into this source."""
+    try:
+        return pwd.getpwuid(os.getuid()).pw_name
+    except (KeyError, OSError):
+        return None
+
+
+def assert_no_private_markers(case, text):
+    """Fail on a machine path marker or the current account name, without echoing the name."""
+    for marker in MACHINE_PATH_MARKERS:
+        case.assertNotIn(marker, text)
+    name = account_name()
+    # Shorter names would match ordinary words. The name counts only as a whole
+    # identifier, so an account such as "root" does not match the syscall pivot_root.
+    if name and len(name) >= 4:
+        found = re.search(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"(?![A-Za-z0-9_])", text)
+        case.assertFalse(found is not None, "the current account name appears in public source")
 
 
 def load_derive():
@@ -187,8 +212,21 @@ class ReaderSeccompProfileTests(unittest.TestCase):
         self.assertIn("no added capabilities", approval["unchanged"])
         # Public source carries no workstation paths or identities.
         for data in (json.dumps(value), self.derived_bytes.decode()):
-            for marker in ("/Users/", "/home/", "/private/"):
-                self.assertNotIn(marker, data)
+            assert_no_private_markers(self, data)
+
+    def test_private_marker_guard_reads_the_account_name_at_run_time(self):
+        name = account_name()
+        if not name or len(name) < 4:
+            self.skipTest("the current account name is unavailable or shorter than four characters")
+        # A path or a standalone identifier with the name fails; the failure message omits it.
+        for text in ("synthetic /srv/" + name + "/profile.json", name + "@synthetic-host"):
+            with self.assertRaises(AssertionError) as caught:
+                assert_no_private_markers(self, text)
+            self.assertFalse(name in str(caught.exception), "the failure message echoes the account name")
+        assert_no_private_markers(self, "pivot_" + name)
+        for marker in MACHINE_PATH_MARKERS:
+            with self.assertRaises(AssertionError):
+                assert_no_private_markers(self, "synthetic " + marker + "x")
 
 
 class ReaderSeccompReadmeTests(unittest.TestCase):
