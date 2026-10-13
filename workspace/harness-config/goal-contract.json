@@ -56,14 +56,15 @@
       "policy": "Freeze the same actual reader/base-agent/runtime/common tools and declared resources in both arms; bind judge settings separately and identically"
     },
     "arms": {
-      "baseline": "Raw documents only, no precomputed parse/OCR/tree/index; ordinary permitted inspection, extraction, rendering and search tools remain available during the online query budget",
-      "treatment": "Same raw documents and base agent/tools, plus GPTgrep tools and a frozen index built from raw documents alone"
+      "baseline": "Raw documents only, no precomputed parse/OCR/tree/index; ordinary permitted inspection, extraction, rendering and search tools remain available during the online query budget; the common task prompt with Codex's default base instructions and no GPTgrep answer rules",
+      "treatment": "Same raw documents and base agent/tools, plus GPTgrep tools, its reader contract as base instructions and a frozen index built from raw documents alone"
     },
     "treatment_feature_profile": {
       "declaration": "Freeze exact commands, preparation mode, enabled route/rerank provider/model and available tree/structure/text/OCR/visual paths",
       "actual_observation": "Distinguish configured availability from actual use, failure or unknown in the trace",
       "deterministic_harbor_pilot": "Deterministic rich-batch tools without Luna Decisions are protocol/tool-use development evidence only, not a full routing/reranking or System One helper claim",
-      "claim_scope": "No requirement that every mechanism be enabled or win; report the capabilities actually configured and observed"
+      "claim_scope": "No requirement that every mechanism be enabled or win; report the capabilities actually configured and observed",
+      "reader_contract": "GPTgrep's reader contract (base instructions, structured answer/citation/insufficient_evidence schema, abstention rule and generic answer rules) is a declared part of the treatment; the comparison measures the GPTgrep harness, not retrieval alone. An optional bare-Codex-plus-answer-rules arm is a diagnostic, not the primary claim"
     },
     "cost_time_boundary": {
       "excluded": "All pre-query build, parse, render, OCR, enrichment, tree/index preparation costs; judge costs reported separately",
