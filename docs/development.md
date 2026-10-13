@@ -323,7 +323,9 @@ PDFium bundle to the treatment derivative; build the treatment index inside that
 Linux image at `/data/corpus` with its product binary, from the raw documents only
 and before any question is exposed (materialization rejects an index whose pinned
 manifest root is not `/data/corpus` or whose sources differ from the pinned
-documents, such as a host-built index); qualify matching reader permissions and account mounts; supply
+documents, such as a host-built index); qualify matching reader permissions and account mounts; pin
+the owner-approved reader seccomp profile that both reader containers need for Codex's
+bubblewrap sandbox (the adapter's `seccomp/` directory); supply
 the frozen private cohort and Judge contract; select one treatment Decisions mode
 (an existing shared ledger, per-trial preparation, or invocation-bounded contexts
 with one create-new host claim per treatment trial, a pinned price and a cohort
@@ -340,6 +342,8 @@ GPTgrep receives the same bytes plus a frozen index built before question access
 Both readers use the same selected native binary and generic raw-document tools,
 with identical configuration bytes that disable hosted web search, the host-side
 connector, plugin and tool-suggestion features, and model-tool network access.
+Both reader containers run under the same seccomp profile, which adds only the
+namespace calls bubblewrap needs to Docker's default; the Judge keeps the default.
 The Judge runs in a separate environment with the complete answer and frozen
 reference, not the reader's history. Task failures stay in the denominator;
 unavailable judging stays unknown. INDEX and Judge costs are separate from
