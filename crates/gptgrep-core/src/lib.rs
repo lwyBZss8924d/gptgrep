@@ -2,7 +2,8 @@
 use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
 use gptgrep_jev::{
-    Candidate, DecisionFailure, DecisionRetriedAttempt, JevClient, RerankResponse, TransientRetry,
+    Candidate, DecisionFailure, DecisionFailureKind, DecisionRetriedAttempt, FailedResponseUsage,
+    JevClient, RerankResponse, TransientRetry, UsageObservation, UsagePresence,
 };
 
 pub mod batch;
@@ -341,7 +342,9 @@ pub struct Metrics {
     /// it too may stop before network I/O. Never a claim of physical provider
     /// requests.
     pub jev_calls_attempted: usize,
-    /// Successful validated Jev responses observed by this search.
+    /// Successful validated Jev responses observed by this search, including a
+    /// bounded retry's reply that validated before a later local accounting or
+    /// observer step failed (failure kind `retry_post_send`).
     pub jev_requests: usize,
     /// Served (provider-returned) model of each validated response.
     pub jev_models: Vec<String>,
@@ -350,6 +353,9 @@ pub struct Metrics {
     /// `~` aliases; both are reported so neither is inferred from the other.
     #[serde(default)]
     pub jev_requested_models: Vec<String>,
+    /// Provider usage of each validated response, parallel to `jev_models`;
+    /// null when none was reported, never zero-filled. A `retry_post_send`
+    /// reply keeps only its checked numeric fields.
     pub jev_usage: Vec<Value>,
     pub jev_candidate_bytes: usize,
     /// Failed submissions repeated by the bounded transient retry, in attempt
@@ -384,6 +390,66 @@ fn retried_attempts_of(error: &anyhow::Error) -> &[DecisionRetriedAttempt] {
     error
         .downcast_ref::<DecisionFailure>()
         .map_or(&[], |failure| &failure.diagnostic().prior_attempts)
+}
+
+/// A bounded retry whose reply validated before a later local accounting or
+/// observer step failed (`retry_post_send`) was completed by the provider with
+/// known usage. Count it as an observed validated response, with its served
+/// model and checked usage, instead of dropping it. Any other failure, and a
+/// retry sent without a validated reply, adds nothing: its usage stays unknown.
+fn record_validated_retry_reply(metrics: &mut Metrics, error: &anyhow::Error) {
+    let Some(diagnostic) = error
+        .downcast_ref::<DecisionFailure>()
+        .map(DecisionFailure::diagnostic)
+        .filter(|diagnostic| diagnostic.kind == DecisionFailureKind::RetryPostSend)
+    else {
+        return;
+    };
+    let served = diagnostic
+        .response_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.model.value.as_ref());
+    if let (Some(usage), Some(served)) = (&diagnostic.reported_usage, served) {
+        metrics.jev_requests += 1;
+        metrics.jev_models.push(served.clone());
+        metrics.jev_usage.push(checked_usage(usage));
+    }
+}
+
+/// Checked numeric usage of a validated reply as a Decisions `usage` value:
+/// reported numbers, explicit nulls, absent fields omitted, and `null` when the
+/// reply reported no usage at all. Nothing unknown becomes zero.
+fn checked_usage(usage: &FailedResponseUsage) -> Value {
+    fn field<T: Serialize>(
+        object: &mut serde_json::Map<String, Value>,
+        name: &str,
+        observation: &UsageObservation<T>,
+    ) {
+        match (observation.presence, &observation.value) {
+            (UsagePresence::Absent, _) => {}
+            (UsagePresence::Reported, Some(value)) => {
+                object.insert(name.into(), json!(value));
+            }
+            _ => {
+                object.insert(name.into(), Value::Null);
+            }
+        }
+    }
+    if [
+        usage.input_tokens.presence,
+        usage.output_tokens.presence,
+        usage.cost.presence,
+    ]
+    .iter()
+    .all(|presence| *presence == UsagePresence::Null)
+    {
+        return Value::Null;
+    }
+    let mut object = serde_json::Map::new();
+    field(&mut object, "input_tokens", &usage.input_tokens);
+    field(&mut object, "output_tokens", &usage.output_tokens);
+    field(&mut object, "cost", &usage.cost);
+    Value::Object(object)
 }
 
 /// Submit one logical relevance call for `stage`. When the client's bounded
@@ -453,6 +519,9 @@ async fn rerank_call(
             // carries these metrics and a fixed cause.
             error
         } else {
+            // A retry reply that validated before a local step failed keeps
+            // its usage beside the failed attempt it repeated.
+            record_validated_retry_reply(metrics, &error);
             jev_search_error(
                 stage,
                 error,
@@ -590,14 +659,22 @@ fn jev_search_error(
     started: Instant,
 ) -> JevSearchError {
     let message = error.to_string();
-    let retried = error
-        .downcast_ref::<DecisionFailure>()
-        .filter(|failure| !failure.diagnostic().prior_attempts.is_empty());
+    // A failure after a bounded retry, or a transient status whose retry its
+    // Retry-After refused, keeps the client's own rendering.
+    let retried = error.downcast_ref::<DecisionFailure>().filter(|failure| {
+        let diagnostic = failure.diagnostic();
+        !diagnostic.prior_attempts.is_empty() || diagnostic.retry_after_refusal.is_some()
+    });
     let cause = if let Some(failure) = retried {
-        // Fixed wording plus numeric statuses and validation codes only.
+        // Fixed wording plus numeric statuses, validation codes and fixed
+        // refusal reasons only.
         failure.to_string()
     } else if message == "OPENROUTER_API_KEY is not available" {
         message
+    } else if message == "Decisions submission budget exhausted" {
+        // The shared submission budget refused this call at reservation,
+        // before anything was sent.
+        "Decisions submission budget exhausted; the call was not sent; no local fallback".into()
     } else if message.contains("API key") {
         "Jev credentials are missing or invalid".into()
     } else if let Some(status) = message
@@ -3210,12 +3287,21 @@ mod tests {
         statuses: Vec<u16>,
         scorer: Arc<dyn Fn(&str) -> f64 + Send + Sync>,
     ) -> Result<(JevClient, tokio::task::JoinHandle<Vec<Value>>)> {
+        let replies = statuses.into_iter().map(|status| (status, "")).collect();
+        mock_jev_replies(replies, scorer).await
+    }
+
+    /// Scripted statuses, each with extra raw response header lines (CRLF-terminated).
+    async fn mock_jev_replies(
+        replies: Vec<(u16, &'static str)>,
+        scorer: Arc<dyn Fn(&str) -> f64 + Send + Sync>,
+    ) -> Result<(JevClient, tokio::task::JoinHandle<Vec<Value>>)> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("http://{}/api/alpha/decisions", listener.local_addr()?);
         let client = JevClient::with_endpoint("synthetic-core-test-key", None, &endpoint)?;
         let server = tokio::spawn(async move {
             let mut bodies = Vec::new();
-            for (ordinal, status) in statuses.into_iter().enumerate() {
+            for (ordinal, (status, headers)) in replies.into_iter().enumerate() {
                 let (mut socket, _) =
                     tokio::time::timeout(Duration::from_secs(5), listener.accept())
                         .await
@@ -3281,7 +3367,7 @@ mod tests {
                     "Service Unavailable"
                 };
                 let wire = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{headers}Connection: close\r\n\r\n{response}",
                     response.len()
                 );
                 socket.write_all(wire.as_bytes()).await.unwrap();
@@ -3289,6 +3375,26 @@ mod tests {
             bodies
         });
         Ok((client, server))
+    }
+
+    /// Rejects every validated reply, as a failed local ledger record or
+    /// caller observer would after the provider completed the submission.
+    pub(crate) struct RejectValidated;
+
+    impl gptgrep_jev::DecisionObserver for RejectValidated {
+        fn send_started(&self, _: &gptgrep_jev::DecisionRequestObservation<'_>) -> Result<()> {
+            Ok(())
+        }
+        fn validated_response(
+            &self,
+            _: &gptgrep_jev::DecisionRequestObservation<'_>,
+            _: &gptgrep_jev::DecisionResponse,
+        ) -> Result<()> {
+            bail!("synthetic-local-ledger-failure")
+        }
+        fn failed(&self, _: &gptgrep_jev::DecisionRequestObservation<'_>) -> Result<()> {
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -4233,6 +4339,216 @@ mod tests {
         assert!(!failure.accounting_complete);
         let serialized = serde_json::to_string(failure)?;
         assert!(!serialized.contains("secret-provider-body-sentinel"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn validated_retry_reply_keeps_its_usage_when_a_local_step_fails() -> Result<()> {
+        let directory = one_document_corpus().await?;
+        // The rerank gets HTTP 502; its retry is sent and validated, then a
+        // local observer step rejects the reply.
+        let (client, server) = mock_jev(vec![502, 200]).await?;
+        let client = client
+            .with_transient_retry(TransientRetry::with_jitter(|| 0.0))
+            .with_decision_observer(Arc::new(RejectValidated));
+        let events: Arc<Mutex<Vec<JevSearchProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = events.clone();
+        let observer = move |progress: &JevSearchProgress| {
+            recorded.lock().unwrap().push(progress.clone());
+            Ok(())
+        };
+        let error = search_with_client_and_observer(
+            directory.path(),
+            "needle",
+            &SearchOptions::default(),
+            &client,
+            &observer,
+        )
+        .await
+        .unwrap_err();
+        // Both submissions were sent.
+        assert_eq!(server.await?.len(), 2);
+        let failure = error
+            .downcast_ref::<JevSearchError>()
+            .context("missing typed Jev error")?;
+        assert_eq!(failure.stage, "evidence_reranking");
+        assert_eq!(
+            (
+                failure.metrics.jev_calls_attempted,
+                failure.metrics.jev_requests
+            ),
+            (2, 1)
+        );
+        // The validated retry's served model and checked usage are kept; the
+        // failed first attempt stays unknown, never zero.
+        assert_eq!(
+            failure.metrics.jev_models,
+            ["openai/gpt-6-luna-decisions-20261006"]
+        );
+        assert_eq!(
+            failure.metrics.jev_usage,
+            [json!({"input_tokens":101,"output_tokens":2,"cost":0.002})]
+        );
+        assert_eq!(failure.metrics.jev_requested_models.len(), 2);
+        let retried = &failure.metrics.jev_retried_attempts;
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0].attempt.http_status, Some(502));
+        assert!(retried[0].attempt.reported_usage.is_none());
+        assert!(
+            failure.cause.contains("attempt 2: sent and validated"),
+            "{}",
+            failure.cause
+        );
+        assert!(failure.cause.contains("its reported usage is retained"));
+        assert!(!failure.accounting_complete);
+        assert!(!format!("{error:#}").contains("synthetic-local-ledger-failure"));
+        let roundtrip: JevSearchError = serde_json::from_str(&serde_json::to_string(failure)?)?;
+        assert_eq!(roundtrip.metrics.jev_usage, failure.metrics.jev_usage);
+        // The retry was on record before it was sent.
+        let events = events.lock().unwrap();
+        let retry = events
+            .iter()
+            .find(|event| event.event == "before_retry")
+            .unwrap();
+        assert_eq!(
+            (
+                retry.metrics.jev_calls_attempted,
+                retry.metrics.jev_requests
+            ),
+            (2, 0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn checked_usage_keeps_reported_fields_and_never_invents_zero() {
+        use UsagePresence::{Absent, Invalid, Null, Reported};
+        fn observation<T>(presence: UsagePresence, value: Option<T>) -> UsageObservation<T> {
+            UsageObservation { presence, value }
+        }
+        let usage = |input_tokens, output_tokens, cost| FailedResponseUsage {
+            input_tokens,
+            output_tokens,
+            cost,
+        };
+        assert_eq!(
+            checked_usage(&usage(
+                observation(Reported, Some(7)),
+                observation(Reported, Some(1)),
+                observation(Reported, Some(0.0002)),
+            )),
+            json!({"input_tokens":7,"output_tokens":1,"cost":0.0002})
+        );
+        // A reply without usage (or with only null fields) has unknown usage.
+        assert_eq!(
+            checked_usage(&usage(
+                observation(Null, None),
+                observation(Null, None),
+                observation(Null, None),
+            )),
+            Value::Null
+        );
+        assert_eq!(
+            checked_usage(&usage(
+                observation(Absent, None),
+                observation(Null, None),
+                observation(Invalid, None),
+            )),
+            json!({"output_tokens":null,"cost":null})
+        );
+        assert_eq!(
+            checked_usage(&usage(
+                observation(Absent, None),
+                observation(Absent, None),
+                observation(Reported, Some(0.001)),
+            )),
+            json!({"cost":0.001})
+        );
+    }
+
+    #[tokio::test]
+    async fn unusable_retry_after_is_named_in_the_search_failure() -> Result<()> {
+        let directory = one_document_corpus().await?;
+        let (client, server) = mock_jev_replies(
+            vec![(503, "Retry-After: Wed, 21 Oct 2099 07:28:00 GMT\r\n")],
+            Arc::new(|_| 3.0),
+        )
+        .await?;
+        let client = client.with_transient_retry(TransientRetry::with_jitter(|| 0.0));
+        let error = search_with_client(
+            directory.path(),
+            "needle",
+            &SearchOptions::default(),
+            &client,
+        )
+        .await
+        .unwrap_err();
+        // The unusable wait refuses the retry: exactly one submission.
+        assert_eq!(server.await?.len(), 1);
+        let failure = error
+            .downcast_ref::<JevSearchError>()
+            .context("missing typed Jev error")?;
+        assert_eq!(
+            failure.cause,
+            "Jev provider returned HTTP 503; request was not retried because its Retry-After was not a non-negative integer number of seconds"
+        );
+        assert_eq!(
+            (
+                failure.metrics.jev_calls_attempted,
+                failure.metrics.jev_requests
+            ),
+            (1, 0)
+        );
+        assert!(failure.metrics.jev_retried_attempts.is_empty());
+        assert!(failure.metrics.jev_usage.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exhausted_submission_budget_is_reported_as_such() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("first.txt"), "needle first evidence")?;
+        fs::write(
+            directory.path().join("second.txt"),
+            "needle second evidence",
+        )?;
+        index(directory.path(), 10).await?;
+        // Routing uses the only submission; the rerank cannot be reserved.
+        let (client, server) = mock_jev(vec![200]).await?;
+        let context = gptgrep_jev::ExecutionContext::new(
+            "synthetic-budget-exhaustion",
+            &"e".repeat(64),
+            std::time::SystemTime::now() + Duration::from_secs(30),
+            1,
+        )?;
+        let client = client
+            .with_execution_context(context.clone())
+            .with_transient_retry(TransientRetry::with_jitter(|| 0.0));
+        let error = search_with_client(
+            directory.path(),
+            "needle",
+            &SearchOptions::default(),
+            &client,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(server.await?.len(), 1);
+        let failure = error
+            .downcast_ref::<JevSearchError>()
+            .context("missing typed Jev error")?;
+        assert_eq!(failure.stage, "evidence_reranking");
+        assert_eq!(
+            failure.cause,
+            "Decisions submission budget exhausted; the call was not sent; no local fallback"
+        );
+        assert_eq!(
+            (
+                failure.metrics.jev_calls_attempted,
+                failure.metrics.jev_requests
+            ),
+            (2, 1)
+        );
+        assert_eq!(context.snapshot()?.logical_reservations, 1);
         Ok(())
     }
 

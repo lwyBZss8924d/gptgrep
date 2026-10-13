@@ -299,11 +299,17 @@ or provider fallback, and at most 64 questions. The default text retrieval clien
 (search routing and evidence reranking, including ask/summarize initial and reader
 searches) admits one bounded transient retry: only after a received HTTP 429, 500,
 502, 503 or 504, at most once, with the identical request bytes. It waits a jittered
-250-1000 ms, or a longer numeric `Retry-After`, and retries only if the original
-request deadline still leaves that wait plus 2 seconds; the deadline is never
-renewed. The retry is a separate reservation in the same execution context and is
-skipped when no submission remains. Timeouts, connection or mid-body errors, parse
-and validation failures and other statuses are never retried. Both attempts are
+250-1000 ms, or a longer `Retry-After` of one non-negative integer number of
+seconds (at most ten digits), and retries only if the original request deadline
+still leaves that wait plus 2 seconds; the deadline is never renewed. A
+`Retry-After` returned in any other form (an HTTP-date, a repeated field, or a
+negative, fractional or longer value) refuses the retry instead of being ignored,
+and the failure diagnostic records why (`retry_after_refusal`: `repeated`,
+`out_of_range` or `not_delta_seconds`). The retry is a separate reservation in
+the same execution context and is skipped when no submission remains; a later
+call that the exhausted budget refuses fails with `Decisions submission budget
+exhausted` before any send. Timeouts, connection or mid-body errors, parse and
+validation failures and other statuses are never retried. Both attempts are
 reported: the failed one keeps its HTTP status in `jev_retried_attempts` and counts
 in `jev_calls_attempted` without a usage entry, so its unknown cost keeps accounting
 incomplete. The retry counts as an attempt once admitted: a `before_retry`
@@ -313,12 +319,15 @@ drop either submission from the host ledger, and a receipt that cannot be record
 stops the retry unsent. Planned query-view operations accept one such retry per
 logical call, and a failed operation receipt keeps the retried attempt. An error
 after the retry was sent (for example a failed local ledger record) is kind
-`retry_post_send` and keeps a validated reply's reported usage; only a retry
-stopped before its send is `retry_admission`. Judge, enrichment support calls
-(their own explicit retry plan), navigation scans, evidence-role decisions,
-rich/multimodal searches, explicit rerank pools and batch submissions remain
-single-submission; the rich paths remove any retry policy attached to a
-caller-supplied client. Text requests
+`retry_post_send`. When the retry's reply had already validated, the provider
+completed it with known usage: the failure diagnostic keeps that checked numeric
+usage and served model, and the search error, operation receipt and host ledger
+count it in `jev_requests`, `jev_models` and `jev_usage`; otherwise its usage stays
+unknown. Only a retry stopped before its send is `retry_admission`. Judge,
+enrichment support calls (their own explicit retry plan), navigation scans,
+evidence-role decisions, rich/multimodal searches, explicit rerank pools and
+batch submissions remain single-submission; the rich paths remove any retry
+policy attached to a caller-supplied client. Text requests
 and the escaped text/questions envelope retain a 64 KiB limit. Typed Luna image
 requests have an 8 MiB complete-body limit, with at most four PNG/JPEG images,
 1 MiB of compressed bytes and 8 million pixels per image, and 24 million pixels

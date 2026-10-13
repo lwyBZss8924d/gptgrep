@@ -27,6 +27,44 @@ pub enum DecisionFailureKind {
     RetryPostSend,
 }
 
+/// Why a received transient status was not retried because of its
+/// `Retry-After`. Only one non-negative integer number of seconds of at most
+/// ten digits is honoured; any other returned form refuses the bounded retry
+/// instead of being ignored.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryAfterRefusal {
+    /// More than one `Retry-After` field was returned.
+    Repeated,
+    /// An unsigned integer of more than ten digits.
+    OutOfRange,
+    /// Not an unsigned integer: for example an HTTP-date, or a negative,
+    /// signed, fractional or empty value.
+    NotDeltaSeconds,
+}
+
+impl RetryAfterRefusal {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Repeated => "its Retry-After header was repeated",
+            Self::OutOfRange => "its Retry-After exceeded ten digits",
+            Self::NotDeltaSeconds => {
+                "its Retry-After was not a non-negative integer number of seconds"
+            }
+        }
+    }
+}
+
+/// The `Retry-After` returned with an HTTP status failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetryAfter {
+    Absent,
+    /// One non-negative integer number of seconds of at most ten digits.
+    Seconds(Duration),
+    /// Present in a form that cannot be honoured; it refuses the bounded retry.
+    Unusable(RetryAfterRefusal),
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum UsagePresence {
@@ -190,6 +228,11 @@ pub struct DecisionFailureDiagnostic {
     /// final submission. Empty, and omitted, when no retry was made.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prior_attempts: Vec<DecisionRetriedAttempt>,
+    /// Set when an attached bounded transient retry would otherwise have been
+    /// considered for this transient status, but its `Retry-After` could not be
+    /// honoured, so the request was not retried. Omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_refusal: Option<RetryAfterRefusal>,
 }
 
 /// Downcast an unsuccessful client result to retain safe typed observations.
@@ -199,8 +242,8 @@ pub struct DecisionFailureDiagnostic {
 pub struct DecisionFailure {
     diagnostic: DecisionFailureDiagnostic,
     message: &'static str,
-    /// Numeric `Retry-After` of an HTTP status failure; never serialized.
-    retry_after: Option<Duration>,
+    /// `Retry-After` of an HTTP status failure; never serialized.
+    retry_after: RetryAfter,
 }
 
 impl DecisionFailure {
@@ -210,7 +253,23 @@ impl DecisionFailure {
 
     /// Numeric `Retry-After` returned with an HTTP status failure, if any.
     pub fn retry_after(&self) -> Option<Duration> {
-        self.retry_after
+        match self.retry_after {
+            RetryAfter::Seconds(after) => Some(after),
+            RetryAfter::Absent | RetryAfter::Unusable(_) => None,
+        }
+    }
+
+    /// A returned `Retry-After` that cannot be honoured, if any.
+    pub(crate) fn unusable_retry_after(&self) -> Option<RetryAfterRefusal> {
+        match self.retry_after {
+            RetryAfter::Unusable(refusal) => Some(refusal),
+            RetryAfter::Absent | RetryAfter::Seconds(_) => None,
+        }
+    }
+
+    /// Record that the bounded retry was refused because of `Retry-After`.
+    pub(crate) fn refuse_retry(&mut self, refusal: RetryAfterRefusal) {
+        self.diagnostic.retry_after_refusal = Some(refusal);
     }
 
     pub(crate) fn transport(
@@ -243,7 +302,7 @@ impl DecisionFailure {
         Self::new(kind, message, status, bytes)
     }
 
-    pub(crate) fn http(status: u16, retry_after: Option<Duration>) -> Self {
+    pub(crate) fn http(status: u16, retry_after: RetryAfter) -> Self {
         let mut failure = Self::new(
             DecisionFailureKind::HttpStatus,
             "Jev provider returned HTTP",
@@ -323,9 +382,10 @@ impl DecisionFailure {
                 reported_usage: None,
                 response_metadata: None,
                 prior_attempts: Vec::new(),
+                retry_after_refusal: None,
             },
             message,
-            retry_after: None,
+            retry_after: RetryAfter::Absent,
         }
     }
 
@@ -497,7 +557,13 @@ impl fmt::Display for DecisionFailure {
         }
         if self.diagnostic.kind == DecisionFailureKind::HttpStatus {
             match self.diagnostic.http_status {
-                Some(status) => write!(f, "{} {status}; request was not retried", self.message),
+                Some(status) => {
+                    write!(f, "{} {status}; request was not retried", self.message)?;
+                    match self.diagnostic.retry_after_refusal {
+                        Some(refusal) => write!(f, " because {}", refusal.reason()),
+                        None => Ok(()),
+                    }
+                }
                 None => f.write_str(
                     "Jev provider returned an unavailable HTTP status; request was not retried",
                 ),

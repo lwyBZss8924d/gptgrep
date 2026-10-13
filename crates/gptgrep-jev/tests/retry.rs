@@ -4,7 +4,7 @@ use anyhow::Result;
 use gptgrep_jev::{
     Candidate, DecisionFailure, DecisionFailureKind, DecisionObserver, DecisionRequestObservation,
     DecisionResponse, ExecutionContext, JevClient, RETRY_BACKOFF_MAX, RETRY_BACKOFF_MIN,
-    TransientRetry,
+    RetryAfterRefusal, TransientRetry,
 };
 use serde_json::{Value, json};
 use std::{
@@ -326,10 +326,106 @@ async fn retry_after_beyond_the_original_deadline_refuses_the_retry() {
     let diagnostic = failure(&error).diagnostic();
     assert_eq!(diagnostic.http_status, Some(429));
     assert!(diagnostic.prior_attempts.is_empty());
+    // A usable numeric value is kept; only the deadline refused the retry.
+    assert_eq!(diagnostic.retry_after_refusal, None);
     assert_eq!(failure(&error).retry_after(), Some(Duration::from_secs(30)));
     let served = server.await.unwrap();
     assert_eq!((served.bodies.len(), served.unexpected), (1, 0));
     assert_eq!(context.snapshot().unwrap().logical_reservations, 1);
+}
+
+#[tokio::test]
+async fn unusable_retry_after_refuses_the_retry_instead_of_using_the_backoff() {
+    // Each form a provider might send that is not one non-negative integer
+    // number of seconds of at most ten digits.
+    for (status, headers, refusal) in [
+        (
+            "503 Service Unavailable",
+            "Retry-After: Wed, 21 Oct 2099 07:28:00 GMT\r\n",
+            RetryAfterRefusal::NotDeltaSeconds,
+        ),
+        (
+            "429 Too Many Requests",
+            "Retry-After: 1\r\nRetry-After: 1\r\n",
+            RetryAfterRefusal::Repeated,
+        ),
+        (
+            "503 Service Unavailable",
+            "Retry-After: 99999999999\r\n",
+            RetryAfterRefusal::OutOfRange,
+        ),
+        (
+            "429 Too Many Requests",
+            "Retry-After: -1\r\n",
+            RetryAfterRefusal::NotDeltaSeconds,
+        ),
+        (
+            "502 Bad Gateway",
+            "Retry-After: 1.5\r\n",
+            RetryAfterRefusal::NotDeltaSeconds,
+        ),
+    ] {
+        let (endpoint, server) = serve(vec![Reply {
+            status,
+            headers,
+            body: "private-body".into(),
+        }])
+        .await;
+        let context = context(Duration::from_secs(30), 5);
+        let client = retrying(&endpoint, &context);
+        let error = decide(&client).await.unwrap_err();
+        let diagnostic = failure(&error).diagnostic();
+        assert_eq!(
+            diagnostic.kind,
+            DecisionFailureKind::HttpStatus,
+            "{headers:?}"
+        );
+        assert!(diagnostic.prior_attempts.is_empty(), "{headers:?}");
+        // The reason the transient status was not retried is recorded.
+        assert_eq!(diagnostic.retry_after_refusal, Some(refusal), "{headers:?}");
+        assert_eq!(failure(&error).retry_after(), None);
+        let serialized = serde_json::to_value(diagnostic).unwrap();
+        assert_eq!(
+            serialized["retry_after_refusal"],
+            serde_json::to_value(refusal).unwrap()
+        );
+        let rendered = error.to_string();
+        let code = &status[..3];
+        assert!(
+            rendered.starts_with(&format!(
+                "Jev provider returned HTTP {code}; request was not retried because its Retry-After"
+            )),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("private-body"));
+        // Exactly one submission: no backoff retry replaced the unusable wait.
+        let served = server.await.unwrap();
+        assert_eq!(
+            (served.bodies.len(), served.unexpected),
+            (1, 0),
+            "{headers:?}"
+        );
+        let snapshot = context.snapshot().unwrap();
+        assert_eq!(snapshot.logical_reservations, 1, "{headers:?}");
+        assert_eq!(snapshot.terminal_submissions, 1, "{headers:?}");
+    }
+    // A client without the retry policy keeps its single submission and its
+    // unchanged message; no retry was considered, so no refusal is recorded.
+    let (endpoint, server) = serve(vec![Reply {
+        status: "503 Service Unavailable",
+        headers: "Retry-After: Wed, 21 Oct 2099 07:28:00 GMT\r\n",
+        body: String::new(),
+    }])
+    .await;
+    let client = JevClient::with_endpoint(KEY, None, &endpoint).unwrap();
+    let error = decide(&client).await.unwrap_err();
+    assert_eq!(failure(&error).diagnostic().retry_after_refusal, None);
+    assert_eq!(
+        error.to_string(),
+        "Jev provider returned HTTP 503; request was not retried"
+    );
+    let served = server.await.unwrap();
+    assert_eq!((served.bodies.len(), served.unexpected), (1, 0));
 }
 
 #[tokio::test]

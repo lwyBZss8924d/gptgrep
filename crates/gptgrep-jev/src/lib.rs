@@ -20,9 +20,11 @@ pub use execution::{
     DecisionsBudgetStatus, ExecutionContext, ExecutionSnapshot, MAX_CONCURRENT_REQUESTS,
     MAX_SUBMISSIONS, ReservationOutcomeCounts,
 };
+use failure::RetryAfter;
 pub use failure::{
     DecisionFailure, DecisionFailureDiagnostic, DecisionFailureKind, DecisionRetriedAttempt,
-    FailedResponseMetadata, FailedResponseUsage, UsageObservation, UsagePresence,
+    FailedResponseMetadata, FailedResponseUsage, RetryAfterRefusal, UsageObservation,
+    UsagePresence,
 };
 pub use input::{
     DecisionInput, ImageEvidence, MAX_IMAGE_BASE64_BYTES, MAX_IMAGE_BYTES,
@@ -167,9 +169,12 @@ pub struct DecisionResponse {
 /// validation failures and every other status are never retried, because the
 /// provider may have completed the request or the failure is not transient.
 /// The wait is a jittered backoff in [`RETRY_BACKOFF_MIN`]..=[`RETRY_BACKOFF_MAX`]
-/// or a longer numeric `Retry-After` (delta-seconds); other `Retry-After` forms
-/// are ignored. The retry is refused unless the original request deadline still
-/// leaves the wait plus [`RETRY_MIN_ATTEMPT_TIME`]; that deadline is never renewed.
+/// or a longer `Retry-After` of one non-negative integer number of seconds (at
+/// most ten digits). A `Retry-After` returned in any other form (an HTTP-date, a
+/// repeated field, or a negative, fractional or longer value) refuses the retry,
+/// recorded as [`DecisionFailureDiagnostic::retry_after_refusal`]. The retry is
+/// also refused unless the original request deadline still leaves the wait plus
+/// [`RETRY_MIN_ATTEMPT_TIME`]; that deadline is never renewed.
 /// Each attempt is a separate reservation in the client's execution context, and
 /// no retry is made when that context has no submission left. The failed attempt
 /// is reported in `retried_attempts` or the final failure's `prior_attempts`; a
@@ -264,19 +269,25 @@ fn validated_observation(
     )
 }
 
-/// A single numeric (delta-seconds) `Retry-After`; absent, repeated, HTTP-date
-/// or malformed values are ignored.
-fn numeric_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+/// Classify a returned `Retry-After`: absent, one non-negative integer number
+/// of seconds of at most ten digits, or a form that cannot be honoured (an
+/// HTTP-date, a repeated field, a negative, fractional or longer value).
+fn retry_after_header(headers: &reqwest::header::HeaderMap) -> RetryAfter {
     let mut values = headers.get_all(reqwest::header::RETRY_AFTER).iter();
-    let value = values.next()?;
+    let Some(value) = values.next() else {
+        return RetryAfter::Absent;
+    };
     if values.next().is_some() {
-        return None;
+        return RetryAfter::Unusable(RetryAfterRefusal::Repeated);
     }
-    let text = value.to_str().ok()?.trim();
-    if text.is_empty() || text.len() > 10 || !text.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
+    let text = value.to_str().map(str::trim).unwrap_or_default();
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return RetryAfter::Unusable(RetryAfterRefusal::NotDeltaSeconds);
     }
-    text.parse().ok().map(Duration::from_secs)
+    match text.parse() {
+        Ok(seconds) if text.len() <= 10 => RetryAfter::Seconds(Duration::from_secs(seconds)),
+        _ => RetryAfter::Unusable(RetryAfterRefusal::OutOfRange),
+    }
 }
 
 /// Metadata derived from the exact bytes handed to the HTTP request builder.
@@ -607,7 +618,7 @@ impl JevClient {
             } else {
                 (body, None)
             };
-            let error = match self
+            let mut error = match self
                 .submit_once(
                     first_body,
                     questions,
@@ -625,7 +636,8 @@ impl JevClient {
             let Some(retry_body) = retry_body else {
                 return Err(error);
             };
-            let Some((wait, retry_after)) = self.retry_wait(retry, &error, deadline).await else {
+            let Some((wait, retry_after)) = self.retry_wait(retry, &mut error, deadline).await
+            else {
                 return Err(error);
             };
             let Some(failure) = error.downcast_ref::<DecisionFailure>() else {
@@ -700,21 +712,30 @@ impl JevClient {
     }
 
     /// Admit the bounded retry of one failed submission, returning its wait and
-    /// the honoured numeric `Retry-After`, or `None` for no retry.
+    /// the honoured numeric `Retry-After`, or `None` for no retry. A transient
+    /// status whose `Retry-After` cannot be honoured is not retried, and that
+    /// reason is recorded in the failure's diagnostic.
     async fn retry_wait(
         &self,
         retry: Option<&TransientRetry>,
-        error: &anyhow::Error,
+        error: &mut anyhow::Error,
         deadline: tokio::time::Instant,
     ) -> Option<(Duration, Option<Duration>)> {
         let retry = retry?;
-        let failure = error.downcast_ref::<DecisionFailure>()?;
+        let failure = error.downcast_mut::<DecisionFailure>()?;
         let diagnostic = failure.diagnostic();
         if diagnostic.kind != DecisionFailureKind::HttpStatus
             || !diagnostic
                 .http_status
                 .is_some_and(|status| TRANSIENT_RETRY_STATUSES.contains(&status))
         {
+            return None;
+        }
+        // An HTTP-date, repeated, negative or otherwise unusable Retry-After is
+        // never replaced by the default backoff: the provider's requested wait
+        // cannot be determined exactly, so no retry is sent.
+        if let Some(refusal) = failure.unusable_retry_after() {
+            failure.refuse_retry(refusal);
             return None;
         }
         let backoff = retry.backoff();
@@ -777,7 +798,7 @@ impl JevClient {
             .map_err(|error| DecisionFailure::transport(&error, false, None, None))?;
         let status = response.status().as_u16();
         if !response.status().is_success() {
-            let retry_after = numeric_retry_after(response.headers());
+            let retry_after = retry_after_header(response.headers());
             reservation.terminal().await?;
             return Err(DecisionFailure::http(status, retry_after).into());
         }
@@ -1122,38 +1143,137 @@ mod tests {
     }
 
     #[test]
-    fn only_one_numeric_retry_after_is_honoured() {
+    fn only_one_integer_retry_after_is_honoured_and_other_forms_are_unusable() {
         use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
-        let parse = |values: &[&str]| {
+        let parse = |values: &[&[u8]]| {
             let mut headers = HeaderMap::new();
             for value in values {
-                headers.append(RETRY_AFTER, HeaderValue::from_str(value).unwrap());
+                headers.append(RETRY_AFTER, HeaderValue::from_bytes(value).unwrap());
             }
-            numeric_retry_after(&headers)
+            retry_after_header(&headers)
         };
-        assert_eq!(parse(&["1"]), Some(Duration::from_secs(1)));
-        assert_eq!(parse(&["0"]), Some(Duration::ZERO));
-        assert_eq!(parse(&["17 "]), Some(Duration::from_secs(17)));
-        for ignored in [
-            &[][..],
+        let honoured = |value: &str, seconds: u64| {
+            assert_eq!(
+                parse(&[value.as_bytes()]),
+                RetryAfter::Seconds(Duration::from_secs(seconds)),
+                "{value:?}"
+            );
+        };
+        let unusable = |values: &[&str], refusal: RetryAfterRefusal| {
+            let values: Vec<&[u8]> = values.iter().map(|value| value.as_bytes()).collect();
+            assert_eq!(parse(&values), RetryAfter::Unusable(refusal), "{values:?}");
+        };
+        assert_eq!(parse(&[]), RetryAfter::Absent);
+        honoured("1", 1);
+        honoured("0", 0);
+        honoured("17 ", 17);
+        honoured("007", 7);
+        honoured("9999999999", 9_999_999_999);
+        unusable(&["2", "2"], RetryAfterRefusal::Repeated);
+        unusable(
+            &["1", "Wed, 21 Oct 2015 07:28:00 GMT"],
+            RetryAfterRefusal::Repeated,
+        );
+        unusable(
             &["Wed, 21 Oct 2015 07:28:00 GMT"],
-            &["-1"],
-            &["1.5"],
-            &["2", "2"],
-            &["12345678901"],
-            &[""],
-        ] {
-            assert_eq!(parse(ignored), None, "{ignored:?}");
+            RetryAfterRefusal::NotDeltaSeconds,
+        );
+        for value in ["-1", "+1", "1.5", "1 2", "1, 2", ""] {
+            unusable(&[value], RetryAfterRefusal::NotDeltaSeconds);
         }
+        for value in [
+            "12345678901",
+            "99999999999",
+            "123456789012345678901234567890",
+        ] {
+            unusable(&[value], RetryAfterRefusal::OutOfRange);
+        }
+        // Opaque (non-ASCII) header bytes are not delta-seconds either.
+        assert_eq!(
+            parse(&[&b"\xff1"[..]]),
+            RetryAfter::Unusable(RetryAfterRefusal::NotDeltaSeconds)
+        );
     }
 
     async fn admitted(
         client: &JevClient,
-        error: anyhow::Error,
+        mut error: anyhow::Error,
         policy: Option<&TransientRetry>,
         deadline: tokio::time::Instant,
     ) -> Option<(Duration, Option<Duration>)> {
-        client.retry_wait(policy, &error, deadline).await
+        client.retry_wait(policy, &mut error, deadline).await
+    }
+
+    #[tokio::test]
+    async fn unusable_retry_after_refuses_the_retry_and_records_why() {
+        let client =
+            JevClient::with_endpoint("ordinary-fixture", None, "http://127.0.0.1:9/decisions")
+                .unwrap();
+        let retry = TransientRetry::with_jitter(|| 0.0);
+        let far = tokio::time::Instant::now() + Duration::from_secs(20);
+        for refusal in [
+            RetryAfterRefusal::Repeated,
+            RetryAfterRefusal::OutOfRange,
+            RetryAfterRefusal::NotDeltaSeconds,
+        ] {
+            for status in TRANSIENT_RETRY_STATUSES {
+                let mut error: anyhow::Error =
+                    DecisionFailure::http(status, RetryAfter::Unusable(refusal)).into();
+                assert!(
+                    client
+                        .retry_wait(Some(&retry), &mut error, far)
+                        .await
+                        .is_none(),
+                    "{status} {refusal:?}"
+                );
+                let failure = error.downcast_ref::<DecisionFailure>().unwrap();
+                assert_eq!(failure.diagnostic().retry_after_refusal, Some(refusal));
+                assert_eq!(failure.retry_after(), None);
+                let rendered = failure.to_string();
+                assert!(
+                    rendered.starts_with(&format!(
+                        "Jev provider returned HTTP {status}; request was not retried because its Retry-After "
+                    )),
+                    "{rendered}"
+                );
+                let serialized = serde_json::to_value(failure.diagnostic()).unwrap();
+                assert_eq!(
+                    serialized["retry_after_refusal"],
+                    serde_json::to_value(refusal).unwrap()
+                );
+            }
+            // Without the policy, or for a status that is never retried, no
+            // retry was considered, so no refusal reason is recorded.
+            for (status, policy) in [(503, None), (400, Some(&retry))] {
+                let mut error: anyhow::Error =
+                    DecisionFailure::http(status, RetryAfter::Unusable(refusal)).into();
+                assert!(client.retry_wait(policy, &mut error, far).await.is_none());
+                let failure = error.downcast_ref::<DecisionFailure>().unwrap();
+                assert_eq!(failure.diagnostic().retry_after_refusal, None);
+                assert_eq!(
+                    failure.to_string(),
+                    format!("Jev provider returned HTTP {status}; request was not retried")
+                );
+                assert!(
+                    serde_json::to_value(failure.diagnostic())
+                        .unwrap()
+                        .get("retry_after_refusal")
+                        .is_none()
+                );
+            }
+        }
+        assert_eq!(
+            serde_json::to_value(RetryAfterRefusal::NotDeltaSeconds).unwrap(),
+            "not_delta_seconds"
+        );
+        assert_eq!(
+            serde_json::to_value(RetryAfterRefusal::OutOfRange).unwrap(),
+            "out_of_range"
+        );
+        assert_eq!(
+            serde_json::to_value(RetryAfterRefusal::Repeated).unwrap(),
+            "repeated"
+        );
     }
 
     #[tokio::test]
@@ -1164,15 +1284,15 @@ mod tests {
         let retry = TransientRetry::with_jitter(|| 0.0);
         let far = tokio::time::Instant::now() + Duration::from_secs(20);
         for status in TRANSIENT_RETRY_STATUSES {
-            let error = DecisionFailure::http(status, None).into();
+            let error = DecisionFailure::http(status, RetryAfter::Absent).into();
             let wait = admitted(&client, error, Some(&retry), far).await;
             assert_eq!(wait, Some((RETRY_BACKOFF_MIN, None)), "{status}");
             // Without the policy nothing is ever retried.
-            let error = DecisionFailure::http(status, None).into();
+            let error = DecisionFailure::http(status, RetryAfter::Absent).into();
             assert!(admitted(&client, error, None, far).await.is_none());
         }
         for status in [400, 401, 403, 404, 408, 409, 413, 422, 501, 505] {
-            let error = DecisionFailure::http(status, None).into();
+            let error = DecisionFailure::http(status, RetryAfter::Absent).into();
             assert!(
                 admitted(&client, error, Some(&retry), far).await.is_none(),
                 "{status}"
@@ -1201,19 +1321,35 @@ mod tests {
         }
         let budget = anyhow!("Decisions submission budget exhausted");
         assert!(admitted(&client, budget, Some(&retry), far).await.is_none());
-        // A numeric Retry-After longer than the backoff sets the wait.
-        let slow = DecisionFailure::http(503, Some(Duration::from_secs(3))).into();
+        // A numeric Retry-After longer than the backoff sets the wait; a
+        // shorter one keeps the backoff.
+        let slow = DecisionFailure::http(503, RetryAfter::Seconds(Duration::from_secs(3))).into();
         assert_eq!(
             admitted(&client, slow, Some(&retry), far).await,
             Some((Duration::from_secs(3), Some(Duration::from_secs(3))))
         );
+        let zero = DecisionFailure::http(429, RetryAfter::Seconds(Duration::ZERO)).into();
+        assert_eq!(
+            admitted(&client, zero, Some(&retry), far).await,
+            Some((RETRY_BACKOFF_MIN, Some(Duration::ZERO)))
+        );
         // A wait that cannot leave the minimum attempt time is refused.
         let near = tokio::time::Instant::now() + Duration::from_millis(2100);
+        let mut error = DecisionFailure::http(502, RetryAfter::Absent).into();
         assert!(
             client
-                .retry_wait(Some(&retry), &DecisionFailure::http(502, None).into(), near)
+                .retry_wait(Some(&retry), &mut error, near)
                 .await
                 .is_none()
+        );
+        // Refusals other than an unusable Retry-After record no refusal reason.
+        assert_eq!(
+            error
+                .downcast_ref::<DecisionFailure>()
+                .unwrap()
+                .diagnostic()
+                .retry_after_refusal,
+            None
         );
     }
 

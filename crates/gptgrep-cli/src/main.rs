@@ -988,13 +988,13 @@ fn contract() -> Value {
         "transient_retry":{"applies_to":"search hybrid/semantic document routing and evidence reranking, including ask/summarize initial and reader searches and planned query-view routes and union rerank",
             "max_retries":1,"statuses":gptgrep_jev::TRANSIENT_RETRY_STATUSES,"request":"identical prepared bytes",
             "backoff_ms":[gptgrep_jev::RETRY_BACKOFF_MIN.as_millis() as u64,gptgrep_jev::RETRY_BACKOFF_MAX.as_millis() as u64],
-            "retry_after":"numeric delta-seconds honoured when longer than the backoff; other forms ignored",
+            "retry_after":"one non-negative integer number of seconds (at most ten digits) is honoured when longer than the backoff; any other returned form (HTTP-date, repeated, negative, fractional or longer) refuses the retry and is recorded as retry_after_refusal: repeated, out_of_range or not_delta_seconds",
             "deadline":"original request deadline, never renewed; retry only if it leaves the wait plus 2 s",
-            "budget":"each attempt is a separate reservation in the same execution context; no retry without a remaining submission",
+            "budget":"each attempt is a separate reservation in the same execution context; no retry without a remaining submission; a call refused by the exhausted budget fails with 'Decisions submission budget exhausted' before any send",
             "never":"timeouts, deadlines, connection or mid-body errors, size/JSON/validation failures, other statuses",
             "accounting":"metrics.jev_retried_attempts keeps each failed attempt's HTTP status with null usage; it counts in jev_calls_attempted, has no jev_usage entry and leaves accounting incomplete",
             "receipts":"an admitted retry is counted, with its failed attempt, in a before_retry progress receipt before its backoff and send; if that receipt cannot be recorded the retry is not sent",
-            "failure_kinds":{"retry_admission":"the retry stopped before its HTTP send","retry_post_send":"a local step failed after the retry was sent; a validated reply's reported usage is kept"},
+            "failure_kinds":{"retry_admission":"the retry stopped before its HTTP send","retry_post_send":"a local step failed after the retry was sent; a reply that had validated keeps its checked usage and served model and counts in jev_requests, jev_models and jev_usage, otherwise its usage is unknown"},
             "single_submission":["judge","enrich support calls (own --support-retries plan)","navigation scans","evidence-role decisions","rich/multimodal search and ask","explicit rerank pools","batch"]}});
     contract["commands"]["judge"]["output"] = json!({
         "success":"validated Decisions response JSON; model is the served build, requested_model is the selector sent",
@@ -2757,7 +2757,29 @@ mod query_plan_cli_tests {
         assert_eq!(retry["statuses"], json!([429, 500, 502, 503, 504]));
         assert_eq!(retry["backoff_ms"], json!([250, 1000]));
         assert!(retry["receipts"].as_str().unwrap().contains("before_retry"));
-        assert!(retry["failure_kinds"]["retry_post_send"].is_string());
+        assert!(
+            retry["failure_kinds"]["retry_post_send"]
+                .as_str()
+                .unwrap()
+                .contains("counts in jev_requests, jev_models and jev_usage")
+        );
+        let retry_after = retry["retry_after"].as_str().unwrap();
+        assert!(retry_after.contains("refuses the retry"));
+        assert!(!retry_after.contains("ignored"));
+        for refusal in [
+            gptgrep_jev::RetryAfterRefusal::Repeated,
+            gptgrep_jev::RetryAfterRefusal::OutOfRange,
+            gptgrep_jev::RetryAfterRefusal::NotDeltaSeconds,
+        ] {
+            let code = serde_json::to_value(refusal).unwrap();
+            assert!(retry_after.contains(code.as_str().unwrap()), "{code}");
+        }
+        assert!(
+            retry["budget"]
+                .as_str()
+                .unwrap()
+                .contains("Decisions submission budget exhausted")
+        );
         assert!(llms().contains("metrics.jev_retried_attempts"));
     }
 

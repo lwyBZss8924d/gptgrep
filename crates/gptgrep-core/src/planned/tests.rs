@@ -1201,3 +1201,117 @@ async fn bounded_retry_of_the_union_rerank_keeps_both_attempts_in_operation_rece
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn validated_union_retry_reply_keeps_its_usage_when_a_local_step_fails() -> Result<()> {
+    // One scoped document: the union rerank and its bounded retry are the only
+    // submissions. The retry validates, then a local observer step rejects it.
+    let (directory, generation, _) = fixture("notes.txt", "\n", false).await?;
+    let (client, server) = crate::tests::mock_jev(vec![502, 200]).await?;
+    let client = client
+        .with_transient_retry(gptgrep_jev::TransientRetry::with_jitter(|| 0.0))
+        .with_decision_observer(Arc::new(crate::tests::RejectValidated));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let error = search_planned_with_client_and_observer(
+        directory.path(),
+        "cobalt",
+        &[],
+        &options("notes.txt"),
+        &generation,
+        &client,
+        &event_sink(events.clone()),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(server.await?.len(), 2);
+    let failure = error.downcast_ref::<PlannedSearchError>().unwrap();
+    assert_eq!(failure.stage, "union.rerank");
+    assert_eq!(
+        (
+            failure.metrics.jev_calls_attempted,
+            failure.metrics.jev_requests
+        ),
+        (2, 1)
+    );
+    let usage = json!({"input_tokens":101,"output_tokens":2,"cost":0.002});
+    assert_eq!(failure.metrics.jev_usage, std::slice::from_ref(&usage));
+    assert_eq!(
+        failure.metrics.jev_models,
+        ["openai/gpt-6-luna-decisions-20261006"]
+    );
+    assert_eq!(failure.metrics.jev_retried_attempts.len(), 1);
+    assert!(
+        failure.metrics.jev_retried_attempts[0]
+            .attempt
+            .reported_usage
+            .is_none()
+    );
+    assert!(
+        failure.cause.contains("attempt 2: sent and validated"),
+        "{}",
+        failure.cause
+    );
+    assert!(!failure.accounting_complete);
+    // The failed operation receipt carries the same retained usage.
+    let events = events.lock().unwrap();
+    let last = events
+        .iter()
+        .rev()
+        .find(|event| event.operation_id == "union.rerank")
+        .unwrap();
+    assert_eq!(last.event, "failed");
+    assert_eq!(
+        (
+            last.metrics.jev_calls_attempted,
+            last.metrics.jev_requests,
+            last.metrics.jev_retried_attempts.len()
+        ),
+        (2, 1, 1)
+    );
+    assert_eq!(last.metrics.jev_usage, [usage]);
+    assert!(!last.accounting_complete);
+    Ok(())
+}
+
+#[tokio::test]
+async fn exhausted_submission_budget_mid_plan_is_reported_as_such() -> Result<()> {
+    // Routing-call mechanics: the one-document route uses the only submission,
+    // so the union rerank is refused at reservation, before any send.
+    let _route = crate::RouteSingleDocument::enable();
+    let (directory, generation, _) = fixture("notes.txt", "\n", false).await?;
+    let mock = mock(&["cobalt"], [0; 3], [200; 4], 3.0, false).await?;
+    let context = gptgrep_jev::ExecutionContext::new(
+        "planned-budget-exhaustion",
+        &"f".repeat(64),
+        std::time::SystemTime::now() + Duration::from_secs(30),
+        1,
+    )?;
+    let client = mock.client.clone().with_execution_context(context.clone());
+    let error = search_planned_with_client_and_observer(
+        directory.path(),
+        "cobalt",
+        &[],
+        &options("notes.txt"),
+        &generation,
+        &client,
+        &|_: &PlannedSearchEvent| -> Result<()> { Ok(()) },
+    )
+    .await
+    .unwrap_err();
+    let failure = error.downcast_ref::<PlannedSearchError>().unwrap();
+    assert_eq!(failure.stage, "union.rerank");
+    assert_eq!(
+        failure.cause,
+        "Decisions submission budget exhausted; the call was not sent; no local fallback"
+    );
+    assert_eq!(
+        (
+            failure.metrics.jev_calls_attempted,
+            failure.metrics.jev_requests
+        ),
+        (2, 1)
+    );
+    assert_eq!(mock.requests.lock().unwrap().len(), 1);
+    assert_eq!(context.snapshot()?.logical_reservations, 1);
+    Ok(())
+}

@@ -268,10 +268,32 @@ pub(crate) async fn mock_jev(plan: Vec<u16>) -> (JevClient, tokio::task::JoinHan
     (client, server)
 }
 
+/// Rejects every validated Decisions reply, as a failed local ledger record or
+/// caller observer would after the provider completed the submission.
+pub(crate) struct RejectValidated;
+
+impl gptgrep_jev::DecisionObserver for RejectValidated {
+    fn send_started(&self, _: &gptgrep_jev::DecisionRequestObservation<'_>) -> Result<()> {
+        Ok(())
+    }
+    fn validated_response(
+        &self,
+        _: &gptgrep_jev::DecisionRequestObservation<'_>,
+        _: &gptgrep_jev::DecisionResponse,
+    ) -> Result<()> {
+        Err(anyhow!("synthetic-local-ledger-failure"))
+    }
+    fn failed(&self, _: &gptgrep_jev::DecisionRequestObservation<'_>) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// A planned seed whose union rerank receives a transient status, under the
-/// same bounded retry the production host client uses.
+/// same bounded retry the production host client uses, optionally with a
+/// local decision observer on the client.
 async fn planned_retry_bootstrap(
     statuses: Vec<u16>,
+    observer: Option<std::sync::Arc<dyn gptgrep_jev::DecisionObserver>>,
 ) -> (Result<()>, Accounting, Vec<Value>, tempfile::TempDir) {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -282,7 +304,10 @@ async fn planned_retry_bootstrap(
     gptgrep_core::index(root.path(), 10).await.unwrap();
     // One scoped document: the union rerank and its retry are the only calls.
     let (client, server) = mock_jev(statuses).await;
-    let client = client.with_transient_retry(gptgrep_jev::TransientRetry::with_jitter(|| 0.0));
+    let mut client = client.with_transient_retry(gptgrep_jev::TransientRetry::with_jitter(|| 0.0));
+    if let Some(observer) = observer {
+        client = client.with_decision_observer(observer);
+    }
     let (mut evidence, accounting) = configured(root.path(), client, Some("ledger.md"));
     let question = "Which items are stored in the copper archive?";
     accounting
@@ -297,7 +322,7 @@ async fn planned_retry_bootstrap(
 
 #[tokio::test]
 async fn planned_bootstrap_accounts_a_successful_bounded_retry() {
-    let (result, accounting, requests, _root) = planned_retry_bootstrap(vec![502, 200]).await;
+    let (result, accounting, requests, _root) = planned_retry_bootstrap(vec![502, 200], None).await;
     result.unwrap();
     assert_eq!(requests.len(), 2);
     assert_eq!(
@@ -332,7 +357,7 @@ async fn planned_bootstrap_accounts_a_successful_bounded_retry() {
 
 #[tokio::test]
 async fn planned_bootstrap_keeps_both_attempts_when_the_retry_also_fails() {
-    let (result, accounting, requests, _root) = planned_retry_bootstrap(vec![502, 503]).await;
+    let (result, accounting, requests, _root) = planned_retry_bootstrap(vec![502, 503], None).await;
     assert!(result.is_err());
     assert_eq!(requests.len(), 2);
     let summary = accounting.summary();
@@ -352,6 +377,59 @@ async fn planned_bootstrap_keeps_both_attempts_when_the_retry_also_fails() {
         ),
         (2, 1)
     );
+}
+
+#[tokio::test]
+async fn planned_bootstrap_keeps_a_validated_retry_reply_when_a_local_step_fails() {
+    // The union rerank's retry is sent and validated; a local observer step
+    // then rejects it. Its usage stays in the failed operation and summary.
+    let (result, accounting, requests, _root) =
+        planned_retry_bootstrap(vec![502, 200], Some(std::sync::Arc::new(RejectValidated))).await;
+    assert!(result.is_err());
+    assert_eq!(requests.len(), 2);
+    let summary = accounting.summary();
+    assert_eq!(summary.initial_status, "failed");
+    assert_eq!((summary.attempted_calls, summary.requests), (2, 1));
+    assert_eq!(summary.unobserved_attempts, 1);
+    assert_eq!(
+        summary.usage,
+        [json!({"input_tokens":12,"output_tokens":2,"cost":0.001})]
+    );
+    assert_eq!(summary.models, ["openai/gpt-6-luna-decisions-20261006"]);
+    assert!(!summary.accounting_complete);
+    let search = &summary.searches[0];
+    assert_eq!(search.status, "failed");
+    assert_eq!(search.metrics.jev_retried_attempts.len(), 1);
+    assert!(
+        search.metrics.jev_retried_attempts[0]
+            .attempt
+            .reported_usage
+            .is_none()
+    );
+    let union = &search.plan.as_ref().unwrap().operations["union.rerank"];
+    assert_eq!(union.event, "failed");
+    assert_eq!(
+        (
+            union.metrics.jev_calls_attempted,
+            union.metrics.jev_requests,
+            union.metrics.jev_usage.len()
+        ),
+        (2, 1, 1)
+    );
+    assert!(
+        union
+            .cause
+            .as_deref()
+            .is_some_and(|cause| cause.contains("attempt 2: sent and validated"))
+    );
+    // The durable ledger keeps the same totals; no local error text leaks.
+    let ledger = std::fs::read_to_string(accounting.path()).unwrap();
+    let last: Value = serde_json::from_str(ledger.lines().last().unwrap()).unwrap();
+    assert_eq!(
+        (last["attempted_calls"].as_u64(), last["requests"].as_u64()),
+        (Some(2), Some(1))
+    );
+    assert!(!ledger.contains("synthetic-local-ledger-failure"));
 }
 
 #[tokio::test]

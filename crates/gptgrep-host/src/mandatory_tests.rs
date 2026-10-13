@@ -452,6 +452,71 @@ async fn partial_rerank_failure_preserves_routing_usage_in_typed_error_and_ledge
 }
 
 #[tokio::test]
+async fn validated_retry_reply_keeps_its_usage_in_the_typed_error_and_ledger() {
+    let root = corpus().await;
+    // One scoped document: the rerank gets HTTP 502; its retry is sent and
+    // validated, then a local observer step rejects the reply.
+    let (client, server, requests) = mock_jev(vec![(502, 0.0), (200, 3.0)]).await;
+    let client = client
+        .with_transient_retry(gptgrep_jev::TransientRetry::with_jitter(|| 0.0))
+        .with_decision_observer(Arc::new(crate::query_plan::tests::RejectValidated));
+    let home = tempfile::tempdir().unwrap();
+    let config = HostConfig {
+        codex_home: home.path().to_owned(),
+        codex_bin: "/missing/mock-codex".into(),
+        document: Some("pipeline-notes.md".into()),
+        ..HostConfig::default()
+    };
+    let error = execute_with_client(
+        root.path(),
+        "Describe the transformation.",
+        None,
+        &config,
+        Some(client),
+    )
+    .await
+    .unwrap_err();
+    server.await.unwrap();
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    let error = error.downcast_ref::<HostRetrievalError>().unwrap();
+    assert_eq!(error.stage, "initial_search");
+    assert_eq!((error.jev.attempted_calls, error.jev.requests), (2, 1));
+    assert_eq!(error.jev.unobserved_attempts, 1);
+    // The validated retry keeps its usage; the failed attempt stays unknown.
+    assert_eq!(
+        error.jev.usage,
+        [json!({"input_tokens":101,"output_tokens":2,"cost":0.002})]
+    );
+    assert!(!error.jev.accounting_complete);
+    let retried = &error.jev.searches[0].metrics.jev_retried_attempts;
+    assert_eq!(retried.len(), 1);
+    assert_eq!(retried[0].attempt.http_status, Some(502));
+    assert!(retried[0].attempt.reported_usage.is_none());
+    let cause = error.cause.as_ref().unwrap();
+    assert_eq!(cause["stage"], "evidence_reranking");
+    assert!(
+        cause["cause"]
+            .as_str()
+            .unwrap()
+            .contains("attempt 2: sent and validated")
+    );
+    let events = ledger_events(&error.ledger_path);
+    let last = events.last().unwrap();
+    assert_eq!(
+        (last["attempted_calls"].as_u64(), last["requests"].as_u64()),
+        (Some(2), Some(1))
+    );
+    assert!(events.iter().any(|event| {
+        event["search"]["metrics"]["jev_usage"]
+            .as_array()
+            .is_some_and(|usage| usage.len() == 1)
+    }));
+    let raw = std::fs::read_to_string(&error.ledger_path).unwrap();
+    assert!(!raw.contains("synthetic-local-ledger-failure"));
+    assert!(!raw.contains("private-provider-body-sentinel"));
+}
+
+#[tokio::test]
 async fn codex_startup_failure_retains_successful_initial_accounting() {
     let root = corpus().await;
     let (client, server, _) = mock_jev(vec![(200, 3.0)]).await;
