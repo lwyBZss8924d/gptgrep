@@ -418,7 +418,10 @@ done
     );
     let error = result.unwrap_err();
     assert!(
-        error.to_string().contains("time limit") || error.to_string() == "host_deadline_exceeded",
+        matches!(
+            error.to_string().as_str(),
+            "host_codex_process_timeout" | "host_deadline_exceeded"
+        ),
         "{error}"
     );
     let ready_pid = ready.expect("mock runtime did not reach turn/start before the startup limit");

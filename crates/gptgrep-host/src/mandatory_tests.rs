@@ -539,6 +539,11 @@ async fn codex_startup_failure_retains_successful_initial_accounting() {
     server.await.unwrap();
     let error = error.downcast_ref::<HostRetrievalError>().unwrap();
     assert_eq!(error.stage, "codex");
+    assert_eq!(error.code, "host_codex_binary_unavailable");
+    assert_eq!(
+        error.model_attempts[0].error,
+        Some(json!({"code":"host_codex_binary_unavailable"}))
+    );
     assert_eq!(error.jev.requests, 1);
     assert_eq!(error.jev.attempted_calls, 1);
     assert_eq!(error.jev.usage.len(), 1);
@@ -547,6 +552,77 @@ async fn codex_startup_failure_retains_successful_initial_accounting() {
     assert_eq!(
         ledger_events(&error.ledger_path).last().unwrap()["event"],
         "failed"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn reader_turn_failure_code_reaches_the_ask_error_and_attempt_ledger() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = corpus().await;
+    let (client, server, _) = mock_jev(vec![(200, 3.0)]).await;
+    let home = tempfile::tempdir().unwrap();
+    let launcher = home.path().join("mock-reader-runtime");
+    // A completed turn that never delivers a final agent message.
+    let mut script = String::from("#!/bin/sh\n");
+    for response in [
+        json!({"id":1,"result":{}}),
+        json!({"id":100,"result":{"account":{"type":"chatgpt"}}}),
+        json!({"id":2,"result":{"config":{}}}),
+        json!({"id":3,"result":{"thread":{"id":"thread-native"},"model":DEFAULT_MODEL,
+            "modelProvider":"openai","reasoningEffort":"max","serviceTier":"priority",
+            "approvalPolicy":"never","sandbox":{"type":"readOnly","networkAccess":false}}}),
+        json!({"id":4,"result":{"turn":{"id":"turn-native"}}}),
+        json!({"method":"turn/completed","params":{"threadId":"thread-native",
+            "turn":{"id":"turn-native","status":"completed","items":[]}}}),
+    ] {
+        if response.get("id").is_some() {
+            script.push_str("read -r request\n");
+        }
+        if response["id"] == 100 {
+            script.push_str("read -r request\n"); // initialized precedes account/read
+        }
+        script.push_str(&format!("printf '%s\\n' '{response}'\n"));
+    }
+    script.push_str("while :; do sleep 1; done\n");
+    std::fs::write(&launcher, script).unwrap();
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config = HostConfig {
+        codex_home: home.path().to_owned(),
+        codex_bin: launcher.to_string_lossy().into_owned(),
+        document: Some("pipeline-notes.md".into()),
+        timeout_secs: 30,
+        ..HostConfig::default()
+    };
+    let error = execute_with_client(
+        root.path(),
+        "Describe the transformation.",
+        None,
+        &config,
+        Some(client),
+    )
+    .await
+    .unwrap_err();
+    server.await.unwrap();
+    let error = error.downcast_ref::<HostRetrievalError>().unwrap();
+    assert_eq!(
+        (error.code.as_str(), error.stage.as_str()),
+        ("host_codex_no_final_answer", "codex")
+    );
+    assert!(error.cause.is_none());
+    let reader = &error.model_attempts[0];
+    assert_eq!(reader.role, "final_reader");
+    assert_eq!(reader.status, "failed");
+    assert_eq!(reader.turn_id.as_deref(), Some("turn-native"));
+    assert_eq!(
+        reader.error,
+        Some(json!({"code":"host_codex_no_final_answer"}))
+    );
+    let last = ledger_events(&error.ledger_path).pop().unwrap();
+    assert_eq!(last["event"], "failed");
+    assert_eq!(
+        last["model_attempts"][0]["error"]["code"],
+        "host_codex_no_final_answer"
     );
 }
 

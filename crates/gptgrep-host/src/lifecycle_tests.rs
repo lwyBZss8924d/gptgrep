@@ -145,19 +145,36 @@ async fn planner_tool_call_is_denied_and_preserves_prior_usage() {
         "threadId":"thread-native","turnId":"turn-native","callId":"call-1",
         "namespace":"gptgrep","tool":"gptgrep_search","arguments":{"query":"x"}}});
     let (result, attempts, _) = protocol_attempt(vec![usage(), tool], None, true).await;
-    assert!(
-        result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("Pure completion")
+    assert_eq!(
+        result.err().unwrap().to_string(),
+        "host_codex_completion_tool_request"
     );
     assert_eq!(attempts[0].status, "failed");
+    assert_eq!(
+        attempts[0].error.as_ref().unwrap()["code"],
+        "host_codex_completion_tool_request"
+    );
     assert_eq!(
         attempts[0].usage.as_ref().unwrap()["total"]["totalTokens"],
         10
     );
     assert!(!attempts[0].accounting_complete);
+}
+
+#[tokio::test]
+async fn planner_tool_item_reports_its_stable_code() {
+    let item = json!({"method":"item/completed","params":{
+        "threadId":"thread-native","turnId":"turn-native",
+        "item":{"type":"dynamicToolCall","namespace":"gptgrep","tool":"gptgrep_search"}}});
+    let (result, attempts, _) = protocol_attempt(vec![usage(), item], None, false).await;
+    assert_eq!(
+        result.err().unwrap().to_string(),
+        "host_codex_completion_tool_item"
+    );
+    assert_eq!(
+        attempts[0].error.as_ref().unwrap()["code"],
+        "host_codex_completion_tool_item"
+    );
 }
 
 #[tokio::test]
@@ -915,9 +932,17 @@ async fn planned_ask_runs_two_distinct_turns_with_original_question_and_summed_u
 #[cfg(unix)]
 #[tokio::test]
 async fn reader_validation_failures_preserve_completed_planner_and_both_turn_usages() {
-    for answer in [
-        json!({"answer":12,"citations":[],"insufficient_evidence":false}),
-        json!({"answer":"An unsupported claim.","citations":["never-issued"],"insufficient_evidence":false}),
+    for (answer, code, cause) in [
+        (
+            json!({"answer":12,"citations":[],"insufficient_evidence":false}),
+            "host_answer_schema_mismatch",
+            "final_response_schema",
+        ),
+        (
+            json!({"answer":"An unsupported claim.","citations":["never-issued"],"insufficient_evidence":false}),
+            "host_answer_citation_unissued",
+            "unissued_citation",
+        ),
     ] {
         let (root, _) = planner_corpus().await;
         let home = tempfile::tempdir().unwrap();
@@ -935,10 +960,13 @@ async fn reader_validation_failures_preserve_completed_planner_and_both_turn_usa
         assert_eq!(jev_server.await.unwrap().len(), 1);
         let error = error.downcast_ref::<HostRetrievalError>().unwrap();
         assert_eq!(error.stage, "citation_validation");
+        assert_eq!(error.code, code);
+        assert_eq!(error.cause, Some(json!({"code":cause})));
         assert_eq!(error.query_plan.as_ref().unwrap().status, "completed");
         assert_eq!(error.model_attempts.len(), 2);
         assert_eq!(error.model_attempts[0].status, "completed");
         assert_eq!(error.model_attempts[1].status, "failed");
+        assert_eq!(error.model_attempts[1].error, Some(json!({"code":code})));
         assert_eq!(error.model_usage.known_totals.total_tokens, Some(38));
         assert_eq!(error.model_usage.observed_turns, 2);
         assert!(!error.model_usage.accounting_complete);

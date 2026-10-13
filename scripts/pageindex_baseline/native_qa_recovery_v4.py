@@ -27,6 +27,49 @@ POLICY = "gpt6_pre_final_technical_v1"
 MAX_JSON = 32 * 1024 * 1024
 ALLOWED_CODES = {"host_codex_failed", "host_query_plan_failed", "host_jev_search_failed",
                  "host_jev_initial_timeout", "host_navigation_failed", "host_navigation_timeout"}
+# Stable host failure codes (crates/gptgrep-host/README.md, "Failure codes") replaced the
+# host_{stage}_failed fallback of these exits. Each is admitted only at a stage where the
+# fallback it replaced was admitted; the fallbacks above stay admitted for runs recorded before
+# the stable codes. Codes a stage already reported keep their decision, final-answer codes are
+# post-final, and host_codex_process_timeout is never reported for the observed planner or
+# reader. A deadline reached during a pending write is now host_deadline_exceeded and, like
+# other planner and reader timeouts, is not admitted.
+CODEX_PROCESS_CODES = frozenset({
+    "host_codex_home_unavailable", "host_codex_home_not_directory", "host_codex_binary_unavailable",
+    "host_codex_spawn_failed", "host_codex_working_directory_unavailable", "host_codex_state_dir_not_absolute",
+    "host_codex_state_dir_unavailable", "host_codex_state_dir_not_directory", "host_codex_state_dir_not_canonical",
+    "host_codex_state_path_encoding", "host_codex_startup_override_unsupported",
+    "host_codex_startup_override_table_unsupported", "host_codex_startup_override_encoding",
+    "host_codex_stdin_unavailable", "host_codex_stdout_unavailable", "host_codex_stderr_unavailable",
+    "host_codex_process_identity_unavailable", "host_codex_process_identity_invalid",
+    "host_codex_process_group_signal_failed", "host_codex_process_group_check_timeout",
+    "host_codex_process_group_check_failed", "host_codex_process_group_check_unavailable",
+    "host_codex_process_metadata_invalid", "host_codex_process_reap_timeout", "host_codex_process_reap_failed",
+    "host_trace_directory_unavailable", "host_trace_file_unavailable", "host_trace_write_failed",
+    "host_trace_flush_failed", "host_trace_encoding",
+    "host_codex_input_transport_closed", "host_codex_output_transport_failed", "host_codex_app_server_closed",
+    "host_codex_frame_too_large", "host_codex_message_limit", "host_codex_invalid_json", "host_codex_frame_encoding",
+    "host_codex_initialize_rejected", "host_codex_account_read_rejected", "host_codex_config_read_rejected",
+    "host_codex_skills_list_rejected", "host_codex_thread_start_rejected", "host_codex_turn_start_rejected",
+    "host_codex_request_rejected", "host_codex_response_without_result", "host_codex_chatgpt_login_required",
+    "host_codex_config_unavailable", "host_codex_mcp_config_unsupported", "host_codex_mcp_server_limit",
+    "host_codex_identity_missing", "host_codex_identity_invalid", "host_codex_model_provider_changed",
+    "host_codex_model_changed", "host_codex_reasoning_effort_changed", "host_codex_service_tier_changed",
+    "host_codex_service_tier_invalid", "host_codex_approval_policy_rejected", "host_codex_sandbox_rejected",
+    "host_codex_permission_profile_unacknowledged", "host_codex_event_thread_mismatch",
+    "host_codex_turn_identity_changed", "host_codex_turn_identity_missing", "host_codex_item_not_allowed",
+    "host_codex_item_tool_not_allowed", "host_codex_tool_call_thread_mismatch", "host_codex_tool_call_repeated",
+    "host_codex_tool_name_invalid", "host_codex_tool_not_allowed", "host_codex_tool_arguments_too_large",
+    "host_codex_tool_arguments_encoding", "host_codex_completion_tool_request", "host_codex_completion_tool_item",
+    "host_codex_agent_message_without_text", "host_codex_final_message_invalid",
+    "host_codex_final_response_too_large", "host_codex_no_final_answer"})
+STABLE_CODE_STAGES = {
+    "query_plan": CODEX_PROCESS_CODES,
+    "codex": CODEX_PROCESS_CODES | {"host_navigation_overlay_unavailable", "host_index_unavailable", "host_search_failed",
+                                    "host_evidence_interval_uncontained", "host_tool_result_encoding",
+                                    "host_tool_budget_unknown_tool", "host_tool_budget_invalid_arguments"},
+    "navigation": frozenset({"host_index_unavailable", "host_generation_changed"}),
+}
 REMOTE_INFO = {"rateLimitExceeded", "serverOverloaded", "httpConnectionFailed",
                "responseStreamConnectionFailed", "internalServerError", "responseStreamDisconnected",
                "responseTooManyFailedAttempts"}
@@ -223,8 +266,9 @@ def assess_attempt(origin, receipt, case, source, publication, manifest):
     cause = proof["typed_cause"]
     prohibited = cause is not None and (cause["codex_error_info"] in NONRECOVERABLE_INFO
                   or cause["kind"] in {"tool_budget_exhausted", "identity_mismatch", "malformed_error", "invalid_turn_status"})
-    eligible = (failure["code"] in ALLOWED_CODES and failure.get("stage") in
-                ("query_plan", "query_plan_prepare", "initial_search", "codex", "navigation")
+    stage = failure.get("stage")
+    admitted = failure["code"] in ALLOWED_CODES or (isinstance(stage, str) and failure["code"] in STABLE_CODE_STAGES.get(stage, ()))
+    eligible = (admitted and stage in ("query_plan", "query_plan_prepare", "initial_search", "codex", "navigation")
                 and proof["pre_final_proven"] and not prohibited)
     return {**result, "eligible": eligible, "reason": proof["boundary"] if eligible else "final_boundary_or_failure_category_not_admitted",
             "failure_code": failure["code"], "failure_stage": failure.get("stage"), "proof": proof,

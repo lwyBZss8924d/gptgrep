@@ -16,7 +16,7 @@ impl Trace {
         let Some(path) = path else { return Ok(None) };
         if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)
-                .map_err(|_| anyhow!("Could not create private trace directory"))?;
+                .map_err(|_| anyhow!("host_trace_directory_unavailable"))?;
         }
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -27,7 +27,7 @@ impl Trace {
         }
         let file = options
             .open(path)
-            .map_err(|_| anyhow!("Private trace path must be a new writable file"))?;
+            .map_err(|_| anyhow!("host_trace_file_unavailable"))?;
         Ok(Some(Self {
             file,
             bytes: 0,
@@ -79,23 +79,23 @@ impl Trace {
             "error_diagnostics":error.as_ref().and_then(|error|error.diagnostics.as_ref()),
             "http_status_code":error.and_then(|error|error.http_status_code)
         });
-        let mut line = serde_json::to_vec(&entry)?;
+        let mut line = serde_json::to_vec(&entry).map_err(|_| anyhow!("host_trace_encoding"))?;
         line.push(b'\n');
         if self.events >= 256 || self.bytes + line.len() > 64 * 1024 - 32 {
             self.closed = true;
             self.file
                 .write_all(b"{\"trace_truncated\":true}\n")
-                .map_err(|_| anyhow!("Private trace write failed"))?;
+                .map_err(|_| anyhow!("host_trace_write_failed"))?;
         } else {
             self.file
                 .write_all(&line)
-                .map_err(|_| anyhow!("Private trace write failed"))?;
+                .map_err(|_| anyhow!("host_trace_write_failed"))?;
             self.events += 1;
             self.bytes += line.len();
         }
         self.file
             .flush()
-            .map_err(|_| anyhow!("Private trace flush failed"))?;
+            .map_err(|_| anyhow!("host_trace_flush_failed"))?;
         Ok(())
     }
 }

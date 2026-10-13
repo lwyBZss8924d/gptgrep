@@ -118,7 +118,10 @@ async fn missing_or_wrong_profile_acknowledgment_refuses_before_turn() {
         }
         let (result, sent) = exchange(Some("gptgrep_reader"), response).await;
         let error = result.err().expect("unacknowledged profile must fail");
-        assert!(error.to_string().contains("requested permission profile"));
+        assert_eq!(
+            error.to_string(),
+            "host_codex_permission_profile_unacknowledged"
+        );
         assert!(sent.iter().all(|message| message["method"] != "turn/start"));
     }
 }
@@ -129,12 +132,9 @@ async fn named_profile_still_requires_selected_approval_before_turn() {
     response["activePermissionProfile"] = json!({"id":"gptgrep_reader"});
     response["approvalPolicy"] = json!("on-request");
     let (result, sent) = exchange(Some("gptgrep_reader"), response).await;
-    assert!(
-        result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("approval policy")
+    assert_eq!(
+        result.err().unwrap().to_string(),
+        "host_codex_approval_policy_rejected"
     );
     assert!(sent.iter().all(|message| message["method"] != "turn/start"));
 }
@@ -165,12 +165,12 @@ async fn default_profile_preserves_legacy_wire_and_needs_no_named_acknowledgment
         let mut projected = thread_response();
         projected["sandbox"] = sandbox;
         let (result, sent) = exchange(None, projected).await;
-        assert!(
+        assert_eq!(
             result
                 .err()
                 .expect("default must retain read-only network-disabled policy")
-                .to_string()
-                .contains("read-only sandbox")
+                .to_string(),
+            "host_codex_sandbox_rejected"
         );
         assert!(sent.iter().all(|message| message["method"] != "turn/start"));
     }
