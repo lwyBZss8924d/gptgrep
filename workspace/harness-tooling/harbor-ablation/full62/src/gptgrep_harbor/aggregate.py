@@ -35,11 +35,21 @@ def decisions_costs(rows, runtime):
     limit = None
     if mode == "invocation_bounded":
         # The product enforces the per-trial submission limit; a failed Ask with
-        # no remaining submission is limit-bound (an operational failure).
+        # no remaining submission is limit-bound (an operational failure). Every
+        # attempt takes a reservation, a transient retry included: a bound trial
+        # with reservations that returned no validated response may have bound
+        # because of provider errors rather than its own need.
         budgets = [row["trial_budget"] if type(row["trial_budget"]) is dict else {} for row in rows]
+        unvalidated = [budget.get("unvalidated_reservations") for budget in budgets
+                       if budget.get("limit_bound") is True]
+        unvalidated = [value if type(value) is int and value >= 0 else None for value in unvalidated]
         limit = {"max_submissions_per_trial": runtime.get("decisions_max_submissions_per_trial"),
                  "enforced_by": TRIAL_LIMIT_ENFORCER,
-                 "bound_trials": sum(budget.get("limit_bound") is True for budget in budgets),
+                 "bound_trials": len(unvalidated),
+                 "bound_trials_with_unvalidated_reservations": sum(value is not None and value > 0
+                                                                   for value in unvalidated),
+                 "bound_trials_with_only_validated_reservations": sum(value == 0 for value in unvalidated),
+                 "bound_trials_reservations_unobserved": sum(value is None for value in unvalidated),
                  "reached_trials": sum(budget.get("limit_reached") is True for budget in budgets),
                  "unobserved_trials": sum(type(budget.get("limit_reached")) is not bool for budget in budgets)}
     return {"mode": mode, "treatment_trials": len(rows),
@@ -349,8 +359,17 @@ def summarize(export, records, runtime):
     if builds > 1:
         mixed_builds = [str(builds) + " distinct product provenance digests among the treatment records: the "
                         "treatment trials did not all run one product build, so their reader contracts may differ."]
+    decisions = decisions_costs(values["gptgrep"], runtime)
+    submission_limit = decisions["submission_limit"] or {}
+    provider_bound = []
+    if submission_limit.get("bound_trials_with_unvalidated_reservations"):
+        provider_bound = ["Limit-bound treatment trials that spent part of their Decisions submission limit on "
+                          "attempts without a validated response, for example a transient provider error before "
+                          "its retry: " + str(submission_limit["bound_trials_with_unvalidated_reservations"]) +
+                          ". With more headroom they might have completed, so their known zeros partly reflect "
+                          "provider errors."]
     return {"schema": "gptgrep.harbor.paired-summary.v1", "search": summary, "paired": comparison,
-            "decisions": decisions_costs(values["gptgrep"], runtime),
+            "decisions": decisions,
             "reader_contract": contract,
             "trial_claims": claims,
             "judge": {"outer_attempts_observed": len(judge_attempts),
@@ -381,4 +400,5 @@ def summarize(export, records, runtime):
               "No full62 result establishes comprehensive INDEX quality.",
               "Answerable and unanswerable slices need evaluator-side answerability metadata, "
               "which the cohort projection does not carry; abstention counts are not those slices.",
-              "Source preparation and aggregation do not grant release or Goal acceptance."] + reexecuted + mixed_builds}
+              "Source preparation and aggregation do not grant release or Goal acceptance."]
+                           + reexecuted + mixed_builds + provider_bound}

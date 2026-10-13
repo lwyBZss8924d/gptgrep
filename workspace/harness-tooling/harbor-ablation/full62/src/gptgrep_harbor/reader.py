@@ -14,7 +14,7 @@ from .process import run
 from .runtime import CODEX_VERSION, DECISIONS_BUDGET, DECISIONS_LEDGER_DIR, check_config, native_environment
 from .decisions import (TRIAL_BUDGET, acquire_writer, claim_invocation, init_trial_budget,
                         prepare as prepare_decisions, product_limits, record_invocation, selected_mode,
-                        trial_budget_status, trial_paths, trial_submission_limit)
+                        trial_budget_status, trial_paths, trial_submission_limit, unvalidated_reservations)
 
 
 # A completed legacy report is a response. An insufficient_evidence report with
@@ -411,12 +411,15 @@ def main():
                 operation["decisions_receipt"] = record_invocation(binding, result["stdout"], attempt)
             except (OSError, ValueError, TypeError):
                 operation["decisions_receipt"] = None
-            # The product's own ledger shows whether the Ask used its whole allowance.
+            # The product's own ledger shows whether the Ask used its whole allowance,
+            # and how much of it went to attempts without a validated response.
             trial_budget = operation["decisions_trial_budget"]
             status = trial_budget["status_after_ask"] = trial_budget_status(config, trial_budget)
             if status is not None:
                 trial_budget["remaining_submissions"] = status["remaining_submissions"]
                 trial_budget["limit_reached"] = status["remaining_submissions"] == 0
+                trial_budget["unvalidated_reservations"] = unvalidated_reservations(status,
+                                                                                    attempt.get("decisions_cost"))
         require(result["failure"] is None and result["return_code"] == 0, "reader_process")
         answer, metadata = (product_result(result["stdout"], config["reader_mode"]) if binding["arm"] == "gptgrep"
                             else codex_result(result["stdout"]))

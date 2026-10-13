@@ -432,17 +432,35 @@ class CostAggregationTests(unittest.TestCase):
 
     def test_limit_bound_trials_are_judged_failures_visible_in_the_summary(self):
         known = {"cost_complete": True, "reported_cost_usd": 0.01, "priced_rows": 3}
-        budgets = ([{"limit_reached": True, "limit_bound": True}] * 2 + [{"limit_reached": True, "limit_bound": False}]
-                   + [{"limit_reached": False, "limit_bound": False}] * 58 + [{"limit_reached": None, "limit_bound": None}])
-        self.budgets = budgets
+
+        def budget(reached, bound, unvalidated):
+            return {"limit_reached": reached, "limit_bound": bound, "unvalidated_reservations": unvalidated}
+        # Bound trials: one spent a reservation on an attempt without a validated response,
+        # one needed more submissions than the limit, and one has no usable count.
+        self.budgets = ([budget(True, True, 1), budget(True, True, 0), budget(True, True, None),
+                         budget(True, False, 0)] + [budget(False, False, 0)] * 57 + [budget(None, None, None)])
         summary = self.results([known] * 62)
         self.assertEqual(summary["submission_limit"], {"max_submissions_per_trial": LIMIT,
                                                        "enforced_by": "product_decisions_budget_ledger",
-                                                       "bound_trials": 2, "reached_trials": 3, "unobserved_trials": 1})
+                                                       "bound_trials": 3,
+                                                       "bound_trials_with_unvalidated_reservations": 1,
+                                                       "bound_trials_with_only_validated_reservations": 1,
+                                                       "bound_trials_reservations_unobserved": 1,
+                                                       "reached_trials": 4, "unobserved_trials": 1})
         treatment = self.summary["search"]["gptgrep"]
-        self.assertEqual((treatment["operational_failures"], treatment["correct"]), (2, 60))
-        self.assertEqual(treatment["operational_failure_codes"], {"decisions_submission_limit_reached": 2})
+        self.assertEqual((treatment["operational_failures"], treatment["correct"]), (3, 59))
+        self.assertEqual(treatment["operational_failure_codes"], {"decisions_submission_limit_reached": 3})
         self.assertEqual(self.summary["search"]["raw_only"]["operational_failure_codes"], {})
+        # Provider errors that may have made the limit bind are a stated limitation.
+        notes = [note for note in self.summary["limitations"] if note.startswith("Limit-bound treatment trials")]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("without a validated response, for example a transient provider error before its retry: 1.",
+                      notes[0])
+        # Without such a trial there is no such limitation.
+        self.budgets = [budget(True, True, 0)] + [budget(False, False, 0)] * 61
+        self.assertEqual(self.results([known] * 62)["submission_limit"]["bound_trials_with_unvalidated_reservations"],
+                         0)
+        self.assertFalse(any(note.startswith("Limit-bound") for note in self.summary["limitations"]))
 
 
 if __name__ == "__main__":

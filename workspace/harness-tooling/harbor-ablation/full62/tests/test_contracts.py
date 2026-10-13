@@ -932,13 +932,26 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
         self.assertNotIn("failure_code", operation)
 
     def test_binding_trial_limit_is_a_recorded_operational_failure_and_never_retried(self):
-        failed = canonical({"status": "failed", "error": {"jev": {"requests": 8, "attempted_calls": 9}}})
-        cases = (("failed_at_limit", failed, FakeTrialLedger(remaining=0), "operational_failure", True, True),
-                 ("completed_at_limit", legacy_report(), FakeTrialLedger(remaining=0), "response", True, False),
-                 ("failed_below_limit", failed, FakeTrialLedger(remaining=3), "operational_failure", False, False),
-                 ("status_unavailable", failed, FakeTrialLedger(status="unavailable"), "operational_failure",
-                  None, None))
-        for name, report, ledger, status, reached, bound in cases:
+        def failed(requests, attempted):
+            # A failed Ask's own Decisions accounting: a submission refused at the
+            # limit is an attempted call without a reservation or a validated response.
+            return canonical({"status": "failed", "error": {"jev": {"requests": requests,
+                                                                    "attempted_calls": attempted}}})
+        completed = legacy_report(jev={"requests": 8, "attempted_calls": 8, "usage": [{"cost": 0.0125}] * 8})
+        # (case, report, ledger, envelope status, limit_reached, limit_bound, unvalidated_reservations)
+        cases = (("failed_at_limit", failed(8, 9), FakeTrialLedger(remaining=0), "operational_failure", True, True, 0),
+                 # One transient provider error took a reservation, so its retry was refused at the limit.
+                 ("failed_at_limit_after_a_transient_error", failed(7, 9), FakeTrialLedger(remaining=0),
+                  "operational_failure", True, True, 1),
+                 ("completed_at_limit", completed, FakeTrialLedger(remaining=0), "response", True, False, 0),
+                 ("failed_below_limit", failed(5, 6), FakeTrialLedger(remaining=3), "operational_failure",
+                  False, False, 0),
+                 # More validated responses than reservations is no usable count.
+                 ("inconsistent_receipt", failed(9, 9), FakeTrialLedger(remaining=0), "operational_failure",
+                  True, True, None),
+                 ("status_unavailable", failed(8, 9), FakeTrialLedger(status="unavailable"), "operational_failure",
+                  None, None, None))
+        for name, report, ledger, status, reached, bound, unvalidated in cases:
             with self.subTest(case=name):
                 outputs, child = self.run_reader(report, config=self.invocation_config(),
                                                  claim_root=self.claim_root(), ledger=ledger)
@@ -947,7 +960,8 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
                 self.assertEqual(envelope["status"], status)
                 operation = outputs["/logs/agent/operational.json"]
                 budget = operation["decisions_trial_budget"]
-                self.assertEqual((budget["limit_reached"], budget["limit_bound"]), (reached, bound))
+                self.assertEqual((budget["limit_reached"], budget["limit_bound"], budget["unvalidated_reservations"]),
+                                 (reached, bound, unvalidated))
                 self.assertEqual(operation.get("failure_code"),
                                  "decisions_submission_limit_reached" if bound else None)
                 if bound:

@@ -295,7 +295,22 @@ def init_trial_budget(config, binding, claim, deadline_unix_ms, remaining, envir
             "deadline_unix_ms": budget["deadline_unix_ms"], "ledger_path": str(ledger),
             "control": {"path": str(control), "bytes": len(data), "sha256": sha(data)},
             "init_elapsed_ms": result["elapsed_ms"], "status_after_ask": None,
-            "remaining_submissions": None, "limit_reached": None, "limit_bound": None}
+            "remaining_submissions": None, "limit_reached": None, "limit_bound": None,
+            "unvalidated_reservations": None}
+
+
+def unvalidated_reservations(status, receipt):
+    """Reservations in this trial's ledger whose attempt returned no validated response; None when unknown.
+
+    Every Decisions attempt takes its own reservation, a bounded transient retry
+    included, so a failed attempt (for example a provider error before its
+    retry) spends part of the per-trial limit without a validated response. A
+    submission refused at the limit takes none. The count is the ledger's
+    reservation total minus the Ask's validated responses from its cost receipt.
+    """
+    validated = receipt.get("validated_requests") if type(receipt) is dict else None
+    total = status["reservations"]["total"]
+    return total - validated if type(validated) is int and 0 <= validated <= total else None
 
 
 def trial_budget_status(config, record):
