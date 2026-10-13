@@ -15,7 +15,9 @@ def main():
     prepare = sub.add_parser(
         "prepare", help="Validate the admitted runtime, print its budget preflight, then write all 124 tasks",
         description="Validate the pinned manifest and its admitted runtime, print the budget preflight "
-                    "(treatment tool cap against the uncapped bare arm, selected Decisions mode and, for "
+                    "(treatment tool cap against the uncapped bare arm, where any cap below the adapter "
+                    "maximum is a declared deviation; the selected Decisions mode with, for existing_context, "
+                    "the shared ledger allowance against the cohort's mandatory bootstraps and, for "
                     "invocation_bounded, the cohort bound of one claimed Ask per trial against "
                     "decisions_cost_cap_usd, which is an admission check rather than a runtime stop; advisory "
                     "warnings) as one JSON line before any task is created, then materialize the complete "

@@ -40,6 +40,13 @@ def write_pin(path, value):
     return {"path": str(path), "bytes": len(data), "sha256": sha(data)}
 
 
+def synthetic_budget(max_submissions):
+    """A synthetic existing-context budget control; no finance owner or ledger behind it."""
+    return {"schema_version": "gptgrep.decisions-budget-contract.v1", "run_id": "synthetic-run",
+            "plan_digest": "a" * 64, "max_submissions": max_submissions, "deadline_unix_ms": 1,
+            "ledger_path": "/opt/full62-private/ledger/decisions.json"}
+
+
 class HarborMaterializationTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"])
@@ -57,7 +64,7 @@ class HarborMaterializationTests(unittest.TestCase):
             "native_cli": {"version": "0.162.1", "release_tag": "rust-v0.162.1", "source_commit": CODEX_SOURCE_COMMIT},
             "auth": {"method": "chatgpt_device_file", "reader_file": "/synthetic-private/reader/auth.json",
                      "judge_file": "/synthetic-private/judge/auth.json"},
-            "decisions_budget": {"path": "/synthetic-private/decisions-budget.json", "bytes": 2, "sha256": "e" * 64},
+            "decisions_budget": write_pin(self.root / "decisions-budget.json", synthetic_budget(200)),
             "decisions_ledger_dir": "/synthetic-private/ledger",
             "admitted": True, "admission": None, "account_scope": "Dev/Test/Eval", "platform": "linux/amd64",
             "run_id": "synthetic-full62", "jobs_dir": str(self.root / "jobs"),
@@ -73,7 +80,8 @@ class HarborMaterializationTests(unittest.TestCase):
             "native_ptc": True, "codex_permissions": "full62_reader",
             "primary_metric": "answer_equivalence_delta", "bootstrap_seed": 17, "trial_order_seed": 23,
             "max_asset_bytes": 1048576, "max_assets_total_bytes": 1048576,
-            "deadline_seconds": 20, "judge_deadline_seconds": 20, "max_tool_calls": 8, "max_input_bytes": 8192,
+            "deadline_seconds": 20, "judge_deadline_seconds": 20, "max_tool_calls": MAX_TOOL_CALLS,
+            "max_input_bytes": 8192,
             "documents": documents, "index_files": [{"relative_path": ".gptgrep/index.bin",
                 "pin": write_pin(self.root / "index.bin", b"generic synthetic index")}],
             "resources": {"cpus": 1, "memory_mb": 512, "storage_mb": 512}}
@@ -138,10 +146,12 @@ class HarborMaterializationTests(unittest.TestCase):
                          [output / name for name in result["trial_order"]["task_names"]])
         self.assertTrue(all(task.source == output.name for task in job.tasks))
         self.assertEqual(job.agents[0].import_path, "gptgrep_harbor.agent:PairedNativeAgent")
-        # The fixture's treatment cap (8) is below the parity floor: valid, but warned.
-        self.assertEqual(result["preflight"]["tool_budget"]["treatment_max_tool_calls"], 8)
+        # The fixture uses the parity cap and one shared existing-context ledger,
+        # whose allowance is warned against the cohort's mandatory bootstraps.
+        self.assertEqual((result["preflight"]["tool_budget"]["treatment_max_tool_calls"],
+                          result["preflight"]["tool_budget"]["parity"]), (MAX_TOOL_CALLS, "adapter_maximum"))
         self.assertEqual([warning["code"] for warning in result["preflight"]["warnings"]],
-                         ["treatment_tool_cap_may_bind_before_deadline"])
+                         ["decisions_shared_allowance_may_exhaust"])
         # Decisions run in the treatment's GPTgrep host process, outside the Codex
         # tool sandbox, so the job keeps the OpenRouter key reference (never a value).
         job_record = json.loads((self.root / "dataset.job.json").read_text())
@@ -163,7 +173,8 @@ class HarborMaterializationTests(unittest.TestCase):
             self.assertNotIn("auth", reader)
             self.assertEqual(reader["budget_scope"]["reader_question_max_bytes"], 8192)
             self.assertEqual(reader["budget_scope"]["tool_calls"], "treatment_enforced_raw_observed_only")
-            self.assertEqual(reader["budget_scope"]["treatment_max_tool_calls"], 8)
+            self.assertEqual(reader["budget_scope"]["treatment_max_tool_calls"], MAX_TOOL_CALLS)
+            self.assertEqual(reader["budget_scope"]["treatment_tool_cap_parity"], "adapter_maximum")
             self.assertEqual(reader["budget_scope"]["raw_tool_call_cap"], "none")
             budget_scopes.add(canonical(reader["budget_scope"]))
             self.assertIs(reader["native_ptc"], True)
@@ -217,27 +228,77 @@ class HarborMaterializationTests(unittest.TestCase):
         self.assertEqual(policy["web_search"], "disabled")
         self.assertIs(policy["permissions"]["full62_reader"]["network"]["enabled"], False)
 
-    def test_treatment_tool_cap_accepts_adapter_maximum_and_warns_below_parity_floor(self):
-        self.runtime["max_tool_calls"] = MAX_TOOL_CALLS
+    def tool_cap_warnings(self, preflight):
+        return [warning for warning in preflight["warnings"] if warning["code"].startswith("treatment_tool_cap")]
+
+    def test_treatment_tool_cap_is_the_adapter_maximum_or_a_declared_deviation(self):
         adapter = self.materializer()
         self.assertEqual(adapter.preflight["tool_budget"],
                          {"treatment_max_tool_calls": 10000, "raw_tool_call_cap": "none",
-                          "adapter_maximum": 10000, "warning_floor": 64})
-        self.assertEqual(adapter.preflight["warnings"], [])
+                          "adapter_maximum": 10000, "warning_floor": 64, "parity": "adapter_maximum"})
+        self.assertEqual(self.tool_cap_warnings(adapter.preflight), [])
         argv = reader_argv({**self.runtime, "source_relative_path": "raw-0.txt"},
                            {"arm": "gptgrep"}, "generic question")
         self.assertEqual(argv[argv.index("--max-tool-calls") + 1], "10000")
-        for value, warned in ((TOOL_CALL_WARNING_FLOOR, False), (TOOL_CALL_WARNING_FLOOR - 1, True), (1, True)):
+        # Native items count toward the treatment cap and exceeding it fails the
+        # Ask, while the bare arm is uncapped: any lower cap must be declared in
+        # qualification_mismatches, which the admission binds, and is warned.
+        for value, code in ((MAX_TOOL_CALLS - 1, "treatment_tool_cap_below_adapter_maximum"),
+                            (TOOL_CALL_WARNING_FLOOR, "treatment_tool_cap_below_adapter_maximum"),
+                            (TOOL_CALL_WARNING_FLOOR - 1, "treatment_tool_cap_may_bind_before_deadline"),
+                            (1, "treatment_tool_cap_may_bind_before_deadline")):
             self.runtime["max_tool_calls"] = value
             with self.subTest(max_tool_calls=value):
-                warnings = self.materializer().preflight["warnings"]
-                self.assertEqual(warnings, [{"code": "treatment_tool_cap_may_bind_before_deadline",
-                                             "max_tool_calls": value, "warning_floor": 64}] if warned else [])
+                self.runtime["qualification_mismatches"] = []
+                with self.assertRaisesRegex(ValueError, "treatment_tool_cap_deviation_undeclared"):
+                    self.materializer()
+                self.runtime["qualification_mismatches"] = [{"code": "observed generic mismatch"},
+                                                            adapter_module.tool_cap_deviation(value)]
+                preflight = self.materializer().preflight
+                self.assertEqual(preflight["tool_budget"]["parity"], "declared_deviation")
+                self.assertEqual(self.tool_cap_warnings(preflight),
+                                 [{"code": code, "max_tool_calls": value, "adapter_maximum": 10000,
+                                   "warning_floor": 64}])
+        # A declaration for another value, or a stale one at parity, is rejected.
+        self.runtime["qualification_mismatches"] = [adapter_module.tool_cap_deviation(100)]
+        self.runtime["max_tool_calls"] = 99
+        with self.assertRaisesRegex(ValueError, "treatment_tool_cap_deviation_undeclared"):
+            self.materializer()
+        self.runtime["max_tool_calls"] = MAX_TOOL_CALLS
+        with self.assertRaisesRegex(ValueError, "treatment_tool_cap_deviation_stale"):
+            self.materializer()
+        self.runtime["qualification_mismatches"] = []
         for value in (0, MAX_TOOL_CALLS + 1, True, 64.0):
             self.runtime["max_tool_calls"] = value
             with self.subTest(max_tool_calls=value), self.assertRaisesRegex(ValueError, "integer_range"):
                 self.materializer()
         self.assertFalse((self.root / "dataset").exists())
+
+    def test_existing_context_preflight_weighs_the_shared_allowance_against_bootstraps(self):
+        preflight = self.materializer().preflight
+        self.assertEqual(preflight["decisions"],
+                         {"mode": "existing_context", "treatment_trials": 62, "max_submissions_at_most": 200,
+                          "min_bootstrap_submissions_per_ask": 2, "bootstrap_submissions": 124,
+                          "submissions_after_bootstraps_at_most": 76, "reservations": "shared_and_permanent"})
+        self.assertEqual(preflight["warnings"], [{"code": "decisions_shared_allowance_may_exhaust",
+                                                  "max_submissions": 200, "bootstrap_submissions": 124,
+                                                  "treatment_trials": 62}])
+        self.runtime["decisions_budget"] = write_pin(self.root / "decisions-budget.json", synthetic_budget(100))
+        preflight = self.materializer().preflight
+        self.assertEqual(preflight["warnings"][0]["code"], "decisions_shared_allowance_below_bootstrap_floor")
+        self.assertEqual(preflight["decisions"]["submissions_after_bootstraps_at_most"], 0)
+        # The pin must hold the product's budget contract joined to the mounted ledger.
+        for budget, code in (({**synthetic_budget(200), "ledger_path": "/elsewhere/decisions.json"},
+                              "decisions_budget_contract"),
+                             ({**synthetic_budget(200), "schema_version": "other"}, "decisions_budget_contract"),
+                             (synthetic_budget(0), "integer_range"), (synthetic_budget(201), "integer_range")):
+            self.runtime["decisions_budget"] = write_pin(self.root / "decisions-budget.json", budget)
+            with self.subTest(budget=budget), self.assertRaisesRegex(ValueError, code):
+                self.materializer()
+        self.runtime["decisions_budget"] = write_pin(self.root / "decisions-budget.json", synthetic_budget(200))
+        (self.root / "decisions-budget.json").write_bytes(canonical(synthetic_budget(199)))
+        with self.assertRaisesRegex(ValueError, "pin_mismatch"):
+            self.materializer()
 
     def test_prepare_prints_budget_preflight_before_any_task_is_created(self):
         from contextlib import redirect_stdout
@@ -253,7 +314,7 @@ class HarborMaterializationTests(unittest.TestCase):
             cli.main()
         self.assertEqual(json.loads(seen[0]), {"preflight": adapter.preflight})
         self.assertEqual(json.loads(seen[0])["preflight"]["warnings"][0]["code"],
-                         "treatment_tool_cap_may_bind_before_deadline")
+                         "decisions_shared_allowance_may_exhaust")
 
     def test_frozen_judge_schema_must_be_strict_structured_output(self):
         del self.judge["response_schema"]["additionalProperties"]

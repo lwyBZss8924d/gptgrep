@@ -5,33 +5,55 @@ from pathlib import Path, PurePosixPath
 import re
 import string
 
-from .common import ARMS, MAX_READER_QUESTION_BYTES, PROFILE, canonical, copy_asset, digest, integer, parse, pinned, put, relative, require, sha
+from .common import (ARMS, MAX_READER_QUESTION_BYTES, MAX_TOOL_CALLS, PROFILE, canonical, copy_asset, digest, integer,
+                     parse, pinned, put, relative, require, sha, tool_cap_parity)
 from .native import JUDGE_OUTPUT_SCHEMA, output_schema_bytes
 from .runtime import (API_ENV, BASE_CAPABILITIES, BASE_TOOLS_PATH, CODEX_HOME, DECISIONS_BUDGET, DECISIONS_LEDGER_DIR, PASS_ENV, WORK_DIR, auth_compose, auth_paths,
                       base_tools_identity, model_config, native_identity, validate_asset_path)
 from .product_bundle import PRODUCT_ENTRYPOINT, PRODUCT_PROVENANCE, bundle_identity
 from .decisions import (CLAIM_ROOT, CONTROL_ROOT, FAMILY_ROOT, TRIAL_ROOT, WRITER_LOCK,
                         control as decisions_control, decisions_model, directory as decisions_directory,
-                        invocation_cost_bound, selected_mode)
+                        invocation_cost_bound, selected_mode, shared_allowance)
 from .trial_order import paired_order
 
 
 # The bare arm has no tool-call cap; the stock CLI only observes native calls.
-# The treatment cap must therefore not bind before the shared query deadline:
-# validation accepts the adapter maximum and warns below the advisory floor.
-MAX_TOOL_CALLS = 10000
+# In the treatment, native shell, image, MCP and sub-agent items count toward
+# max_tool_calls together with GPTgrep calls, and exceeding it fails the Ask.
+# Only the adapter maximum (MAX_TOOL_CALLS) is the parity choice; a lower cap is
+# a declared, admission-bound deviation, and a cap below the floor is likely to bind.
 TOOL_CALL_WARNING_FLOOR = 64
+TOOL_CAP_DEVIATION = "treatment_tool_cap_below_adapter_maximum"
 
 
-def tool_budget(value):
-    """Validate the treatment tool cap; return its budget_scope record and warnings."""
+def tool_cap_deviation(value):
+    """The exact qualification_mismatches entry that declares a treatment cap below the maximum."""
+    return {"code": TOOL_CAP_DEVIATION, "treatment_max_tool_calls": value, "raw_tool_call_cap": "none"}
+
+
+def tool_budget(value, qualification_mismatches=()):
+    """Validate the treatment tool cap against the uncapped bare arm.
+
+    Returns its budget_scope record and advisory warnings. A cap below the
+    adapter maximum must be declared in qualification_mismatches, which the
+    admission binds through the runtime subject; a stale declaration is
+    rejected too.
+    """
     integer(value, 1, MAX_TOOL_CALLS)
+    declared = [entry for entry in qualification_mismatches
+                if isinstance(entry, dict) and entry.get("code") == TOOL_CAP_DEVIATION]
+    parity = value == MAX_TOOL_CALLS
+    require(parity or declared == [tool_cap_deviation(value)], "treatment_tool_cap_deviation_undeclared")
+    require(not parity or not declared, "treatment_tool_cap_deviation_stale")
     warnings = []
-    if value < TOOL_CALL_WARNING_FLOOR:
-        warnings.append({"code": "treatment_tool_cap_may_bind_before_deadline",
-                         "max_tool_calls": value, "warning_floor": TOOL_CALL_WARNING_FLOOR})
+    if not parity:
+        warnings.append({"code": ("treatment_tool_cap_may_bind_before_deadline" if value < TOOL_CALL_WARNING_FLOOR
+                                  else TOOL_CAP_DEVIATION),
+                         "max_tool_calls": value, "adapter_maximum": MAX_TOOL_CALLS,
+                         "warning_floor": TOOL_CALL_WARNING_FLOOR})
     return {"treatment_max_tool_calls": value, "raw_tool_call_cap": "none",
-            "adapter_maximum": MAX_TOOL_CALLS, "warning_floor": TOOL_CALL_WARNING_FLOOR}, warnings
+            "adapter_maximum": MAX_TOOL_CALLS, "warning_floor": TOOL_CALL_WARNING_FLOOR,
+            "parity": tool_cap_parity(value)}, warnings
 
 
 def validate_cohort(cohort):
@@ -164,6 +186,9 @@ class Full62Adapter:
             require(isinstance(ledger_dir, str) and ledger_dir.startswith("/") and ledger_dir != "/" and
                     Path(ledger_dir).as_posix() == ledger_dir and ".." not in Path(ledger_dir).parts and
                     not any(c in ledger_dir for c in ("$", "\n", "\r", "\x00")), "ledger_directory_reference")
+            # One shared allowance for all treatment trials: record it and warn.
+            self.preflight["decisions"], warnings = shared_allowance(budget, len(self.rows))
+            self.preflight["warnings"] += warnings
         require(runtime["account_scope"] == "Dev/Test/Eval" and runtime["admitted"] is True,
                 "isolated_runtime_admission")
         # This receipt is independently selected by root. Source preparation does
@@ -240,7 +265,8 @@ class Full62Adapter:
         integer(runtime["max_asset_bytes"], 1, 2**40)
         for key in ("deadline_seconds", "judge_deadline_seconds"):
             integer(runtime[key], 1, 3600)
-        self.preflight["tool_budget"], warnings = tool_budget(runtime["max_tool_calls"])
+        self.preflight["tool_budget"], warnings = tool_budget(runtime["max_tool_calls"],
+                                                              runtime["qualification_mismatches"])
         self.preflight["warnings"] += warnings
         integer(runtime["max_input_bytes"], 1024, 1048576)
         # Validate every selected row before run() can create either arm. The
@@ -370,6 +396,7 @@ class Full62Adapter:
                       "reader_question_max_bytes": min(MAX_READER_QUESTION_BYTES, runtime["max_input_bytes"]),
                       "tool_calls": "treatment_enforced_raw_observed_only",
                       "treatment_max_tool_calls": runtime["max_tool_calls"], "raw_tool_call_cap": "none",
+                      "treatment_tool_cap_parity": tool_cap_parity(runtime["max_tool_calls"]),
                       "total_provider_input": "not_enforced_by_raw_cli"},
                   **{key: runtime[key] for key in ("platform", "codex_binary", "gptgrep_binary", "codex_home",
                      "jev_model", "reader_mode", "native_ptc", "codex_permissions",

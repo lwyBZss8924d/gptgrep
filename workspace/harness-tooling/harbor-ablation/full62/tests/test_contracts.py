@@ -174,6 +174,10 @@ class PairedTests(unittest.TestCase):
         scope = self.aggregate(export, records, runtime, blobs)["profile"]["budget_scope"]
         self.assertEqual((scope["treatment_max_tool_calls"], scope["raw_tool_call_cap"]), (10000, "none"))
         self.assertEqual(scope["tool_calls"], "treatment_enforced_raw_observed_only")
+        self.assertEqual(scope["treatment_tool_cap_parity"], "adapter_maximum")
+        runtime["max_tool_calls"] = 500
+        scope = self.aggregate(export, records, runtime, blobs)["profile"]["budget_scope"]
+        self.assertEqual(scope["treatment_tool_cap_parity"], "declared_deviation")
 
     def test_abstention_counts_come_from_retained_verdicts_and_operation_records(self):
         export, records, runtime, blobs = synthetic_results()

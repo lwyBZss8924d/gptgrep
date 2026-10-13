@@ -12,7 +12,7 @@ import unicodedata
 
 from .common import canonical, digest, integer, parse, pinned, put, require, sha
 from .process import run
-from .runtime import native_environment, validate_asset_path
+from .runtime import DECISIONS_LEDGER_DIR, native_environment, validate_asset_path
 
 CONTROL_ROOT = "/opt/full62-private/controls"
 FAMILY_ROOT = "/opt/full62-private/financial-family"
@@ -39,6 +39,10 @@ MAX_REQUEST_BYTES = 64 * 1024
 MAX_MODEL_BYTES = 256
 # Sanity bound for every USD amount and rate; keeps each bound a finite JSON number.
 MAX_USD = 10**9
+BUDGET_CONTRACT_SCHEMA = "gptgrep.decisions-budget-contract.v1"
+# Every Ask first runs the product's mandatory retrieval pass: one document-routing
+# and at least one evidence-reranking submission, even with --document scope.
+MIN_BOOTSTRAP_SUBMISSIONS = 2
 PRICE_FIELDS = {"model", "usd_per_million_prompt_tokens", "usd_per_million_completion_tokens",
                 "usd_per_request", "provenance"}
 
@@ -54,6 +58,33 @@ def selected_mode(runtime):
         require(other == mode or all(runtime.get(field) is None for field in fields),
                 "decisions_" + mode + "_mode_conflict")
     return mode
+
+
+def shared_allowance(budget_pin, treatment_trials):
+    """Existing-context preflight: the one shared ledger's allowance against the cohort's bootstraps.
+
+    Every reservation in the shared ledger is permanent, and every treatment Ask
+    spends at least two submissions on its mandatory retrieval pass before any
+    model-driven search. Once the allowance is exhausted, each later treatment
+    Ask fails at that pass and scores an operational zero, while the bare arm is
+    unaffected. The ledger may already hold reservations; this adapter never
+    reads it, so the record is an upper bound.
+    """
+    budget = parse(pinned(budget_pin, 16384))
+    require(type(budget) is dict and budget.get("schema_version") == BUDGET_CONTRACT_SCHEMA and
+            isinstance(budget.get("ledger_path"), str) and
+            Path(budget["ledger_path"]).parent == Path(DECISIONS_LEDGER_DIR), "decisions_budget_contract")
+    maximum = integer(budget.get("max_submissions"), 1, INVOCATION_MAX_SUBMISSIONS)
+    integer(treatment_trials, 1)
+    floor = treatment_trials * MIN_BOOTSTRAP_SUBMISSIONS
+    record = {"mode": "existing_context", "treatment_trials": treatment_trials,
+              "max_submissions_at_most": maximum, "min_bootstrap_submissions_per_ask": MIN_BOOTSTRAP_SUBMISSIONS,
+              "bootstrap_submissions": floor, "submissions_after_bootstraps_at_most": max(0, maximum - floor),
+              "reservations": "shared_and_permanent"}
+    warning = {"code": ("decisions_shared_allowance_below_bootstrap_floor" if maximum < floor
+                        else "decisions_shared_allowance_may_exhaust"),
+               "max_submissions": maximum, "bootstrap_submissions": floor, "treatment_trials": treatment_trials}
+    return record, [warning]
 
 
 def decisions_model(value):
