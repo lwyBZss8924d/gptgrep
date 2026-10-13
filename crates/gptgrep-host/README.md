@@ -46,6 +46,47 @@ The retrieval reader's instructions, restricted and native, also carry two gener
 
 An identity-bound `error` notification with explicit `willRetry: true` keeps the same turn running under the original host deadline and protocol limits. The app-server owns that recovery; GPTgrep starts no replacement turn, performs no independent retry, and does not reset the timeout. Missing or malformed retry flags, foreign or missing identities, terminal errors, and failed turn completion remain failures. `HostProtocolError` exposes a typed `kind`, optional whitelisted `codex_error_info`, `will_retry`, valid `http_status_code`, already-observed numeric token `usage`, closed `diagnostics` and, for budget failures, `tool_budget`. Failed workflows retain `accounting_complete: false`; missing usage stays null. Retrieval preserves this object in `HostRetrievalError.cause`. Success reports and typed failures expose `server_retry_notifications`, which counts server events, not physical or billed provider requests.
 
+## Failure codes
+
+Codex process, protocol, tool-handling and final-answer failures carry a stable code instead of error text. `HostRetrievalError.code` reports it for the failed `stage`, and the failed entry in `model_attempts` records the same value as `error.code`. Codex, serializer, I/O and source text never reach a report. Typed protocol failures keep their `HostProtocolError` codes (`host_codex_terminal_error`, `host_codex_failed_turn`, `host_codex_interrupted_turn`, ...), timeouts keep `host_model_attempt_timeout` and the `host_*_deadline_*` codes, and a typed Jev failure during a reader search keeps `host_jev_search_failed` in both places. Only an error without a code still falls back to `host_{stage}_failed` (for example `host_codex_failed`) and `host_model_attempt_failed`.
+
+| Code | Meaning |
+| --- | --- |
+| `host_codex_home_unavailable`, `host_codex_home_not_directory` | The selected `CODEX_HOME` cannot be resolved or is not a directory. |
+| `host_codex_binary_unavailable`, `host_codex_spawn_failed` | The configured Codex binary path cannot be resolved, or the app-server process cannot be started. |
+| `host_codex_working_directory_unavailable` | The owned temporary working directory cannot be created. |
+| `host_codex_state_dir_not_absolute`, `host_codex_state_dir_unavailable`, `host_codex_state_dir_not_directory`, `host_codex_state_dir_not_canonical`, `host_codex_state_path_encoding` | The explicit Codex state or logs directory is relative, missing, not a real directory, not canonical, or not encodable as an override. |
+| `host_codex_startup_override_unsupported`, `host_codex_startup_override_table_unsupported`, `host_codex_startup_override_encoding` | A startup or capability override has an unsupported shape or cannot be encoded. |
+| `host_codex_stdin_unavailable`, `host_codex_stdout_unavailable`, `host_codex_stderr_unavailable` | A standard stream of the started app-server is missing. |
+| `host_codex_process_identity_unavailable`, `host_codex_process_identity_invalid` | The started process has no usable process identity. |
+| `host_codex_process_group_signal_failed`, `host_codex_process_group_check_timeout`, `host_codex_process_group_check_failed`, `host_codex_process_group_check_unavailable`, `host_codex_process_metadata_invalid`, `host_codex_process_reap_timeout` | Cleanup of the owned process group could not be signalled, verified or reaped in time. |
+| `host_codex_process_timeout` | An invocation without a model-attempt record (independent completion or native task) reached its deadline; its app-server was terminated. |
+| `host_trace_directory_unavailable`, `host_trace_file_unavailable`, `host_trace_write_failed`, `host_trace_flush_failed`, `host_trace_encoding` | The optional protocol trace cannot be created or written. |
+| `host_codex_input_transport_closed`, `host_codex_output_transport_failed`, `host_codex_app_server_closed` | Writing to the app-server failed, reading from it failed, or it closed its output before the turn completed. |
+| `host_codex_frame_too_large`, `host_codex_message_limit`, `host_codex_invalid_json`, `host_codex_frame_encoding` | A received frame exceeds 4 MiB, more than 4,096 frames arrived, a frame is not JSON, or a host frame cannot be encoded. |
+| `host_codex_initialize_rejected`, `host_codex_account_read_rejected`, `host_codex_config_read_rejected`, `host_codex_skills_list_rejected`, `host_codex_thread_start_rejected`, `host_codex_turn_start_rejected`, `host_codex_request_rejected` | The app-server answered that request with an error. |
+| `host_codex_response_without_result` | A response carries neither an error nor a result. |
+| `host_codex_chatgpt_login_required` | The selected runtime has no ChatGPT login. |
+| `host_codex_config_unavailable`, `host_codex_mcp_config_unsupported`, `host_codex_mcp_server_limit` | The effective configuration is missing, or its inherited MCP servers have an unsupported shape or exceed 128. |
+| `host_codex_identity_missing`, `host_codex_identity_invalid` | A thread, turn, call, model or provider identity is missing, or is empty, longer than 256 bytes or contains control characters. |
+| `host_codex_model_provider_changed`, `host_codex_model_changed`, `host_codex_reasoning_effort_changed`, `host_codex_service_tier_changed`, `host_codex_service_tier_invalid` | The thread acknowledged a different provider, model, effort or tier, or a tier that is not a string. |
+| `host_codex_approval_policy_rejected`, `host_codex_sandbox_rejected`, `host_codex_permission_profile_unacknowledged` | The thread did not accept the required approval policy or read-only sandbox, or did not acknowledge the selected permission profile. |
+| `host_codex_event_thread_mismatch`, `host_codex_turn_identity_changed`, `host_codex_turn_identity_missing` | An event names another thread or turn, or the turn ended without a turn identity. |
+| `host_codex_item_not_allowed`, `host_codex_item_tool_not_allowed` | The reader received an item type outside its workflow (for example a command execution in the restricted reader) or a dynamic tool item outside its `gptgrep` allowlist. |
+| `host_codex_tool_call_thread_mismatch`, `host_codex_tool_call_repeated`, `host_codex_tool_name_invalid`, `host_codex_tool_not_allowed`, `host_codex_tool_arguments_too_large`, `host_codex_tool_arguments_encoding` | A dynamic tool request comes from another thread, repeats a call ID, has no tool name, is outside the allowlist (denied), or has arguments above 4 KiB or not encodable. |
+| `host_codex_completion_tool_request`, `host_codex_completion_tool_item` | A pure JSON completion requested or emitted a tool call. |
+| `host_codex_agent_message_without_text`, `host_codex_final_message_invalid` | A completed agent message, or the agent message in the turn's final item snapshot, has no text. |
+| `host_codex_final_response_too_large` | The final response exceeds the reader output limit (16 KiB for retrieval). |
+| `host_codex_no_final_answer` | The turn completed without a final agent message. |
+| `host_generation_changed`, `host_index_unavailable`, `host_navigation_overlay_unavailable` | The index generation changed during the workflow, the index catalog cannot be read, or the bound navigation overlay cannot be verified. |
+| `host_search_failed`, `host_evidence_interval_uncontained`, `host_tool_result_encoding` | A search failed for a reason other than a typed Jev failure (for example a local index error), a delivered window is not contained in its node, or a tool result cannot be encoded. |
+| `host_tool_budget_unknown_tool`, `host_tool_budget_invalid_arguments` | After the tool budget is exhausted, a request names an unknown tool or has invalid arguments. |
+| `host_answer_too_large`, `host_answer_invalid_json`, `host_answer_schema_mismatch`, `host_answer_length_invalid` | The final answer exceeds 16 KiB, is not JSON, does not match the answer schema (wrong type, missing, unknown or repeated field), or its text is blank or above 8,192 bytes. |
+| `host_answer_citation_limit`, `host_answer_citations_missing`, `host_answer_citation_repeated`, `host_answer_citation_unissued` | The answer has more than 24 citations, none for a substantive answer, a repeated one, or one that was not issued as evidence. |
+| `host_answer_citation_window_invalid`, `host_answer_citation_window_unreadable`, `host_answer_citation_source_changed`, `host_answer_citation_window_changed` | An issued window is invalid, cannot be reread (for example because its source changed or disappeared), or no longer matches its source or issued bytes. |
+
+Final-answer failures keep their earlier `cause.code` values at the `citation_validation` stage (`final_response_byte_limit`, `final_response_schema`, `answer_length`, `citation_count`, `missing_citations`, `duplicate_citation`, `unissued_citation`, `invalid_issued_window`, `stale_cited_source`, `changed_cited_window`, `no_evidence_tools`); an unreadable window, a changed generation and an unreadable index add `unreadable_cited_window`, `generation_changed` and `index_unavailable`.
+
 ## Native parsing and OCR roles
 
 `parse_agent_driver` coordinates one prepared-document turn and delegates required
