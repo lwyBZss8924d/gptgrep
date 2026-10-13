@@ -294,7 +294,9 @@ async fn opt_in_exposes_direct_tools_without_fallback_and_preserves_the_permissi
     assert!(instructions.contains("does not create a GPTgrep citation"));
     assert!(!instructions.contains("Do not run commands, access browsers"));
     // Both readers carry the generic answer rules exactly once, beside every
-    // unchanged evidence and citation rule.
+    // unchanged evidence and citation rule. Opt-1b removed the
+    // answer-commitment sentence from those rules.
+    assert!(!crate::protocol::READER_ANSWER_RULES.contains("commit to that answer"));
     for text in [original, instructions] {
         assert_eq!(
             text.matches(crate::protocol::READER_ANSWER_RULES).count(),
