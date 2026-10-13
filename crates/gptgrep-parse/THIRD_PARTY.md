@@ -10,8 +10,10 @@ Direct dependency:
 - Build profile: `default-features = false`; no Tesseract or ONNX OCR feature.
 - Upstream reference checkouts remain unchanged. The workspace uses a narrow
   owned copy of the pinned PDFium wrapper exposing an allocation-free annotation
-  count; its source hashes, patch scope and Apache-2.0 notice are retained in
-  [vendor/liteparse-pdfium](../../vendor/liteparse-pdfium/UPSTREAM.json).
+  count, admitted document Info/page-label/outline getters, admitted font info
+  and checked page-object/segment accessors (see `modifications` in
+  `UPSTREAM.json`); its source hashes, patch scope and Apache-2.0 notice are
+  retained in [vendor/liteparse-pdfium](../../vendor/liteparse-pdfium/UPSTREAM.json).
 
 The adapter relies on the public APIs in `crates/liteparse/src/lib.rs`,
 `parser.rs`, `config.rs`, `types.rs` and `layout.rs`. These exact source contracts
@@ -45,8 +47,9 @@ no upstream benchmark PDF or dataset has been copied into this crate.
 The rich image adapter uses the existing exact registry dependency `image`
 `0.25.10` with only PNG/JPEG features. Its selected decoder packages are `png`
 `0.18.1` and `zune-jpeg` `0.5.15`; Cargo.lock binds their registry checksums and
-transitive dependencies. JPEG preparation and cropping are unqualified and
-reject before decode; its package remains in the dependency and notice closure.
+transitive dependencies. Restricted baseline JPEG preparation decodes with the
+direct `zune-jpeg` 0.5.15 dependency in strict mode after GPTgrep's own entropy
+validator; JPEG crop remains unavailable.
 The small streaming PDF writer, container admission
 scan and synthetic image fixtures are original GPTgrep code. No decoder source
 is copied or changed. The inspected package manifests declare the image and PNG

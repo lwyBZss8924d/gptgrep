@@ -70,8 +70,8 @@ On September 22, 2026, a relocated macOS ARM64 parser test executable passed the
 synthetic two-page PDF test while dyld reported only the copied bundle library;
 the plaintext test loaded no PDFium even with an absent override directory.
 That validates this parser dependency path; the final CLI archive still needs
-its own relocation check. The research sources manifest records the test and
-library digests and the observed dyld path.
+its own relocation check. The test and library digests and the observed dyld
+path are kept in the maintainer's private evidence, not in this repository.
 
 Run `cargo test -p gptgrep-parse`. Tests include real native PDFium parsing of a
 small original synthetic PDF, bookmark/page/line citations, textless-document
@@ -171,19 +171,26 @@ before constructing owned metadata. It retains numeric native glyph data,
 raw vector paths/object matrices, normalized page geometry, native text and
 metadata artifacts, complexity signals and admitted PNG page renditions.
 Native metadata also binds the original source-only complexity output, admitted
-image rectangles and original page geometry. The native extraction recipe is
-`gptgrep.native.count-admitted.v4-metadata-classifier-geometry-binding`; completed
-public DTO consumers must validate these retained facts before accepting mutable
-coverage or page-frame fields.
+image rectangles and original page geometry. The native page recipe is
+`gptgrep.native.count-admitted.v7-graphics` (`NATIVE_GRAPHICS_RECIPE`), bound
+with the `v5-document-metadata` (Info, page labels, outline) and `v6-font-words`
+(retained characters, font info, glyph words) records. Completed public DTO
+consumers validate them with `validate_native_graphics_metadata`,
+`validate_native_text_metadata` and `validate_native_document_metadata` before
+accepting mutable coverage or page-frame fields.
 Crop, rotation and UserUnit transformations are explicit invertible affines.
-Variable-length font names, tagged structure, annotations, bookmarks and
-document metadata are represented as unsupported capabilities. Nested image
-geometry fails explicitly because ancestor matrix composition is not yet
-qualified. The rich path uses a conservative source-only OCR policy; vector
-paths and sparse text can require OCR without a claim that they are unreadable.
-An owned, licensed patch of the pinned PDFium wrapper exposes an allocation-free
-annotation count. A positive count conservatively requires OCR; zero preserves
-the native classifier. Blank coverage requires zero native text, zero page
+Font names are Present only when every retained character has one; otherwise
+they carry an explicit Unsupported state. Document metadata and bookmarks are
+retained artifacts. Tagged structure, annotations (beyond their count), form
+fields and XFA remain unsupported. Nested Form paths and images are composed
+through ancestor matrices (depth 32, with an active-ancestor cycle check). The
+rich path uses a conservative source-only OCR policy; vector paths and sparse
+text can require OCR without a claim that they are unreadable. The owned,
+licensed patch of the pinned PDFium wrapper exposes the annotation count plus
+admitted document-metadata, font-info and page-object accessors (see
+[UPSTREAM.json](../../vendor/liteparse-pdfium/UPSTREAM.json) and
+[native metadata](../../docs/native-metadata.md)). A positive annotation count
+conservatively requires OCR; zero preserves the native classifier. Blank coverage requires zero native text, zero page
 objects and zero annotations. A white finite-DPI raster is not blank-source
 proof. Every rich rendition clears the admitted bitmap and uses the public
 display rendering entry with `FPDF_ANNOT` only, so visible non-print annotation
@@ -191,8 +198,12 @@ appearances remain in the delivered image. This currently renders twice into
 one bitmap; its preprocessing latency must be measured as actual work. The
 legacy renderer and its printing flags remain unchanged.
 
-`ResourceBudget::default()` freezes the development contract's admission
-maxima. Callers can lower limits. Glyph/object bounds, projected sparse-space
+`ResourceBudget::default()` supplies the development contract's admission
+defaults. `validate()` caps every field at its default except the configurable
+encoded-image capacities (`image_file_bytes`, `image_base64_bytes`,
+`image_file_bytes_per_page`, which must stay base64- and per-page-consistent) and
+the `document_staging_bytes`, `run_staging_bytes` and `owned_working_bytes`
+envelopes. Pixel and decode limits keep their ceilings. Glyph/object bounds, projected sparse-space
 output bounds and image pixel/RGBA dimensions are checked before owned
 materialization, projection or raster allocation. Serialized metadata and PNG
 output use bounded writers. Image validation reads only the admitted encoded
@@ -207,13 +218,23 @@ sharing its original counter. Later limits may only decrease from the admitted
 values. A new or deserialized budget cannot reset the invocation's accounting.
 
 `NativeCandidate` exposes immutable `summary()`, `pages()`, `artifacts()`,
-`plan()` and `native_profile_sha256()` accessors. It retains a private snapshot
+`plan()`, `document_metadata()` and `native_profile_sha256()` accessors. It retains a private snapshot
 of source, raw pages, coverage, artifacts, task plan and extraction recipe.
 Finalization verifies that snapshot and its source/page/artifact/task
 relationships before accepting results. Callers may clone task DTOs for a host
 executor; they cannot replace candidate fields or remove required OCR coverage.
 The completed `RichParsedDocument` is a portable public DTO and remains
 untrusted input to publication, which must perform its own validation.
+
+Native metadata, crops and compatibility OCR have their own public entry points.
+`crop_rendition` makes bounded crops of PNG renditions; JPEG crop returns
+`capability_unavailable`. `create_native_ocr_crop`, `validate_native_crop_proof`
+and `validate_native_crop_set` create and check native OCR crop proofs. The
+v5/v6/v7 metadata validators are listed above. `NativeImageLimits` is derived
+from the budget for native image transport. `CompatibilityOcrTask` and
+`validate_compatibility_result` serve the `/ocr` compatibility endpoint. See
+[foreground OCR](../../docs/ocr-serve.md) and
+[native metadata](../../docs/native-metadata.md).
 
 `OcrExecutor` is an object-safe host trait accepting an owned `OcrTask` and
 returning an owned future. The parser never launches a model. Tasks bind source,

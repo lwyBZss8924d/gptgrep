@@ -27,7 +27,7 @@ All forwarding commands accept `--request` with one JSON object. Nested names ar
 | `search` | `query`, `root`, `mode` (`regex`, `lexical`, `hybrid`, `semantic`; default `hybrid`), optional `document` and Jev `model`, `limit` (1–1000; default 20), `context` (0–100; default 0), `minScore` (0–1; default 0.5), `ignoreCase`, `fixedStrings` | `gptgrep search QUERY ROOT --mode MODE [--document PATH] [--model JEV_MODEL] --limit N --context C --min-score S --json` |
 | `tree` | `file`, `root` | `gptgrep tree FILE --root ROOT --json` |
 | `read` | `nodeId`, `root`, `offset` (default 0), `maxBytes` (1–65536; default 8192) | `gptgrep read DOCUMENT_ID:NODE_ID --root ROOT --offset OFFSET --max-bytes BYTES --json` |
-| `batch` | `root`, `rich` (default false), `batch` (native request object) | `gptgrep batch --root ROOT --input - [--rich] --json`, with the request sent on stdin |
+| `batch` | `root`, `rich` (default false), `batch` (native request object); optional `model` and `multimodalTimeout` (both require `rich: true`) and `decisionsBudget` (used only by paid rich operations) | `gptgrep batch --root ROOT --input - [--rich] --json`, with the request sent on stdin |
 | `files` | `root` | `gptgrep files ROOT --json` |
 | `parse` | `file` | `gptgrep parse FILE --json` |
 | `status` | `root` | `gptgrep status ROOT --json` |
@@ -55,7 +55,7 @@ node src/cli.js summarize --request '{"nodeId":"DOCUMENT_ID:NODE_ID","root":"./d
 
 Use `--format json`, `--format jsonl`, `--format toon`, `--format yaml`, or `--format md` for incur presentation. `--full-output` requests its envelope. The native response is preserved as structured data; the wrapper does not infer an answer, alter rankings, or claim that a fallback used an index.
 
-Native invocations use argument arrays, never a shell. Each request may include `execution: {"timeoutSeconds": 3600, "maxOutputBytes": 16777216}` for wrapper process limits. Captured stdout and stderr each default to 8 MiB; foreground streams share that byte allowance. Ordinary calls default to five minutes. Host, enrichment and multimodal calls derive their wrapper deadline from the declared native timeout plus ten seconds. Native-control-driven document operations, document-agent indexing and foreground serving use the native original deadline unless a wrapper deadline is selected. A wrapper limit does not renew any native model, resource or ledger allowance. Interrupt and termination signals are forwarded to the child. Exit 1 is treated as a no-match success only for search with a recognizable empty `hits` or `results` array and no error marker.
+Native invocations use argument arrays, never a shell. Each request may include `execution: {"timeoutSeconds": 3600, "maxOutputBytes": 16777216}` for wrapper process limits. Captured stdout and stderr each default to 8 MiB; foreground streams share that byte allowance. Ordinary calls default to five minutes. Host, enrichment and multimodal calls derive their wrapper deadline from the declared native timeout plus ten seconds; `index` with `ocr: "auto"` derives it from `ocrTimeoutSeconds` (default 1800) plus ten seconds. Native-control-driven document operations, document-agent indexing and foreground serving use the native original deadline unless a wrapper deadline is selected. A wrapper limit does not renew any native model, resource or ledger allowance. Interrupt and termination signals are forwarded to the child. Exit 1 is treated as a no-match success only for search with a recognizable empty `hits` or `results` array and no error marker.
 
 Recognized `gptgrep.error.v1` failures retain their native structured report, including partial Jev request/usage accounting and ledger paths, with a nonzero process exit status. Exit-2 search reports with nonempty `coverage.stale_files` are also preserved. `--full-output` marks these envelopes `ok: false` and includes the native report under `data`; output filtering does not discard failure accounting. Invalid or unrecognized native failures remain actionable `NATIVE_ERROR` responses. Known provider-key values are redacted from forwarded diagnostics and failure reports.
 
@@ -71,7 +71,7 @@ node src/cli.js search --request '{"query":"What does the chart show?","root":".
 node src/cli.js ask --request '{"question":"Explain this chart.","root":"./documents","multimodal":true,"maxCitations":4}' --json
 ```
 
-The optional `decisionsBudget` on search/ask forwards the existing `--decisions-budget` contract; it never initializes a ledger. The native model default is now `gpt-6-luna/max/fast`, matching the native CLI. Multimodal ask rejects other native profiles. Model exposure in search is noncitable, while ask requires complete actual reader delivery and fresh source/coordinate bindings. Offline wrapper checks do not qualify real provider image influence or native model availability.
+The optional `decisionsBudget` on search, ask, summarize, rich batch, rerank, judge and enrich forwards the existing `--decisions-budget` contract; it never initializes a ledger. The native model default is now `gpt-6-luna/max/fast`, matching the native CLI. Multimodal ask rejects other native profiles. Model exposure in search is noncitable, while ask requires complete actual reader delivery and fresh source/coordinate bindings. Offline wrapper checks do not qualify real provider image influence or native model availability.
 
 
 `rerank` forwards a nested `rerank` object to native bounded stdin. Its wrapper
@@ -82,7 +82,7 @@ Structured native failures retain partial observations and a nonzero exit status
 `request-schema rerank --json` describes this forwarding boundary. The equivalent
 rich batch `rerank` operation uses the same batch client and output/call shares.
 
-The complete native command surface also includes:
+The wrapper also forwards these native commands:
 
 | Command | Request fields | Result/effect |
 |---|---|---|
@@ -95,6 +95,8 @@ The complete native command surface also includes:
 | `judge` | `input` (native JSON file), optional `model`, `decisionsBudget` | Explicit paid native Decisions request; native file bound is 64 KiB |
 | `host-complete` | `completion: {instructions, state, schema}` and host fields | One bounded structured request on native stdin |
 | `native-schema` | none | Current native versioned contract |
+
+Native `gptgrep decisions-budget init` (creates a new ledger and its 0600 control file) and `gptgrep decisions-budget status --control FILE --json` are not forwarded by this wrapper. Run them with the native CLI and pass the control file as `decisionsBudget`.
 
 `index` exposes `rich`, `ocr`, `planOnly`, `resume`, `ocrRunId`, `ocrRuntimeProfile`, `ocrCodexBin`, `ocrCodexHome`, `ocrCodexStateDir`, `ocrMaxPages`, `ocrTimeoutSeconds`, `pageWindow` and `expectedPlanSha256`. Document-agent indexing instead supplies all four fields `parseAgentConfig`, `expectedParseAgentConfigSha256`, `documentAgentControls` and `expectedDocumentAgentControlsSha256`. The native CLI rejects mixing that pinned path with legacy rich/OCR controls or `optimizeMerge`. The wrapper forwards no unsolicited OCR defaults on the pinned path.
 

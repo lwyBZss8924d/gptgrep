@@ -120,11 +120,15 @@ codex_auth_supervisor.py --config CFG run --role R --run-id ID [--lease exclusiv
     [--pre-refresh never|if-stale|always] [--live-request-attempted yes|no|unknown]
     [--manifest-field KEY=VALUE]... [--stdin null|inherit] [--dry-run] -- CMD...
 codex_auth_supervisor.py --config CFG refresh --run-id ID [--force] [--wait-seconds N]
-codex_auth_supervisor.py --config CFG relogin --run-id ID --confirm-relogin
+codex_auth_supervisor.py --config CFG relogin --run-id ID --confirm-relogin [--wait-seconds N]
 codex_auth_supervisor.py --config CFG clear-quarantine --run-id ID --confirm [--auth-block] --reason TEXT
-codex_auth_supervisor.py --config CFG rebind-lease --run-id ID --confirm --reason TEXT
-codex_auth_supervisor.py account-probe --codex-bin BIN --out FILE [--stderr-log FILE]   # inside `run` only
+    [--wait-seconds N]
+codex_auth_supervisor.py --config CFG rebind-lease --run-id ID --confirm --reason TEXT [--wait-seconds N]
+codex_auth_supervisor.py account-probe --codex-bin BIN --out FILE [--stderr-log FILE]
+    [--timeout SECONDS]   # inside `run` only; timeout defaults to 60
 ```
+
+`--config CFG` may be omitted when `GPTGREP_CODEX_AUTH_CONFIG` names the config file.
 
 `CMD` may use the placeholders `{codex_home} {state_dir} {log_dir} {work_dir} {home} {tmp}
 {results} {run_dir}`. The child's `PATH` is fixed, so pass absolute executables. Do not use a wrapper
@@ -189,8 +193,8 @@ and both are recorded.
   (reader and judge compose files). Harbor gives each trial its own compose project, so that label
   is the only job-wide handle.
 - Launch the Harbor executable directly under `run --role harbor --harbor-job-label
-  gptgrep.auth-job=<run_id>`. Never launch through a local wrapper that
-  re-exports the canonical `CODEX_HOME`.
+  gptgrep.auth-job=<run_id>`. Never launch through a wrapper that re-exports the canonical
+  `CODEX_HOME`.
 - The supervisor polls the label while Harbor runs and requires at least one matching container
   before it accepts "cleared". A label that never matched gives `UNKNOWN`, so a wrong label cannot
   release the lease early. After Harbor exits, the supervisor waits for the label to clear. The
@@ -302,7 +306,7 @@ commands can read and write it (qualified in the unguarded pass). The guard ther
    one of them. They are the run's intended writable roots: Codex makes the working directory one
    even without `-C`. This also holds when a role deny such as `/Users` contains `runs_root`. The
    production Judge shape `codex exec ... -C {work_dir} ... -o {results}/verdict.json -`, with the
-   role denies `/Users`, `/Volumes` and the agent scratch directory, passes the guard (qualified with
+   role denies such as `/Users`, `/Volumes` and a private temporary directory, passes the guard (qualified with
    a fake Codex and, unguarded, with the official `codex sandbox -C {work_dir}`).
 2. Any other directory equal to or inside any deny of the profile is refused
    (`consumer_argv_reopens_denied_path`).
@@ -356,9 +360,9 @@ The lease covers only processes the supervisor launches. These entry points use 
 `CODEX_HOME` with no lease and must not be used with the shared login. Treat them as `BLOCKED` for
 shared-login use until each is routed through `run`:
 
-- Local workstation wrappers outside this repository that force or export the canonical
-  `CODEX_HOME`, or do not unset `CODEX_API_KEY`.
-- Local metadata front doors that keep their own lock file.
+- Workstation wrappers that export or force the canonical `CODEX_HOME` (or leave `CODEX_API_KEY`
+  set), and metadata front doors that keep their own lock file, bypass the lease. Record such local
+  entry points in ignored local configuration and route them through `run` before shared-login use.
 - The harbor-ablation Rust harness (`judge_app_server`, `judge_backend`, `codex_agent`) sets the
   refresh and revoke blockers and loopback `NO_PROXY` in its children. It takes no lease. Use it with
   the shared login only under `run`.
