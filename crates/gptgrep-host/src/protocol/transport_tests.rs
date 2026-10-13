@@ -99,7 +99,7 @@ async fn partial_send_is_unknown_and_never_refunds_or_retries() {
         .len();
     assert_eq!(
         rpc.send(value.clone()).await.unwrap_err().to_string(),
-        "Codex input transport closed"
+        "host_codex_input_transport_closed"
     );
     assert_eq!(budget.used(), length);
     assert_eq!(
@@ -177,7 +177,7 @@ async fn complete_write_with_failed_flush_is_still_unknown() {
     let frame = crate::transport::encode_frame(&value, MAX_FRAME_BYTES).unwrap();
     assert_eq!(
         rpc.send(value).await.unwrap_err().to_string(),
-        "Codex input transport closed"
+        "host_codex_input_transport_closed"
     );
     assert_eq!(rpc.writer.lock().await.bytes, frame);
     assert_eq!(budget.used(), frame.len());
@@ -319,7 +319,7 @@ async fn receive_accepts_exact_delimited_frame_cap_and_rejects_one_more_byte() {
     );
     assert_eq!(
         rpc.receive().await.unwrap_err().to_string(),
-        "Codex frame exceeded the byte limit"
+        "host_codex_frame_too_large"
     );
 }
 

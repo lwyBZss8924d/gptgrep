@@ -339,17 +339,27 @@ fn safe_error(error: &anyhow::Error) -> Value {
     if let Some(completion) = error.downcast_ref::<crate::CompletionError>() {
         return json!({"code":completion.code()});
     }
-    let code = error.to_string();
-    if code.starts_with("host_")
-        && code.len() <= 128
-        && code
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+    // A fatal reader search keeps its ask-level code; the typed cause stays in the ledger.
+    if error.is::<gptgrep_core::JevSearchError>() || error.is::<gptgrep_core::PlannedSearchError>()
     {
+        return json!({"code":"host_jev_search_failed"});
+    }
+    let code = error.to_string();
+    if is_host_code(&code) {
         json!({"code":code})
     } else {
         json!({"code":"host_model_attempt_failed"})
     }
+}
+
+/// A stable host failure code: `host_` and lowercase ASCII letters or
+/// underscores, at most 128 bytes. Any other error text is never recorded.
+pub(crate) fn is_host_code(text: &str) -> bool {
+    text.starts_with("host_")
+        && text.len() <= 128
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
 }
 
 fn observed_usage(value: &Value) -> Option<Value> {

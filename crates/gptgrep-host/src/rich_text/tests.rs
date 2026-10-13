@@ -944,12 +944,12 @@ async fn invalid_tool_arguments_do_not_recover_scope_or_size_failures() -> Resul
         (
             ArgumentMode::ForeignThread,
             0,
-            "Dynamic tool call came from a different thread",
+            "host_codex_tool_call_thread_mismatch",
         ),
         (
             ArgumentMode::ForeignTurn,
             0,
-            "Codex event changed turn identity",
+            "host_codex_turn_identity_changed",
         ),
         (ArgumentMode::Namespace, 0, "host_rich_tool_allowlist"),
         (ArgumentMode::Document, 1, "host_rich_document_scope"),

@@ -366,7 +366,7 @@ sleep 30
     .await
     .expect("The original deadline was extended during finalization");
     let error = result.err().unwrap();
-    assert!(error.to_string().contains("time limit"), "{error}");
+    assert_eq!(error.to_string(), "host_codex_process_timeout");
     assert_eq!(evidence.receipts.len(), 2);
     assert_eq!(
         evidence.receipts[1].tool_budget.unwrap().denied_tool_calls,

@@ -20,10 +20,10 @@ impl OwnedGroup {
     pub fn new(child: &Child) -> Result<Self> {
         let id = child
             .id()
-            .ok_or_else(|| anyhow!("Owned Codex child has no process identity"))?;
+            .ok_or_else(|| anyhow!("host_codex_process_identity_unavailable"))?;
         ensure!(
             id > 1 && id <= i32::MAX as u32,
-            "Invalid owned process identity"
+            "host_codex_process_identity_invalid"
         );
         Ok(Self {
             #[cfg(unix)]
@@ -46,7 +46,7 @@ impl OwnedGroup {
         let reaped = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
         ensure!(
             matches!(reaped, Ok(Ok(_))),
-            "Could not reap the owned Codex app-server within the cleanup limit"
+            "host_codex_process_reap_timeout"
         );
         self.armed = false;
         Ok(())
@@ -65,7 +65,7 @@ impl OwnedGroup {
         if let Err(error) = self.signal(signal) {
             // Darwin can return EPERM for a group containing only an unreaped zombie.
             if error.raw_os_error() != Some(libc::EPERM) || self.has_live_members().await? {
-                return Err(anyhow!("Could not signal the owned Codex process group"));
+                return Err(anyhow!("host_codex_process_group_signal_failed"));
             }
         }
         Ok(())
@@ -80,27 +80,27 @@ impl OwnedGroup {
                 .output(),
         )
         .await
-        .map_err(|_| anyhow!("Owned process-group verification timed out"))?
-        .map_err(|_| anyhow!("Owned process-group verification failed"))?;
+        .map_err(|_| anyhow!("host_codex_process_group_check_timeout"))?
+        .map_err(|_| anyhow!("host_codex_process_group_check_failed"))?;
         ensure!(
             output.status.success() && output.stdout.len() <= 512 * 1024,
-            "Owned process-group verification unavailable"
+            "host_codex_process_group_check_unavailable"
         );
-        let text =
-            std::str::from_utf8(&output.stdout).map_err(|_| anyhow!("Invalid process metadata"))?;
+        let text = std::str::from_utf8(&output.stdout)
+            .map_err(|_| anyhow!("host_codex_process_metadata_invalid"))?;
         for line in text.lines() {
             let mut fields = line.split_whitespace();
             let _pid = fields
                 .next()
                 .and_then(|v| v.parse::<i32>().ok())
-                .ok_or_else(|| anyhow!("Invalid process metadata"))?;
+                .ok_or_else(|| anyhow!("host_codex_process_metadata_invalid"))?;
             let group = fields
                 .next()
                 .and_then(|v| v.parse::<i32>().ok())
-                .ok_or_else(|| anyhow!("Invalid process metadata"))?;
+                .ok_or_else(|| anyhow!("host_codex_process_metadata_invalid"))?;
             let status = fields
                 .next()
-                .ok_or_else(|| anyhow!("Invalid process metadata"))?;
+                .ok_or_else(|| anyhow!("host_codex_process_metadata_invalid"))?;
             if group == self.id && !status.starts_with('Z') {
                 return Ok(true);
             }
