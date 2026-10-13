@@ -7,12 +7,14 @@ from pathlib import Path
 from .product_bundle import PRODUCT_PROVENANCE, PRODUCT_ROOT, check_product_bundle
 import time
 
-from .common import MAX_ANSWER, MAX_READER_QUESTION_BYTES, PROFILE, canonical, copy_asset, finite_number, parse, pinned, put, read, require, sha, validate_binding
+from .common import (MAX_ANSWER, MAX_READER_QUESTION_BYTES, PROFILE, canonical, copy_asset, field_at, finite_number,
+                     parse, pinned, put, read, require, sha, validate_binding)
 from .native import codex_accounting, codex_argv, codex_result, prompt_bytes
 from .process import run
 from .runtime import CODEX_VERSION, DECISIONS_BUDGET, DECISIONS_LEDGER_DIR, check_config, native_environment
-from .decisions import (TRIAL_BUDGET, acquire_writer, claim_invocation, prepare as prepare_decisions,
-                        record_invocation, selected_mode)
+from .decisions import (TRIAL_BUDGET, acquire_writer, claim_invocation, init_trial_budget,
+                        prepare as prepare_decisions, product_limits, record_invocation, selected_mode,
+                        trial_budget_status, trial_paths, trial_submission_limit, unvalidated_reservations)
 
 
 # A completed legacy report is a response. An insufficient_evidence report with
@@ -21,32 +23,43 @@ from .decisions import (TRIAL_BUDGET, acquire_writer, claim_invocation, prepare 
 LEGACY_ANSWER_STATUSES = ("completed", "insufficient_evidence")
 
 
+def treatment_command(config):
+    """The product arguments for the selected reader and Decisions modes, before the per-task options.
+
+    Every treatment reader launches GPTgrep with exactly these arguments, and
+    the frozen treatment feature profile declares them.
+    """
+    require(config["reader_mode"] in ("rich_multimodal", "legacy_text"), "explicit_reader_mode")
+    mode_flags = ["--multimodal"] if config["reader_mode"] == "rich_multimodal" else []
+    decisions = selected_mode(config)
+    require((decisions == "preparation") == (config.get("decisions_preparation") is not None),
+            "decisions_mode")
+    if decisions == "preparation":
+        require(config["reader_mode"] == "rich_multimodal"
+                and config["decisions_preparation"]["max_concurrent_batches"] == 1,
+                "decisions_preparation_mode")
+        mode_flags += ["--max-concurrent-batches", "1"]
+        budget = ["--decisions-budget", TRIAL_BUDGET]
+    elif decisions == "existing_context":
+        budget = ["--decisions-budget", DECISIONS_BUDGET]
+    else:
+        # invocation_bounded: no shared ledger. The Ask joins this trial's own
+        # product ledger, created right after its claim with the per-trial
+        # submission limit, so the product enforces that limit.
+        require(config["reader_mode"] == "legacy_text", "decisions_invocation_bounded_mode")
+        trial_submission_limit(config.get("decisions_max_submissions_per_trial"))
+        budget = ["--decisions-budget", str(trial_paths()[2])]
+    return [*budget, "ask", "--native-ptc", *mode_flags]
+
+
 def reader_argv(config, binding, question):
     require(len(question.encode()) <= min(MAX_READER_QUESTION_BYTES, config["max_input_bytes"]),
             "instruction_bytes_limit")
     if binding["arm"] == "gptgrep":
         require(config.get("native_ptc") is True and config.get("codex_permissions") == "full62_reader",
                 "shared_native_reader_required")
-        require(config["reader_mode"] in ("rich_multimodal", "legacy_text"), "explicit_reader_mode")
-        mode_flags = ["--multimodal"] if config["reader_mode"] == "rich_multimodal" else []
-        decisions = selected_mode(config)
-        require((decisions == "preparation") == (config.get("decisions_preparation") is not None),
-                "decisions_mode")
-        if decisions == "preparation":
-            require(config["reader_mode"] == "rich_multimodal"
-                    and config["decisions_preparation"]["max_concurrent_batches"] == 1,
-                    "decisions_preparation_mode")
-            mode_flags += ["--max-concurrent-batches", "1"]
-            budget = ["--decisions-budget", TRIAL_BUDGET]
-        elif decisions == "existing_context":
-            budget = ["--decisions-budget", DECISIONS_BUDGET]
-        else:
-            # invocation_bounded: no shared ledger or budget file. The Ask keeps
-            # the product's own single-invocation context (at most 200 submissions).
-            require(config["reader_mode"] == "legacy_text", "decisions_invocation_bounded_mode")
-            budget = []
-        return [config["gptgrep_binary"], *budget,
-                "ask", "--native-ptc", *mode_flags, "--document=" + config["source_relative_path"],
+        return [config["gptgrep_binary"], *treatment_command(config),
+                "--document=" + config["source_relative_path"],
                 "--jev-model", config["jev_model"], "--codex-bin", "/opt/full62/codex-native",
                 "--codex-home", config["codex_home"], "--codex-permissions", config["codex_permissions"],
                 "--model", PROFILE["model"],
@@ -59,34 +72,96 @@ def reader_argv(config, binding, question):
     return codex_argv(config["codex_binary"])
 
 
-# Generic answer rules, byte-identical to READER_ANSWER_RULES in
-# crates/gptgrep-host/src/protocol.rs. The legacy_text GPTgrep reader receives
-# them in its base instructions, so the raw-only arm of a legacy_text run
-# receives the same text: answer strategy is matched between the arms and is
-# not credited to retrieval. The rich_multimodal reader has no such rules, so
-# neither arm receives them in that mode.
-READER_ANSWER_RULES = (
-    "Answer rules: Lead with the direct answer in the form the question asks for. "
-    "When the evidence you have read answers the question as asked, commit to that "
-    "answer and cite it rather than hedging. When the question depends on a specific "
-    "passage, resolve the in-text references it relies on before answering by reading "
-    "the referenced note or section, for example footnote or endnote markers, citation "
-    "numbers, and see Table or see Section pointers.")
-
-
-def shared_answer_rules(config):
-    """The answer rules both arms receive for the run's reader mode, if any."""
-    require(config.get("reader_mode") in ("rich_multimodal", "legacy_text"), "explicit_reader_mode")
-    return READER_ANSWER_RULES if config["reader_mode"] == "legacy_text" else None
-
-
+# GPTgrep's reader contract (its base instructions, answer/citation/
+# insufficient_evidence schema, abstention rule and, in legacy_text, its generic
+# answer rules) is part of the treatment under test (owner direction,
+# 2026-10-13). The raw-only arm receives only this common task prompt with
+# Codex's default base instructions, in every reader mode, and no GPTgrep rule text.
 def raw_prompt(config, question):
     # States the enforced reader policy: web search and model-tool network are disabled.
-    rules = shared_answer_rules(config)
     return prompt_bytes("Answer the question using only the protocol-scoped raw document at "
               + config["raw_document"] + ". You may inspect that document with native tools. "
               "No external search or network access is available. Give the complete answer and source locations "
-              "when available. " + (rules + " " if rules else "") + "Question:\n" + question)
+              "when available. Question:\n" + question)
+
+
+READER_CONTRACT_SCHEMA = "gptgrep.harbor.reader-contract.v1"
+# The treatment's identity is the digest of its verified bundle provenance,
+# which pins the product binary and so the contract text compiled into it: a
+# product change to the rules changes it with no adapter edit. The pinned
+# product's offline `--schema` report also describes the answer rules its
+# legacy_text reader receives. That field is the product's own prose
+# description, written separately from the rule text, so its digest identifies
+# only the description: it is recorded beside the identity, never as it.
+TREATMENT_IDENTITY = "product_provenance_sha256"
+ANSWER_RULES_DESCRIPTION_FIELD = ("commands", "ask", "reader_answer_rules")
+# A local report: Harbor's agent timeout leaves only ten seconds beyond the
+# query deadline for everything outside it.
+PRODUCT_SCHEMA_SECONDS = 5
+# Adapter-defined failure codes that an operation record may carry verbatim.
+# Every other exception stays the redacted generic failure.
+RECORDED_FAILURE_CODES = ("product_reader_contract_unavailable", "decisions_max_submissions_per_trial",
+                          "decisions_trial_budget_unavailable", "decisions_submission_limit_reached",
+                          "decisions_product_limits_mismatch", "decisions_claim_mount", "trial_already_claimed")
+
+
+def product_schema(config):
+    """Run the pinned product's offline `--schema`; return its report bytes and parsed contract.
+
+    Called only after the installed bundle matches its pins. No model, network or
+    credential is involved, and the call precedes the query timer.
+    """
+    result = run([config["gptgrep_binary"], "--schema"], cwd="/data/corpus",
+                 timeout=PRODUCT_SCHEMA_SECONDS, env=native_environment(os.environ))
+    require(result["failure"] is None and result["return_code"] == 0, "product_reader_contract_unavailable")
+    contract = parse(result["stdout"])
+    require(type(contract) is dict, "product_reader_contract_unavailable")
+    return result["stdout"], contract
+
+
+def reader_contract(config, binding, schema=None):
+    """This arm's reader-contract record for its operation record.
+
+    The raw-only arm records that it received none of GPTgrep's contract. The
+    treatment records its contract and its identity, the verified bundle
+    provenance digest. In legacy_text it also records the digest of the pinned
+    product's own description of its answer rules, which is not the rule text;
+    rich_multimodal readers receive no answer rules, so that digest stays null.
+    """
+    if binding["arm"] == "raw_only":
+        return {"schema": READER_CONTRACT_SCHEMA, "arm": "raw_only",
+                "base_instructions": "codex_default", "prompt": "common_task_prompt",
+                "gptgrep_contract_received": False, "answer_rules_received": False,
+                "answer_rules_description_sha256": None}
+    require(binding["arm"] == "gptgrep", "arm")
+    mode = config["reader_mode"]
+    require(mode in ("rich_multimodal", "legacy_text"), "explicit_reader_mode")
+    record = {"schema": READER_CONTRACT_SCHEMA, "arm": "gptgrep",
+              "base_instructions": "gptgrep_reader_contract", "reader_mode": mode,
+              "answer_rules_received": mode == "legacy_text", "answer_rules_description_sha256": None,
+              "identity": TREATMENT_IDENTITY,
+              TREATMENT_IDENTITY: config["gptgrep_bundle"]["provenance"]["sha256"]}
+    if mode == "legacy_text":
+        require(schema is not None, "product_reader_contract_unavailable")
+        data, contract = schema
+        description = field_at(contract, ANSWER_RULES_DESCRIPTION_FIELD)
+        require(isinstance(description, str) and description.strip(), "product_reader_contract_unavailable")
+        record.update(answer_rules_description_source="product_schema:" + ".".join(ANSWER_RULES_DESCRIPTION_FIELD),
+                      answer_rules_description_sha256=sha(description.encode()), product_schema_sha256=sha(data))
+    return record
+
+
+def observe_reader_contract(config, binding):
+    """(record, schema report, None), or (None, None, failure code): a treatment that
+    cannot report its contract stops before its Ask."""
+    try:
+        schema = None
+        if binding["arm"] == "gptgrep" and config["reader_mode"] == "legacy_text":
+            schema = product_schema(config)
+        return reader_contract(config, binding, schema), schema, None
+    except Exception:
+        # Redacted code only: product output is never copied into the record.
+        return None, None, "product_reader_contract_unavailable"
 
 
 def product_accounting(report):
@@ -230,6 +305,17 @@ def main():
         check_product_bundle(config)
     require(not Path("/answer/answer.json").exists() and not Path("/logs/agent/operational.json").exists(),
             "reader_outputs_already_exist")
+    # Before the query timer: the treatment's identity comes from the verified
+    # product's own report; a failure is recorded and stops the trial below.
+    contract, schema, contract_failure = observe_reader_contract(config, binding)
+    claimed = config.get("decisions_mode") == "invocation_bounded"
+    limits = None
+    if claimed and binding["arm"] == "gptgrep" and contract_failure is None:
+        # The admitted cost bound uses mirrored product limits: the pinned
+        # product's own report must confirm them before the claim.
+        limits = product_limits(schema[1]) if schema is not None else None
+        if limits is None or not limits["match"]:
+            contract_failure = "decisions_product_limits_mismatch"
     put("/logs/agent/attempt-start.json", {"binding": binding, "profile": PROFILE})
     started = time.monotonic()
     deadline_unix_ms = time.time_ns() // 1000000 + config["deadline_seconds"] * 1000
@@ -241,15 +327,21 @@ def main():
                  "native_cli": config["native_cli"], "native_config_sha256": config["native_config_sha256"],
                  "base_tool_environment": config["base_tool_environment"],
                  "reader_mode": config["reader_mode"] if binding["arm"] == "gptgrep" else "raw_only",
+                 "reader_contract": contract,
                  "effective_permissions_verified": False,
                  "permitted_tools": config["permitted_tools"],
                  "generic_capabilities": config["generic_capabilities"],
                  "qualification_mismatches": config["qualification_mismatches"],
+                 "declared_treatment_differences": config.get("declared_treatment_differences", []),
                  "budget_scope": config["budget_scope"],
                  "outer_retry_count": 0, "provider_internal_retry_count": None,
                  "index_excluded": True, "grounding": "unassessed"}
+    if limits is not None:
+        operation["decisions_product_limits"] = limits
     writer = None
     try:
+        if contract_failure is not None:
+            raise ValueError(contract_failure)
         env = native_environment(os.environ, product=binding["arm"] == "gptgrep")
         version = run([config["codex_binary"], "--version"], cwd="/data/corpus",
                       timeout=min(5, config["deadline_seconds"]), env=native_environment(os.environ))
@@ -260,9 +352,6 @@ def main():
         if binding["arm"] == "gptgrep":
             decisions = operation["decisions_mode"] = selected_mode(config)
         argv = reader_argv(config, binding, question)
-        # Both arms record the same shared answer rules, or none, for the run.
-        rules = shared_answer_rules(config)
-        operation["shared_answer_rules_sha256"] = sha(rules.encode()) if rules else None
         if decisions == "preparation":
             writer = acquire_writer()
             env, operation["decisions_preparation"] = prepare_decisions(
@@ -272,15 +361,23 @@ def main():
             budget = parse(pinned(config["decisions_budget"], 16384))
             require(Path(budget["ledger_path"]).parent == Path(DECISIONS_LEDGER_DIR),
                     "decisions_ledger_mount_contract")
-        # invocation_bounded joins no ledger: the Ask creates its own context and
-        # its reported Decisions cost receipt is kept per trial below.
+        # invocation_bounded joins no shared ledger: the trial's own ledger is
+        # created after its claim, and its cost receipt is kept per trial below.
         native_input = raw_prompt(config, question) if binding["arm"] == "raw_only" else None
         remaining = config["deadline_seconds"] - (time.monotonic() - started)
         require(remaining > 0, "reader_deadline")
+        if claimed:
+            # Create-new, immediately before this trial's one reader process,
+            # in both arms: a re-executed trial stops here as an operational
+            # failure (trial_already_claimed), the treatment with no Decisions spend.
+            claim = operation["trial_claim"] = claim_invocation(binding, deadline_unix_ms)
         if decisions == "invocation_bounded":
-            # Create-new, immediately before the one Ask: a re-executed trial
-            # stops here as an operational failure with no Decisions spend.
-            operation["decisions_claim"] = claim_invocation(binding, deadline_unix_ms)
+            # The product creates this trial's own ledger with the per-trial
+            # submission limit; the Ask joins it and the product enforces it.
+            operation["decisions_trial_budget"] = init_trial_budget(config, binding, claim, deadline_unix_ms,
+                                                                    remaining, os.environ)
+            remaining = config["deadline_seconds"] - (time.monotonic() - started)
+            require(remaining > 0, "reader_deadline")
         result = run(argv, cwd="/data/corpus", timeout=remaining, env=env, input_bytes=native_input)
         attempt = {"ordinal": 0, "elapsed_ms": result["elapsed_ms"],
                    "return_code": result["return_code"], "failure": result["failure"],
@@ -314,6 +411,15 @@ def main():
                 operation["decisions_receipt"] = record_invocation(binding, result["stdout"], attempt)
             except (OSError, ValueError, TypeError):
                 operation["decisions_receipt"] = None
+            # The product's own ledger shows whether the Ask used its whole allowance,
+            # and how much of it went to attempts without a validated response.
+            trial_budget = operation["decisions_trial_budget"]
+            status = trial_budget["status_after_ask"] = trial_budget_status(config, trial_budget)
+            if status is not None:
+                trial_budget["remaining_submissions"] = status["remaining_submissions"]
+                trial_budget["limit_reached"] = status["remaining_submissions"] == 0
+                trial_budget["unvalidated_reservations"] = unvalidated_reservations(status,
+                                                                                    attempt.get("decisions_cost"))
         require(result["failure"] is None and result["return_code"] == 0, "reader_process")
         answer, metadata = (product_result(result["stdout"], config["reader_mode"]) if binding["arm"] == "gptgrep"
                             else codex_result(result["stdout"]))
@@ -323,12 +429,23 @@ def main():
             # for judging; the flag stays in the private operation record.
             operation["insufficient_evidence"] = metadata["insufficient_evidence"]
         outcome.update(status="response", answer=answer)
-    except Exception:
+    except Exception as error:
         # Redacted code only: exception text may contain task/provider/private data.
         operation["failure"] = "reader_failed"
+        code = error.args[0] if type(error) is ValueError and len(error.args) == 1 else None
+        if code in RECORDED_FAILURE_CODES:
+            operation["failure_code"] = code
     finally:
         if writer is not None:
             os.close(writer)
+    trial_budget = operation.get("decisions_trial_budget")
+    if trial_budget is not None and trial_budget["limit_reached"] is not None:
+        # The product refuses a submission beyond the limit and that fails the
+        # whole legacy Ask: a failed Ask with no remaining submission is bound
+        # by the per-trial limit. It stays an operational failure, never retried.
+        trial_budget["limit_bound"] = outcome["status"] != "response" and trial_budget["limit_reached"]
+        if trial_budget["limit_bound"]:
+            operation["failure_code"] = "decisions_submission_limit_reached"
     operation["cumulative_query_wall_ms"] = round((time.monotonic() - started) * 1000)
     operation["status"] = outcome["status"]
     operation["answer_sha256"] = sha(canonical(outcome))

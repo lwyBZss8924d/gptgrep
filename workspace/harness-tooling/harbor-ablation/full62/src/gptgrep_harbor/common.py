@@ -145,6 +145,13 @@ def relative(value):
     return value
 
 
+def field_at(value, path):
+    """The value at a key path through nested JSON objects, or None."""
+    for key in path:
+        value = value.get(key) if type(value) is dict else None
+    return value
+
+
 def put(path, data):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)

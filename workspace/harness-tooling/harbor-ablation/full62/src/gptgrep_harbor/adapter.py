@@ -12,9 +12,11 @@ from .runtime import (API_ENV, BASE_CAPABILITIES, BASE_TOOLS_PATH, CODEX_HOME, D
                       base_tools_identity, model_config, native_identity, reader_seccomp_profile, reader_security_opt,
                       validate_asset_path)
 from .product_bundle import PRODUCT_ENTRYPOINT, PRODUCT_PROVENANCE, bundle_identity
-from .decisions import (CLAIM_ROOT, CONTROL_ROOT, FAMILY_ROOT, TRIAL_ROOT, WRITER_LOCK,
-                        control as decisions_control, decisions_model, directory as decisions_directory,
-                        invocation_cost_bound, selected_mode, shared_allowance)
+from .reader import ANSWER_RULES_DESCRIPTION_FIELD, TREATMENT_IDENTITY, treatment_command
+from .decisions import (CLAIM_ROOT, CONTROL_ROOT, FAMILY_ROOT, TRIAL_BUDGET_INIT_PER_TRIAL, TRIAL_LIMIT_ENFORCER,
+                        TRIAL_ROOT, WRITER_LOCK, control as decisions_control, decisions_model,
+                        directory as decisions_directory, invocation_cost_bound, selected_mode, shared_allowance,
+                        trial_budget_init_options, trial_submission_limit)
 from .trial_order import paired_order
 
 
@@ -25,6 +27,78 @@ from .trial_order import paired_order
 # a declared, admission-bound deviation, and a cap below the floor is likely to bind.
 TOOL_CALL_WARNING_FLOOR = 64
 TOOL_CAP_DEVIATION = "treatment_tool_cap_below_adapter_maximum"
+
+
+# GPTgrep's reader contract is a declared treatment difference (owner
+# direction, 2026-10-13), not a parity mismatch. A runtime qualification that
+# observes the readers' different base instructions records exactly this entry,
+# once; that entry is classified as declared treatment and never carried as a
+# mismatch.
+READER_CONTRACT_DIFFERENCE = "reader_contract_differs"
+READER_CONTRACT_ENTRY = {"code": READER_CONTRACT_DIFFERENCE}
+TREATMENT_PROFILE_SCHEMA = "gptgrep.harbor.treatment-feature-profile.v1"
+
+
+def qualification(entries):
+    """Split observed qualification entries into parity mismatches and declared treatment differences.
+
+    Only the exact entry {"code": "reader_contract_differs"}, once, is the
+    declared difference. Every other entry stays a parity mismatch, including a
+    repeat of it and any entry that carries that code with other fields, such as
+    an observation about the bare arm.
+    """
+    require(isinstance(entries, list), "qualification_observations")
+    mismatches, declared = [], []
+    for entry in entries:
+        treatment = type(entry) is dict and entry == READER_CONTRACT_ENTRY and not declared
+        (declared if treatment else mismatches).append(entry)
+    return {"mismatches": mismatches, "declared_treatment_differences": declared}
+
+
+def treatment_feature_profile(runtime):
+    """The frozen treatment declaration, derived from the admitted runtime.
+
+    The admission binds every input through the runtime subject, so the profile
+    cannot change after admission. It declares configured availability, not
+    observed use. Its command is the exact product argument prefix that every
+    treatment reader launches for the selected reader and Decisions modes.
+    GPTgrep's reader contract is part of the treatment: the bare arm receives
+    Codex's default base instructions and the common task prompt.
+    """
+    mode = runtime["reader_mode"]
+    require(mode in INDEX_SCHEMAS, "explicit_reader_mode")
+    components = ["base_instructions", "answer_citation_insufficient_evidence_schema", "abstention_rule"]
+    decisions = {"mode": selected_mode(runtime), "model": runtime["jev_model"], "routing_and_reranking": "mandatory"}
+    if decisions["mode"] == "invocation_bounded":
+        # The product enforces the per-trial submission limit through the
+        # trial's own ledger, which this command creates after the trial's
+        # claim and before its one Ask; the Ask command joins that ledger.
+        limit = trial_submission_limit(runtime.get("decisions_max_submissions_per_trial"))
+        decisions.update(max_submissions_per_trial=limit, enforced_by=TRIAL_LIMIT_ENFORCER,
+                         trial_ledger_init={"command": ["gptgrep", "decisions-budget", "init",
+                                                        *trial_budget_init_options(limit)],
+                                            "per_trial_options": list(TRIAL_BUDGET_INIT_PER_TRIAL),
+                                            "runs": "after_the_trial_claim_before_the_ask"})
+    return {"schema": TREATMENT_PROFILE_SCHEMA,
+            "declared_differences": ["gptgrep_tools", "frozen_prebuilt_index", "reader_contract"],
+            "reader_mode": mode, "index_schema": INDEX_SCHEMAS[mode],
+            "command": ["gptgrep", *treatment_command(runtime)],
+            "decisions": decisions,
+            "treatment_max_tool_calls": runtime["max_tool_calls"],
+            "reader_contract": {
+                "declared_treatment": True, "treatment": "gptgrep_reader_contract",
+                "components": components + (["answer_rules"] if mode == "legacy_text" else []),
+                # The bundle provenance binds the contract text compiled into the
+                # product; the --schema field only describes the answer rules.
+                "identity": "per treatment trial: " + TREATMENT_IDENTITY,
+                "answer_rules_description": ("per treatment trial: product_schema:"
+                                             + ".".join(ANSWER_RULES_DESCRIPTION_FIELD)
+                                             if mode == "legacy_text" else None),
+                "baseline": "codex_default_base_instructions_and_common_task_prompt",
+                "baseline_receives_gptgrep_rules": False,
+                "qualification_code": READER_CONTRACT_DIFFERENCE,
+                "diagnostic_arm": "bare_codex_plus_answer_rules_optional_not_materialized_not_primary"},
+            "observation": "configured_availability_not_observed_use"}
 
 
 def tool_cap_deviation(value):
@@ -222,9 +296,11 @@ class Full62Adapter:
                     and runtime["jev_model"] == "openai/gpt-6-luna-decisions",
                     "decisions_preparation_mode_conflict")
         elif mode == "invocation_bounded":
-            # No shared ledger or budget file: each legacy Ask keeps the product's
-            # own single-invocation context, and a per-trial host claim allows one
-            # Ask per trial. The cohort's bound must fit the cap.
+            # No shared ledger or budget file from the host. A per-trial host claim
+            # allows one Ask per trial; right after it the product creates the
+            # trial's own ledger with the per-trial submission limit, and the legacy
+            # Ask joins that ledger with --decisions-budget, so the product enforces
+            # the limit. The cohort's bound must fit the cap.
             require(runtime["reader_mode"] == "legacy_text", "decisions_invocation_bounded_mode_conflict")
             decisions_directory(runtime.get("decisions_claims_dir"))
             self.preflight["decisions"] = invocation_cost_bound(runtime, len(self.rows))
@@ -285,8 +361,8 @@ class Full62Adapter:
                     0 < len(runtime["permitted_tools"][arm]) <= 64 and
                     all(isinstance(tool, str) and 0 < len(tool) <= 128
                         for tool in runtime["permitted_tools"][arm]) for arm in ARMS), "finite_permitted_tools")
-        require(isinstance(runtime["generic_capabilities"], list) and
-                isinstance(runtime["qualification_mismatches"], list), "qualification_observations")
+        require(isinstance(runtime["generic_capabilities"], list), "qualification_observations")
+        checked = self.preflight["qualification"] = qualification(runtime["qualification_mismatches"])
         for role in ("gptgrep", "raw_only", "judge"):
             image(runtime["images"][role])
         base = runtime["base_tool_environment"]
@@ -318,9 +394,9 @@ class Full62Adapter:
         integer(runtime["max_asset_bytes"], 1, 2**40)
         for key in ("deadline_seconds", "judge_deadline_seconds"):
             integer(runtime[key], 1, 3600)
-        self.preflight["tool_budget"], warnings = tool_budget(runtime["max_tool_calls"],
-                                                              runtime["qualification_mismatches"])
+        self.preflight["tool_budget"], warnings = tool_budget(runtime["max_tool_calls"], checked["mismatches"])
         self.preflight["warnings"] += warnings
+        self.preflight["treatment_feature_profile"] = treatment_feature_profile(runtime)
         integer(runtime["max_input_bytes"], 1024, 1048576)
         # Validate every selected row before run() can create either arm. The
         # broad private row parser is not the product question capacity.
@@ -383,11 +459,15 @@ class Full62Adapter:
             # One claims root per materialized cohort: a consumed root, whose
             # trials may already have spent, cannot be materialized again.
             require(not any(claims.iterdir()), "decisions_claims_not_fresh")
-            put(claims / "cohort.json", {"schema": "gptgrep.harbor.decisions-invocation-claims.v1",
+        root.mkdir(mode=0o700, parents=False)
+        if selected_mode(self.runtime) == "invocation_bounded":
+            # Only after the output root exists: a failed start leaves the
+            # claims root fresh for a retried materialization.
+            put(claims / "cohort.json", {"schema": "gptgrep.harbor.trial-claims.v1",
                                          "run_id": self.runtime["run_id"],
                                          "runtime_sha256": self.manifest["runtime"]["sha256"],
+                                         "claimed_arms": list(ARMS), "trials": len(ARMS) * len(self.rows),
                                          "treatment_trials": len(self.rows)})
-        root.mkdir(mode=0o700, parents=False)
         package = Path(__file__).parent
         exported = []
         for row in self.rows:
@@ -433,6 +513,7 @@ class Full62Adapter:
 
     def _task(self, task, package, row, document, binding):
         runtime, arm = self.runtime, binding["arm"]
+        checked = qualification(runtime["qualification_mismatches"])
         # Every task materializes a reader role: refuse a missing pin before writing.
         reader_security = reader_security_opt(runtime.get("reader_seccomp_profile"))
         template = package / "task-template"
@@ -451,7 +532,8 @@ class Full62Adapter:
                                                       "path": PRODUCT_PROVENANCE}},
                   "permitted_tools": runtime["permitted_tools"][arm],
                   "generic_capabilities": runtime["generic_capabilities"],
-                  "qualification_mismatches": runtime["qualification_mismatches"],
+                  "qualification_mismatches": checked["mismatches"],
+                  "declared_treatment_differences": checked["declared_treatment_differences"],
                   "budget_scope": {"query_deadline": "shared", "instruction_bytes": "shared_local_cap",
                       "reader_question_max_bytes": min(MAX_READER_QUESTION_BYTES, runtime["max_input_bytes"]),
                       "tool_calls": "treatment_enforced_raw_observed_only",
@@ -476,10 +558,13 @@ class Full62Adapter:
                 "seed": {**preparation["seed"], "path": CONTROL_ROOT + "/seed.json"},
                 # The unchanged financial guard caps each identifier at 96 bytes.
                 "run_id": runtime["run_id"][:63] + "-" + trial_id, "max_concurrent_batches": 1}
-        elif mode == "invocation_bounded" and arm == "gptgrep":
-            # One fresh claim directory per treatment trial, outside the job.
+        elif mode == "invocation_bounded":
+            # One fresh claim directory per trial of either arm, outside the job:
+            # a re-executed trial of either arm fails closed on its claim.
             trial_state = Path(runtime["decisions_claims_dir"]) / sha(canonical(binding))[:32]
             trial_state.mkdir(mode=0o700)
+            if arm == "gptgrep":
+                reader["decisions_max_submissions_per_trial"] = runtime["decisions_max_submissions_per_trial"]
         put(task / "environment/reader.json", reader)
         # The frozen response schema enters only the Judge's private /tests area.
         schema_bytes = output_schema_bytes(self.judge["response_schema"])
@@ -533,24 +618,25 @@ class Full62Adapter:
                 # Both arms identically. The Judge/verifier compose keeps
                 # Docker's default profile and carries no security option.
                 compose["services"]["main"]["security_opt"] = list(reader_security)
-            if role == "reader" and arm == "gptgrep":
+            mounts = []
+            if role == "reader" and mode == "invocation_bounded":
+                # Both arms identically: no ledger or budget state leaves the
+                # host; only this trial's own claim directory is writable.
+                mounts = [(str(trial_state), CLAIM_ROOT, False)]
+            elif role == "reader" and arm == "gptgrep":
                 if mode == "preparation":
                     mounts = [(preparation["controls_directory"], CONTROL_ROOT, True),
                               (preparation["financial_family_directory"], FAMILY_ROOT, False),
                               (str(trial_state), TRIAL_ROOT, False),
                               (str(Path(preparation["trial_state_directory"]) / "sole-writer.lock"), WRITER_LOCK,
                                False)]
-                elif mode == "existing_context":
+                else:
                     mounts = [(runtime["decisions_budget"]["path"], DECISIONS_BUDGET, True),
                               (runtime["decisions_ledger_dir"], DECISIONS_LEDGER_DIR, False)]
-                else:
-                    # invocation_bounded: no ledger or budget state leaves the
-                    # host; only this trial's own claim directory is writable.
-                    mounts = [(str(trial_state), CLAIM_ROOT, False)]
-                for source, target, read_only in mounts:
-                    compose["services"]["main"]["volumes"].append({"type": "bind",
-                        "source": source, "target": target, "read_only": read_only,
-                        "bind": {"create_host_path": False}})
+            for source, target, read_only in mounts:
+                compose["services"]["main"]["volumes"].append({"type": "bind",
+                    "source": source, "target": target, "read_only": read_only,
+                    "bind": {"create_host_path": False}})
             put(task / directory / "docker-compose.yaml", compose)
             # Credentials and arbitrary sibling files cannot enter either image.
             allowed = ["gptgrep_harbor", "config.toml"] + (

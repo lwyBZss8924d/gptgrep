@@ -305,6 +305,72 @@ class HarborMaterializationTests(unittest.TestCase):
                 self.materializer()
         self.assertFalse((self.root / "dataset").exists())
 
+    def test_treatment_profile_declares_the_reader_contract_as_treatment_not_a_mismatch(self):
+        generic = {"code": "observed generic mismatch"}
+        declared = {"code": "reader_contract_differs"}
+        self.runtime["qualification_mismatches"] = [generic, declared]
+        for mode in ("rich_multimodal", "legacy_text"):
+            self.runtime["reader_mode"] = mode
+            with self.subTest(reader_mode=mode):
+                adapter = self.materializer()
+                self.assertEqual(adapter.preflight["qualification"],
+                                 {"mismatches": [generic], "declared_treatment_differences": [declared]})
+                profile = adapter.preflight["treatment_feature_profile"]
+                self.assertEqual(profile["schema"], "gptgrep.harbor.treatment-feature-profile.v1")
+                self.assertEqual(profile["declared_differences"],
+                                 ["gptgrep_tools", "frozen_prebuilt_index", "reader_contract"])
+                self.assertEqual((profile["reader_mode"], profile["decisions"]["mode"]), (mode, "existing_context"))
+                # The declared command is the exact prefix the treatment reader launches.
+                argv = reader_argv({**self.runtime, "source_relative_path": "raw-0.txt"}, {"arm": "gptgrep"},
+                                   "generic question")
+                self.assertEqual(profile["command"], ["gptgrep", *argv[1:len(profile["command"])]])
+                self.assertEqual(profile["command"][1:3], ["--decisions-budget", DECISIONS_BUDGET])
+                self.assertEqual("--multimodal" in profile["command"], mode == "rich_multimodal")
+                self.assertNotIn("max_submissions_per_trial", profile["decisions"])
+                contract = profile["reader_contract"]
+                self.assertIs(contract["declared_treatment"], True)
+                self.assertIs(contract["baseline_receives_gptgrep_rules"], False)
+                self.assertEqual(contract["qualification_code"], "reader_contract_differs")
+                # Every treatment trial reports its build identity; only the text reader
+                # receives the answer rules and records the product's description of them.
+                self.assertEqual(contract["identity"], "per treatment trial: product_provenance_sha256")
+                self.assertEqual("answer_rules" in contract["components"], mode == "legacy_text")
+                self.assertEqual(contract["answer_rules_description"],
+                                 "per treatment trial: product_schema:commands.ask.reader_answer_rules"
+                                 if mode == "legacy_text" else None)
+                self.assertNotIn("answer_rules_identity", contract)
+                row = adapter.rows[0]
+                document = next(d for d in self.runtime["documents"] if d["document_id"] == row["document_id"])
+                for arm in ("gptgrep", "raw_only"):
+                    task = self.root / ("single-" + mode + "-" + arm)
+                    adapter._task(task, Path(adapter_module.__file__).parent, row, document,
+                                  {"pair_id": row["pair_id"], "document_id": row["document_id"], "arm": arm})
+                    reader = json.loads((task / "environment/reader.json").read_text())
+                    self.assertEqual(reader["qualification_mismatches"], [generic])
+                    self.assertEqual(reader["declared_treatment_differences"], [declared])
+        # Only the exact entry, once, is declared: a repeat, or an entry with that code
+        # and other fields, stays a parity mismatch in the preflight and in reader.json.
+        shaped = {"code": "reader_contract_differs", "arm": "raw_only", "observation": "synthetic bare deviation"}
+        self.runtime["qualification_mismatches"] = [declared, shaped, declared]
+        adapter = self.materializer()
+        self.assertEqual(adapter.preflight["qualification"],
+                         {"mismatches": [shaped, declared], "declared_treatment_differences": [declared]})
+        row = adapter.rows[0]
+        document = next(d for d in self.runtime["documents"] if d["document_id"] == row["document_id"])
+        task = self.root / "single-shaped-entries"
+        adapter._task(task, Path(adapter_module.__file__).parent, row, document,
+                      {"pair_id": row["pair_id"], "document_id": row["document_id"], "arm": "raw_only"})
+        reader = json.loads((task / "environment/reader.json").read_text())
+        self.assertEqual((reader["qualification_mismatches"], reader["declared_treatment_differences"]),
+                         ([shaped, declared], [declared]))
+        # The declared entry is not a tool-cap declaration and does not disturb it.
+        self.runtime["max_tool_calls"] = 500
+        with self.assertRaisesRegex(ValueError, "treatment_tool_cap_deviation_undeclared"):
+            self.materializer()
+        self.runtime["qualification_mismatches"] = [declared, adapter_module.tool_cap_deviation(500)]
+        self.assertEqual(self.materializer().preflight["qualification"]["mismatches"],
+                         [adapter_module.tool_cap_deviation(500)])
+
     def test_existing_context_preflight_weighs_the_shared_allowance_against_bootstraps(self):
         preflight = self.materializer().preflight
         self.assertEqual(preflight["decisions"],
@@ -587,16 +653,18 @@ class NativePolicyTests(unittest.TestCase):
         self.assertEqual(config["web_search"], "disabled")
         self.assertEqual(config["features"], {
             "shell_tool": True, "view_image": True, "unified_exec": True,
-            "multi_agent": True, "plugins": False, "apps": False,
-            "tool_suggest": False, "code_mode": {"enabled": True}, "code_mode_host": {"enabled": True}})
+            "multi_agent": True, "plugins": False, "apps": False, "tool_suggest": False,
+            "image_generation": False, "code_mode": {"enabled": True}, "code_mode_host": {"enabled": True}})
+        self.assertEqual(config["cloud"], {"skills": {"enabled": False}})
         judge = tomllib.loads(model_config(PROFILE, "judge").decode())
         self.assertEqual(judge["web_search"], "disabled")
         self.assertFalse(judge["permissions"]["full62_judge"]["network"]["enabled"])
         self.assertEqual(judge["features"], {
             "shell_tool": False, "view_image": False, "code_mode_only": False, "code_mode_prewarm": False,
-            "apps": False, "plugins": False, "tool_suggest": False,
+            "apps": False, "plugins": False, "tool_suggest": False, "image_generation": False,
             "code_mode": {"enabled": False, "direct_only_tool_namespaces": []},
             "code_mode_host": {"enabled": False, "disable_in_process_fallback": True}})
+        self.assertEqual(judge["cloud"], {"skills": {"enabled": False}})
 
     def test_product_credential_never_reaches_native_environment(self):
         source = {"PATH": "/usr/bin", "OPENROUTER_API_KEY": "synthetic-only", "HTTPS_PROXY": "http://synthetic-proxy",
@@ -731,11 +799,56 @@ class NativePolicyTests(unittest.TestCase):
         self.assertEqual(product_accounting(partial)["model_attempts"][0]["native_ptc"]["command_failures"], 1)
 
 
+def harbor_exec_env(per_exec, overlay):
+    """The env Harbor 0.24 gives an agent command: its own merge of persistent,
+    per-exec and the scoped agent overlay, which has the highest precedence."""
+    import contextvars
+    from harbor.environments.base import BaseEnvironment
+    stub = SimpleNamespace(_persistent_env={}, _exec_env_overlays=contextvars.ContextVar("overlays", default=()))
+    with BaseEnvironment.scoped_exec_env(stub, overlay):
+        return BaseEnvironment._merge_env(stub, per_exec) or {}
+
+
 class AgentInterfaceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_only_treatment_trials_receive_the_provider_key(self):
+        source = {"OPENROUTER_API_KEY": "synthetic-only", "HTTPS_PROXY": "http://synthetic-proxy"}
+        shared = {"HTTPS_PROXY": "http://synthetic-proxy"}
+        for arm in ("raw_only", "gptgrep"):
+            with self.subTest(arm=arm), tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
+                agent = PairedNativeAgent(logs_dir=Path(directory).resolve(), model_name=PROFILE["model"],
+                                          extra_env=source)
+                # Harbor scopes setup with this overlay before the arm is known.
+                self.assertEqual(agent.extra_env, shared)
+                environment = SimpleNamespace(
+                    exec=AsyncMock(return_value=SimpleNamespace(return_code=0, stdout=arm + "\n")),
+                    upload_file=AsyncMock())
+                await agent.setup(environment)
+                self.assertIn('["binding"]["arm"]', environment.exec.call_args.args[0])
+                self.assertNotIn("env", environment.exec.call_args.kwargs)
+                await agent.run("generic synthetic question", environment, AgentContext())
+                expected = source if arm == "gptgrep" else shared
+                self.assertEqual((agent.extra_env, environment.exec.call_args.kwargs["env"]), (expected, expected))
+                # Under Harbor's own merge, where the agent overlay wins, the raw-only
+                # reader wrapper still receives no key; proxy settings reach both arms.
+                merged = harbor_exec_env(environment.exec.call_args.kwargs["env"], agent.extra_env)
+                self.assertEqual("OPENROUTER_API_KEY" in merged, arm == "gptgrep")
+                self.assertEqual(merged["HTTPS_PROXY"], "http://synthetic-proxy")
+
+    async def test_setup_without_a_recognized_arm_refuses_the_trial(self):
+        for result in (SimpleNamespace(return_code=0, stdout="judge\n"), SimpleNamespace(return_code=1, stdout="gptgrep"),
+                       SimpleNamespace(return_code=0, stdout=None)):
+            with self.subTest(result=result):
+                agent = PairedNativeAgent(logs_dir=Path(os.environ["TMPDIR"]), model_name=PROFILE["model"],
+                                          extra_env={"OPENROUTER_API_KEY": "synthetic-only"})
+                with self.assertRaisesRegex(ValueError, "reader_image_contract"):
+                    await agent.setup(SimpleNamespace(exec=AsyncMock(return_value=result)))
+                self.assertEqual(agent.extra_env, {})
+
     async def test_real_baseagent_setup_and_run_use_harbor_interfaces(self):
         with tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"]) as directory:
             agent = PairedNativeAgent(logs_dir=Path(directory).resolve(), model_name=PROFILE["model"])
-            environment = SimpleNamespace(exec=AsyncMock(return_value=SimpleNamespace(return_code=0)),
+            environment = SimpleNamespace(exec=AsyncMock(return_value=SimpleNamespace(return_code=0,
+                                                                                      stdout="raw_only\n")),
                                           upload_file=AsyncMock())
             await agent.setup(environment)
             context = AgentContext()

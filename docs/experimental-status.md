@@ -20,9 +20,14 @@ completion does not complete the goal.
 
 The reader images are rebuilt, the zero-model Linux text index is built and pinned
 inside the treatment image, and the adapter carries the approved reader-only sandbox
-setting. The current cursor is **remove the bare-arm copy of GPTgrep's answer rules,
-bound Decisions submissions per trial and apply the adapter's open review fixes →
-freeze the inputs on a published commit → Judge-container check and paired smoke →
+setting. The bare arm receives none of GPTgrep's reader contract, including its
+answer rules, in any reader mode, and the product enforces an explicit per-trial
+Decisions submission limit that the cost preflight uses. The adapter's open
+review fixes are applied. The current cursor is **freeze the inputs on a published
+commit → re-qualify permissions and external tools on the changed reader and Judge
+configuration bytes → set the per-trial submission limit with retry headroom and
+re-bind the admission → check the pinned product's `--schema` report and trial
+ledger in the treatment image → Judge-container check and paired smoke →
 complete full62 paired SEARCH → Judge → analyze failures → next Opt**. The first paired run
 is prepared in the adapter's `legacy_text` mode with a frozen zero-model text
 index, built inside the Linux treatment image before question exposure. Native
@@ -80,11 +85,18 @@ no tag or binary release was created.
 ### Current cursor
 
 Done in this round: common and treatment images rebuilt, the zero-model text index
-built and pinned inside the Linux treatment image before any question exposure, and
-the approved reader sandbox setting integrated. Next: remove the raw-only
-answer-rules copy, bound Decisions submissions per trial and apply the adapter's
-open review fixes → freeze inputs on a published commit → check the Judge/verifier
-containers → paired smoke → complete full62 paired SEARCH in the
+built and pinned inside the Linux treatment image before any question exposure,
+the approved reader sandbox setting integrated, the raw-only answer-rules copy
+removed, Decisions submissions bounded per trial by the product, and the adapter's
+open review fixes applied. Next: freeze inputs on a published commit →
+re-qualify both readers' permissions, now including the writable per-trial claim
+mount, and the excluded external tools on the changed reader and Judge
+configuration bytes → set the per-trial Decisions submission limit with headroom
+for retries and re-bind the admission, which must now cover that required field →
+check in the treatment image that the pinned product's `gptgrep --schema` reports
+the fields every `legacy_text` treatment trial reads and that
+`decisions-budget init` creates a trial ledger on the claim mount → check the
+Judge/verifier containers → paired smoke → complete full62 paired SEARCH in the
 adapter's `legacy_text` mode → Judge → failure analysis → next Opt. In parallel,
 Opt-1b removes or conditions the answer-commitment rule and re-measures all three
 cohorts, and native PTC parsing/OCR (D3) continues.
@@ -215,11 +227,15 @@ this branch updates it.) Earlier intermediate merges in this round recorded
 **Paired comparison.** Not run. By owner direction, GPTgrep's reader contract is
 part of the declared treatment. That contract covers its base instructions, its
 citation and abstention rules, and its answer rules. The comparison therefore
-measures the GPTgrep harness against bare Codex, not retrieval alone. In this
-source, the full62 adapter still copies the two answer rules into the raw-only
-prompt in `legacy_text` mode. Removing that copy before the paired run is pending,
-together with the adapter's open review fixes. An optional
-bare-Codex-plus-answer-rules arm can later separate prompt-contract effects.
+measures the GPTgrep harness against bare Codex, not retrieval alone. The full62
+adapter gives the raw-only arm none of GPTgrep's rule text in any reader mode, and
+each operation record identifies the reader contract its arm received. The
+treatment's identity is its verified product bundle's provenance digest; the
+product's own description of its answer rules is recorded beside it, not as it.
+The adapter's open review fixes are applied in source; the runtime qualification
+must be repeated on the changed reader and Judge configuration bytes. An optional
+bare-Codex-plus-answer-rules arm can later separate prompt-contract effects; it is
+not part of the primary claim.
 
 ## Public SELF-PM checkpoint log
 

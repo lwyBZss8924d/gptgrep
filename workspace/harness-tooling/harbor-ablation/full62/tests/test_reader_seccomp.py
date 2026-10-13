@@ -10,6 +10,7 @@ import io
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import subprocess
 import tempfile
@@ -27,6 +28,44 @@ ENGINE_COMMIT = "daa0cb7f23594cdbcce5002e370027d3fd36ffd7"
 # bubblewrap's fresh /proc mount inside a reader container.
 APPROVED_PROBE_1 = "bwrap --unshare-user --unshare-pid --ro-bind / / --proc /proc --dev /dev true"
 AMENDED_PROBE_1 = "bwrap --unshare-user --unshare-pid --ro-bind / / --dev /dev true"
+
+
+# Generic workstation path markers that no public source may carry.
+MACHINE_PATH_MARKERS = ("/Users/", "/home/", "/private/")
+
+
+def account_name():
+    """The current account name, read at run time; no name is ever written into this source."""
+    try:
+        return pwd.getpwuid(os.getuid()).pw_name
+    except (KeyError, OSError):
+        return None
+
+
+def account_name_patterns(name):
+    """Where an account name leaks into text: a path component, a home shorthand or an identity.
+
+    A bare word is no leak. Common account names such as "user", "docker",
+    "owner", "github", "harbor" or "default" are ordinary words in the vendored
+    upstream profile, its provenance and the derived rule comment.
+    """
+    escaped = re.escape(name)
+    return (r"[/\\]" + escaped + r"(?![A-Za-z0-9_.-])",   # /srv/NAME/profile.json, C:\Users\NAME\, /x/NAME
+            r"~" + escaped + r"(?![A-Za-z0-9_.-])",       # ~NAME/profile.json
+            r"(?<![A-Za-z0-9_.+-])" + escaped + r"@")     # NAME@host, NAME@example.org
+
+
+def assert_no_private_markers(case, text):
+    """Fail on a machine path marker or the current account name, without echoing the name."""
+    for marker in MACHINE_PATH_MARKERS:
+        case.assertNotIn(marker, text)
+    name = account_name()
+    # Shorter names would also match ordinary path segments. The name counts only
+    # in a path, home or identity shape, so an account such as "root" does not
+    # match the syscall pivot_root and "user" does not match "user namespaces".
+    if name and len(name) >= 4:
+        found = any(re.search(pattern, text) for pattern in account_name_patterns(name))
+        case.assertFalse(found, "the current account name appears in public source")
 
 
 def load_derive():
@@ -187,12 +226,41 @@ class ReaderSeccompProfileTests(unittest.TestCase):
         self.assertIn("no added capabilities", approval["unchanged"])
         # Public source carries no workstation paths or identities.
         for data in (json.dumps(value), self.derived_bytes.decode()):
-            for marker in ("/Users/", "/home/", "/private/"):
-                self.assertNotIn(marker, data)
+            assert_no_private_markers(self, data)
+
+    def test_private_marker_guard_reads_the_account_name_at_run_time(self):
+        name = account_name()
+        if not name or len(name) < 4:
+            self.skipTest("the current account name is unavailable or shorter than four characters")
+        # A path or an identity with the name fails; the failure message omits it.
+        for text in ("synthetic /srv/" + name + "/profile.json", name + "@synthetic-host"):
+            with self.assertRaises(AssertionError) as caught:
+                assert_no_private_markers(self, text)
+            self.assertFalse(name in str(caught.exception), "the failure message echoes the account name")
+        assert_no_private_markers(self, "pivot_" + name)
+        for marker in MACHINE_PATH_MARKERS:
+            with self.assertRaises(AssertionError):
+                assert_no_private_markers(self, "synthetic " + marker + "x")
+
+    def test_private_marker_guard_passes_clean_files_under_common_account_names(self):
+        # Ordinary words in the committed public files are no leak, whatever the
+        # account is called; the same names in a path, home or identity shape still fail.
+        public = (json.dumps(self.provenance), self.derived_bytes.decode())
+        for name in ("user", "docker", "owner", "github", "harbor", "default"):
+            with self.subTest(name=name), patch(__name__ + ".account_name", return_value=name):
+                for text in public:
+                    assert_no_private_markers(self, text)
+                assert_no_private_markers(self, "unprivileged " + name + "/mount namespaces, " + name + ".json")
+                for leak in ("/srv/" + name + "/profile.json", "C:\\Users\\" + name + "\\profile.json",
+                             "/srv/" + name, "~" + name + "/profile.json", name + "@synthetic-host",
+                             "contact " + name + "@example.org"):
+                    with self.assertRaises(AssertionError, msg=leak):
+                        assert_no_private_markers(self, leak)
 
 
 class ReaderSeccompReadmeTests(unittest.TestCase):
-    """The README's acceptance record never presents an amended probe as the approved one."""
+    """The README's acceptance record never presents an amended probe as the approved one,
+    and records which probes the owner has accepted."""
 
     def setUp(self):
         text = README.read_text(encoding="utf-8")
@@ -209,12 +277,17 @@ class ReaderSeccompReadmeTests(unittest.TestCase):
         self.assertIn("`%s`" % APPROVED_PROBE_1, first)
         self.assertIn("`%s`" % AMENDED_PROBE_1, first)
         self.assertIn("refuses", first)
-        # The owner's acknowledgement of the amended criterion is stated, whichever way it stands.
-        self.assertRegex(first, r"owner[^.]*acknowledg")
+        # The owner accepted the amended criterion (bwrap without --proc) on 2026-10-13.
+        self.assertRegex(first, r"owner accepted the amended criterion on 2026-10-13")
+        self.assertNotRegex(first, r"not yet")
         # The status never counts probe 1 among the probes that passed as approved.
         self.assertNotRegex(self.status, r"Probes 1\s*(?:[-–]|to)\s*\d passed")
         self.assertRegex(self.status, r"Probe 1 passed[^.]*\bamended form")
-        self.assertRegex(self.status, r"owner[^.]*acknowledg")
+        self.assertRegex(self.status, r"owner accepted the amended criterion on 2026-10-13")
+        # Probes 1-3 are accepted; probes 4 and 5 stay pending.
+        self.assertRegex(self.status, r"probes 1[–-]3 are therefore accepted")
+        self.assertRegex(self.status, r"Probes 4 and 5 stay pending")
+        self.assertNotRegex(self.status, r"acknowledg")
 
 
 class ReaderSeccompMaterializationTests(unittest.TestCase):

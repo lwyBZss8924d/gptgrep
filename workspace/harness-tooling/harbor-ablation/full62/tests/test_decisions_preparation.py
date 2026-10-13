@@ -39,6 +39,9 @@ class PreparationMaterializationTests(unittest.TestCase):
         adapter = fixtures.HarborMaterializationTests.materializer(self)
         dataset = self.root / "prepared-dataset"
         result = adapter.run(dataset)
+        command = result["preflight"]["treatment_feature_profile"]["command"]
+        self.assertEqual(command, ["gptgrep", "--decisions-budget", decisions.TRIAL_BUDGET, "ask", "--native-ptc",
+                                   "--multimodal", "--max-concurrent-batches", "1"])
         states, run_ids, locks = set(), set(), set()
         for record in result["tasks"]:
             task = dataset / record["task_name"]
@@ -61,6 +64,8 @@ class PreparationMaterializationTests(unittest.TestCase):
             self.assertLessEqual(len(config["decisions_preparation"]["run_id"]), 96)
             argv = reader_argv(config, record["binding"], "synthetic request")
             self.assertEqual(argv[2], decisions.TRIAL_BUDGET)
+            # The frozen profile declares exactly the prefix this reader launches.
+            self.assertEqual(argv[1:len(command)], command[1:])
             self.assertEqual(argv[argv.index("--max-concurrent-batches") + 1], "1")
             self.assertFalse(any("reference" in key for key in config["decisions_preparation"]))
         self.assertEqual((len(states), len(run_ids), len(locks)), (62, 62, 1))

@@ -4,11 +4,10 @@ from __future__ import annotations
 import copy
 import json
 import os
-import re
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from gptgrep_harbor.adapter import Full62Adapter, validate_cohort, env_templates
 import gptgrep_harbor.adapter as adapter_module
@@ -16,7 +15,7 @@ from gptgrep_harbor.aggregate import paired, summarize, time_bounds
 from gptgrep_harbor.common import MAX_ANSWER, MAX_NATIVE_PROMPT_BYTES, PROFILE, canonical, parse, sha
 from gptgrep_harbor.native import codex_accounting, codex_result, output_schema_bytes, prompt_bytes
 from gptgrep_harbor.reader import product_accounting
-from gptgrep_harbor import reader, verifier
+from gptgrep_harbor import decisions as decisions_module, reader, verifier
 from gptgrep_harbor.runtime import CODEX_VERSION, READER_SECCOMP_BYTES, READER_SECCOMP_SHA256
 from gptgrep_harbor.verifier import grade, transport_reward
 from gptgrep_harbor.process import run as bounded_process
@@ -29,10 +28,27 @@ def synthetic_cohort():
                        "reference": str(i * 17), "answer_format": "integer"} for i in range(62)]}
 
 
+# Generic markers of GPTgrep's reader contract (answer rules, citation and
+# abstention schema). None may reach the raw-only prompt in any reader mode.
+GPTGREP_RULE_MARKERS = ("Answer rules", "answer rules", "Lead with the direct answer", "commit to",
+                        "in-text references", "footnote", "hedging", "insufficient_evidence",
+                        "citation", "GPTgrep", "gptgrep")
+RAW_READER_CONTRACT = {"schema": "gptgrep.harbor.reader-contract.v1", "arm": "raw_only",
+                       "base_instructions": "codex_default", "prompt": "common_task_prompt",
+                       "gptgrep_contract_received": False, "answer_rules_received": False,
+                       "answer_rules_description_sha256": None}
+
+
+def assert_no_gptgrep_rule_text(case, prompt):
+    for marker in GPTGREP_RULE_MARKERS:
+        case.assertNotIn(marker, prompt)
+
+
 def synthetic_results():
     rows, inputs, blobs = [], [], {}
     runtime = {"deadline_seconds": 20, "bootstrap_seed": 19, "profile": PROFILE,
-               "primary_metric": "answer_equivalence_delta"}
+               "primary_metric": "answer_equivalence_delta", "reader_mode": "legacy_text",
+               "jev_model": "synthetic-decisions", "max_tool_calls": 10000, "qualification_mismatches": []}
     export = {"expected_pairs": 62, "expected_documents": 34,
               "cohort": {"sha256": "a" * 64}, "runtime": {"sha256": "b" * 64},
               "judge_contract": {"sha256": "c" * 64}, "tasks": rows}
@@ -220,6 +236,141 @@ class PairedTests(unittest.TestCase):
                     self.aggregate(export, records, runtime, blobs)
                 blobs[by_arm["gptgrep"][0]["judgment"]] = original
 
+    def test_summary_keeps_the_declared_reader_contract_out_of_qualification_mismatches(self):
+        export, records, runtime, blobs = synthetic_results()
+        generic, declared = {"code": "observed generic mismatch"}, {"code": "reader_contract_differs"}
+        runtime["qualification_mismatches"] = [generic, declared]
+        profile = self.aggregate(export, records, runtime, blobs)["profile"]
+        self.assertEqual(profile["qualification_mismatches"], [generic])
+        self.assertEqual(profile["declared_treatment_differences"], [declared])
+        contract = profile["treatment_feature_profile"]["reader_contract"]
+        self.assertIs(contract["declared_treatment"], True)
+        self.assertIn("answer_rules", contract["components"])
+        self.assertIs(contract["baseline_receives_gptgrep_rules"], False)
+        # The export's frozen profile must be the one the admitted runtime declares.
+        export["preflight"] = {"treatment_feature_profile": profile["treatment_feature_profile"]}
+        self.aggregate(export, records, runtime, blobs)
+        export["preflight"]["treatment_feature_profile"] = {**profile["treatment_feature_profile"],
+                                                            "reader_mode": "rich_multimodal"}
+        with self.assertRaisesRegex(ValueError, "treatment_profile_join"):
+            self.aggregate(export, records, runtime, blobs)
+
+    def test_only_the_exact_reader_contract_entry_once_is_a_declared_difference(self):
+        exact = {"code": "reader_contract_differs"}
+        shaped = {"code": "reader_contract_differs", "arm": "raw_only", "observation": "synthetic bare deviation"}
+        generic = {"code": "observed generic mismatch"}
+        listed = {"code": ["reader_contract_differs"]}
+        self.assertEqual(adapter_module.qualification([exact, shaped, generic, exact, "reader_contract_differs", listed]),
+                         {"mismatches": [shaped, generic, exact, "reader_contract_differs", listed],
+                          "declared_treatment_differences": [exact]})
+        self.assertEqual(adapter_module.qualification([shaped, exact]),
+                         {"mismatches": [shaped], "declared_treatment_differences": [exact]})
+        # Nothing but that one entry drops out of the summary's mismatches.
+        export, records, runtime, blobs = synthetic_results()
+        runtime["qualification_mismatches"] = [shaped, exact, exact]
+        profile = self.aggregate(export, records, runtime, blobs)["profile"]
+        self.assertEqual((profile["qualification_mismatches"], profile["declared_treatment_differences"]),
+                         ([shaped, exact], [exact]))
+
+    def test_summary_checks_each_arm_reader_contract_against_the_declaration(self):
+        export, records, runtime, blobs = synthetic_results()
+        unobserved = self.aggregate(export, records, runtime, blobs)["reader_contract"]
+        self.assertEqual((unobserved["raw_only_records_unobserved"], unobserved["treatment_records_without_identity"],
+                          unobserved["treatment_records_without_answer_rules_description"],
+                          unobserved["treatment_product_provenance_sha256"]), (62, 62, 62, []))
+        treatment = {"schema": "gptgrep.harbor.reader-contract.v1", "arm": "gptgrep",
+                     "base_instructions": "gptgrep_reader_contract", "reader_mode": "legacy_text",
+                     "answer_rules_received": True, "answer_rules_description_sha256": "1" * 64,
+                     "identity": "product_provenance_sha256", "product_provenance_sha256": "9" * 64}
+
+        def stamp(index, arm, contract):
+            record = [r for r, row in zip(records, export["tasks"]) if row["binding"]["arm"] == arm][index]
+            operation = parse(blobs[record["operation"]])
+            operation["reader_contract"] = contract
+            blobs[record["operation"]] = canonical(operation)
+        for index in range(62):
+            stamp(index, "gptgrep", treatment)
+            stamp(index, "raw_only", RAW_READER_CONTRACT)
+        result = self.aggregate(export, records, runtime, blobs)
+        self.assertEqual(result["reader_contract"],
+                         {"declared_treatment": True, "treatment_identity": "product_provenance_sha256",
+                          "treatment_product_provenance_sha256": ["9" * 64],
+                          "treatment_identity_consistent": True, "treatment_records_without_identity": 0,
+                          "treatment_answer_rules_expected": True,
+                          "treatment_answer_rules_description_sha256": ["1" * 64],
+                          "treatment_records_without_answer_rules_description": 0,
+                          "raw_only_records_without_gptgrep_contract": 62,
+                          "raw_only_records_reporting_gptgrep_contract": 0,
+                          "raw_only_records_unobserved": 0})
+        self.assertFalse(any("product provenance" in note for note in result["limitations"]))
+        # A raw-only record that reports the contract is visible.
+        stamp(0, "raw_only", {**RAW_READER_CONTRACT, "gptgrep_contract_received": True})
+        summary = self.aggregate(export, records, runtime, blobs)["reader_contract"]
+        self.assertEqual((summary["raw_only_records_reporting_gptgrep_contract"],
+                          summary["raw_only_records_without_gptgrep_contract"]), (1, 61))
+        # rich_multimodal treatment trials have no answer-rules description by design,
+        # but every treatment record still carries its build identity.
+        stamp(0, "gptgrep", {**treatment, "reader_mode": "rich_multimodal", "answer_rules_received": False,
+                             "answer_rules_description_sha256": None})
+        runtime["reader_mode"] = "rich_multimodal"
+        summary = self.aggregate(export, records, runtime, blobs)["reader_contract"]
+        self.assertEqual((summary["treatment_records_without_identity"],
+                          summary["treatment_records_without_answer_rules_description"]), (0, 0))
+
+    def test_summary_binds_the_treatment_identity_to_the_build_not_the_rules_description(self):
+        # The product's --schema description of its answer rules is written separately
+        # from the rule text the reader receives: an unchanged description digest cannot
+        # show that two builds gave the reader the same rules. Only the bundle
+        # provenance digest binds the build.
+        export, records, runtime, blobs = synthetic_results()
+        treatment = {"schema": "gptgrep.harbor.reader-contract.v1", "arm": "gptgrep",
+                     "base_instructions": "gptgrep_reader_contract", "reader_mode": "legacy_text",
+                     "answer_rules_received": True, "answer_rules_description_sha256": "1" * 64,
+                     "identity": "product_provenance_sha256"}
+        for index, (record, row) in enumerate((r, row) for r, row in zip(records, export["tasks"])
+                                              if row["binding"]["arm"] == "gptgrep"):
+            operation = parse(blobs[record["operation"]])
+            operation["reader_contract"] = {**treatment, "product_provenance_sha256": ("8" if index else "9") * 64}
+            blobs[record["operation"]] = canonical(operation)
+        result = self.aggregate(export, records, runtime, blobs)
+        contract = result["reader_contract"]
+        self.assertEqual(contract["treatment_answer_rules_description_sha256"], ["1" * 64])
+        self.assertEqual(contract["treatment_product_provenance_sha256"], ["8" * 64, "9" * 64])
+        self.assertIs(contract["treatment_identity_consistent"], False)
+        self.assertNotIn("treatment_answer_rules_sha256", contract)
+        self.assertEqual([note for note in result["limitations"] if "product provenance" in note],
+                         ["2 distinct product provenance digests among the treatment records: the treatment trials "
+                          "did not all run one product build, so their reader contracts may differ."])
+
+    def test_summary_flags_pairs_with_a_pre_existing_trial_claim(self):
+        export, records, runtime, blobs = synthetic_results()
+        self.assertIsNone(self.aggregate(export, records, runtime, blobs)["trial_claims"])
+        runtime.update(decisions_mode="invocation_bounded", decisions_max_submissions_per_trial=8)
+        claim = {"path": "/opt/full62-private/claim/claim.json", "bytes": 1, "sha256": "3" * 64}
+        for index, (record, row) in enumerate(zip(records, export["tasks"])):
+            operation = parse(blobs[record["operation"]])
+            if index == 1:
+                # A resumed job re-executed this raw-only trial: its claim was present.
+                answer = parse(blobs[record["answer"]])
+                answer.update(status="operational_failure", answer=None)
+                blobs[record["answer"]] = canonical(answer)
+                operation.update(status="operational_failure", answer_sha256=sha(canonical(answer)),
+                                 failure="reader_failed", failure_code="trial_already_claimed")
+                judgment = parse(blobs[record["judgment"]])
+                judgment.update(status="operational_failure", label=0, answer_envelope_sha256=sha(canonical(answer)))
+                blobs[record["judgment"]] = canonical(judgment)
+            else:
+                operation["trial_claim"] = claim
+            blobs[record["operation"]] = canonical(operation)
+        self.assertEqual(export["tasks"][1]["binding"]["arm"], "raw_only")
+        summary = self.aggregate(export, records, runtime, blobs)
+        self.assertEqual(summary["trial_claims"],
+                         {"claimed_arms": ["gptgrep", "raw_only"], "pairs_with_pre_existing_claim": 1,
+                          "arms": {"gptgrep": {"claimed": 62, "pre_existing_claim": 0, "unclaimed": 0},
+                                   "raw_only": {"claimed": 61, "pre_existing_claim": 1, "unclaimed": 0}}})
+        self.assertEqual(summary["search"]["raw_only"]["operational_failure_codes"], {"trial_already_claimed": 1})
+        self.assertTrue(any("found its claim already present" in note for note in summary["limitations"]))
+
     def test_unknown_cost_is_not_free(self):
         export, records, runtime, blobs = synthetic_results()
         result = self.aggregate(export, records, runtime, blobs)
@@ -318,10 +469,11 @@ class NativeAccountingTests(unittest.TestCase):
         self.assertEqual(argv[-2:], ["--", "-"])
         self.assertNotIn("synthetic question", argv)
         self.assertTrue(child.call_args.kwargs["input_bytes"].endswith(b"synthetic question"))
-        # A legacy_text run gives the raw-only arm the reader's generic answer rules.
-        self.assertIn(reader.READER_ANSWER_RULES.encode(), child.call_args.kwargs["input_bytes"])
-        self.assertEqual(outputs["/logs/agent/operational.json"]["shared_answer_rules_sha256"],
-                         sha(reader.READER_ANSWER_RULES.encode()))
+        # Even in a legacy_text run, the raw-only arm receives only the common
+        # task prompt: none of GPTgrep's reader contract, and it says so.
+        self.assertEqual(child.call_args.kwargs["input_bytes"], reader.raw_prompt(config, "synthetic question"))
+        assert_no_gptgrep_rule_text(self, child.call_args.kwargs["input_bytes"].decode())
+        self.assertEqual(outputs["/logs/agent/operational.json"]["reader_contract"], RAW_READER_CONTRACT)
         self.assertLess(child.call_args.kwargs["timeout"], config["deadline_seconds"])
         return outputs
 
@@ -372,6 +524,45 @@ class NativeAccountingTests(unittest.TestCase):
             self.assertEqual(child.call_args.kwargs["input_bytes"], expected)
             self.assertLess(child.call_args.kwargs["timeout"], config["judge_deadline_seconds"])
         return outputs
+
+    def test_raw_only_trial_claims_its_one_reader_process_in_invocation_bounded_mode(self):
+        directory = tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"])
+        self.addCleanup(directory.cleanup)
+        claim_root = Path(directory.name).resolve()
+        config = {"binding": self.binding(), "profile": PROFILE, "codex_binary": "/synthetic/codex",
+                  "gptgrep_binary": "/synthetic/gptgrep", "raw_document": "/data/corpus/synthetic.txt",
+                  "reader_base_binary": {"path": "/synthetic/codex"}, "max_input_bytes": 8192,
+                  "native_cli": {}, "native_config_sha256": "e" * 64, "deadline_seconds": 20,
+                  "base_tool_environment": {}, "permitted_tools": [], "generic_capabilities": [],
+                  "qualification_mismatches": [], "budget_scope": {}, "reader_mode": "legacy_text",
+                  "decisions_mode": "invocation_bounded"}
+
+        def execute():
+            outputs = {}
+            with patch("gptgrep_harbor.decisions.CLAIM_ROOT", str(claim_root)), \
+                 patch.object(reader, "read", side_effect=[canonical(config), b"synthetic question"]), \
+                 patch.object(reader, "check_config"), patch.object(reader, "copy_asset"), \
+                 patch.object(reader, "native_environment", return_value={}), \
+                 patch.object(reader.Path, "exists", return_value=False), \
+                 patch.object(reader, "put", side_effect=lambda path, value: outputs.update({path: value})), \
+                 patch("sys.argv", ["reader", "--instruction", "/synthetic/instruction.txt"]), \
+                 patch.object(reader, "run", side_effect=[
+                     self.native_run_result(("codex-cli " + CODEX_VERSION).encode()),
+                     self.native_run_result(self.events())]) as child:
+                reader.main()
+            return outputs, child
+        outputs, child = execute()
+        self.assertEqual(outputs["/answer/answer.json"]["status"], "response")
+        claim = (claim_root / "claim.json").read_bytes()
+        self.assertEqual(json.loads(claim)["binding_sha256"], sha(canonical(self.binding())))
+        self.assertEqual(outputs["/logs/agent/operational.json"]["trial_claim"]["sha256"], sha(claim))
+        self.assertEqual(child.call_count, 2)
+        # A re-executed bare trial fails closed before Codex starts, like the treatment.
+        again, child = execute()
+        self.assertEqual(child.call_count, 1)
+        self.assertEqual(again["/answer/answer.json"]["status"], "operational_failure")
+        self.assertEqual(again["/logs/agent/operational.json"]["failure_code"], "trial_already_claimed")
+        self.assertEqual((claim_root / "claim.json").read_bytes(), claim)
 
     def test_reader_and_judge_entrypoints_retain_usage_before_answer_or_process_acceptance(self):
         cases = [(name, data, {}) for name, data in self.failed_streams().items()]
@@ -503,6 +694,62 @@ def legacy_report(**changes):
     return canonical(report)
 
 
+SYNTHETIC_ANSWER_RULES = "Synthetic answer rules that the pinned product reports for its text reader."
+
+
+def product_schema_report(rules=SYNTHETIC_ANSWER_RULES, request_bytes=65536, max_submissions=200):
+    """A synthetic `gptgrep --schema` report carrying only the fields the reader checks."""
+    budget = {"init_options": {"max-submissions": {"type": "integer", "minimum": 1, "maximum": max_submissions}}}
+    return canonical({"schema_version": "gptgrep.cli.v1",
+                      "commands": {"ask": {"reader_answer_rules": rules}, "decisions-budget": budget},
+                      "decisions": {"limits": {"text_envelope_bytes": request_bytes}}})
+
+
+class FakeTrialLedger:
+    """Synthetic stand-in for the product's offline `decisions-budget init` and `status`; nothing is executed."""
+
+    def __init__(self, remaining=6, init=None, status=None):
+        self.remaining, self.init_changes, self.status_changes = remaining, init or {}, status
+        self.control = None
+
+    def __call__(self, argv, result):
+        options = dict(zip(argv[3::2], argv[4::2]))
+        if argv[2] == "init":
+            control = {"schema_version": "gptgrep.decisions-budget-contract.v1", "run_id": options["--run-id"],
+                       "plan_digest": sha(Path(options["--plan-file"]).read_bytes()),
+                       "deadline_unix_ms": 1000 * (10**9 + int(options["--deadline-seconds"])),
+                       "max_submissions": int(options["--max-submissions"]), "ledger_path": options["--ledger"]}
+            data = canonical(control)
+            Path(options["--output"]).write_bytes(data)
+            self.control = control
+            report = {"schema_version": "gptgrep.decisions-budget-init.v1", "status": "initialized",
+                      "control_schema": control["schema_version"],
+                      **{key: control[key] for key in ("run_id", "plan_digest", "deadline_unix_ms",
+                                                         "max_submissions", "ledger_path")},
+                      "max_concurrent_requests": 4, "control_path": options["--output"],
+                      "control_sha256": sha(data), "control_mode": "0600", "joins_existing": False}
+            report.update(self.init_changes)
+            return {**result, "stdout": canonical(report)}
+        if self.status_changes == "unavailable":
+            return {**result, "return_code": 2, "stdout": b"{}"}
+        limit = self.control["max_submissions"]
+        used = limit - self.remaining
+        status = {"schema_version": "gptgrep.decisions-budget-status.v1", "run_id": self.control["run_id"],
+                  "plan_digest": self.control["plan_digest"], "ledger_path": self.control["ledger_path"],
+                  "max_submissions": limit, "max_concurrent_requests": 4,
+                  "reservations": {"total": used, "reserved": 0, "in_flight": 0, "unknown": 0, "terminal": used},
+                  "send_started": used, "submission_observations": used, "remaining_submissions": self.remaining,
+                  "occupied_slots": 0, "requested_models": {}, "deadline_unix_ms": self.control["deadline_unix_ms"],
+                  "deadline_state": "open", "wall_remaining_ms": 1, "anchor_remaining_ms": 1,
+                  "admission_open": self.remaining > 0, "read_only": True}
+        return {**result, "stdout": canonical(status)}
+
+
+def ask_calls(child):
+    """The product Ask launches among a mocked reader's child processes."""
+    return [call for call in child.call_args_list if "ask" in call.args[0]]
+
+
 class LegacyTreatmentReaderTests(unittest.TestCase):
     """The treatment entrypoint and primary Judge for reader_mode=legacy_text."""
     question = "synthetic question"
@@ -516,6 +763,8 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
     def config(self):
         return {"binding": self.binding(), "profile": PROFILE, "codex_binary": "/synthetic/codex",
                 "gptgrep_binary": "/synthetic/gptgrep", "codex_home": "/opt/full62-home",
+                "gptgrep_bundle": {"provenance": {"path": "/synthetic/provenance.json", "bytes": 1,
+                                                  "sha256": "9" * 64}},
                 "reader_base_binary": {"path": "/synthetic/codex"}, "max_input_bytes": 8192, "max_tool_calls": 8,
                 "native_cli": {}, "native_config_sha256": "e" * 64, "deadline_seconds": 20,
                 "base_tool_environment": {}, "permitted_tools": [], "generic_capabilities": [],
@@ -525,13 +774,26 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
                 "decisions_budget": {"path": "/opt/full62-private/decisions-budget.json", "bytes": 1,
                                      "sha256": "f" * 64}}
 
-    def run_reader(self, stdout, environ=None, config=None, claim_root="/synthetic/unmounted-claim"):
+    def run_reader(self, stdout, environ=None, config=None, claim_root="/synthetic/unmounted-claim",
+                   schema=None, ledger=None):
         outputs = {}
         version = {"stdout": ("codex-cli " + CODEX_VERSION).encode(), "stderr": b"", "elapsed_ms": 1,
                    "return_code": 0, "failure": None, "stdin_bytes": 0, "stdin_bytes_sent": 0, "stdin_complete": True}
         product = {**version, "stdout": stdout, "elapsed_ms": 10}
+        report = {**version, "stdout": product_schema_report(), **(schema or {})}
         budget = canonical({"ledger_path": "/opt/full62-private/ledger/decisions.json"})
         config = self.config() if config is None else config
+        self.ledger = FakeTrialLedger() if ledger is None else ledger
+
+        def child(argv, **_kwargs):
+            # The pinned product's offline contract report, the native version
+            # check, the trial ledger commands, then the one Ask.
+            if argv[1:] == ["--schema"]:
+                return report
+            if argv[1] == "decisions-budget":
+                return self.ledger(argv, version)
+            return version if argv[1:] == ["--version"] else product
+        process = Mock(side_effect=child)
         with patch("gptgrep_harbor.decisions.CLAIM_ROOT", str(claim_root)), \
              patch.object(reader, "read", side_effect=[canonical(config), self.question.encode()]), \
              patch.object(reader, "check_config"), patch.object(reader, "copy_asset"), \
@@ -541,10 +803,10 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
              patch.object(reader, "put", side_effect=lambda path, value: outputs.update({path: value})), \
              patch.dict(os.environ, environ or {"PATH": "/usr/bin"}, clear=True), \
              patch("sys.argv", ["reader", "--instruction", "/synthetic/instruction.txt"]), \
-             patch.object(reader, "run", side_effect=[version, product]) as child:
+             patch.object(reader, "run", process), patch("gptgrep_harbor.decisions.run", process):
             reader.main()
         self.budget_reads = budget_read.call_count
-        return outputs, child
+        return outputs, process
 
     def judge_config(self):
         return {"binding": self.binding(), "question": self.question, "reference": "synthetic reference",
@@ -593,12 +855,16 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
         from gptgrep_harbor.runtime import model_config
         outputs, child = self.run_reader(legacy_report(),
                                          environ={"PATH": "/usr/bin", "OPENROUTER_API_KEY": "synthetic-only"})
-        version_call, product_call = child.call_args_list
+        schema_call, version_call, product_call = child.call_args_list
         # Decisions requests come from the GPTgrep host process, outside the
         # Codex tool sandbox whose network the shared reader policy disables.
+        self.assertEqual(product_call, ask_calls(child)[0])
         self.assertEqual(product_call.args[0][0], "/synthetic/gptgrep")
         self.assertEqual(product_call.kwargs["env"]["OPENROUTER_API_KEY"], "synthetic-only")
         self.assertNotIn("OPENROUTER_API_KEY", version_call.kwargs["env"])
+        # The offline contract report needs no credential.
+        self.assertEqual(schema_call.args[0], ["/synthetic/gptgrep", "--schema"])
+        self.assertNotIn("OPENROUTER_API_KEY", schema_call.kwargs["env"])
         self.assertEqual(outputs["/answer/answer.json"]["status"], "response")
         policy = tomllib.loads(model_config(PROFILE, "reader").decode())
         self.assertEqual(policy["web_search"], "disabled")
@@ -607,7 +873,7 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
     def test_existing_context_ask_still_joins_the_mounted_budget(self):
         outputs, child = self.run_reader(legacy_report())
         self.assertEqual(self.budget_reads, 1)
-        self.assertEqual(child.call_args_list[1].args[0][1:4],
+        self.assertEqual(ask_calls(child)[0].args[0][1:4],
                          ["--decisions-budget", "/opt/full62-private/decisions-budget.json", "ask"])
         self.assertEqual(outputs["/logs/agent/operational.json"]["decisions_mode"], "existing_context")
 
@@ -616,8 +882,119 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         return Path(directory.name).resolve()
 
+    def invocation_config(self):
+        config = {**self.config(), "decisions_mode": "invocation_bounded", "decisions_max_submissions_per_trial": 8}
+        del config["decisions_budget"]
+        return config
+
+    def ledger_calls(self, child, command):
+        return [call for call in child.call_args_list if call.args[0][1:3] == ["decisions-budget", command]]
+
+    def test_invocation_bounded_ask_joins_its_own_product_ledger_with_the_trial_limit(self):
+        claim_root = self.claim_root()
+        outputs, child = self.run_reader(legacy_report(), config=self.invocation_config(), claim_root=claim_root,
+                                         environ={"PATH": "/usr/bin", "OPENROUTER_API_KEY": "synthetic-only"})
+        control = claim_root / "decisions-budget.json"
+        (init,), (status,) = self.ledger_calls(child, "init"), self.ledger_calls(child, "status")
+        options = dict(zip(init.args[0][3::2], init.args[0][4::2]))
+        self.assertEqual((options["--max-submissions"], options["--plan-file"], options["--ledger"],
+                          options["--output"]),
+                         ("8", str(claim_root / "claim.json"), str(claim_root / "decisions-ledger.json"), str(control)))
+        self.assertTrue(0 < int(options["--deadline-seconds"]) <= 20)
+        # Exactly the per-trial options and then the fixed ones the frozen profile declares.
+        with patch("gptgrep_harbor.decisions.CLAIM_ROOT", str(claim_root)):
+            declared = decisions_module.trial_budget_init_options(8)
+        self.assertEqual((init.args[0][1:3], init.args[0][3:7:2], init.args[0][7:]),
+                         (["decisions-budget", "init"], list(decisions_module.TRIAL_BUDGET_INIT_PER_TRIAL), declared))
+        self.assertEqual(status.args[0][1:], ["decisions-budget", "status", "--control", str(control), "--json"])
+        # Ledger commands are offline: no provider credential.
+        for call in (init, status):
+            self.assertNotIn("OPENROUTER_API_KEY", call.kwargs["env"])
+        # The ledger exists before the one Ask, which joins it.
+        order = [call.args[0][1:3] for call in child.call_args_list]
+        self.assertLess(order.index(["decisions-budget", "init"]), order.index(["--decisions-budget", str(control)]))
+        self.assertEqual(ask_calls(child)[0].args[0][1:4], ["--decisions-budget", str(control), "ask"])
+        operation = outputs["/logs/agent/operational.json"]
+        budget = operation["decisions_trial_budget"]
+        data = control.read_bytes()
+        self.assertEqual(budget["control"], {"path": str(control), "bytes": len(data), "sha256": sha(data)})
+        self.assertEqual((budget["max_submissions"], budget["enforced_by"], budget["plan_sha256"]),
+                         (8, "product_decisions_budget_ledger", operation["trial_claim"]["sha256"]))
+        # The mirrored limits behind the admitted bound match the product's own report.
+        self.assertEqual(operation["decisions_product_limits"],
+                         {"schema": "gptgrep.harbor.decisions-product-limits.v1", "source": "product_schema",
+                          "mirrored": {"max_submissions": 200, "max_request_bytes": 65536},
+                          "product_reported": {"max_submissions": 200, "max_request_bytes": 65536}, "match": True})
+        self.assertEqual((budget["remaining_submissions"], budget["limit_reached"], budget["limit_bound"]),
+                         (6, False, False))
+        self.assertEqual(budget["status_after_ask"]["reservations"]["total"], 2)
+        self.assertEqual(outputs["/answer/answer.json"]["status"], "response")
+        self.assertNotIn("failure_code", operation)
+
+    def test_binding_trial_limit_is_a_recorded_operational_failure_and_never_retried(self):
+        def failed(requests, attempted):
+            # A failed Ask's own Decisions accounting: a submission refused at the
+            # limit is an attempted call without a reservation or a validated response.
+            return canonical({"status": "failed", "error": {"jev": {"requests": requests,
+                                                                    "attempted_calls": attempted}}})
+        completed = legacy_report(jev={"requests": 8, "attempted_calls": 8, "usage": [{"cost": 0.0125}] * 8})
+        # (case, report, ledger, envelope status, limit_reached, limit_bound, unvalidated_reservations)
+        cases = (("failed_at_limit", failed(8, 9), FakeTrialLedger(remaining=0), "operational_failure", True, True, 0),
+                 # One transient provider error took a reservation, so its retry was refused at the limit.
+                 ("failed_at_limit_after_a_transient_error", failed(7, 9), FakeTrialLedger(remaining=0),
+                  "operational_failure", True, True, 1),
+                 ("completed_at_limit", completed, FakeTrialLedger(remaining=0), "response", True, False, 0),
+                 ("failed_below_limit", failed(5, 6), FakeTrialLedger(remaining=3), "operational_failure",
+                  False, False, 0),
+                 # More validated responses than reservations is no usable count.
+                 ("inconsistent_receipt", failed(9, 9), FakeTrialLedger(remaining=0), "operational_failure",
+                  True, True, None),
+                 ("status_unavailable", failed(8, 9), FakeTrialLedger(status="unavailable"), "operational_failure",
+                  None, None, None))
+        for name, report, ledger, status, reached, bound, unvalidated in cases:
+            with self.subTest(case=name):
+                outputs, child = self.run_reader(report, config=self.invocation_config(),
+                                                 claim_root=self.claim_root(), ledger=ledger)
+                self.assertEqual(len(ask_calls(child)), 1)
+                envelope = outputs["/answer/answer.json"]
+                self.assertEqual(envelope["status"], status)
+                operation = outputs["/logs/agent/operational.json"]
+                budget = operation["decisions_trial_budget"]
+                self.assertEqual((budget["limit_reached"], budget["limit_bound"], budget["unvalidated_reservations"]),
+                                 (reached, bound, unvalidated))
+                self.assertEqual(operation.get("failure_code"),
+                                 "decisions_submission_limit_reached" if bound else None)
+                if bound:
+                    # A recorded, judged failure: label 0 without any Judge call.
+                    result = grade(self.judge_config(), envelope, lambda *_: self.fail("Judge called"))
+                    self.assertEqual((result["status"], result["label"]), ("operational_failure", 0))
+
+    def test_trial_ledger_must_exist_before_the_ask_or_the_trial_stops_unspent(self):
+        cases = {"init_failed": FakeTrialLedger(init={"status": "joined"}),
+                 "other_limit": FakeTrialLedger(init={"max_submissions": 9}),
+                 "joins_existing": FakeTrialLedger(init={"joins_existing": True}),
+                 "other_control": FakeTrialLedger(init={"control_sha256": "0" * 64})}
+        for name, ledger in cases.items():
+            with self.subTest(case=name):
+                claim_root = self.claim_root()
+                outputs, child = self.run_reader(legacy_report(), config=self.invocation_config(),
+                                                 claim_root=claim_root, ledger=ledger)
+                self.assertEqual(ask_calls(child), [])
+                operation = outputs["/logs/agent/operational.json"]
+                self.assertEqual(operation["failure_code"], "decisions_trial_budget_unavailable")
+                self.assertNotIn("decisions_trial_budget", operation)
+                self.assertTrue((claim_root / "claim.json").exists())
+        # An unset limit stops before the claim, the ledger and the Ask.
+        config = self.invocation_config()
+        del config["decisions_max_submissions_per_trial"]
+        claim_root = self.claim_root()
+        outputs, child = self.run_reader(legacy_report(), config=config, claim_root=claim_root)
+        self.assertEqual((ask_calls(child), self.ledger_calls(child, "init")), ([], []))
+        self.assertEqual(outputs["/logs/agent/operational.json"]["failure_code"], "decisions_max_submissions_per_trial")
+        self.assertEqual(list(claim_root.iterdir()), [])
+
     def test_invocation_bounded_ask_claims_once_and_keeps_its_cost_receipt(self):
-        config = {**self.config(), "decisions_mode": "invocation_bounded"}
+        config = {**self.config(), "decisions_mode": "invocation_bounded", "decisions_max_submissions_per_trial": 8}
         del config["decisions_budget"]
         jev = {"requests": 2, "attempted_calls": 2, "unobserved_attempts": 0, "accounting_complete": True,
                "usage": [{"cost": 0.0125}, {"cost": 0.0075}]}
@@ -630,9 +1007,9 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
                 claim_root = self.claim_root()
                 outputs, child = self.run_reader(report, config=config, claim_root=claim_root)
                 self.assertEqual(self.budget_reads, 0)
-                argv = child.call_args_list[1].args[0]
-                self.assertEqual(argv[:2], ["/synthetic/gptgrep", "ask"])
-                self.assertNotIn("--decisions-budget", argv)
+                argv = ask_calls(child)[0].args[0]
+                self.assertEqual(argv[:4], ["/synthetic/gptgrep", "--decisions-budget",
+                                            str(claim_root / "decisions-budget.json"), "ask"])
                 self.assertEqual(outputs["/answer/answer.json"]["status"], expected)
                 operation = outputs["/logs/agent/operational.json"]
                 self.assertEqual(operation["decisions_mode"], "invocation_bounded")
@@ -644,7 +1021,7 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
                 # trial's own host directory, outside the Harbor job directory.
                 claim = (claim_root / "claim.json").read_bytes()
                 self.assertEqual(json.loads(claim)["binding_sha256"], sha(canonical(self.binding())))
-                self.assertEqual(operation["decisions_claim"]["sha256"], sha(claim))
+                self.assertEqual(operation["trial_claim"]["sha256"], sha(claim))
                 host = (claim_root / "decisions-cost.json").read_bytes()
                 self.assertEqual(json.loads(host)["decisions_cost"], receipt)
                 self.assertEqual(json.loads(host)["product_report_sha256"], sha(report))
@@ -652,25 +1029,48 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
                 # A re-executed trial (for example in a resumed Harbor job) finds
                 # the claim and fails closed before the Ask: no Decisions spend.
                 again, child = self.run_reader(report, config=config, claim_root=claim_root)
-                self.assertEqual(child.call_count, 1)
+                self.assertEqual((ask_calls(child), self.ledger_calls(child, "init")), ([], []))
                 self.assertEqual(again["/answer/answer.json"]["status"], "operational_failure")
                 repeated = again["/logs/agent/operational.json"]
                 self.assertEqual((repeated["failure"], repeated["attempts"]), ("reader_failed", []))
+                self.assertEqual(repeated["failure_code"], "trial_already_claimed")
                 self.assertNotIn("decisions_receipt", repeated)
                 self.assertEqual((claim_root / "claim.json").read_bytes(), claim)
 
+    def test_product_report_must_confirm_the_mirrored_limits_before_the_claim(self):
+        cases = {"larger_requests": {"request_bytes": 131072}, "more_submissions": {"max_submissions": 400},
+                 "unreported": {"request_bytes": None}}
+        for name, changes in cases.items():
+            with self.subTest(case=name):
+                claim_root = self.claim_root()
+                outputs, child = self.run_reader(legacy_report(), config=self.invocation_config(),
+                                                 claim_root=claim_root,
+                                                 schema={"stdout": product_schema_report(**changes)})
+                self.assertEqual((ask_calls(child), self.ledger_calls(child, "init")), ([], []))
+                self.assertEqual(list(claim_root.iterdir()), [])
+                operation = outputs["/logs/agent/operational.json"]
+                self.assertEqual(operation["failure_code"], "decisions_product_limits_mismatch")
+                limits = operation["decisions_product_limits"]
+                self.assertIs(limits["match"], False)
+                self.assertEqual(limits["product_reported"],
+                                 {"max_submissions": changes.get("max_submissions", 200),
+                                  "max_request_bytes": changes.get("request_bytes", 65536)})
+        # Other Decisions modes do not rely on the mirrored request bound.
+        outputs, _ = self.run_reader(legacy_report(), schema={"stdout": product_schema_report(request_bytes=1)})
+        self.assertNotIn("decisions_product_limits", outputs["/logs/agent/operational.json"])
+        self.assertEqual(outputs["/answer/answer.json"]["status"], "response")
+
     def test_invocation_bounded_ask_requires_its_claim_mount(self):
-        config = {**self.config(), "decisions_mode": "invocation_bounded"}
+        config = {**self.config(), "decisions_mode": "invocation_bounded", "decisions_max_submissions_per_trial": 8}
         del config["decisions_budget"]
         missing = self.claim_root() / "not-mounted"
         outputs, child = self.run_reader(legacy_report(), config=config, claim_root=missing)
-        self.assertEqual(child.call_count, 1)
+        self.assertEqual(ask_calls(child), [])
         self.assertEqual(outputs["/answer/answer.json"]["status"], "operational_failure")
         self.assertFalse(missing.exists())
 
     def test_bare_prompt_states_the_enforced_no_external_search_policy(self):
-        # raw_prompt requires an explicit reader_mode (explicit_reader_mode), so the
-        # policy wording is checked in both modes.
+        # The bare prompt is the same common task prompt in every reader mode.
         for mode in ("legacy_text", "rich_multimodal"):
             with self.subTest(reader_mode=mode):
                 prompt = reader.raw_prompt({"raw_document": "/data/corpus/synthetic.txt", "reader_mode": mode},
@@ -692,6 +1092,57 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
                 result = grade(self.judge_config(), envelope, lambda *_: self.fail("Judge called"))
                 self.assertEqual((result["status"], result["label"]), ("operational_failure", 0))
                 self.assertEqual(transport_reward(result)["answer_equivalence"], 0)
+
+    def test_treatment_records_its_build_identity_and_the_product_rules_description(self):
+        outputs, child = self.run_reader(legacy_report())
+        operation = outputs["/logs/agent/operational.json"]
+        contract = operation["reader_contract"]
+        # The identity is the verified bundle's provenance digest, which binds the
+        # rule text compiled into the product.
+        self.assertEqual((contract["identity"], contract["product_provenance_sha256"]),
+                         ("product_provenance_sha256", "9" * 64))
+        # The --schema field is the product's own description of its rules, not the
+        # rule text: its digest is recorded under that name and never as the identity.
+        self.assertEqual(contract["answer_rules_description_sha256"], sha(SYNTHETIC_ANSWER_RULES.encode()))
+        self.assertEqual(contract["answer_rules_description_source"], "product_schema:commands.ask.reader_answer_rules")
+        self.assertNotIn("answer_rules_sha256", contract)
+        self.assertEqual(contract["product_schema_sha256"], sha(product_schema_report()))
+        self.assertEqual((contract["arm"], contract["base_instructions"], contract["answer_rules_received"]),
+                         ("gptgrep", "gptgrep_reader_contract", True))
+        self.assertEqual(outputs["/answer/answer.json"]["status"], "response")
+        # Observed once, before the query timer and the Ask.
+        self.assertEqual(child.call_args_list[0].args[0], ["/synthetic/gptgrep", "--schema"])
+        self.assertEqual(len(ask_calls(child)), 1)
+        # A changed description changes only its own digest; the identity follows the bundle.
+        changed, _ = self.run_reader(legacy_report(), schema={"stdout": product_schema_report("Changed rules.")})
+        changed = changed["/logs/agent/operational.json"]["reader_contract"]
+        self.assertEqual((changed["answer_rules_description_sha256"], changed["product_provenance_sha256"]),
+                         (sha(b"Changed rules."), "9" * 64))
+        # The materialized split travels unchanged: the declared contract difference is no mismatch.
+        declared = [{"code": "reader_contract_differs"}]
+        config = {**self.config(), "qualification_mismatches": [{"code": "observed generic mismatch"}],
+                  "declared_treatment_differences": declared}
+        split, _ = self.run_reader(legacy_report(), config=config)
+        operation = split["/logs/agent/operational.json"]
+        self.assertEqual((operation["qualification_mismatches"], operation["declared_treatment_differences"]),
+                         ([{"code": "observed generic mismatch"}], declared))
+
+    def test_treatment_without_a_reported_contract_stops_before_the_ask(self):
+        cases = {"process_failure": {"return_code": 2},
+                 "child_failure": {"failure": "child_failed_or_limit"},
+                 "not_json": {"stdout": b"not a schema"},
+                 "missing_field": {"stdout": canonical({"schema_version": "gptgrep.cli.v1", "commands": {"ask": {}}})},
+                 "empty_rules": {"stdout": product_schema_report("  ")},
+                 "not_text": {"stdout": product_schema_report(["rules"])}}
+        for name, schema in cases.items():
+            with self.subTest(case=name):
+                outputs, child = self.run_reader(legacy_report(), schema=schema)
+                self.assertEqual(ask_calls(child), [])
+                self.assertEqual(outputs["/answer/answer.json"]["status"], "operational_failure")
+                operation = outputs["/logs/agent/operational.json"]
+                self.assertIsNone(operation["reader_contract"])
+                self.assertEqual((operation["failure"], operation["failure_code"]),
+                                 ("reader_failed", "product_reader_contract_unavailable"))
 
 
 class MaterializationIsolationTests(unittest.TestCase):
@@ -772,11 +1223,13 @@ class NativeDirectToolPolicyTests(unittest.TestCase):
         from gptgrep_harbor.runtime import model_config
         config = tomllib.loads(model_config(PROFILE, "reader").decode())
         # Native code, shell, image and sub-agent tools stay on; host-side
-        # connector, plugin and tool-suggestion features are off for both arms.
+        # connector, plugin, tool-suggestion and image-generation features and
+        # account cloud Skills are off for both arms.
         self.assertEqual(config["features"], {
             "shell_tool": True, "view_image": True, "unified_exec": True,
-            "multi_agent": True, "plugins": False, "apps": False,
-            "tool_suggest": False, "code_mode": {"enabled": True}, "code_mode_host": {"enabled": True}})
+            "multi_agent": True, "plugins": False, "apps": False, "tool_suggest": False,
+            "image_generation": False, "code_mode": {"enabled": True}, "code_mode_host": {"enabled": True}})
+        self.assertEqual(config["cloud"], {"skills": {"enabled": False}})
         self.assertEqual(config["web_search"], "disabled")
         self.assertEqual(config["default_permissions"], "full62_reader")
         self.assertEqual(config["model"], PROFILE["model"])
@@ -798,9 +1251,10 @@ class NativeDirectToolPolicyTests(unittest.TestCase):
                          {"enabled": False, "direct_only_tool_namespaces": []})
         self.assertFalse(config["features"]["shell_tool"])
         self.assertFalse(config["features"]["view_image"])
-        # Codex enables these by default; the Judge disables them explicitly.
-        for feature in ("apps", "plugins", "tool_suggest"):
+        # The Judge disables the same host-side tools and account cloud Skills.
+        for feature in ("apps", "plugins", "tool_suggest", "image_generation"):
             self.assertIs(config["features"][feature], False)
+        self.assertEqual(config["cloud"], {"skills": {"enabled": False}})
         self.assertEqual(config["default_permissions"], "full62_judge")
         self.assertEqual(config["web_search"], "disabled")
         self.assertFalse(config["permissions"]["full62_judge"]["network"]["enabled"])
@@ -809,26 +1263,45 @@ class NativeDirectToolPolicyTests(unittest.TestCase):
                          config["permissions"]["full62_judge"]["filesystem"])
 
 
+class ReaderContractTests(unittest.TestCase):
+    """GPTgrep's reader contract is the treatment's; the raw-only arm receives none of it."""
 
-class SharedAnswerRuleTests(unittest.TestCase):
-    def test_legacy_text_raw_prompt_carries_the_reader_answer_rules_verbatim(self):
-        # The constant must stay byte-identical to the product reader's rules.
-        protocol = Path(__file__).resolve().parents[5] / "crates/gptgrep-host/src/protocol.rs"
-        match = re.search(r'pub\(crate\) const READER_ANSWER_RULES: &str = "((?:[^"\\]|\\.)*)";',
-                          protocol.read_text(encoding="utf-8"))
-        self.assertIsNotNone(match)
-        self.assertEqual(json.loads('"' + match.group(1) + '"'), reader.READER_ANSWER_RULES)
+    COMMON_TASK_PROMPT = ("Answer the question using only the protocol-scoped raw document at "
+                          "/data/corpus/generic.txt. You may inspect that document with native tools. "
+                          "No external search or network access is available. Give the complete answer "
+                          "and source locations when available. Question:\nGeneric question?")
+
+    def test_raw_only_prompt_is_the_common_task_prompt_in_every_reader_mode(self):
         config = {"raw_document": "/data/corpus/generic.txt"}
-        legacy = reader.raw_prompt({**config, "reader_mode": "legacy_text"}, "Generic question?").decode()
-        rich = reader.raw_prompt({**config, "reader_mode": "rich_multimodal"}, "Generic question?").decode()
-        self.assertEqual(legacy.count(reader.READER_ANSWER_RULES), 1)
-        self.assertTrue(legacy.endswith("Question:\nGeneric question?"))
-        # The rich_multimodal reader has no answer rules, so neither arm gets them.
-        self.assertNotIn("Answer rules:", rich)
-        self.assertEqual(legacy.replace(reader.READER_ANSWER_RULES + " ", ""), rich)
-        self.assertIsNone(reader.shared_answer_rules({"reader_mode": "rich_multimodal"}))
-        with self.assertRaisesRegex(ValueError, "explicit_reader_mode"):
-            reader.raw_prompt(config, "Generic question?")
+        for mode in ("legacy_text", "rich_multimodal", None):
+            with self.subTest(reader_mode=mode):
+                prompt = reader.raw_prompt({**config, "reader_mode": mode}, "Generic question?").decode()
+                self.assertEqual(prompt, self.COMMON_TASK_PROMPT)
+                assert_no_gptgrep_rule_text(self, prompt)
+        # The adapter keeps no mirrored copy of the product's rule text.
+        for name in ("READER_ANSWER_RULES", "shared_answer_rules"):
+            self.assertFalse(hasattr(reader, name), name)
+
+    def test_raw_only_record_states_that_it_received_no_gptgrep_contract(self):
+        with patch.object(reader, "run", side_effect=AssertionError("no product call for the bare arm")):
+            for mode in ("legacy_text", "rich_multimodal"):
+                with self.subTest(reader_mode=mode):
+                    record, schema, failure = reader.observe_reader_contract({"reader_mode": mode},
+                                                                             {"arm": "raw_only"})
+                    self.assertEqual((schema, failure), (None, None))
+                    self.assertEqual(record, RAW_READER_CONTRACT)
+
+    def test_rich_treatment_receives_no_answer_rules_and_needs_no_schema_report(self):
+        config = {"reader_mode": "rich_multimodal",
+                  "gptgrep_bundle": {"provenance": {"path": "/synthetic/p.json", "bytes": 1, "sha256": "9" * 64}}}
+        with patch.object(reader, "run", side_effect=AssertionError("no schema report in rich_multimodal")):
+            record, schema, failure = reader.observe_reader_contract(config, {"arm": "gptgrep"})
+        self.assertEqual((schema, failure), (None, None))
+        self.assertEqual(record, {"schema": "gptgrep.harbor.reader-contract.v1", "arm": "gptgrep",
+                                  "base_instructions": "gptgrep_reader_contract", "reader_mode": "rich_multimodal",
+                                  "answer_rules_received": False, "answer_rules_description_sha256": None,
+                                  "identity": "product_provenance_sha256",
+                                  "product_provenance_sha256": "9" * 64})
 
 
 if __name__ == "__main__":

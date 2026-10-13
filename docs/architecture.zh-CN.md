@@ -282,9 +282,8 @@ Base64 与 JSON 封装均计入完整请求体上限。
 （脚注或尾注标记、引文编号、“见表／见节”之类的指引）后再回答。这些规则只说明何时确定答案，
 从不放宽弃答：所有证据、引用与弃答规则保持不变，证据缺失或无法支持答案时仍须设置
 `insufficient_evidence: true`。富文本与多模态阅读器不接收这些规则。这些规则属于 GPTgrep 的
-reader 合同，主比较将其视为实验处理的一部分。在当前源码中，full62 adapter 仍会把相同的规则文本
-交给 `legacy_text` 运行中仅原始文档的一组；按所有者的决定，这一复制会在成对运行之前移除，
-届时裸 Codex 一组将不再收到这些规则。
+reader 合同，主比较将其视为实验处理的一部分：在任何 reader 模式下，full62 adapter 都不会把
+这些规则文本交给仅原始文档的一组。
 
 `HostConfig.native_ptc`（默认 false）和 `--native-ptc` 为最终检索 reader 选择原生执行。必须在
 turn 开始前确认一个已存在的命名权限 profile。原生配置继承所选运行时的 Code Mode、MCP、web 及

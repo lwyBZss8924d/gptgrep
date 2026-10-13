@@ -7,7 +7,9 @@ import statistics
 
 from .common import (ARMS, MAX_ANSWER, binding_equal, canonical, finite_number, integer, parse, pinned, require, sha,
                      tool_cap_parity, validate_binding)
-from .decisions import selected_mode
+from .adapter import qualification, treatment_feature_profile
+from .decisions import TRIAL_LIMIT_ENFORCER, selected_mode
+from .reader import TREATMENT_IDENTITY
 
 
 def trial_decisions_cost(attempts):
@@ -29,7 +31,28 @@ def decisions_costs(rows, runtime):
     partial = [value for row in rows for value in row["retrieval_known"]]
     total = sum(known) if len(known) == len(rows) else None
     cap = runtime.get("decisions_cost_cap_usd")
-    return {"mode": selected_mode(runtime), "treatment_trials": len(rows),
+    mode = selected_mode(runtime)
+    limit = None
+    if mode == "invocation_bounded":
+        # The product enforces the per-trial submission limit; a failed Ask with
+        # no remaining submission is limit-bound (an operational failure). Every
+        # attempt takes a reservation, a transient retry included: a bound trial
+        # with reservations that returned no validated response may have bound
+        # because of provider errors rather than its own need.
+        budgets = [row["trial_budget"] if type(row["trial_budget"]) is dict else {} for row in rows]
+        unvalidated = [budget.get("unvalidated_reservations") for budget in budgets
+                       if budget.get("limit_bound") is True]
+        unvalidated = [value if type(value) is int and value >= 0 else None for value in unvalidated]
+        limit = {"max_submissions_per_trial": runtime.get("decisions_max_submissions_per_trial"),
+                 "enforced_by": TRIAL_LIMIT_ENFORCER,
+                 "bound_trials": len(unvalidated),
+                 "bound_trials_with_unvalidated_reservations": sum(value is not None and value > 0
+                                                                   for value in unvalidated),
+                 "bound_trials_with_only_validated_reservations": sum(value == 0 for value in unvalidated),
+                 "bound_trials_reservations_unobserved": sum(value is None for value in unvalidated),
+                 "reached_trials": sum(budget.get("limit_reached") is True for budget in budgets),
+                 "unobserved_trials": sum(type(budget.get("limit_reached")) is not bool for budget in budgets)}
+    return {"mode": mode, "treatment_trials": len(rows),
             "cost_complete_trials": len(known), "cost_unknown_trials": len(rows) - len(known),
             # Trials whose attempts carry a decisions-cost receipt, and the priced
             # Jev usage rows inside those receipts (one Ask has many rows).
@@ -39,7 +62,57 @@ def decisions_costs(rows, runtime):
             "reported_cost_usd_known_subtotal": sum(partial) if partial else None,
             "reported_cost_usd_total": total, "cost_cap_usd": cap,
             "total_within_cap": total <= cap if total is not None and finite_number(cap) else None,
+            "submission_limit": limit,
             "currency_verified": False, "included_in_query_cost": False}
+
+
+def trial_claims(values, runtime):
+    """invocation_bounded: every trial of both arms claims once; flag re-executed trials.
+
+    A trial that found its claim already present (for example in a resumed job)
+    is an operational failure, and its pair may mix two executions.
+    """
+    if selected_mode(runtime) != "invocation_bounded":
+        return None
+    arms, pairs = {}, set()
+    for arm, rows in values.items():
+        repeated = [row for row in rows if row["failure_code"] == "trial_already_claimed"]
+        pairs.update(row["pair_id"] for row in repeated)
+        arms[arm] = {"claimed": sum(row["trial_claimed"] for row in rows), "pre_existing_claim": len(repeated),
+                     "unclaimed": sum(not row["trial_claimed"] for row in rows) - len(repeated)}
+    return {"claimed_arms": list(ARMS), "arms": arms, "pairs_with_pre_existing_claim": len(pairs)}
+
+
+def reader_contracts(contracts, runtime):
+    """Check the operation records' reader contracts against the frozen declaration.
+
+    The raw-only arm must report that it received none of GPTgrep's contract.
+    Treatment trials report their identity, the verified bundle provenance
+    digest, which binds the contract text compiled into the product; one cohort
+    is expected to share one build. legacy_text treatment trials also report the
+    digest of the product's own description of its answer rules: it is not the
+    rule text and is never counted as the identity.
+    """
+    def recorded(contract, key):
+        value = contract.get(key) if type(contract) is dict else None
+        return value if isinstance(value, str) else None
+    described = runtime.get("reader_mode") == "legacy_text"
+    treatment, raw = contracts["gptgrep"], contracts["raw_only"]
+    builds = sorted({recorded(c, TREATMENT_IDENTITY) for c in treatment} - {None})
+    descriptions = sorted({recorded(c, "answer_rules_description_sha256") for c in treatment} - {None})
+    return {"declared_treatment": True, "treatment_identity": TREATMENT_IDENTITY,
+            "treatment_product_provenance_sha256": builds,
+            "treatment_identity_consistent": len(builds) <= 1,
+            "treatment_records_without_identity": sum(recorded(c, TREATMENT_IDENTITY) is None for c in treatment),
+            "treatment_answer_rules_expected": described,
+            "treatment_answer_rules_description_sha256": descriptions,
+            "treatment_records_without_answer_rules_description": (
+                sum(recorded(c, "answer_rules_description_sha256") is None for c in treatment) if described else 0),
+            "raw_only_records_without_gptgrep_contract": sum(type(c) is dict and c.get("gptgrep_contract_received")
+                                                             is False for c in raw),
+            "raw_only_records_reporting_gptgrep_contract": sum(type(c) is dict and c.get("gptgrep_contract_received")
+                                                               is not False for c in raw),
+            "raw_only_records_unobserved": sum(type(c) is not dict for c in raw)}
 
 
 def judge_abstained(judgment, status):
@@ -139,6 +212,7 @@ def summarize(export, records, runtime):
             {row["task_name"] for row in records} == names, "missing_or_duplicate_result_binding")
     by_name = {row["task_name"]: row for row in records}
     values, pairs = {arm: [] for arm in ARMS}, {}
+    contracts = {arm: [] for arm in ARMS}
     judge_attempts = []
     for item in expected:
         binding = validate_binding(item["binding"])
@@ -194,6 +268,7 @@ def summarize(export, records, runtime):
                     len({a["ordinal"] for a in attempts}) == len(attempts), "unique_outer_attempts")
         else:
             attempts = []
+        contracts[arm].append(operation.get("reader_contract") if operation is not None else None)
         if grounding is not None:
             require(grounding["schema"] == "gptgrep.harbor.grounding.v1" and
                     grounding["primary_label_modified"] is False and
@@ -203,7 +278,8 @@ def summarize(export, records, runtime):
         known_cost = sum(a["cost_usd"] for a in attempts if finite_number(a.get("cost_usd")))
         complete_cost = bool(attempts) and all(a.get("cost_complete") is True and
                                                finite_number(a.get("cost_usd")) for a in attempts)
-        values[arm].append({"label": label, "status": status, "elapsed": elapsed,
+        values[arm].append({"pair_id": pair, "label": label, "status": status, "elapsed": elapsed,
+                            "trial_claimed": operation is not None and type(operation.get("trial_claim")) is dict,
                             "time_lower": low, "time_upper": high, "known_cost_usd": known_cost,
                             "cost_complete": complete_cost, "attempt_count": len(attempts),
                             "grounding_available": grounding is not None,
@@ -211,6 +287,9 @@ def summarize(export, records, runtime):
                                                 if finite_number(a.get("reported_retrieval_cost_subtotal"))],
                             "decisions_receipts": decisions_receipts(attempts),
                             "decisions_cost_usd": trial_decisions_cost(attempts),
+                            "trial_budget": operation.get("decisions_trial_budget") if operation else None,
+                            "failure_code": (operation.get("failure_code") if operation is not None and
+                                             isinstance(operation.get("failure_code"), str) else None),
                             "judge_abstained": abstained,
                             # A completed legacy abstention keeps this flag in the private operation record.
                             "insufficient_evidence": operation is not None and status in ("judged", "judge_unavailable")
@@ -252,15 +331,47 @@ def summarize(export, records, runtime):
                         "cost_per_correct_usd": known / correct if cost_complete and correct else None,
                         "outer_attempts_observed": sum(r["attempt_count"] for r in rows),
                         "grounding_unassessed": sum(not r["grounding_available"] for r in rows)}
+        codes = {}
+        for row in rows:
+            if row["failure_code"] is not None and row["status"] in ("operational_failure", "missing_task"):
+                codes[row["failure_code"]] = codes.get(row["failure_code"], 0) + 1
         summary[arm].update(intentional_abstentions=abstentions(rows),
+                            operational_failure_codes=dict(sorted(codes.items())),
                             final_reader_usage_diagnostic=usage_subtotals,
                             all_model_turn_usage_complete=False,
                             reported_retrieval_cost_known_subtotal=sum(retrieval_costs) if retrieval_costs else None,
                             retrieval_cost_denomination_verified=False,
                             usage_subsets_not_added_twice=True)
     comparison = paired(list(pairs.values()), runtime["bootstrap_seed"])
+    checked = qualification(runtime.get("qualification_mismatches", []))
+    profile = treatment_feature_profile(runtime)
+    frozen = export.get("preflight", {}).get("treatment_feature_profile")
+    require(frozen is None or frozen == profile, "treatment_profile_join")
+    claims = trial_claims(values, runtime)
+    reexecuted = []
+    if claims is not None and claims["pairs_with_pre_existing_claim"]:
+        reexecuted = [str(claims["pairs_with_pre_existing_claim"]) + " pairs include a trial that found its claim "
+                      "already present (a re-execution); that trial is an operational failure and its pair may "
+                      "mix two executions."]
+    contract = reader_contracts(contracts, runtime)
+    builds = len(contract["treatment_product_provenance_sha256"])
+    mixed_builds = []
+    if builds > 1:
+        mixed_builds = [str(builds) + " distinct product provenance digests among the treatment records: the "
+                        "treatment trials did not all run one product build, so their reader contracts may differ."]
+    decisions = decisions_costs(values["gptgrep"], runtime)
+    submission_limit = decisions["submission_limit"] or {}
+    provider_bound = []
+    if submission_limit.get("bound_trials_with_unvalidated_reservations"):
+        provider_bound = ["Limit-bound treatment trials that spent part of their Decisions submission limit on "
+                          "attempts without a validated response, for example a transient provider error before "
+                          "its retry: " + str(submission_limit["bound_trials_with_unvalidated_reservations"]) +
+                          ". With more headroom they might have completed, so their known zeros partly reflect "
+                          "provider errors."]
     return {"schema": "gptgrep.harbor.paired-summary.v1", "search": summary, "paired": comparison,
-            "decisions": decisions_costs(values["gptgrep"], runtime),
+            "decisions": decisions,
+            "reader_contract": contract,
+            "trial_claims": claims,
             "judge": {"outer_attempts_observed": len(judge_attempts),
                       "observed_attempt_wall_ms_subtotal": sum(a["elapsed_ms"] for a in judge_attempts
                                                                if finite_number(a.get("elapsed_ms"))),
@@ -273,7 +384,9 @@ def summarize(export, records, runtime):
                         "actually_served_verified": False, "reader_base_binary": runtime.get("reader_base_binary"),
                         "permitted_tools": runtime.get("permitted_tools"),
                         "generic_capabilities": runtime.get("generic_capabilities"),
-                        "qualification_mismatches": runtime.get("qualification_mismatches"),
+                        "qualification_mismatches": checked["mismatches"],
+                        "declared_treatment_differences": checked["declared_treatment_differences"],
+                        "treatment_feature_profile": profile,
                         "budget_scope": {"query_deadline": "shared", "instruction_bytes": "shared_local_cap",
                             "tool_calls": "treatment_enforced_raw_observed_only",
                             "treatment_max_tool_calls": runtime.get("max_tool_calls"), "raw_tool_call_cap": "none",
@@ -287,4 +400,5 @@ def summarize(export, records, runtime):
               "No full62 result establishes comprehensive INDEX quality.",
               "Answerable and unanswerable slices need evaluator-side answerability metadata, "
               "which the cohort projection does not carry; abstention counts are not those slices.",
-              "Source preparation and aggregation do not grant release or Goal acceptance."]}
+              "Source preparation and aggregation do not grant release or Goal acceptance."]
+                           + reexecuted + mixed_builds + provider_bound}

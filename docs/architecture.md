@@ -380,9 +380,8 @@ evidence, citation and abstention rule is unchanged, including
 `insufficient_evidence: true` when evidence is missing or cannot support the
 answer. Rich text and multimodal readers do not receive these rules. The rules
 are part of GPTgrep's reader contract, which the main comparison treats as part
-of the treatment. In this source the full62 adapter still gives the raw-only arm
-of a `legacy_text` run the same rule text; by owner direction that copy is
-removed before the paired run, so the bare arm then receives none.
+of the treatment: the full62 adapter gives the raw-only arm none of this rule
+text in any reader mode.
 
 `HostConfig.native_ptc` (default false) and `--native-ptc` select native
 execution for the final retrieval reader. An existing named permission profile

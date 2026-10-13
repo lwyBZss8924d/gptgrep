@@ -18,6 +18,7 @@
   "decisions_cost_cap_usd": null,
   "decisions_prompt_price": null,
   "decisions_claims_dir": null,
+  "decisions_max_submissions_per_trial": null,
   "profile": {"model": "gpt-6-luna", "reasoning_effort": "max", "service_tier": "fast"},
   "judge_profile": null,
   "images": {"gptgrep": null, "raw_only": null, "judge": null},

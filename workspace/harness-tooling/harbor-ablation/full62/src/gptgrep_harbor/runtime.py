@@ -42,8 +42,10 @@ LOOPBACK_NO_PROXY = ("127.0.0.1", "localhost", "::1")
 # supervisor (codex-auth `run --harbor-job-label`) can see the job's containers
 # and keep the credential lease until they are gone.
 AUTH_JOB_LABEL = "gptgrep.auth-job"
-# Codex 0.162.1 enables these by default; every role disables them explicitly.
-EXTERNAL_TOOL_FEATURES = ("apps", "plugins", "tool_suggest")
+# Every role disables these host-side tools explicitly: Codex 0.162.1 enables
+# apps, plugins and tool_suggest by default, and image_generation would add a
+# hosted image-generation tool that neither arm's raw-document task needs.
+EXTERNAL_TOOL_FEATURES = ("apps", "plugins", "tool_suggest", "image_generation")
 # The owner-approved (2026-10-13) seccomp profile of the two reader roles only:
 # Docker 29.4.0's default profile plus one unconditional allow for exactly
 # unshare, clone, clone3, setns, mount, umount2 and pivot_root, which Codex's
@@ -242,6 +244,8 @@ def model_config(profile, role):
                   "direct_only_tool_namespaces = []",
                   "", "[features.code_mode_host]", "enabled = false",
                   "disable_in_process_fallback = true"]
+    # Account cloud Skills would load content from outside the image: off for every role.
+    lines += ["", "[cloud.skills]", "enabled = false"]
     lines += ["", "[permissions." + name + ".filesystem]", '":minimal" = "read"']
     if role == "reader":
         lines += ['"/data/corpus" = "read"', json.dumps(WORK_DIR) + ' = "write"']
