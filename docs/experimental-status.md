@@ -163,9 +163,10 @@ The source documents are research-use data and are not redistributed.
 
 **Opt-1.** Opt-1 adds the bounded transient Decisions retry, the single-document
 routing skip, flagged below-threshold seed candidates, rarity-ordered seed terms
-and two reader answer rules; see [retrieval modes](architecture.md#retrieval-modes).
-It was measured on a pre-merge integration build with the same frozen indexes,
-tool budget, concurrency and judge:
+and two reader answer rules; see [retrieval modes](architecture.md#retrieval-modes)
+and [local reasoning](architecture.md#local-pageindex-style-reasoning). It was
+measured on a pre-merge integration build with the same frozen indexes, tool
+budget, concurrency and judge:
 
 | Cohort | Before | Opt-1 | Change |
 | --- | --- | --- | --- |
