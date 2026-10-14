@@ -20,16 +20,17 @@ reported separately. Whole-document parsing, native PTC OCR, document trees,
 tgrep and Decisions routing/reranking support this comparison; component
 completion does not complete the goal.
 
-The current cursor is **repair and qualify the combined source → independent
-review and source delivery → qualify fake-credential custody through the complete
-nested runtime chain → freeze source, runtimes, images, inputs, prompts and
+The current cursor is **qualify product-image identity and runtime-user access →
+qualify fake-credential custody through the complete nested runtime chain →
+full34 native INDEX → freeze source, runtimes, images, inputs, prompts and
 budgets → paired smoke → full62 SEARCH → Judge → failure analysis → next Opt**.
-Source changes address lease observation, treatment-only answer rules, identical
-document/question task inputs, query timing, retry/Document usage retention and
-packed fallback counts. Their current
-source review is accepted within its frozen scope. Full Rust workspace checks
-and applicable wrapper regressions have passed. Source delivery requires the
-matching independent review; runtime and comparison acceptance remain separate.
+The combined source and packager round have passed independent review and source
+delivery. They address lease observation, treatment-only answer rules, identical
+document/question inputs, timing, retained usage and portable packaging. Full
+Rust workspace and offline evaluation results remain retained for the unchanged
+Rust source. The material-key compatibility repair has passed independent source
+review and 15 selected synthetic regressions. Product-image, complete runtime
+and comparison acceptance remain separate.
 The reviewed Claude source reports rebuilt reader images, a pinned zero-model
 Linux text index and reader sandbox probes. Exact remote qualification receipts
 remain unverified by the integration review. Those reports do not qualify the
@@ -79,6 +80,9 @@ comparison.
 | Linux helper build, first attempt | Offline dependency resolution failed before helper compilation; failure retained |
 | Linux helper build, repaired attempt | Offline locked release compilation passed with the original dependency versions and checksums; packaging then failed because Git was unavailable, before archive creation or relocation smoke; failure retained |
 | Linux native package, repaired packager | Archive created with a complete license inventory; relocated plain-text and PDF smoke passed; source revision remains unknown and dirty; local preparation only |
+| Product image, first attempt | Docker client failed to discover Buildx; build command exited 125 before image qualification; failure retained |
+| Product image, second attempt | Buildx returned zero, then the material-identity guard failed before derived-image inspection and runtime-user qualification; failure retained |
+| Local image material-key compatibility | 15 selected tests passed: all 12 local-image methods plus three related bundle/treatment cases; synthetic engine responses, with no Docker or provider calls |
 
 The wrapper failure exposed archive modes inherited from a private staging
 umask. The packager now assigns portable TAR modes without changing staging
@@ -88,6 +92,12 @@ upstream build script downloaded a public dependency despite the run's
 zero-download declaration. That run is rejected and retained. Its successor
 requires explicit existing dependency bindings and effective build-process
 network denial; Cargo's offline setting alone does not constrain build scripts.
+The retained image-build metadata used a namespaced digest over the base layer
+ChainID. The material-key repair explicitly supports that contract alongside the
+legacy ChainID mode, with no fallback between them. Both modes require the sole
+material to match the generated alias, selected platform and computed digest.
+Base/config, parent-layer, engine and context checks remain enforced. The source
+and synthetic checks do not establish a qualified image or runtime-user access.
 The Node observer repair removes a privileged process-list dependency. Its real
 descendant check now waits for signal-zero queries to report process absence;
 permission errors remain failures. The original observer failure is retained.
@@ -116,11 +126,11 @@ The source change passes the current workspace checks. Its local TLS and complet
 fake-credential nested-chain qualification remain required before shared-login
 Harbor use.
 
-This round improves comparison validity and failure evidence, while measured
-search quality remains unknown. The next checkpoint is a qualified combined
-source delivery, followed by the complete runtime qualifications and live
-evaluation. Repeated development cohorts and a growing passing-test count do
-not establish a benchmark advantage.
+Measured search quality remains unknown. The next checkpoint is accepted
+product-image identity and runtime-user access, followed by complete nested
+runtime custody, current-source full34 native INDEX and paired live evaluation.
+Repeated development cohorts and passing component tests do not establish a
+benchmark advantage.
 
 The original D1–D7 goal objects retain the following states. A completed component
 keeps its accepted scope; it does not complete the broader document pipeline or
@@ -341,6 +351,8 @@ historical producer reports under the evidence boundary above.
 | 2026-10-13, merged source before I0 | Reported 1,109 Rust tests (0 failed, 4 ignored), 145 evaluator tests, 11 offline cases and 90 full62 wrapper tests passed; at lower load the incur wrapper passed and 2 harness-workspace deadline tests failed, also reported on the published base | Historical failures retained; baseline reproduction is not a passed gate. Image/index/sandbox work followed in I0; G5 HOLD |
 | 2026-10-13, I0 enablement merged | Producer reported rebuilt credential-free images, a pinned 34-document zero-model Linux text index, the reader-only seccomp profile, probes 1–3 acceptance (probe 1 without `--proc`) and 141 adapter tests passing | Exact remote receipts unverified. Probes 4 (Judge/verifier default profile), 5 (paired smoke), complete nested-chain custody and a verified per-trial Decisions submission bound remain pending; paired SEARCH not run |
 | 2026-10-13, integration staged | Preserved the six-file Document diagnostic delta and staged the reviewed descendant at `964bf377`; refreshed source has no supplemental commits | Six review findings under repair; combined-source tests and independent acceptance pending. No new live acceptance or release |
+| 2026-10-14, combined source and packaging | Independent review accepted the source; current Rust, offline and wrapper checks above completed. The native Linux archive passed relocated text/PDF smoke | Qualified source branch delivered; the retained product binary's exact source revision remains unknown and dirty. No complete live comparison |
+| 2026-10-14, product-image failure and material repair | Initial client-discovery failure retained; the following build completed but its material guard failed. Explicit compatibility repair passed independent source review and 15 selected synthetic tests | Fresh image identity/runtime-user qualification, complete fake-credential chain, full34 and paired SEARCH/Judge remain required; G5 HOLD |
 
 The 2026-10-12 unified runtime round unified native Document/OCR execution, configuration,
 the [runtime package](../runtime/codex/STAGING.md), the

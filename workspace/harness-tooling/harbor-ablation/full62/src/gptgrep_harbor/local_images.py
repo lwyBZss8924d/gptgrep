@@ -34,7 +34,8 @@ def chain_id(layers):
 def base_provenance(value, base_id):
     require(isinstance(value, dict) and set(value) == {"build_metadata", "material_kind"},
             "base_build_provenance_fields")
-    require(value["material_kind"] == "moby-classic-chain-id-v1", "local_material_kind")
+    require(value["material_kind"] in ("moby-classic-chain-id-v1", "moby-verified-local-image-key-v1"),
+            "local_material_kind")
     metadata = parse(pinned(value["build_metadata"]))
     require(metadata["containerimage.config.digest"] == config_id(base_id), "base_build_config_identity")
     config_id(metadata["containerimage.digest"])
@@ -174,6 +175,8 @@ class LocalImageBuilder:
                     "local_base_layers")
             require(base.get("GraphDriver", {}).get("Name") == "overlay2", "moby_classic_layer_store")
             material = chain_id(layers)
+            if provenance["material_kind"] == "moby-verified-local-image-key-v1":
+                material = "sha256:" + sha(("moby.buildkit.local-image.v1:" + material).encode())
             require(self.inspect(alias, absent_ok=True) is None and
                     self.inspect(derived_tag, absent_ok=True) is None, "fresh_local_build_alias")
             self.command("image", "tag", base_id, alias)
@@ -189,7 +192,9 @@ class LocalImageBuilder:
             metadata = parse(read(metadata_path))
             require(metadata["containerimage.config.digest"] == image_id, "derived_image_metadata")
             materials = metadata["buildx.build.provenance"]["materials"]
-            require(len(materials) == 1 and materials[0]["digest"] == {"sha256": material[7:]},
+            material_uri = "pkg:docker/" + alias.replace(":", "@") + "?platform=" + platform.replace("/", "%2F")
+            require(isinstance(materials, list) and len(materials) == 1 and isinstance(materials[0], dict) and
+                    materials[0].get("uri") == material_uri and materials[0].get("digest") == {"sha256": material[7:]},
                     "buildkit_selected_base_identity")
             derived = self.inspect(image_id)
             require(derived["Id"] == image_id and derived["Os"] + "/" + derived["Architecture"] == platform and

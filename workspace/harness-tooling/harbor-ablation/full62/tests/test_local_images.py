@@ -23,14 +23,19 @@ import test_harbor_runtime as fixtures
 BASE = "sha256:" + "a" * 64
 DERIVED = "sha256:" + "b" * 64
 LAYERS = ["sha256:" + "c" * 64, "sha256:" + "e" * 64]
+# Fixed synthetic oracle, independently derived from the upstream namespaced ChainID contract.
+VERIFIED_MATERIAL = "sha256:947d14fba8c7ca2dc6ab34cb22a51325f04c987b56106e1310b5e8c3872bdd61"
+MATERIAL_MODES = (("moby-classic-chain-id-v1", None),
+                  ("moby-verified-local-image-key-v1", VERIFIED_MATERIAL))
 
 
 class FakeEngine:
-    def __init__(self, fault=None):
+    def __init__(self, fault=None, material_digest=None):
         self.images = {BASE: {"Id": BASE, "Architecture": "amd64", "Os": "linux",
                               "GraphDriver": {"Name": "overlay2"},
                               "RootFS": {"Type": "layers", "Layers": LAYERS}}}
         self.fault = fault
+        self.material_digest = material_digest or chain_id(LAYERS)
         self.built = False
         self.calls = []
 
@@ -57,10 +62,25 @@ class FakeEngine:
                            ["sha256:" + "d" * 64]}}
             self.images[args[args.index("--tag") + 1]] = self.images[DERIVED]
             Path(args[args.index("--iidfile") + 1]).write_text(DERIVED + "\n")
+            uri = "pkg:docker/" + self.alias.replace(":", "@") + "?platform=linux%2Famd64"
+            if self.fault == "material-alias":
+                uri = "pkg:docker/another-base@pinned?platform=linux%2Famd64"
+            elif self.fault == "material-platform":
+                uri = uri.replace("amd64", "arm64")
+            material = {"uri": uri, "digest": {"sha256":
+                (DERIVED if self.fault == "material" else self.material_digest)[7:]}}
+            materials = [material]
+            if self.fault == "material-extra":
+                materials.append(dict(material))
+            elif self.fault == "material-missing-uri":
+                del material["uri"]
+            elif self.fault == "material-map":
+                materials = {"0": material}
+            elif self.fault == "material-scalar":
+                materials = ["invalid"]
             Path(args[args.index("--metadata-file") + 1]).write_bytes(canonical({
                 "containerimage.config.digest": DERIVED,
-                "buildx.build.provenance": {"materials": [{"digest": {
-                    "sha256": (DERIVED if self.fault == "material" else chain_id(LAYERS))[7:]}}]}}))
+                "buildx.build.provenance": {"materials": materials}}))
             if self.fault == "alias":
                 self.images[self.alias] = self.images[DERIVED]
             if self.fault == "context":
@@ -109,20 +129,55 @@ class LocalImageTests(unittest.TestCase):
         self.assertEqual(sum(call[:2] == ["buildx", "build"] for call in fake.calls), 1)
         self.assertFalse(any("push" in call or "prune" in call or "rm" in call for call in fake.calls))
 
+    def test_explicit_verified_local_image_key_joins_exact_parent(self):
+        self.provenance["material_kind"] = "moby-verified-local-image-key-v1"
+        fake = FakeEngine(material_digest=VERIFIED_MATERIAL)
+        result = self.build(fake)
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["base_material_digest"], VERIFIED_MATERIAL)
+        self.assertEqual(result["base_build_provenance"], self.provenance)
+        self.assertEqual(result["base_config_id"], BASE)
+        self.assertEqual(result["image_config_id"], DERIVED)
+        self.assertEqual(result["parent_layers"], LAYERS)
+        self.assertEqual(sum(call[:2] == ["buildx", "build"] for call in fake.calls), 1)
+
+    def test_material_kind_does_not_accept_the_other_kind_digest(self):
+        for kind, wrong_digest in (("moby-classic-chain-id-v1", VERIFIED_MATERIAL),
+                                   ("moby-verified-local-image-key-v1", chain_id(LAYERS))):
+            with self.subTest(kind=kind):
+                self.provenance["material_kind"] = kind
+                with self.assertRaisesRegex(ValueError, "buildkit_selected_base_identity"):
+                    self.build(FakeEngine(material_digest=wrong_digest), "reject-" + kind)
+                self.assertFalse((self.root / ("reject-" + kind) / "result.json").exists())
+
+    def test_material_must_bind_one_exact_alias_and_platform(self):
+        for kind, material_digest in MATERIAL_MODES:
+            self.provenance["material_kind"] = kind
+            for fault in ("material-alias", "material-platform", "material-extra", "material-missing-uri",
+                          "material-map", "material-scalar"):
+                with self.subTest(kind=kind, fault=fault):
+                    directory = kind + "-" + fault
+                    with self.assertRaisesRegex(ValueError, "buildkit_selected_base_identity"):
+                        self.build(FakeEngine(fault, material_digest), directory)
+                    self.assertFalse((self.root / directory / "result.json").exists())
+
     def test_engine_alias_material_layer_and_context_changes_fail_closed(self):
-        for fault, expected in (("engine", "local_alias_after_build"), ("alias", "local_alias_after_build"),
-                                ("material", "buildkit_selected_base_identity"), ("layers", "derived_parent_layers"),
-                                ("context", "asset_size"), ("member", "image_context_membership")):
-            with self.subTest(fault=fault):
-                (self.context / "payload").write_bytes(b"authored generic bytes")
-                extra = self.context / "unlisted-private"
-                if extra.exists():
-                    extra.unlink()
-                fake = FakeEngine(fault)
-                with self.assertRaisesRegex(ValueError, expected):
-                    self.build(fake, "output-" + fault)
-                self.assertFalse((self.root / ("output-" + fault) / "result.json").exists())
-                self.assertFalse(json.loads((self.root / ("output-" + fault) / "failure.json").read_text())["accepted"])
+        for kind, material_digest in MATERIAL_MODES:
+            self.provenance["material_kind"] = kind
+            for fault, expected in (("engine", "local_alias_after_build"), ("alias", "local_alias_after_build"),
+                                    ("material", "buildkit_selected_base_identity"), ("layers", "derived_parent_layers"),
+                                    ("context", "asset_size"), ("member", "image_context_membership")):
+                with self.subTest(kind=kind, fault=fault):
+                    (self.context / "payload").write_bytes(b"authored generic bytes")
+                    extra = self.context / "unlisted-private"
+                    if extra.exists():
+                        extra.unlink()
+                    fake = FakeEngine(fault, material_digest)
+                    directory = "output-" + kind + "-" + fault
+                    with self.assertRaisesRegex(ValueError, expected):
+                        self.build(fake, directory)
+                    self.assertFalse((self.root / directory / "result.json").exists())
+                    self.assertFalse(json.loads((self.root / directory / "failure.json").read_text())["accepted"])
 
     def test_unlisted_member_refuses_before_docker_or_body_read(self):
         (self.context / "unlisted-private").write_bytes(b"do not read")
