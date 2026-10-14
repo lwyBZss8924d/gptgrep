@@ -99,12 +99,21 @@ app-server 的文档 turn。
 `agent` 执行一个原生 Document turn，`qualify` 记录私有的图像证据而不自动验收 profile；显式 index registry
 才将已验证的完整产物移交给 generation writer。writer 不重新解析，共享原始解析器／OCR 上下文，重新检查
 源文件 pin 与清单，并且只在完整准入后发布。
-Document 默认 64 tools／1 turn／900 秒，可在一致绑定的 profile 中显式选择不超过 3600 秒；
-实际期限取 frontend／session／原始 phase 等限制的最小值。Page OCR 保留独立的 8 tools／1 turn／180 秒。
+当前 native PTC 路径使用调用方的 job 预算：Document 控制文件绑定工具次数与时长，native OCR
+执行器从所选 runtime profile 读取工具次数与时长；frontend／session／原始 phase 的期限仍可更早到期。
+保留的固定 transport 中，Document 默认 64 tools／1 turn／900 秒，显式绑定的 native-viewer
+profile 可选 1–3600 秒；Page OCR 为 8 tools／1 turn／180 秒。这些固定限制不适用于 native PTC 路径。
 完整原生提取和元数据覆盖每个原始页，模型观察覆盖另行记录。页窗口不是整份文档页数上限。
 payload、metadata 和 staging 的逻辑预留不能当作整个进程 RSS 或物理磁盘实测。
 原生 `view_image` 使用[固定源码 derivative](../patches/codex-native-viewer/README.md)，Page 与 Document
 资格分别绑定实际 binary／profile，不能从编译成功推断 live 验收。
+
+Document 失败保留强类型 `DocumentRuntimeError`，记录启动方法或活动 turn 阶段、事件类型及有界
+warning 指纹。RPC 发送与匹配确认只证明 transport 观察，不证明提供方准入或请求次数。后续空的或
+非数值 usage 更新不会覆盖最后一个身份匹配的有效数值观察；总账单仍可能未知，
+`provider_request_count` 为 null，`accounting_complete` 为 false。清理保留 typed cause，
+CLI JSON 在 `document_runtime` 中输出该对象，不复制提供方原文、原生身份或私有路径。
+这些诊断不能恢复历史失败中已丢弃的错误内容。
 
 编码后的页图像容量在现有 parse-agent 控制文件的 `resources` 对象中配置。CLI 通过 `--config`
 和 `--expected-control-sha256` 读取该控制文件；`index` 使用固定摘要的 `--parse-agent-config`
@@ -215,7 +224,8 @@ Choice 分数用于比较可用选项，因此不被用作绝对相关性。
 （且没有字面锚点）时，搜索不会返回空集合：它按分数交付前三个候选，每个都标记
 `below_threshold`，计入 `coverage.below_threshold_fallback`（它们仍计入 `filtered_candidates`），
 并添加警告说明这些是低置信度候选。计数与警告只描述经过结果数上限与最终新鲜度检查后实际返回的
-带标记结果。它们从不算作通过门槛；宿主的初始检索报告 `filtered_all`。纯文本 `search` 以 grep 的
+带标记结果。宿主打包后还会让已交付兜底数量与 payload、ledger 保持一致；尝试次数和候选总数保留原值。
+它们从不算作通过门槛；宿主的初始检索报告 `filtered_all`。纯文本 `search` 以 grep 的
 上下文分隔符（`PATH-LINE-TEXT`）输出它们，而不是作为 `PATH:LINE:TEXT` 匹配；由于返回了结果，
 退出码为 0。证据角色排序使用同样的兜底（资格为 `below_floor_fallback`）；富文本／多模态路径保持原有门槛，
 不使用这一兜底。
@@ -238,6 +248,9 @@ Decisions 使用 `/api/alpha/decisions`，请求时限为 20 秒；不跟随重�
 重试发送之后出现的错误（例如本地账本记录失败）类型为 `retry_post_send`。若重试回复此前已通过校验，
 提供方已以已知用量完成该提交：失败诊断保留其经检查的数值用量与返回模型，检索错误、操作回执与宿主账本
 将其计入 `jev_requests`、`jev_models` 和 `jev_usage`；否则其用量保持未知。
+即使 validated-response 与 terminal-failure 两个 observer 回调都失败，错误仍保留封闭的失败阶段、
+请求模型、发送／校验状态及先前尝试。已校验的首个回复以 `observer_callback` 保留并计入已知用量；
+提供方失败后回调再失败仍保留原来的 typed provider cause，不复制任意回调错误原文。
 只有在发送前被阻止的重试才是 `retry_admission`。
 judge、增强支持调用（其自有显式重试计划）、导航扫描、证据角色判断、富文本/多模态检索、显式重排候选池
 与批处理提交仍只提交一次；富文本路径会移除调用方客户端上附带的重试策略。
@@ -282,9 +295,9 @@ Base64 与 JSON 封装均计入完整请求体上限。
 （脚注或尾注标记、引文编号、“见表／见节”之类的指引）后再回答。这些规则只说明何时确定答案，
 从不放宽弃答：所有证据、引用与弃答规则保持不变，证据缺失或无法支持答案时仍须设置
 `insufficient_evidence: true`。富文本与多模态阅读器不接收这些规则。这些规则属于 GPTgrep 的
-reader 合同，主比较将其视为实验处理的一部分。在当前源码中，full62 adapter 仍会把相同的规则文本
-交给 `legacy_text` 运行中仅原始文档的一组；按所有者的决定，这一复制会在成对运行之前移除，
-届时裸 Codex 一组将不再收到这些规则。
+reader 合同，主比较将其视为实验处理的一部分。full62 的主要裸 Codex 组在两种 reader 模式下
+都只接收共同问题与原始文档范围，使用 Codex 默认 base instructions，不接收 GPTgrep 的回答规则
+或 Skills。可选的裸 Codex 加规则诊断必须有独立的实验组身份。
 
 `HostConfig.native_ptc`（默认 false）和 `--native-ptc` 为最终检索 reader 选择原生执行。必须在
 turn 开始前确认一个已存在的命名权限 profile。原生配置继承所选运行时的 Code Mode、MCP、web 及

@@ -1168,6 +1168,467 @@ async fn startup_tool_events_and_auth_mode_changes_are_refused_before_backend_di
     Ok(())
 }
 
+const PRIVATE_RUNTIME_DIAGNOSTIC: &str =
+    "MOCK-private-runtime-canary /synthetic/private/config Bearer mock-secret";
+
+fn document_runtime_notice(method: &str) -> Value {
+    let params = match method {
+        "error" => json!({
+            "threadId":"synthetic-thread","turnId":"synthetic-turn","willRetry":true,
+            "error":{"message":PRIVATE_RUNTIME_DIAGNOSTIC,
+                "additionalDetails":PRIVATE_RUNTIME_DIAGNOSTIC,
+                "codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":503}}}
+        }),
+        "configWarning" | "config/warning" => json!({
+            "summary":PRIVATE_RUNTIME_DIAGNOSTIC,"details":PRIVATE_RUNTIME_DIAGNOSTIC,
+            "path":"/synthetic/private/config","range":{"private":PRIVATE_RUNTIME_DIAGNOSTIC}
+        }),
+        "model/rerouted" => json!({
+            "threadId":"synthetic-thread","turnId":"synthetic-turn",
+            "fromModel":PRIVATE_RUNTIME_DIAGNOSTIC,"toModel":PRIVATE_RUNTIME_DIAGNOSTIC,
+            "reason":"highRiskCyberActivity"
+        }),
+        _ => panic!("closed synthetic notification"),
+    };
+    json!({"method":method,"params":params})
+}
+
+fn document_runtime_diagnostic(error: &anyhow::Error) -> &crate::DocumentRuntimeError {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::DocumentRuntimeError>())
+        .expect("typed Document runtime diagnostic survives wrappers")
+}
+
+fn assert_document_runtime_private(error: &anyhow::Error) {
+    for output in [
+        format!("{error}"),
+        format!("{error:#}"),
+        format!("{error:?}"),
+        format!("{error:#?}"),
+        serde_json::to_string(document_runtime_diagnostic(error)).unwrap(),
+    ] {
+        for forbidden in [
+            "MOCK-private",
+            "/synthetic/private",
+            "mock-secret",
+            "synthetic-thread",
+            "synthetic-turn",
+        ] {
+            assert!(!output.contains(forbidden), "{forbidden}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn document_runtime_startup_refusal_preserves_method_and_closed_event() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let skill_path = temp.path().join("SKILL.md");
+    fs::write(&skill_path, "# Synthetic\nOnly a protocol fixture.\n")?;
+    let skill_path = fs::canonicalize(skill_path)?;
+    let skill = crate::NativeSkillInput {
+        name: "synthetic".into(),
+        sha256: sha(&fs::read(&skill_path)?),
+        path: skill_path,
+    };
+    let responses = native_execution_startup()
+        .split_inclusive(|byte| *byte == b'\n')
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+    for (method, prefix, expected) in [
+        ("initialize", 0, crate::DocumentStartupMethod::Initialize),
+        ("account/read", 1, crate::DocumentStartupMethod::AccountRead),
+        ("config/read", 2, crate::DocumentStartupMethod::ConfigRead),
+        ("skills/list", 3, crate::DocumentStartupMethod::SkillsList),
+        ("thread/start", 3, crate::DocumentStartupMethod::ThreadStart),
+    ] {
+        for event in ["error", "configWarning", "config/warning", "model/rerouted"] {
+            let mut config = native_execution_control()?;
+            if method == "skills/list" {
+                config.native_execution.as_mut().unwrap().native_skills = vec![skill.clone()];
+            }
+            let mut script = responses[..prefix].concat();
+            script.extend(line(document_runtime_notice(event)));
+            script.extend(native_execution_startup());
+            script.extend(line(tool("must-not-dispatch", "finalize")));
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let mut backend = Backend::new();
+            let error = replay_control(&script, &mut backend, captured.clone(), &config)
+                .await
+                .err()
+                .expect("runtime startup refused");
+            let diagnostic = document_runtime_diagnostic(&error);
+            assert_eq!(diagnostic.stage, crate::DocumentRuntimeStage::Startup);
+            assert_eq!(diagnostic.startup_method, Some(expected));
+            assert_eq!(serde_json::to_value(diagnostic.event)?, json!(event));
+            assert_eq!(diagnostic.identity, crate::DocumentRuntimeIdentity::Startup);
+            assert!(diagnostic.usage.is_none());
+            assert!(diagnostic.provider_request_count.is_none());
+            assert!(!diagnostic.accounting_complete);
+            assert_eq!(
+                diagnostic.transport.thread_start_sent,
+                method == "thread/start"
+            );
+            assert!(!diagnostic.transport.thread_start_acknowledged);
+            assert!(!diagnostic.transport.turn_start_sent);
+            assert!(!diagnostic.transport.turn_start_acknowledged);
+            assert_eq!(backend.calls, 0);
+            let sent = sent_frames(&captured);
+            assert_eq!(sent.last().unwrap()["method"], method);
+            assert_eq!(
+                sent.iter()
+                    .filter(|frame| frame["method"] == method)
+                    .count(),
+                1
+            );
+            assert!(sent.iter().all(|frame| frame["method"] != "turn/start"));
+            assert_document_runtime_private(&error);
+            if event == "configWarning" || event == "config/warning" {
+                let details = diagnostic.diagnostics.as_ref().expect("warning projection");
+                assert_eq!(details["native_error_shape_valid"], false);
+                assert_eq!(details["warning_shape_valid"], true);
+                assert_eq!(
+                    details["message"]["sha256"],
+                    sha(PRIVATE_RUNTIME_DIAGNOSTIC.as_bytes())
+                );
+                assert_eq!(
+                    details["additional_details"]["sha256"],
+                    sha(PRIVATE_RUNTIME_DIAGNOSTIC.as_bytes())
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn document_runtime_turn_refusal_keeps_rpc_facts_without_retry_or_fallback() -> Result<()> {
+    let config = native_execution_control()?;
+    let responses = native_execution_startup()
+        .split_inclusive(|byte| *byte == b'\n')
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+    for acknowledged in [false, true] {
+        for event in ["error", "configWarning", "config/warning", "model/rerouted"] {
+            let mut script = responses[..if acknowledged { 5 } else { 4 }].concat();
+            script.extend(line(document_runtime_notice(event)));
+            script.extend(line(tool("must-not-dispatch", "finalize")));
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let mut backend = Backend::new();
+            let error = replay_control(&script, &mut backend, captured.clone(), &config)
+                .await
+                .err()
+                .expect("runtime turn refused");
+            let diagnostic = document_runtime_diagnostic(&error);
+            assert_eq!(
+                diagnostic.stage,
+                if acknowledged {
+                    crate::DocumentRuntimeStage::ActiveTurn
+                } else {
+                    crate::DocumentRuntimeStage::TurnStart
+                }
+            );
+            assert!(diagnostic.startup_method.is_none());
+            assert_eq!(serde_json::to_value(diagnostic.event)?, json!(event));
+            assert_eq!(
+                diagnostic.identity,
+                if event.starts_with("config") {
+                    crate::DocumentRuntimeIdentity::GlobalNotification
+                } else {
+                    crate::DocumentRuntimeIdentity::Matched
+                }
+            );
+            assert!(diagnostic.transport.thread_start_sent);
+            assert!(diagnostic.transport.thread_start_acknowledged);
+            assert!(diagnostic.transport.turn_start_sent);
+            assert_eq!(diagnostic.transport.turn_start_acknowledged, acknowledged);
+            assert!(diagnostic.usage.is_none());
+            assert!(diagnostic.provider_request_count.is_none());
+            assert!(!diagnostic.accounting_complete);
+            assert_eq!(diagnostic.will_retry, (event == "error").then_some(true));
+            let sent = sent_frames(&captured);
+            for method in ["thread/start", "turn/start"] {
+                assert_eq!(
+                    sent.iter()
+                        .filter(|frame| frame["method"] == method)
+                        .count(),
+                    1
+                );
+            }
+            assert_eq!(sent.last().unwrap()["method"], "turn/start");
+            assert_eq!(backend.calls, 0);
+            assert_document_runtime_private(&error);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn document_runtime_usage_and_error_identity_do_not_attribute_foreign_observations()
+-> Result<()> {
+    let config = native_execution_control()?;
+    let usage = json!({"method":"thread/tokenUsage/updated","params":{
+        "threadId":"synthetic-thread","turnId":"synthetic-turn",
+        "tokenUsage":{"total":{"totalTokens":7,"inputTokens":3,"private":PRIVATE_RUNTIME_DIAGNOSTIC},
+            "last":{"outputTokens":4,"inputTokens":"private","reasoningOutputTokens":-1},
+            "modelContextWindow":128000,"private":PRIVATE_RUNTIME_DIAGNOSTIC}}});
+    for bound in [false, true] {
+        let mut observed = usage.clone();
+        if !bound {
+            observed["params"].as_object_mut().unwrap().remove("turnId");
+        }
+        let mut script = native_execution_startup();
+        script.extend(line(observed));
+        script.extend(line(document_runtime_notice("error")));
+        let mut backend = Backend::new();
+        let error = replay_control(&script, &mut backend, Arc::default(), &config)
+            .await
+            .err()
+            .expect("runtime error");
+        let diagnostic = document_runtime_diagnostic(&error);
+        assert_eq!(
+            diagnostic.usage,
+            bound.then(|| json!({
+                "total":{"totalTokens":7,"inputTokens":3},
+                "last":{"outputTokens":4},"modelContextWindow":128000
+            }))
+        );
+        assert_eq!(
+            diagnostic.codex_error_info,
+            Some(crate::CodexErrorInfo::ResponseStreamDisconnected)
+        );
+        assert_eq!(diagnostic.http_status_code, Some(503));
+        assert!(diagnostic.provider_request_count.is_none());
+        assert_document_runtime_private(&error);
+    }
+    for identity_field in ["threadId", "turnId"] {
+        let mut observed = usage.clone();
+        observed["params"][identity_field] = json!("foreign-private-identity");
+        let mut script = native_execution_startup();
+        script.extend(line(observed));
+        script.extend(line(document_runtime_notice("error")));
+        let mut backend = Backend::new();
+        let error = replay_control(&script, &mut backend, Arc::default(), &config)
+            .await
+            .err()
+            .expect("foreign usage refused");
+        assert!(error.chain().all(|cause| {
+            cause
+                .downcast_ref::<crate::DocumentRuntimeError>()
+                .is_none()
+        }));
+        assert_eq!(backend.calls, 0);
+        assert!(!format!("{error:#?}").contains("foreign-private"));
+    }
+    for event in ["error", "configWarning", "config/warning", "model/rerouted"] {
+        for identity_field in ["threadId", "turnId"] {
+            let mut notification = document_runtime_notice(event);
+            notification["params"]["threadId"] = json!("synthetic-thread");
+            notification["params"]["turnId"] = json!("synthetic-turn");
+            notification["params"][identity_field] = json!("foreign-private-identity");
+            let mut script = native_execution_startup();
+            script.extend(line(usage.clone()));
+            script.extend(line(notification));
+            let mut backend = Backend::new();
+            let error = replay_control(&script, &mut backend, Arc::default(), &config)
+                .await
+                .err()
+                .expect("foreign error refused");
+            let diagnostic = document_runtime_diagnostic(&error);
+            assert_eq!(
+                diagnostic.identity,
+                crate::DocumentRuntimeIdentity::Mismatch
+            );
+            assert!(diagnostic.codex_error_info.is_none());
+            assert!(diagnostic.http_status_code.is_none());
+            assert!(diagnostic.will_retry.is_none());
+            assert!(diagnostic.usage.is_none());
+            assert!(diagnostic.diagnostics.is_none());
+            assert!(diagnostic.usage_updates_without_numeric.is_none());
+            assert!(diagnostic.provider_request_count.is_none());
+            assert_eq!(backend.calls, 0);
+            assert_document_runtime_private(&error);
+            assert!(!format!("{error:#?}").contains("foreign-private"));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn document_runtime_unusable_usage_updates_preserve_last_valid_observation() -> Result<()> {
+    let config = native_execution_control()?;
+    let known = json!({"total":{"totalTokens":7,"inputTokens":3},
+        "last":{"outputTokens":4},"modelContextWindow":128000});
+    // Zero is a real token observation and must replace earlier known usage.
+    let updated = json!({"total":{"totalTokens":0}});
+    let notice = |usage: Value| {
+        json!({"method":"thread/tokenUsage/updated","params":{
+        "threadId":"synthetic-thread","turnId":"synthetic-turn","tokenUsage":usage}})
+    };
+    for initial in [false, true] {
+        for replacement in [false, true] {
+            for unusable in [
+                None,
+                Some(Value::Null),
+                Some(json!({})),
+                Some(json!({"modelContextWindow":200000})),
+                Some(
+                    json!({"total":{"totalTokens":"not-numeric","inputTokens":-1},
+                    "modelContextWindow":PRIVATE_RUNTIME_DIAGNOSTIC}),
+                ),
+            ] {
+                let mut script = native_execution_startup();
+                if initial {
+                    script.extend(line(notice(known.clone())));
+                }
+                let mut bad = notice(Value::Null);
+                if let Some(value) = unusable {
+                    bad["params"]["tokenUsage"] = value;
+                } else {
+                    bad["params"].as_object_mut().unwrap().remove("tokenUsage");
+                }
+                script.extend(line(bad));
+                if replacement {
+                    script.extend(line(notice(updated.clone())));
+                }
+                script.extend(line(document_runtime_notice("error")));
+                let mut backend = Backend::new();
+                let error = replay_control(&script, &mut backend, Arc::default(), &config)
+                    .await
+                    .err()
+                    .expect("runtime failure after usage observations");
+                let diagnostic = document_runtime_diagnostic(&error);
+                assert_eq!(
+                    diagnostic.usage,
+                    if replacement {
+                        Some(updated.clone())
+                    } else {
+                        initial.then(|| known.clone())
+                    }
+                );
+                assert_eq!(diagnostic.usage_updates_without_numeric, Some(1));
+                assert_eq!(diagnostic.stage, crate::DocumentRuntimeStage::ActiveTurn);
+                assert_eq!(
+                    diagnostic.codex_error_info,
+                    Some(crate::CodexErrorInfo::ResponseStreamDisconnected)
+                );
+                assert_eq!(diagnostic.http_status_code, Some(503));
+                assert_eq!(diagnostic.will_retry, Some(true));
+                assert_eq!(diagnostic.code(), "document_runtime_refused_no_retry");
+                assert!(diagnostic.provider_request_count.is_none());
+                assert!(!diagnostic.accounting_complete);
+                assert_eq!(backend.calls, 0);
+                assert_document_runtime_private(&error);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn document_runtime_foreign_usage_does_not_mutate_retained_observation() -> Result<()> {
+    let limits = limits();
+    let mut rpc = Rpc {
+        reader: BufReader::new(&b""[..]),
+        writer: Vec::new(),
+        limits: limits.clone(),
+        working: DocumentWorking::new(limits.working_bytes),
+        transport: TransportBudget::new(limits.total_rpc_bytes),
+        deadline: Instant::now() + Duration::from_secs(1),
+        messages: 0,
+        native_execution: true,
+        observation: crate::DocumentRuntimeTransport::default(),
+        usage: None,
+        usage_retained: None,
+        usage_updates_without_numeric: 0,
+    };
+    let mut turn = Some("synthetic-turn".into());
+    let observed = json!({"method":"thread/tokenUsage/updated","params":{
+        "threadId":"synthetic-thread","turnId":"synthetic-turn",
+        "tokenUsage":{"total":{"totalTokens":7}}}});
+    rpc.observe_usage(&observed, "synthetic-thread", &mut turn)?;
+    let mut unusable = observed.clone();
+    unusable["params"]["tokenUsage"] = json!({});
+    rpc.observe_usage(&unusable, "synthetic-thread", &mut turn)?;
+    let retained = rpc.usage.clone();
+    for identity_field in ["threadId", "turnId"] {
+        let mut foreign = observed.clone();
+        foreign["params"][identity_field] = json!("foreign-private-identity");
+        foreign["params"]["tokenUsage"] = json!({"total":{"totalTokens":999}});
+        let error = rpc
+            .observe_usage(&foreign, "synthetic-thread", &mut turn)
+            .expect_err("foreign observation must remain refused");
+        assert_eq!(rpc.usage, retained);
+        assert_eq!(rpc.usage_updates_without_numeric, 1);
+        assert_eq!(turn.as_deref(), Some("synthetic-turn"));
+        assert!(!format!("{error:#?}").contains("foreign-private"));
+    }
+    let mut unbound = observed;
+    unbound["params"].as_object_mut().unwrap().remove("turnId");
+    rpc.observe_usage(&unbound, "synthetic-thread", &mut turn)?;
+    assert_eq!(rpc.usage, retained);
+    assert_eq!(rpc.usage_updates_without_numeric, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn document_runtime_warning_oversize_and_cleanup_keep_bounded_typed_evidence() -> Result<()> {
+    let config = native_execution_control()?;
+    let mut warning = document_runtime_notice("configWarning");
+    let oversized = format!("{PRIVATE_RUNTIME_DIAGNOSTIC}{}", "中".repeat(6000));
+    warning["params"]["summary"] = json!(oversized);
+    let mut script = line(warning);
+    script.extend(native_execution_startup());
+    let mut backend = Backend::new();
+    let error = replay_control(&script, &mut backend, Arc::default(), &config)
+        .await
+        .err()
+        .expect("oversized warning still refused");
+    let diagnostic = document_runtime_diagnostic(&error);
+    let details = diagnostic.diagnostics.as_ref().expect("warning projection");
+    assert_eq!(details["message"]["bytes"], oversized.len());
+    assert_eq!(details["message"]["inspected"], false);
+    assert!(details["message"]["sha256"].is_null());
+    assert_eq!(
+        details["additional_details"]["sha256"],
+        sha(PRIVATE_RUNTIME_DIAGNOSTIC.as_bytes())
+    );
+    assert_document_runtime_private(&error);
+
+    for fail in [false, true] {
+        let mut script = native_execution_startup();
+        script.extend(line(document_runtime_notice("error")));
+        let mut inner = Backend::new();
+        let primary = replay_control(&script, &mut inner, Arc::default(), &config)
+            .await
+            .err()
+            .expect("primary protocol refusal");
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut backend = CleanupBackend {
+            inner,
+            calls: 0,
+            fail,
+            completed: completed.clone(),
+            ocr: None,
+        };
+        let error = finish_document_cleanup::<()>(&mut backend, Err(primary), Some(Instant::now()))
+            .await
+            .expect_err("primary failure survives cleanup");
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(backend.calls, 1);
+        assert_eq!(
+            error.to_string().contains("document_ocr_cleanup_unknown"),
+            fail
+        );
+        assert_eq!(
+            document_runtime_diagnostic(&error).stage,
+            crate::DocumentRuntimeStage::ActiveTurn
+        );
+        assert_document_runtime_private(&error);
+    }
+    Ok(())
+}
+
 fn remote_control_notice(environment: Option<Value>) -> Value {
     let mut notice = json!({"method":"remoteControl/status/changed","params":{
         "installationId":"MOCK-private-installation","serverName":"MOCK-private-server",
@@ -1444,6 +1905,10 @@ async fn incoming_overflow_and_total_wire_failure_precede_tree_or_backend_alloca
         deadline: Instant::now() + Duration::from_secs(1),
         messages: 0,
         native_execution: false,
+        observation: crate::DocumentRuntimeTransport::default(),
+        usage: None,
+        usage_retained: None,
+        usage_updates_without_numeric: 0,
     };
     assert!(rpc.receive().await.is_err());
     assert_eq!(rpc.messages, 0);
@@ -1457,6 +1922,10 @@ async fn incoming_overflow_and_total_wire_failure_precede_tree_or_backend_alloca
         deadline: Instant::now() + Duration::from_secs(1),
         messages: 0,
         native_execution: false,
+        observation: crate::DocumentRuntimeTransport::default(),
+        usage: None,
+        usage_retained: None,
+        usage_updates_without_numeric: 0,
     };
     assert!(rpc.send(json!({"id":1})).await.is_err());
     assert!(rpc.writer.is_empty());

@@ -116,13 +116,24 @@ Decisions のデフォルトは `openai/gpt-6-luna-decisions` です。上限付
 `agent` は一回の native Document turn、`qualify` は profile を自動で受理せずに非公開の画像の根拠を記録します。
 明示的な index registry が完全な検証済み成果物を writer に渡します。writer は再解析せず、元のパーサー／OCR の
 コンテキストを共有し、ソースの pin と一覧を再検査し、完全な受け入れ判定の後にだけ公開します。
-Document は標準で 64 tools／1 turn／900 秒、一致する profile では最大 3600 秒を明示できます。
-実際の期限は frontend、session、元の phase の各期限の最小値です。Page OCR は独立して 8 tools／1 turn／180 秒です。
+現在の native PTC 経路は呼び出し元の job 予算を使います。Document の制御ファイルがツール回数と
+時間を固定し、native OCR executor は選択した runtime profile から回数と時間を取得します。
+frontend、session、元の phase の期限は先に切れることがあります。保持された固定 transport では、
+Document は標準で 64 tools／1 turn／900 秒、明示的に結び付けた native-viewer profile は
+1–3600 秒、Page OCR は 8 tools／1 turn／180 秒です。この固定制限は native PTC 経路には適用しません。
 原文全ページの解析・metadata coverage と、モデルが実際に確認した範囲を分けて記録します。
 ページウィンドウはバッチ上限であり、文書全体のページ数制限ではありません。論理 buffer／staging 予約は
 プロセス全体の RSS や物理ディスク使用量の実測ではありません。native `view_image` は
 [固定された source derivative](../patches/codex-native-viewer/README.md)を使い、実際の binary／profile を
 Page と Document で別々に検証します。ビルド成功だけでは live 受理になりません。
+
+Document の失敗は型付きの `DocumentRuntimeError` に起動メソッドまたは実行中の段階、イベント種別、
+上限付きの warning 指紋を保持します。RPC の送信と一致する応答は transport の観測であり、
+プロバイダーの受理や要求数を証明しません。後の空または数値でない usage 更新は、最後の ID が一致した
+有効な数値観測を消しません。総請求は不明のままで、`provider_request_count` は null、
+`accounting_complete` は false です。後処理は型付きの原因を保持し、CLI JSON は
+`document_runtime` にそれを出力します。プロバイダーの原文、ネイティブ ID、非公開パスは複写しません。
+過去の失敗で捨てられた内容を、この診断から復元することはできません。
 
 エンコード済みのページ画像の容量は、既存の parse-agent 制御ファイルの `resources` オブジェクトで
 設定します。CLI はこの制御ファイルを `--config` と `--expected-control-sha256` で読み込み、`index`
@@ -253,7 +264,8 @@ Choice のスコアは提示された選択肢どうしの比較なので、絶�
 アンカーもない場合、検索は空の結果を返さず、スコア上位 3 件をそれぞれ `below_threshold` と
 して返し、`coverage.below_threshold_fallback` に件数を示し（`filtered_candidates` にも
 含まれます）、低信頼度の候補であるという警告を付けます。件数と警告は、結果数の上限と最後の
-鮮度確認の後に実際に返した印付きの結果だけを表します。これらが下限を満たしたとは扱わず、
+鮮度確認の後に実際に返した印付きの結果だけを表します。ホストで出力を詰めた後の件数も payload と
+台帳に一致させ、試行数と候補総数は保持します。これらが下限を満たしたとは扱わず、
 ホストの初期検索は `filtered_all` を報告します。プレーンテキストの `search` は、これらを
 `PATH:LINE:TEXT` の一致としてではなく、grep の文脈行の区切り（`PATH-LINE-TEXT`）で出力し、
 結果を返すため終了ステータスは 0 です。証拠ロールの並べ替えも同じ代替を行います（適格性は
@@ -283,7 +295,10 @@ Decisions は `/api/alpha/decisions` を使い、リクエストの制限時間�
 など）は種類 `retry_post_send` となります。再試行の応答が既に検証済みなら、プロバイダーはその提出を
 既知の使用量で完了しています。失敗の診断情報はその検査済みの数値使用量と応答モデルを保持し、
 検索エラー、操作レシート、ホスト台帳はそれを `jev_requests`、`jev_models`、`jev_usage` に数えます。
-検証前なら使用量は不明のままです。送信前に
+検証前なら使用量は不明のままです。validated-response と terminal-failure の両方の observer
+callback が失敗しても、限定された失敗段階、要求モデル、送信／検証状態、先行する試行を保持します。
+検証済みの初回応答は `observer_callback` として既知の使用量に数えます。プロバイダーの失敗後に
+callback が失敗しても元の型付きの原因を残し、任意の callback エラー原文はコピーしません。送信前に
 止まった再試行だけが `retry_admission` です。judge、拡張のサポート呼び出し（独自の明示的な
 再試行計画）、ナビゲーション走査、証拠ロール判定、リッチ／マルチモーダル検索、明示的な
 再ランキング候補プールとバッチの提出は1回だけ送信します。リッチ経路は、呼び出し元の
@@ -336,9 +351,9 @@ MCP サーバーは使用しません。モデルには、上限付きの GPTgre
 関する規則はすべて変わらず、根拠がない場合や答えを支えられない場合は引き続き
 `insufficient_evidence: true` とします。リッチテキストとマルチモーダルの読み手にはこれらの
 規則を与えません。これらの規則は GPTgrep の reader 契約の一部で、主比較では処置の一部として
-扱います。現在のソースでは、full62 adapter は `legacy_text` の実行で生文書のみの側にも同じ規則の
-文面を与えていますが、所有者の決定により、対になった実行の前にこの複製を取り除き、素の Codex
-側には規則を与えません。
+扱います。full62 の主比較で生文書のみの側は、どちらの reader mode でも共通の質問と生文書の
+範囲を受け取り、Codex の既定 base instructions を使います。GPTgrep の回答規則や Skills は
+与えません。任意の「素の Codex と回答規則」の診断には別の実験群 ID が必要です。
 
 `HostConfig.native_ptc`（既定 false）と `--native-ptc` は、最終の検索 reader にネイティブ実行を
 選びます。既存の名前付き権限 profile がターンの前に確認されている必要があります。ネイティブ設定は、

@@ -8,6 +8,7 @@ import string
 from .common import (ARMS, MAX_READER_QUESTION_BYTES, MAX_TOOL_CALLS, PROFILE, canonical, copy_asset, digest, integer,
                      parse, pinned, put, relative, require, sha, tool_cap_parity)
 from .native import JUDGE_OUTPUT_SCHEMA, output_schema_bytes
+from .reader import task_prompt
 from .runtime import (API_ENV, BASE_CAPABILITIES, BASE_TOOLS_PATH, CODEX_HOME, DECISIONS_BUDGET, DECISIONS_LEDGER_DIR, PASS_ENV, WORK_DIR, auth_compose, auth_paths,
                       base_tools_identity, model_config, native_identity, reader_seccomp_profile, reader_security_opt,
                       validate_asset_path)
@@ -343,6 +344,13 @@ class Full62Adapter:
             integer(row["pin"]["bytes"], 0, runtime["max_asset_bytes"])
             digest(row["pin"]["sha256"])
         require(len(names) == len(set(names)) and runtime["index_files"], "finite_assets_unique")
+        documents_by_id = {row["document_id"]: row for row in documents}
+        # The same cap must cover the document line and question before either
+        # arm is materialized, using the reader's exact common-payload encoder.
+        require(all(len(task_prompt({"reader_mode": runtime["reader_mode"],
+                        "raw_document": CORPUS_ROOT + "/" + documents_by_id[row["document_id"]]["relative_path"]},
+                       row["question"])) <= question_cap for row in self.rows),
+                "selected_cohort_reader_task_bound")
         require(sum(r["pin"]["bytes"] for r in documents + runtime["index_files"]) <=
                 integer(runtime["max_assets_total_bytes"], 1), "asset_total_bound")
         require(approval.get("assets_sha256") == sha(canonical(documents + runtime["index_files"])) and

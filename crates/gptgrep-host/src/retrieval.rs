@@ -429,6 +429,9 @@ impl Evidence {
             }
             search.delivered_hits = evidence.len();
             search.output_truncated = found.hits.len() < original_hits;
+            if let Some(coverage) = search.plan.as_mut().and_then(|plan| plan.coverage.as_mut()) {
+                coverage.below_threshold_fallback = found.coverage.below_threshold_fallback;
+            }
             search = accounting.delivery(&search)?;
             let receipt = ToolReceipt {
                 call_id: call_id.into(),
@@ -895,6 +898,9 @@ impl Evidence {
         if let Some(search) = &mut self.last_search {
             search.delivered_hits = evidence.len();
             search.output_truncated = found.hits.len() < original_hits;
+            if let Some(coverage) = &mut search.coverage {
+                coverage.below_threshold_fallback = found.coverage.below_threshold_fallback;
+            }
         }
         self.last_search_fatal = false;
         let mut value = serde_json::to_value(found)?;

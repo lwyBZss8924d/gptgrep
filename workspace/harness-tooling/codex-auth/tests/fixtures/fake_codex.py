@@ -4,7 +4,7 @@ Behaviour comes from `<this file>.json` (the supervisor passes an allowlisted
 environment, so no mode variable can be inherited):
   {"app_server": "normal" | "no_write" | "slow_term" | "stuck" | "permanent_fail" | "transient_fail" | "slow_refresh",
    "login_exit": 0, "status_exit": "auto" | int, "login_sleep": 0.0,
-   "refresh_delay": 0.0, "started": PATH, "finished": PATH}
+   "refresh_delay": 0.0, "refresh_mode_cycle": false, "started": PATH, "finished": PATH}
 
 app-server: newline JSON-RPC on stdin/stdout. account/read with refreshToken
 rewrites $CODEX_HOME/auth.json IN PLACE through the run's symlink (like the
@@ -97,6 +97,10 @@ def app_server():
             send({"id": message["id"], "result": {"userAgent": "fake", "codexHome": os.environ.get("CODEX_HOME")}})
         elif method == "account/read":
             refresh = (message.get("params") or {}).get("refreshToken")
+            if refresh and SETTINGS.get("refresh_mode_cycle"):
+                path = os.path.join(os.environ["CODEX_HOME"], "auth.json")
+                os.chmod(path, 0o400)
+                os.chmod(path, 0o600)
             if refresh and mode == "permanent_fail":
                 sys.stderr.write(PERMANENT_LINE + "\n")
                 sys.stderr.flush()

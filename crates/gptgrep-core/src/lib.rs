@@ -343,8 +343,8 @@ pub struct Metrics {
     /// requests.
     pub jev_calls_attempted: usize,
     /// Successful validated Jev responses observed by this search, including a
-    /// bounded retry's reply that validated before a later local accounting or
-    /// observer step failed (failure kind `retry_post_send`).
+    /// reply that validated before a later local accounting or observer step
+    /// failed (`retry_post_send` or a validated initial `observer_callback`).
     pub jev_requests: usize,
     /// Served (provider-returned) model of each validated response.
     pub jev_models: Vec<String>,
@@ -354,8 +354,8 @@ pub struct Metrics {
     #[serde(default)]
     pub jev_requested_models: Vec<String>,
     /// Provider usage of each validated response, parallel to `jev_models`;
-    /// null when none was reported, never zero-filled. A `retry_post_send`
-    /// reply keeps only its checked numeric fields.
+    /// null when none was reported, never zero-filled. A reply followed by a
+    /// local failure keeps only its checked numeric fields.
     pub jev_usage: Vec<Value>,
     pub jev_candidate_bytes: usize,
     /// Failed submissions repeated by the bounded transient retry, in attempt
@@ -392,16 +392,13 @@ fn retried_attempts_of(error: &anyhow::Error) -> &[DecisionRetriedAttempt] {
         .map_or(&[], |failure| &failure.diagnostic().prior_attempts)
 }
 
-/// A bounded retry whose reply validated before a later local accounting or
-/// observer step failed (`retry_post_send`) was completed by the provider with
-/// known usage. Count it as an observed validated response, with its served
-/// model and checked usage, instead of dropping it. Any other failure, and a
-/// retry sent without a validated reply, adds nothing: its usage stays unknown.
+/// A reply that validated before a later local failure keeps its served model
+/// and checked usage. An initial observer failure additionally requires typed
+/// send/validation observations and matching requested/served identity.
 fn record_validated_retry_reply(metrics: &mut Metrics, error: &anyhow::Error) {
     let Some(diagnostic) = error
         .downcast_ref::<DecisionFailure>()
         .map(DecisionFailure::diagnostic)
-        .filter(|diagnostic| diagnostic.kind == DecisionFailureKind::RetryPostSend)
     else {
         return;
     };
@@ -409,6 +406,20 @@ fn record_validated_retry_reply(metrics: &mut Metrics, error: &anyhow::Error) {
         .response_metadata
         .as_ref()
         .and_then(|metadata| metadata.model.value.as_ref());
+    let validated_initial = diagnostic.kind == DecisionFailureKind::ObserverCallback
+        && diagnostic
+            .observer_failure
+            .as_ref()
+            .is_some_and(|observer| {
+                observer.send_started
+                    && observer.response_validated
+                    && served.is_some_and(|served| {
+                        gptgrep_jev::response_model_matches(&observer.requested_model, served)
+                    })
+            });
+    if diagnostic.kind != DecisionFailureKind::RetryPostSend && !validated_initial {
+        return;
+    }
     if let (Some(usage), Some(served)) = (&diagnostic.reported_usage, served) {
         metrics.jev_requests += 1;
         metrics.jev_models.push(served.clone());
@@ -519,8 +530,7 @@ async fn rerank_call(
             // carries these metrics and a fixed cause.
             error
         } else {
-            // A retry reply that validated before a local step failed keeps
-            // its usage beside the failed attempt it repeated.
+            // A reply that validated before a local step failed keeps its usage.
             record_validated_retry_reply(metrics, &error);
             jev_search_error(
                 stage,
@@ -659,13 +669,15 @@ fn jev_search_error(
     started: Instant,
 ) -> JevSearchError {
     let message = error.to_string();
-    // A failure after a bounded retry, or a transient status whose retry its
-    // Retry-After refused, keeps the client's own rendering.
-    let retried = error.downcast_ref::<DecisionFailure>().filter(|failure| {
+    // Retry outcomes, retry refusals and observer failures keep the client's
+    // fixed, redacted diagnostic rendering.
+    let typed_diagnostic = error.downcast_ref::<DecisionFailure>().filter(|failure| {
         let diagnostic = failure.diagnostic();
-        !diagnostic.prior_attempts.is_empty() || diagnostic.retry_after_refusal.is_some()
+        !diagnostic.prior_attempts.is_empty()
+            || diagnostic.retry_after_refusal.is_some()
+            || diagnostic.observer_failure.is_some()
     });
-    let cause = if let Some(failure) = retried {
+    let cause = if let Some(failure) = typed_diagnostic {
         // Fixed wording plus numeric statuses, validation codes and fixed
         // refusal reasons only.
         failure.to_string()
@@ -4417,6 +4429,84 @@ mod tests {
             ),
             (2, 0)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn initial_observer_failures_count_only_validated_provider_replies() -> Result<()> {
+        struct RejectInitial {
+            before_send: bool,
+        }
+        impl gptgrep_jev::DecisionObserver for RejectInitial {
+            fn send_started(&self, _: &gptgrep_jev::DecisionRequestObservation<'_>) -> Result<()> {
+                ensure!(!self.before_send, "synthetic-private-send-error");
+                Ok(())
+            }
+            fn validated_response(
+                &self,
+                _: &gptgrep_jev::DecisionRequestObservation<'_>,
+                _: &gptgrep_jev::DecisionResponse,
+            ) -> Result<()> {
+                bail!("synthetic-private-validated-error")
+            }
+            fn failed(&self, _: &gptgrep_jev::DecisionRequestObservation<'_>) -> Result<()> {
+                bail!("synthetic-private-failed-error")
+            }
+        }
+        let directory = one_document_corpus().await?;
+        for (before_send, http_status) in [(false, 200), (true, 200), (false, 503)] {
+            let (client, server) = mock_jev(if before_send {
+                vec![]
+            } else {
+                vec![http_status]
+            })
+            .await?;
+            let client = client
+                .with_transient_retry(TransientRetry::with_jitter(|| 0.0))
+                .with_decision_observer(Arc::new(RejectInitial { before_send }));
+            let error = search_with_client(
+                directory.path(),
+                "needle",
+                &SearchOptions::default(),
+                &client,
+            )
+            .await
+            .unwrap_err();
+            let requests = usize::from(!before_send);
+            let validated = usize::from(!before_send && http_status == 200);
+            assert_eq!(server.await?.len(), requests);
+            let failure = error.downcast_ref::<JevSearchError>().unwrap();
+            assert_eq!(failure.stage, "evidence_reranking");
+            assert_eq!(failure.metrics.jev_calls_attempted, 1);
+            assert_eq!(failure.metrics.jev_requests, validated);
+            assert_eq!(
+                failure.metrics.jev_requested_models,
+                [gptgrep_jev::DEFAULT_MODEL]
+            );
+            assert!(failure.metrics.jev_retried_attempts.is_empty());
+            if validated == 0 {
+                assert!(failure.metrics.jev_models.is_empty());
+                assert!(failure.metrics.jev_usage.is_empty());
+            } else {
+                assert_eq!(
+                    failure.metrics.jev_models,
+                    ["openai/gpt-6-luna-decisions-20261006"]
+                );
+                assert_eq!(
+                    failure.metrics.jev_usage,
+                    [json!({"input_tokens":100,"output_tokens":2,"cost":0.001})]
+                );
+            }
+            assert!(!failure.accounting_complete);
+            let serialized = serde_json::to_string(failure)?;
+            assert!(!serialized.contains("synthetic-private-"));
+            assert!(serialized.contains("observer callbacks failed"));
+            if http_status == 503 {
+                assert!(failure.cause.contains("HTTP 503"));
+                assert!(failure.cause.contains("observer callbacks failed: failed"));
+                assert!(!serialized.contains("secret-provider-body-sentinel"));
+            }
+        }
         Ok(())
     }
 

@@ -121,15 +121,29 @@ even when reopening identical source bytes produces the same content-bound task
 digest. JSON cannot provide paid OCR results or admit new source paths.
 
 `gptgrep-host::parse_agent_driver` coordinates a selected standalone Codex
-app-server document turn over that typed backend. Document defaults are 64 tools,
-one turn and 900 seconds. An explicit native profile can bind a duration from
-1 to 3,600 seconds; caller limits and the guard contract must match. Frontend,
-session and original phase deadlines can still expire earlier. Required page OCR uses separate qualified page
-children, each retaining eight tools, one turn and 180 seconds. Metadata and
+app-server document turn over that typed backend. The current native PTC paths use
+caller-selected job budgets: Document controls bind the tool count and duration,
+and the native OCR executor takes its tool count and duration from its selected
+runtime profile. Frontend, session and original phase deadlines can expire earlier.
+The retained fixed transport defaults to 64 tools, one turn and 900 seconds for
+Document (an explicitly bound native-viewer profile can select 1–3,600 seconds)
+and eight tools, one turn and 180 seconds for Page OCR. Those fixed limits do not
+apply to the native PTC paths. Metadata and
 parser completeness cover every original page; observed model inspection remains
 separate and may be partial. Page windows are batch bounds, not a whole-document
 page-count cutoff. Logical payload/metadata/staging accounting is reported as such;
 it does not establish total process RSS or measured physical disk use.
+
+Document failures expose a typed `DocumentRuntimeError`, including the startup
+method or active-turn stage, event kind and bounded warning fingerprints. Completed
+RPC writes and matching acknowledgements describe transport observations; they do
+not establish provider admission or request counts. A later empty or nonnumeric
+usage update retains the last valid identity-bound numeric observation. Unknown
+billing stays unknown, `provider_request_count` stays null and
+`accounting_complete` remains false. Cleanup preserves the typed cause, and CLI
+JSON failures include it in `document_runtime`. No provider text, native identities
+or private paths are copied into that object. These diagnostics cannot recover
+discarded error content from a historical failure.
 
 The CLI exposes `parse-agent serve`, `run`, `agent` and `qualify`. Explicit
 parse-agent index controls pin one document control for every selected supported
@@ -286,7 +300,9 @@ score, each flagged `below_threshold`, counts them in
 `coverage.below_threshold_fallback` (they remain in `filtered_candidates`) and
 adds a warning that they are low-confidence candidates. The count and warning
 describe the flagged hits actually returned after the result limit and the final
-freshness check. They never count as passing; a host seed reports `filtered_all`.
+freshness check. Host packing also synchronizes the delivered fallback count with
+the packed payload and ledger; attempted calls and candidate totals retain their
+earlier values. They never count as passing; a host seed reports `filtered_all`.
 Plain-text `search` prints them with grep's context separator (`PATH-LINE-TEXT`)
 instead of as `PATH:LINE:TEXT` matches, and the exit status is 0 because hits are
 returned. Evidence-role ordering applies the same fallback (eligibility
@@ -323,7 +339,13 @@ after the retry was sent (for example a failed local ledger record) is kind
 completed it with known usage: the failure diagnostic keeps that checked numeric
 usage and served model, and the search error, operation receipt and host ledger
 count it in `jev_requests`, `jev_models` and `jev_usage`; otherwise its usage stays
-unknown. Only a retry stopped before its send is `retry_admission`. Judge,
+unknown. Observer callback failures retain a closed list of failed callback stages,
+the requested model, send/validation state and prior attempts even if both the
+validated-response and terminal-failure callbacks fail. A validated initial
+response is retained as `observer_callback` and still contributes its known
+usage; a callback failure after a provider failure preserves that typed provider
+cause. Arbitrary callback error text is omitted. Only a retry stopped before its
+send is `retry_admission`. Judge,
 enrichment support calls (their own explicit retry plan), navigation scans,
 evidence-role decisions, rich/multimodal searches, explicit rerank pools and
 batch submissions remain single-submission; the rich paths remove any retry
@@ -380,9 +402,10 @@ evidence, citation and abstention rule is unchanged, including
 `insufficient_evidence: true` when evidence is missing or cannot support the
 answer. Rich text and multimodal readers do not receive these rules. The rules
 are part of GPTgrep's reader contract, which the main comparison treats as part
-of the treatment. In this source the full62 adapter still gives the raw-only arm
-of a `legacy_text` run the same rule text; by owner direction that copy is
-removed before the paired run, so the bare arm then receives none.
+of the treatment. The full62 primary raw-only arm receives the common question
+and raw-document scope with Codex's default base instructions, without GPTgrep's
+answer rules or Skills, in either reader mode. An optional bare-plus-rules
+diagnostic would require a distinct arm identity.
 
 `HostConfig.native_ptc` (default false) and `--native-ptc` select native
 execution for the final retrieval reader. An existing named permission profile

@@ -8,8 +8,9 @@ native parse/OCR path and the full62 Harbor adapter. Read the
 
 ## Checkout and storage
 
-Set `GPTGREP_BRANCH` to the experimental branch you are reviewing, for example Claude's
-experimental Opt-loop branch `claude/exp-ablation-opt-loop-20261013`. Each branch's
+Set `GPTGREP_BRANCH` to the published experimental branch you are reviewing, such as
+`claude/exp-ablation-opt-loop-20261013` or a subsequently published integration
+branch. Each branch's
 dated [status](experimental-status.md) describes the source that contains it; the
 earlier `codex/gptgrep-unified-runtime-20261012` branch predates the shared
 Decisions budget commands, the credential supervisor and alias admission
@@ -378,9 +379,10 @@ Both reader containers run under the same seccomp profile, which adds only the
 namespace calls bubblewrap needs to Docker's default; the Judge keeps the default.
 GPTgrep's reader contract (base instructions, citation and abstention rules and
 answer rules) is part of the treatment; the raw-only reader receives the common
-task prompt with Codex's default base instructions. In this source the adapter's
-`legacy_text` mode still copies the answer rules into the raw-only prompt; that
-copy is to be removed before the paired run.
+task prompt with Codex's default base instructions. In either reader mode the
+primary raw-only prompt omits GPTgrep's answer rules and Skills. Freeze the actual
+adapter input bytes; keep effective native base-instruction hashes unknown when
+the runtime does not expose them.
 The Judge runs in a separate environment with the complete answer and frozen
 reference, not the reader's history. Task failures stay in the denominator;
 unavailable judging stays unknown. INDEX and Judge costs are separate from

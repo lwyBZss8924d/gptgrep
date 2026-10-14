@@ -103,6 +103,9 @@ class PreparationProcessTests(unittest.TestCase):
         self.seed = write_pin(self.controls / "seed.json", {"synthetic": True})
         self.question = "Where is the ceramic kettle?"
         self.binding = {"arm": "gptgrep", "question_sha256": sha(self.question.encode())}
+        self.task_input = ("Document: /data/corpus/generic.txt\nQuestion: " + self.question).encode()
+        self.argv = ["/synthetic/pinned-product", "--decisions-budget", str(self.state / "budget.json"),
+                     "ask", "--", self.task_input.decode(), "/data/corpus"]
         self.config = {"reader_mode": "rich_multimodal", "deadline_seconds": 20,
                        "decisions_preparation": {"seed": self.seed, "run_id": "ordinary-trial", "max_concurrent_batches": 1}}
         for name, value in (("CONTROL_ROOT", str(self.controls)), ("TRIAL_ROOT", str(self.state)),
@@ -135,8 +138,7 @@ class PreparationProcessTests(unittest.TestCase):
         return {"return_code": 0, "failure": None, "stdout": canonical(value), "stderr": b"", "elapsed_ms": 3000}
 
     def prepare(self):
-        return decisions.prepare(self.config, self.binding, self.question,
-            ["/synthetic/pinned-product", "--decisions-budget", str(self.state / "budget.json"), "ask"],
+        return decisions.prepare(self.config, self.binding, self.question, self.task_input, self.argv,
             started=100, deadline_unix_ms=123456, environ=self.environment)
 
     def test_preparation_is_once_and_uses_remaining_deadline_and_verified_environment(self):
@@ -146,6 +148,10 @@ class PreparationProcessTests(unittest.TestCase):
             argv, kwargs = self.invocation
             self.assertEqual(kwargs["timeout"], 16)
             self.assertIn("--harbor-prepare-input", argv)
+            request = json.loads((self.state / "input.json").read_bytes())
+            self.assertEqual(request["query_sha256"], sha(self.task_input))
+            self.assertNotEqual(request["query_sha256"], self.binding["question_sha256"])
+            self.assertEqual(argv[-2].encode(), self.task_input)
             self.assertNotIn("OPENROUTER_API_KEY", kwargs["env"])
             self.assertNotIn(decisions.ATTACH_PATH_ENV, kwargs["env"])
             self.assertEqual(env["OPENROUTER_API_KEY"], "synthetic-only")
@@ -175,6 +181,14 @@ class PreparationProcessTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "decisions_question_binding"):
                 self.prepare()
             execute.assert_not_called()
+
+    def test_changed_product_query_is_rejected_before_process_launch(self):
+        self.argv[-2] = self.question
+        with patch.object(decisions, "run") as execute:
+            with self.assertRaisesRegex(ValueError, "decisions_query_binding"):
+                self.prepare()
+            execute.assert_not_called()
+        self.assertFalse((self.state / "input.json").exists())
 
     def test_cohort_writer_lock_is_exclusive_until_the_reader_closes_it(self):
         lock = self.root / "writer.lock"

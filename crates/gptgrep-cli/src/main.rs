@@ -2289,6 +2289,7 @@ async fn main() {
                     format!("{error:#}")
                 };
                 let mut report = json!({"schema_version":"gptgrep.error.v1","ok":false,"code":code,"error":diagnostic});
+                append_document_runtime_diagnostic(&error, &mut report);
                 if let Some(partial) = error.downcast_ref::<gptgrep_core::JevSearchError>() {
                     report["retrieval"] = serde_json::to_value(partial).unwrap_or(Value::Null);
                 }
@@ -2383,6 +2384,17 @@ async fn run_ocr_serve(command: OcrCommand) -> Result<i32> {
     Ok(0)
 }
 
+fn append_document_runtime_diagnostic(error: &anyhow::Error, report: &mut Value) {
+    // Cleanup can wrap the primary error through std::error::Error::source.
+    if let Some(diagnostic) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<gptgrep_host::DocumentRuntimeError>())
+    {
+        report["code"] = json!(diagnostic.code());
+        report["document_runtime"] = serde_json::to_value(diagnostic).unwrap_or(Value::Null);
+    }
+}
+
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -2394,6 +2406,83 @@ async fn shutdown_signal() {
         }
     }
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod document_runtime_cli_tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct CleanupWrapper(anyhow::Error);
+    impl std::fmt::Display for CleanupWrapper {
+        fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(output, "{}; document_ocr_cleanup_unknown", self.0)
+        }
+    }
+    impl std::error::Error for CleanupWrapper {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(self.0.as_ref())
+        }
+    }
+
+    #[test]
+    fn document_runtime_json_keeps_typed_failure_through_cleanup_sources() {
+        for cleanup_failed in [false, true] {
+            let diagnostic = gptgrep_host::DocumentRuntimeError {
+                stage: gptgrep_host::DocumentRuntimeStage::ActiveTurn,
+                startup_method: None,
+                event: gptgrep_host::DocumentRuntimeEvent::Error,
+                identity: gptgrep_host::DocumentRuntimeIdentity::Matched,
+                transport: gptgrep_host::DocumentRuntimeTransport {
+                    thread_start_sent: true,
+                    thread_start_acknowledged: true,
+                    turn_start_sent: true,
+                    turn_start_acknowledged: true,
+                },
+                codex_error_info: Some(gptgrep_host::CodexErrorInfo::Unauthorized),
+                http_status_code: None,
+                will_retry: Some(false),
+                usage: None,
+                usage_updates_without_numeric: Some(1),
+                provider_request_count: None,
+                accounting_complete: false,
+                diagnostics: Some(json!({"classification":"authentication"})),
+            };
+            let primary = anyhow::Error::new(diagnostic);
+            let error = if cleanup_failed {
+                anyhow::Error::new(CleanupWrapper(primary))
+            } else {
+                primary
+            };
+            let mut report = json!({"schema_version":"gptgrep.error.v1","ok":false,
+                "code":"gptgrep_error","error":format!("{error:#}")});
+            append_document_runtime_diagnostic(&error, &mut report);
+            assert_eq!(report["code"], "document_runtime_refused_no_retry");
+            assert_eq!(report["document_runtime"]["stage"], "active_turn");
+            assert_eq!(
+                report["document_runtime"]["codex_error_info"],
+                "unauthorized"
+            );
+            assert_eq!(
+                report["document_runtime"]["transport"]["turn_start_acknowledged"],
+                true
+            );
+            assert!(report["document_runtime"]["usage"].is_null());
+            assert_eq!(
+                report["document_runtime"]["usage_updates_without_numeric"],
+                1
+            );
+            assert!(report["document_runtime"]["provider_request_count"].is_null());
+            assert_eq!(report["document_runtime"]["accounting_complete"], false);
+            assert_eq!(
+                report["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("document_ocr_cleanup_unknown"),
+                cleanup_failed
+            );
+        }
+    }
 }
 
 #[cfg(test)]

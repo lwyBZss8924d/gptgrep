@@ -300,6 +300,7 @@ class BindingTests(unittest.TestCase):
 class LifecycleTests(unittest.TestCase):
     def setUp(self):
         self.env = Env("life")
+        self.addCleanup(self.env.cleanup_processes)
         self.env.credential.write(1, time.time() + 3600, in_place=False)
 
     def next_consumer(self, run_id, role="test"):
@@ -391,6 +392,27 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn("QUARANTINE_CLEARED", decisions)
         self.assertEqual(support.run_auth_links(self.env), [], "no run keeps a link after it ends or is refused")
 
+    def test_consumer_changing_canonical_mode_is_quarantined(self):
+        code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "qm1",
+                                               *probe("chmod-canonical", "644"))
+        self.assertEqual((code, receipt["state"]), (sup.EXIT_QUARANTINED, "QUARANTINED"))
+        before, after = receipt["canonical_before"], receipt["canonical_after"]
+        self.assertEqual((before["mode"], after["mode"]), ("0o600", "0o644"))
+        self.assertNotEqual(before["ctime_ns"], after["ctime_ns"])
+        for key in ("mtime_ns", "size", "ino", "dev"):
+            self.assertEqual(before[key], after[key], key)
+        self.assertIn("CANONICAL_CHANGED_BY_CONSUMER", [a["code"] for a in receipt["anomalies"]])
+
+    def test_consumer_restoring_canonical_mode_is_quarantined_by_ctime(self):
+        code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "qm2",
+                                               *probe("chmod-canonical", "400", "600"))
+        self.assertEqual((code, receipt["state"]), (sup.EXIT_QUARANTINED, "QUARANTINED"))
+        before, after = receipt["canonical_before"], receipt["canonical_after"]
+        for key in ("mode", "mtime_ns", "size", "ino", "dev"):
+            self.assertEqual(before[key], after[key], key)
+        self.assertNotEqual(before["ctime_ns"], after["ctime_ns"])
+        self.assertTrue(receipt["canonical_changed"])
+
     # -- auth link lifetime (CS-3) ----------------------------------------------------------
 
     def test_auth_link_exists_only_while_the_run_holds_the_lease(self):
@@ -440,6 +462,10 @@ class LifecycleTests(unittest.TestCase):
                                  (sup.EXIT_QUARANTINED, "QUARANTINED", 0))
                 self.assertIn("CREDENTIAL_LINK_IN_RUN_DIR", [a["code"] for a in receipt["anomalies"]])
                 self.assertNotIn("CANONICAL_HARDLINKED", [a["code"] for a in receipt["anomalies"]])
+                if kind == "hard":
+                    self.assertTrue(receipt["canonical_changed"])
+                    self.assertIn("CANONICAL_CHANGED_BY_CONSUMER", [a["code"] for a in receipt["anomalies"]])
+                self.assertEqual(receipt["quarantine"]["reason"], "CREDENTIAL_LINK_IN_RUN_DIR")
                 links = receipt["credential_links"]
                 self.assertEqual((links["found"], links["removed"], links["canonical_nlink_after"]), (1, 1, 1))
                 self.assertEqual(links["links"], [dict(found, removed=True, path="results/copy.json")])
@@ -510,8 +536,11 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(receipt["credential_links"]["found"], 0)
         self.assertTrue(support.wait_for(lambda: self.env.lease_probe() == "free", 60, 0.2))
         result = json.loads((self.env.run_dir("dev", "gl1") / "state" / "lease-guardian-result.json").read_text())
+        self.assertTrue(result["canonical_changed_since_baseline"])
+        self.assertEqual(result["quarantine"]["reason"], "CANONICAL_CHANGED_AFTER_SUPERVISOR")
         self.assertEqual((result["credential_links"]["found"], result["credential_links"]["removed"]), (1, 1))
         self.assertEqual(result["credential_link_quarantine"]["reason"], "CREDENTIAL_LINK_IN_RUN_DIR")
+        self.assertTrue(result["credential_link_quarantine"]["created"])
         self.assertFalse(os.path.lexists(self.env.run_dir("dev", "gl1") / "results" / "late.json"))
         self.assertEqual(os.lstat(self.env.credential.path).st_nlink, 1)
         self.assertEqual(json.loads(self.env.quarantine_marker().read_text())["reason"], "CREDENTIAL_LINK_IN_RUN_DIR")
@@ -714,17 +743,34 @@ class LifecycleTests(unittest.TestCase):
 
     # -- post-launch robustness (F2 / LC-01) --------------------------------------------------
 
-    def _fake_docker(self, ids, wait_seconds=3):
+    def _set_docker_state(self, state, labels, error=False):
+        temp = state.with_suffix(".tmp")
+        temp.write_text(json.dumps({"labels": labels, "error": error}))
+        os.replace(temp, state)
+
+    def _docker_poll_count(self, state):
+        calls = Path(str(state) + ".calls")
+        return len(calls.read_text().splitlines()) if calls.exists() else 0
+
+    def _fake_docker(self, ids, label, wait_seconds=3, error=False):
         state = self.env.root / "docker-state"
-        state.write_text("\n".join(ids))
+        self._set_docker_state(state, {label: ids}, error=error)
         fake = support.script(self.env.root / "docker", (FIXTURES / "fake_docker.py").read_text())
         Path(str(fake) + ".json").write_text(json.dumps({"state": str(state)}))
         self.env.reconfigure(docker={"bin": str(fake), "env": {"DOCKER_HOST": "unix:///fake/orbstack.sock"},
                                      "wait_seconds": wait_seconds, "poll_seconds": 0.2})
         return state
 
+    def _assert_owner_blocked(self, run_id):
+        owner = sup.Lease(self.env.cfg()).open(create=False)
+        try:
+            self.assertFalse(owner.acquire("exclusive", 0)[0], "a refresh owner cannot acquire the real lease")
+        finally:
+            owner.close()
+        self.assertEqual(self.next_consumer(run_id), (sup.EXIT_AUTH_BUSY, "AUTH_BUSY"))
+
     def _signal_during_docker_wait(self, sig, run_id):
-        state = self._fake_docker(["c0ffee99"], wait_seconds=60)
+        state = self._fake_docker(["c0ffee99"], "gptgrep.auth-job=" + run_id, wait_seconds=60)
         proc = self.env.popen("run", "--role", "harbor", "--run-id", run_id, "--harbor-job-label",
                               "gptgrep.auth-job=" + run_id, *probe("exit", 0))
         self.assertTrue(support.wait_for(lambda: self.env.has_event("harbor", run_id, "child_exited"), 60))
@@ -739,7 +785,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertIsNotNone(self.env.receipt("harbor", run_id))
         self.assertEqual(self.env.lease_probe(), "held_exclusive", "the guardian keeps the lease")
         self.assertEqual(self.next_consumer(run_id + "-busy")[0], sup.EXIT_AUTH_BUSY)
-        state.write_text("")
+        self._set_docker_state(state, {})
         self.assertTrue(self.next_ok(run_id + "-after"))
         support.observe("signal_during_docker_wait", signal=sig.name, supervisor_state=receipt["state"],
                         lease_kept_while_container_listed=True)
@@ -819,6 +865,20 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.next_consumer("kw1-next", role="dev"), (sup.EXIT_QUARANTINED, "QUARANTINED"))
         support.observe("guardian_canonical_recheck", quarantined=True)
 
+    def test_guardian_quarantines_late_canonical_mode_cycle(self):
+        pidfile = self.env.root / "late-chmod.pid"
+        code, receipt, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "km1",
+                                               *probe("escaped", pidfile, 5, "canonical-chmod", "400", "600"))
+        self.assertEqual((code, receipt["state"]), (sup.EXIT_UNKNOWN, "UNKNOWN"))
+        self.assertFalse(receipt["canonical_changed"])
+        self.assertTrue(support.wait_for(lambda: self.env.lease_probe() == "free", 60, 0.2))
+        result = json.loads((self.env.run_dir("dev", "km1") / "state" / "lease-guardian-result.json").read_text())
+        before, after = receipt["canonical_before"], result["canonical_after"]
+        for key in ("mode", "mtime_ns", "size", "ino", "dev"):
+            self.assertEqual(before[key], after[key], key)
+        self.assertNotEqual(before["ctime_ns"], after["ctime_ns"])
+        self.assertEqual(result["quarantine"]["reason"], "CANONICAL_CHANGED_AFTER_SUPERVISOR")
+
     def test_guardian_does_not_adopt_a_reused_root_pid(self):
         """A takeover tracker must not treat an unrelated process that reused the root pid as the run."""
         cfg = self.env.cfg()
@@ -832,13 +892,13 @@ class LifecycleTests(unittest.TestCase):
     # -- Harbor label gate (F1 / LC-02) ------------------------------------------------------
 
     def test_harbor_label_seen_during_run_then_cleared(self):
-        state = self._fake_docker(["c0ffee01", "c0ffee02"])
+        state = self._fake_docker(["c0ffee01", "c0ffee02"], "gptgrep.auth-job=h1")
         ready = self.env.root / "ready-h1"
         proc = self.env.popen("run", "--role", "harbor", "--run-id", "h1", "--harbor-job-label",
                               "gptgrep.auth-job=h1", *probe("hold", 2, ready, self.env.lease_path))
         self.assertTrue(support.wait_for(ready.exists, 60))
         time.sleep(1.0)
-        state.write_text("")
+        self._set_docker_state(state, {})
         out, _ = proc.communicate(timeout=60)
         receipt = support.last_json(out)
         self.assertEqual(receipt["state"], "PASS")
@@ -850,18 +910,100 @@ class LifecycleTests(unittest.TestCase):
                             for c in calls))
 
     def test_harbor_label_that_never_matched_is_unknown(self):
-        self._fake_docker([])
+        state = self._fake_docker(["alive-a"], "gptgrep.auth-job=A")
         code, receipt, _ = self.env.supervisor("run", "--role", "harbor", "--run-id", "h0", "--harbor-job-label",
-                                               "label.never.applied=job-1", *probe("exit", 0))
+                                               "gptgrep.auth-job=B", *probe("exit", 0))
         self.assertEqual((code, receipt["state"]), (sup.EXIT_UNKNOWN, "UNKNOWN"))
         self.assertFalse(receipt["docker"]["label_matched"])
         self.assertFalse(receipt["docker"]["cleared"])
         self.assertIn("HARBOR_LABEL_NEVER_MATCHED", [a["code"] for a in receipt["anomalies"]])
-        self.assertTrue(self.next_ok("h0-after"))
-        support.observe("harbor_label_never_matched", state=receipt["state"])
+        polls = self._docker_poll_count(state)
+        self.assertTrue(support.wait_for(lambda: self._docker_poll_count(state) >= polls + 3, 20))
+        self.assertEqual(json.loads(state.read_text())["labels"], {"gptgrep.auth-job=A": ["alive-a"]})
+        self.assertEqual(self.env.lease_probe(), "held_exclusive")
+        self._assert_owner_blocked("h0-busy")
+        self.assertTrue(support.run_auth_links(self.env), "unknown detached consumers retain the auth link")
+        # Even A disappearing cannot turn B's never-observed empty result into proof.
+        self._set_docker_state(state, {})
+        polls = self._docker_poll_count(state)
+        self.assertTrue(support.wait_for(lambda: self._docker_poll_count(state) >= polls + 3, 20))
+        self._assert_owner_blocked("h0-still-busy")
+        self.assertFalse((self.env.run_dir("harbor", "h0") / "state" / "lease-guardian-docker.json").exists())
+        support.observe("harbor_label_never_matched", state=receipt["state"], wrong_label_keeps_lease=True)
+
+    def test_wrong_label_after_supervisor_death_keeps_lease(self):
+        state = self._fake_docker(["alive-a"], "gptgrep.auth-job=A")
+        ready = self.env.root / "wrong-label-ready"
+        proc = self.env.popen("run", "--role", "harbor", "--run-id", "hd1", "--harbor-job-label",
+                              "gptgrep.auth-job=B", *probe("hold", 60, ready, self.env.lease_path))
+        self.assertTrue(support.wait_for(ready.exists, 20))
+        child = next(e["pid"] for e in self.env.events("harbor", "hd1") if e["event"] == "child_started")
+        self.assertTrue(support.wait_for(lambda: self._docker_poll_count(state) >= 2, 20))
+        proc.kill()
+        proc.communicate(timeout=30)
+        kill_quietly(child)
+        self.assertTrue(support.wait_for(lambda: self.env.has_event("harbor", "hd1", "lease_guardian_takeover"), 20))
+        polls = self._docker_poll_count(state)
+        self.assertTrue(support.wait_for(lambda: self._docker_poll_count(state) >= polls + 3, 20))
+        self.assertEqual(json.loads(state.read_text())["labels"], {"gptgrep.auth-job=A": ["alive-a"]})
+        self._assert_owner_blocked("hd1-busy")
+        self.assertFalse((self.env.run_dir("harbor", "hd1") / "state" / "lease-guardian-result.json").exists())
+
+    def test_positive_label_survives_guardian_restart_and_supervisor_takeover(self):
+        label = "gptgrep.auth-job=hr1"
+        state = self._fake_docker(["seen-a"], label)
+        ready = self.env.root / "restart-ready"
+        proc = self.env.popen("run", "--role", "harbor", "--run-id", "hr1", "--harbor-job-label", label,
+                              *probe("hold", 60, ready, self.env.lease_path))
+        self.assertTrue(support.wait_for(ready.exists, 20))
+        child = next(e["pid"] for e in self.env.events("harbor", "hr1") if e["event"] == "child_started")
+        observed = self.env.run_dir("harbor", "hr1") / "state" / "lease-guardian-docker.json"
+        self.assertTrue(support.wait_for(observed.exists, 20))
+        durable = observed.read_bytes()
+        original = json.loads(self.env.sidecar("harbor", "hr1").read_text())["guardian_pid"]
+        kill_quietly(original)
+        self.assertTrue(support.wait_for(lambda: json.loads(self.env.sidecar("harbor", "hr1").read_text())[
+            "guardian_pid"] != original, 20))
+        self.assertEqual(observed.read_bytes(), durable)
+        self._assert_owner_blocked("hr1-busy")
+        self._set_docker_state(state, {})
+        proc.kill()
+        proc.communicate(timeout=30)
+        kill_quietly(child)
+        self.assertTrue(support.wait_for(lambda: self.env.lease_probe() == "free", 60, 0.2))
+        result = json.loads((self.env.run_dir("harbor", "hr1") / "state" / "lease-guardian-result.json").read_text())
+        self.assertEqual(result["mode"], "takeover")
+        self.assertTrue(result["docker_label_matched"])
+        self.assertEqual(result["docker_first_seen_at"], json.loads(durable)["first_seen_at"])
+        self.assertTrue(self.next_ok("hr1-after"))
+
+    def test_docker_errors_and_empty_polls_require_positive_guardian_observation(self):
+        label = "gptgrep.auth-job=he1"
+        state = self._fake_docker([], label, wait_seconds=0.5, error=True)
+        code, receipt, _ = self.env.supervisor("run", "--role", "harbor", "--run-id", "he1",
+                                               "--harbor-job-label", label, *probe("exit", 0))
+        self.assertEqual((code, receipt["state"]), (sup.EXIT_UNKNOWN, "UNKNOWN"))
+        self.assertGreater(receipt["docker"]["errors"], 0)
+        self.assertFalse(receipt["docker"]["label_matched"])
+        self._set_docker_state(state, {})
+        polls = self._docker_poll_count(state)
+        self.assertTrue(support.wait_for(lambda: self._docker_poll_count(state) >= polls + 3, 20))
+        self._assert_owner_blocked("he1-empty-busy")
+        self._set_docker_state(state, {label: ["late-positive"]})
+        observed = self.env.run_dir("harbor", "he1") / "state" / "lease-guardian-docker.json"
+        self.assertTrue(support.wait_for(observed.exists, 20))
+        self._set_docker_state(state, {}, error=True)
+        polls = self._docker_poll_count(state)
+        self.assertTrue(support.wait_for(lambda: self._docker_poll_count(state) >= polls + 3, 20))
+        self._assert_owner_blocked("he1-error-busy")
+        self._set_docker_state(state, {})
+        self.assertTrue(self.next_ok("he1-after"))
+        result = json.loads((self.env.run_dir("harbor", "he1") / "state" / "lease-guardian-result.json").read_text())
+        self.assertTrue(result["docker_label_matched"])
+        self.assertGreater(result["docker_query_errors"], 0)
 
     def test_harbor_label_with_remaining_containers_is_unknown_and_keeps_lease(self):
-        state = self._fake_docker(["deadbeef01"])
+        state = self._fake_docker(["deadbeef01"], "gptgrep.auth-job=h2")
         code, receipt, _ = self.env.supervisor("run", "--role", "harbor", "--run-id", "h2", "--harbor-job-label",
                                                "gptgrep.auth-job=h2", *probe("exit", 0))
         self.assertEqual((code, receipt["state"]), (sup.EXIT_UNKNOWN, "UNKNOWN"))
@@ -869,18 +1011,18 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(receipt["docker"]["remaining"], 1)
         code, _, _ = self.env.supervisor("run", "--role", "test", "--run-id", "h2-busy", *probe("exit", 0))
         self.assertEqual(code, sup.EXIT_AUTH_BUSY, "guardian retains the lease while labelled containers remain")
-        state.write_text("")
+        self._set_docker_state(state, {})
         self.assertTrue(self.next_ok("h2-after"))
 
     def test_guardian_keeps_watching_the_label_after_a_clear_check(self):
         """Survivors kept the run UNKNOWN; a container they start later still holds the lease."""
-        state = self._fake_docker(["c0ffee03"])
+        state = self._fake_docker(["c0ffee03"], "gptgrep.auth-job=lc1")
         pidfile = self.env.root / "late-container.pid"
         proc = self.env.popen("run", "--role", "harbor", "--run-id", "lc1", "--harbor-job-label",
                               "gptgrep.auth-job=lc1",
-                              *probe("escaped", pidfile, 5, "docker-add", state, "late0001"))
+                              *probe("escaped", pidfile, 5, "docker-add", state, "gptgrep.auth-job=lc1", "late0001"))
         self.assertTrue(support.wait_for(lambda: self.env.has_event("harbor", "lc1", "child_exited"), 60))
-        state.write_text("")
+        self._set_docker_state(state, {})
         out, _ = proc.communicate(timeout=60)
         receipt = support.last_json(out)
         self.assertEqual(receipt["state"], "UNKNOWN")
@@ -891,7 +1033,7 @@ class LifecycleTests(unittest.TestCase):
         time.sleep(3)
         self.assertEqual(self.next_consumer("lc1-busy")[0], sup.EXIT_AUTH_BUSY,
                          "the late container keeps the lease")
-        state.write_text("")
+        self._set_docker_state(state, {})
         self.assertTrue(self.next_ok("lc1-after"))
 
     # -- blocker re-probe (F6) -----------------------------------------------------------------

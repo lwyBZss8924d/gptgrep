@@ -2,9 +2,9 @@
 //! provider credentials are used; every response is a synthetic fixture.
 use anyhow::Result;
 use gptgrep_jev::{
-    Candidate, DecisionFailure, DecisionFailureKind, DecisionObserver, DecisionRequestObservation,
-    DecisionResponse, ExecutionContext, JevClient, RETRY_BACKOFF_MAX, RETRY_BACKOFF_MIN,
-    RetryAfterRefusal, TransientRetry,
+    Candidate, DecisionFailure, DecisionFailureKind, DecisionObserver, DecisionObserverCallback,
+    DecisionRequestObservation, DecisionResponse, ExecutionContext, JevClient, RETRY_BACKOFF_MAX,
+    RETRY_BACKOFF_MIN, RetryAfterRefusal, TransientRetry,
 };
 use serde_json::{Value, json};
 use std::{
@@ -551,6 +551,8 @@ struct Recorded {
     events: Mutex<Vec<&'static str>>,
     reject_second_send: bool,
     reject_validated: bool,
+    reject_failed: bool,
+    reject_failed_after_validated: bool,
 }
 
 impl DecisionObserver for Recorded {
@@ -574,7 +576,11 @@ impl DecisionObserver for Recorded {
         Ok(())
     }
     fn failed(&self, _: &DecisionRequestObservation<'_>) -> Result<()> {
-        self.events.lock().unwrap().push("failed");
+        let mut events = self.events.lock().unwrap();
+        let reject = self.reject_failed
+            || (self.reject_failed_after_validated && events.contains(&"validated"));
+        events.push("failed");
+        anyhow::ensure!(!reject, "synthetic-failed-observer-secret");
         Ok(())
     }
 }
@@ -664,6 +670,135 @@ async fn local_failure_after_the_retry_was_sent_is_not_reported_as_unsent() {
     let snapshot = context.snapshot().unwrap();
     assert_eq!(snapshot.logical_reservations, 2);
     assert_eq!(snapshot.terminal_submissions, 2);
+}
+
+#[tokio::test]
+async fn double_observer_failures_keep_validated_usage_and_attempt_provenance() {
+    for retry in [false, true] {
+        let replies = if retry {
+            vec![reply("502 Bad Gateway", "private-provider-body"), success()]
+        } else {
+            vec![success()]
+        };
+        let (endpoint, server) = serve(replies).await;
+        let observer = Arc::new(Recorded {
+            reject_validated: true,
+            reject_failed_after_validated: true,
+            ..Recorded::default()
+        });
+        let context = context(Duration::from_secs(30), 5);
+        let client = retrying(&endpoint, &context).with_decision_observer(observer.clone());
+        let error = decide(&client).await.unwrap_err();
+        let diagnostic = failure(&error).diagnostic();
+        assert_eq!(
+            diagnostic.kind,
+            if retry {
+                DecisionFailureKind::RetryPostSend
+            } else {
+                DecisionFailureKind::ObserverCallback
+            }
+        );
+        assert_eq!(diagnostic.prior_attempts.len(), usize::from(retry));
+        if retry {
+            let prior = &diagnostic.prior_attempts[0];
+            assert_eq!(prior.attempt, 1);
+            assert_eq!(prior.kind, DecisionFailureKind::HttpStatus);
+            assert_eq!(prior.http_status, Some(502));
+            assert!(prior.reported_usage.is_none());
+        }
+        let callback = diagnostic.observer_failure.as_ref().unwrap();
+        assert_eq!(
+            callback.callbacks,
+            [
+                DecisionObserverCallback::ValidatedResponse,
+                DecisionObserverCallback::Failed
+            ]
+        );
+        assert!(callback.send_started && callback.response_validated);
+        assert_eq!(callback.requested_model, gptgrep_jev::DEFAULT_MODEL);
+        let usage = diagnostic.reported_usage.as_ref().unwrap();
+        assert_eq!(usage.input_tokens.value, Some(7));
+        assert_eq!(usage.output_tokens.value, Some(1));
+        assert_eq!(usage.cost.value, Some(0.0002));
+        let metadata = diagnostic.response_metadata.as_ref().unwrap();
+        assert_eq!(
+            metadata.model.value.as_deref(),
+            Some("openai/gpt-6-luna-decisions-20261006")
+        );
+        assert_eq!(metadata.id.value.as_deref(), Some("synthetic-final"));
+        assert_eq!(
+            metadata.provider.value.as_deref(),
+            Some("synthetic-provider")
+        );
+        let serialized = serde_json::to_value(diagnostic).unwrap();
+        assert_eq!(
+            serialized["observer_failure"]["callbacks"],
+            json!(["validated_response", "failed"])
+        );
+        let rendered = format!("{error:#}\n{error:?}\n{serialized}");
+        for secret in [
+            "synthetic-observer-refusal",
+            "synthetic-failed-observer-secret",
+            "private-provider-body",
+            KEY,
+        ] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+        assert!(rendered.contains("observer callbacks failed: validated_response, failed"));
+        let expected_events = if retry {
+            vec!["send", "failed", "send", "validated", "failed"]
+        } else {
+            vec!["send", "validated", "failed"]
+        };
+        assert_eq!(*observer.events.lock().unwrap(), expected_events);
+        let served = server.await.unwrap();
+        let sent = 1 + usize::from(retry);
+        assert_eq!((served.bodies.len(), served.unexpected), (sent, 0));
+        for body in served.bodies {
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap()["model"],
+                callback.requested_model
+            );
+        }
+        let snapshot = context.snapshot().unwrap();
+        assert_eq!(snapshot.logical_reservations, sent);
+        assert_eq!(snapshot.terminal_submissions, sent);
+    }
+}
+
+#[tokio::test]
+async fn first_failed_observer_keeps_provider_failure_without_starting_retry() {
+    let (endpoint, server) = serve(vec![reply("502 Bad Gateway", "private-provider-body")]).await;
+    let observer = Arc::new(Recorded {
+        reject_failed: true,
+        ..Recorded::default()
+    });
+    let context = context(Duration::from_secs(30), 5);
+    let client = retrying(&endpoint, &context).with_decision_observer(observer.clone());
+    let error = decide(&client).await.unwrap_err();
+    let diagnostic = failure(&error).diagnostic();
+    assert_eq!(diagnostic.kind, DecisionFailureKind::HttpStatus);
+    assert_eq!(diagnostic.http_status, Some(502));
+    assert!(diagnostic.prior_attempts.is_empty());
+    assert!(diagnostic.reported_usage.is_none());
+    let callback = diagnostic.observer_failure.as_ref().unwrap();
+    assert_eq!(callback.callbacks, [DecisionObserverCallback::Failed]);
+    assert_eq!(callback.requested_model, gptgrep_jev::DEFAULT_MODEL);
+    assert!(callback.send_started);
+    assert!(!callback.response_validated);
+    assert_eq!(*observer.events.lock().unwrap(), ["send", "failed"]);
+    let rendered = format!(
+        "{error:#}\n{error:?}\n{}",
+        serde_json::to_string(diagnostic).unwrap()
+    );
+    assert!(rendered.contains("HTTP 502; request was not retried"));
+    assert!(!rendered.contains("synthetic-failed-observer-secret"));
+    assert!(!rendered.contains("private-provider-body"));
+    let served = server.await.unwrap();
+    assert_eq!((served.bodies.len(), served.unexpected), (1, 0));
+    let snapshot = context.snapshot().unwrap();
+    assert_eq!(snapshot.logical_reservations, 1);
+    assert_eq!(snapshot.terminal_submissions, 1);
 }
 
 #[tokio::test]

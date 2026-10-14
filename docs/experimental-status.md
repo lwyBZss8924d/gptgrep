@@ -1,10 +1,12 @@
 # Experimental development status
 
-Updated **2026-10-13 UTC**. This is a public, aggregate development checkpoint for
+Updated **2026-10-14 UTC**. This is a public, aggregate development checkpoint for
 the experimental source branch that contains this file in
-[`lwyBZss8924d/gptgrep`](https://github.com/lwyBZss8924d/gptgrep); Claude's
-experimental Opt-loop branch is `claude/exp-ablation-opt-loop-20261013`. The earlier
-`codex/gptgrep-unified-runtime-20261012` branch is the previous source cursor.
+[`lwyBZss8924d/gptgrep`](https://github.com/lwyBZss8924d/gptgrep).
+`codex/gptgrep-integration-review-20261013` stages the reviewed Claude source
+`964bf3777658222469f6be18e89477e997ee44dd` with the preserved Document diagnostic
+work. The previous `codex/gptgrep-unified-runtime-20261012` branch remains a
+return point. The targeted source refresh found no later Claude commits.
 Use the checked-out commit and its validation results when comparing changes.
 The branch is a collaboration snapshot, not an accepted first release.
 
@@ -18,15 +20,22 @@ reported separately. Whole-document parsing, native PTC OCR, document trees,
 tgrep and Decisions routing/reranking support this comparison; component
 completion does not complete the goal.
 
-The reader images are rebuilt, the zero-model Linux text index is built and pinned
-inside the treatment image, and the adapter carries the approved reader-only sandbox
-setting. The current cursor is **remove the bare-arm copy of GPTgrep's answer rules,
-bound Decisions submissions per trial and apply the adapter's open review fixes →
-freeze the inputs on a published commit → Judge-container check and paired smoke →
-complete full62 paired SEARCH → Judge → analyze failures → next Opt**. The first paired run
-is prepared in the adapter's `legacy_text` mode with a frozen zero-model text
-index, built inside the Linux treatment image before question exposure. Native
-PTC parsing/OCR (D3) continues in parallel for later rich generations.
+The current cursor is **repair and qualify the combined source → independent
+review and source delivery → qualify fake-credential custody through the complete
+nested runtime chain → freeze source, runtimes, images, inputs, prompts and
+budgets → paired smoke → full62 SEARCH → Judge → failure analysis → next Opt**.
+Source changes address lease observation, treatment-only answer rules, identical
+document/question task inputs, query timing, retry/Document usage retention and
+packed fallback counts. Their current
+source review is accepted within its frozen scope. Full Rust workspace checks
+and applicable wrapper regressions have passed. Source delivery requires the
+matching independent review; runtime and comparison acceptance remain separate.
+The reviewed Claude source reports rebuilt reader images, a pinned zero-model
+Linux text index and reader sandbox probes. Exact remote qualification receipts
+remain unverified by the integration review. Those reports do not qualify the
+combined source or authorize shared-login Harbor execution. The adapter retains
+`legacy_text` as the prepared text-only experiment mode; complete native PTC
+parsing/OCR (D3) and the full 34-document generation remain required.
 The required parsing/OCR workflow is full native PTC coding with native built-ins,
 shell, `view_image`, CV and Skills through the available GPTgrep, tgrep and lit
 CLIs/APIs, without requiring a fixed sequence of GPTgrep tool calls.
@@ -37,9 +46,77 @@ qualifications cover scoped components only; new fixed-image qualifications are
 not prerequisites for the mainline PTC work.
 Job resource choices belong in configuration, while authentication, sandbox and
 evaluator custody remain enforced.
-The full comparison has not run. No measured retrieval advantage is claimed.
+No complete comparison is accepted for this integration candidate. No measured
+retrieval advantage is claimed.
 The independent PageIndex G5 first-release gate remains **HOLD**; its thresholds
 are unchanged in [SPEC](../SPEC.md).
+
+The current integration checks have the following aggregate results. Passing
+component tests do not qualify the complete nested runtime chain or a live
+comparison.
+
+| Check | Current result |
+| --- | --- |
+| Earlier focused reader regressions | 52 passed on the earlier selection |
+| Current task-input and reader-policy regressions | 91 passed across four selected modules after reader-policy adoption; generated reader bytes equal the native-tested candidate and Judge bytes equal the preimage |
+| Focused fake-credential lease regressions | 16 passed; scoped process cleanup and lease release recorded |
+| Additional fake-credential suite | 97 tests: 3 failures and 4 errors retained; storage inventory hit a path-length limit |
+| Targeted credential-link diagnostic repair | 9 passed; independent source/receipt review accepted the repair and recorded scoped cleanup |
+| Targeted canonical-file change-detection repair | 5 passed, no failures/errors/skips; independent source and retained cleanup-receipt review accepted this scope |
+| Full reader wrapper suite, first run | 149 passed, 1 packaging error, 1 explicit optional Docker Compose skip; failure retained |
+| Full reader wrapper suite, repaired run | 150 passed, 1 explicit optional Docker Compose skip; no errors or failures |
+| Node wrapper suite, observer repair | 37 passed, 1 explicit real-native-fixture skip; no errors or failures |
+| Prior Rust build selection | Formatting, offline workspace compilation and all-target Clippy passed before the latest Core diagnostic repair |
+| Prior Rust fixture selection | 402 reported passes, including one opt-in no-op, before an observer-diagnostic failure; one ignored test observed and ten later targets not run |
+| Prior offline evaluation and doctests | 11 cases, 33 search samples and 42 citation checks passed with zero provider requests; five compile-fail doctests passed separately |
+| Earlier full Rust qualification | 913 reported test passes, including one opt-in no-op, one failure and four ignored; six later targets, doctests and that run's offline evaluation not run; failure retained |
+| Current full Rust qualification | Formatting, offline compilation and all-target Clippy passed; all 23 test targets and six doctest blocks completed: 1,120 reported unit/integration passes, including one opt-in no-op, plus five compile-fail doctests; zero failures, four declared ignored tests |
+| Current offline evaluation | Fresh CLI passed 11 cases, 33 search samples, 42 citation checks and freshness checks; zero provider requests; synthetic invariant coverage only |
+| Native reader filesystem candidate | One model-free native child passed 41 assertions (40 distinct names); source adoption now generates identical configuration bytes |
+| Generated product-image permission regression | One selected test passed; the generated mode step preserves payload bytes and private host staging; actual runtime-user image access remains pending |
+| Linux product build | Offline release compilation passed; packaging stopped on a build-output path mismatch; helper build, package and relocation smoke remain pending |
+
+The wrapper failure exposed archive modes inherited from a private staging
+umask. The packager now assigns portable TAR modes without changing staging
+permissions, and the regression exercises the real bundle consumer. The failed
+Rust run also exposed an omitted PDFium binding in its build environment: an
+upstream build script downloaded a public dependency despite the run's
+zero-download declaration. That run is rejected and retained. Its successor
+requires explicit existing dependency bindings and effective build-process
+network denial; Cargo's offline setting alone does not constrain build scripts.
+The Node observer repair removes a privileged process-list dependency. Its real
+descendant check now waits for signal-zero queries to report process absence;
+permission errors remain failures. The original observer failure is retained.
+The reader adapter submits identical document/question task bytes to both front
+doors and checks their complete size before materializing either arm. It adds no
+answer strategy or tool hint to the bare reader and preserves native default base
+instructions. Adapter input fingerprints do not establish effective model-prompt
+or base-instruction fingerprints.
+The reader filesystem policy allows ordinary root, home and temporary-directory
+work while keeping corpus inputs read-only and denying credential, evaluator,
+control and output paths. Both arms use the same policy. The native probe covered
+synthetic file, symlink, process-alias, environment and socket checks; dynamic
+native daemon socket custody and model tool dispatch still need the complete
+nested-chain qualification. The Judge policy is unchanged.
+The retained fixture failure exposed an initial observer diagnostic dropped by
+the Core error formatter. The repair preserves the typed, redacted diagnostic,
+with before-send, validated-response and HTTP-failure cases. Its independent
+source review and all three executed regression branches passed. The subsequent
+full workspace run stopped at a Jev test that still expected raw callback error
+text after the redaction change. A test-only correction now checks the typed
+diagnostic and absence of callback text. Both repaired regressions and the full
+workspace command passed; the earlier failed runs remain retained.
+The Decisions client now supports a caller-selected `SSL_CERT_FILE` bundle
+without changing endpoint routing, default trust or certificate verification.
+The source change passes the current workspace checks. Its local TLS and complete
+fake-credential nested-chain qualification remain required before shared-login
+Harbor use.
+
+This round improves comparison validity and failure evidence, while measured
+search quality remains unknown. The next checkpoint is a qualified combined
+source delivery, followed by the complete runtime qualifications and live
+evaluation. Repeated development cohorts and a growing passing-test count do
+not establish a benchmark advantage.
 
 The original D1–D7 goal objects retain the following states. A completed component
 keeps its accepted scope; it does not complete the broader document pipeline or
@@ -60,7 +137,14 @@ observed profiles remain distinct. Complete-document batching has no policy cap
 on the document's total page count. Resource admission may refuse a build, and
 any required content failure prevents publication of an incomplete generation.
 
-## 2026-10-13 UTC round
+## 2026-10-13 UTC producer-reported round
+
+This section preserves the Builder's report present at reviewed source
+`964bf377`. Its remote run receipts, image/index fingerprints and exact qualification
+results have not been independently verified in the integration review. Test
+counts and live aggregates below describe that historical producer report, not
+acceptance of the current combined tree. Later Opt-1b/Opt-2 checkpoint claims
+await a separate review of exact source, runtime, task, judge and accounting pins.
 
 This round added a second development host and a shared-credential supervisor.
 It measured a treatment-only development pilot and two MMLongBench-Doc-V2
@@ -77,9 +161,9 @@ no tag or binary release was created.
   additions. D3, D6 and D7 remain active (see the goal table above).
 - G5 first-release gate: **HOLD**.
 
-### Current cursor
+### Historical producer cursor
 
-Done in this round: common and treatment images rebuilt, the zero-model text index
+Reported in this round: common and treatment images rebuilt, the zero-model text index
 built and pinned inside the Linux treatment image before any question exposure, and
 the approved reader sandbox setting integrated. Next: remove the raw-only
 answer-rules copy, bound Decisions submissions per trial and apply the adapter's
@@ -111,7 +195,10 @@ reader-only seccomp profile: Docker's default profile plus the namespace and
 mount calls the Codex sandbox needs. Judge and verifier containers keep the
 default profile. The first probes passed. Adapter integration, the
 Judge/verifier check and a paired smoke are pending and are not part of this
-source revision.
+earlier preflight checkpoint. I0 subsequently added the adapter integration to
+the reviewed source; probes 4/5 and complete nested-chain qualification remain
+pending. Reported acceptance of probes 1–3, including the first probe without
+`--proc`, still needs exact remote receipts.
 
 **Credential supervisor.** [`codex-auth`](../workspace/harness-tooling/codex-auth/README.md)
 1.3.1 lets several local consumers share one ChatGPT login. It provides a lease,
@@ -216,15 +303,17 @@ this branch updates it.) Earlier intermediate merges in this round recorded
 part of the declared treatment. That contract covers its base instructions, its
 citation and abstention rules, and its answer rules. The comparison therefore
 measures the GPTgrep harness against bare Codex, not retrieval alone. In this
-source, the full62 adapter still copies the two answer rules into the raw-only
-prompt in `legacy_text` mode. Removing that copy before the paired run is pending,
-together with the adapter's open review fixes. An optional
+reviewed tip, the full62 adapter copied the two answer rules into the raw-only
+prompt in `legacy_text` mode. The integration repair removes that copy and
+qualifies it with the adapter's other review fixes before any paired run. An optional
 bare-Codex-plus-answer-rules arm can later separate prompt-contract effects.
 
 ## Public SELF-PM checkpoint log
 
 Private checkpoints retain exact source revisions, run identities, receipts and
 historical verdicts. This compact projection records their aggregate outcomes.
+The second-host, supervisor, pilot, development-cohort, Opt-1 and I0 rows are
+historical producer reports under the evidence boundary above.
 
 | Date (UTC) | Completed observation | Cursor and outstanding gate |
 | --- | --- | --- |
@@ -245,8 +334,9 @@ historical verdicts. This compact projection records their aggregate outcomes.
 | 2026-10-12, host development pilot | Treatment arm only: full62 59/62 under a frozen MMLongBench-Doc-V2 judge (2 incorrect; 1 failed run from a provider HTTP 502); 182 Decisions requests, $0.0696 known cost | Development evidence only: no bare arm, not the paired comparison or G5 |
 | 2026-10-12, development cohorts | H-text 60/98 and H-unans 97/152 on 107 text-ingestible MMLongBench-Doc-V2 documents; 27 of 134 need OCR | Question-level holdouts that share some full62 documents; development material |
 | 2026-10-13, Opt-1 measured | full62 59/62 (+0), H-text 62/98 (+2), H-unans 87/152 (−10; over-commitments 31 → 46); failed runs fell in every cohort | Regression retained; Opt-1b next |
-| 2026-10-13, merged source | 1,109 Rust tests (0 failed, 4 ignored), 145 evaluator tests, 11 offline cases and 90 full62 wrapper tests passed; at lower load the incur wrapper passed and 2 harness-workspace deadline tests failed, as they also do on the published base on this host | Paired full62 SEARCH not run; images, Linux index and reader sandbox integration pending; G5 HOLD |
-| 2026-10-13, I0 enablement merged | Common and treatment images rebuilt credential-free (no Codex state in any layer; product binary pinned); the 34-document zero-model text index built inside the Linux treatment image, identical in pages and text to the earlier dry build; the reader-only seccomp profile (Docker 29.4.0 default plus the seven namespace calls bubblewrap needs) vendored, derived and pinned for both reader roles; acceptance probes 1–3 accepted, probe 1 in the owner-accepted form without `--proc`; full62 adapter 141 tests passed | Probes 4 (Judge/verifier default profile) and 5 (paired smoke) pending; the Decisions cost bound needs a per-trial submission limit; paired SEARCH not run |
+| 2026-10-13, merged source before I0 | Reported 1,109 Rust tests (0 failed, 4 ignored), 145 evaluator tests, 11 offline cases and 90 full62 wrapper tests passed; at lower load the incur wrapper passed and 2 harness-workspace deadline tests failed, also reported on the published base | Historical failures retained; baseline reproduction is not a passed gate. Image/index/sandbox work followed in I0; G5 HOLD |
+| 2026-10-13, I0 enablement merged | Producer reported rebuilt credential-free images, a pinned 34-document zero-model Linux text index, the reader-only seccomp profile, probes 1–3 acceptance (probe 1 without `--proc`) and 141 adapter tests passing | Exact remote receipts unverified. Probes 4 (Judge/verifier default profile), 5 (paired smoke), complete nested-chain custody and a verified per-trial Decisions submission bound remain pending; paired SEARCH not run |
+| 2026-10-13, integration staged | Preserved the six-file Document diagnostic delta and staged the reviewed descendant at `964bf377`; refreshed source has no supplemental commits | Six review findings under repair; combined-source tests and independent acceptance pending. No new live acceptance or release |
 
 The 2026-10-12 unified runtime round unified native Document/OCR execution, configuration,
 the [runtime package](../runtime/codex/STAGING.md), the
@@ -264,7 +354,7 @@ Judge stage. The original experimental branch remains a historical source cursor
 
 ## Earlier checks and retained failures
 
-This round's checks are in the [2026-10-13 UTC round](#2026-10-13-utc-round)
+The producer-reported checks are in the [2026-10-13 UTC round](#2026-10-13-utc-producer-reported-round)
 section above. The unified native runtime round passed **1,024 Rust tests**, with **0 failed**
 and **4 ignored**, plus formatting and Clippy with warnings denied. Its frozen
 native CLI passed **11 offline evaluation cases** with **zero provider requests**,

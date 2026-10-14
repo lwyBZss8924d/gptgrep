@@ -727,7 +727,8 @@ def canonical_metadata(cfg):
         return {"exists": None, "error": errno_name(exc)}
     return {"exists": True, "regular": stat.S_ISREG(info.st_mode), "symlink": stat.S_ISLNK(info.st_mode),
             "mode": oct(stat.S_IMODE(info.st_mode)), "uid_matches": info.st_uid == os.getuid(),
-            "size": info.st_size, "mtime_ns": info.st_mtime_ns, "ino": info.st_ino, "dev": info.st_dev,
+            "size": info.st_size, "mtime_ns": info.st_mtime_ns, "ctime_ns": info.st_ctime_ns,
+            "ino": info.st_ino, "dev": info.st_dev,
             "nlink": info.st_nlink}
 
 
@@ -785,8 +786,13 @@ def preflight_or_quarantine(cfg, run_id, operation, receipt):
 
 
 def canonical_changed(before, after):
-    keys = ("exists", "mtime_ns", "size", "ino", "dev")
+    keys = ("exists", "mtime_ns", "ctime_ns", "mode", "size", "ino", "dev")
     return any(before.get(k) != after.get(k) for k in keys)
+
+
+def canonical_content_changed(before, after):
+    """Refresh evidence, separate from metadata-only integrity changes."""
+    return any(before.get(k) != after.get(k) for k in ("mtime_ns", "size"))
 
 
 def canonical_identities(*metas):
@@ -2254,15 +2260,26 @@ class DockerWatch:
     at least one container during the run: a label nothing applies would make
     the wait vacuous, so that case ends UNKNOWN instead of cleared."""
 
-    def __init__(self, cfg, label):
+    def __init__(self, cfg, label, observation_path=None):
         self.cfg = cfg
         self.label = label
+        self.observation_path = observation_path
         self.polls = 0
         self.errors = 0
         self.last_error = None
         self.max_seen = 0
         self.first_seen_at = None
+        self.label_matched = False
         self._last = 0.0
+        if observation_path is not None:
+            try:
+                observed = read_small_json(observation_path)
+            except (OSError, ValueError):
+                observed = None
+            if (isinstance(observed, dict) and observed.get("label") == label
+                    and observed.get("label_matched") is True):
+                self.label_matched = True
+                self.first_seen_at = observed.get("first_seen_at")
 
     def poll(self, force=False):
         now = time.monotonic()
@@ -2276,9 +2293,18 @@ class DockerWatch:
             self.last_error = error
             return None
         if ids:
+            first_seen = self.first_seen_at or utc_iso()
+            if not self.label_matched:
+                # Publish the positive observation before relying on it. A guardian
+                # respawn or supervisor death must not turn it back into UNKNOWN,
+                # and empty/error polls must never create this record.
+                if self.observation_path is not None:
+                    write_json_atomic(self.observation_path, {
+                        "schema": "gptgrep.codex-auth.docker-observation.v1",
+                        "label": self.label, "label_matched": True, "first_seen_at": first_seen})
+                self.label_matched = True
             self.max_seen = max(self.max_seen, len(ids))
-            if self.first_seen_at is None:
-                self.first_seen_at = utc_iso()
+            self.first_seen_at = first_seen
         return ids
 
     def wait_clear(self, should_stop=None):
@@ -2298,7 +2324,7 @@ class DockerWatch:
                 break
             time.sleep(self.cfg.docker_poll_seconds)
         cleared = remaining == 0
-        matched = self.max_seen > 0
+        matched = self.label_matched
         return {"label": self.label, "polls": self.polls, "errors": self.errors, "last_error": self.last_error,
                 "max_seen_during_run": self.max_seen, "first_seen_at": self.first_seen_at,
                 "label_matched": matched, "remaining": remaining, "cleared": cleared and matched,
@@ -2425,6 +2451,7 @@ def guardian_keep(cfg, layout, kind, mode, baseline, docker_label, sidecar):
     root = state.get("root_pid")
     tracker = Tracker(cfg, int(root) if root else -1, {int(k): v for k, v in (state.get("known") or {}).items()},
                       adopt_root=False)
+    docker = DockerWatch(cfg, docker_label, layout.state_dir / "lease-guardian-docker.json") if docker_label else None
     quiet = 0
     polls = 0
     while quiet < 2:
@@ -2432,9 +2459,9 @@ def guardian_keep(cfg, layout, kind, mode, baseline, docker_label, sidecar):
         try:
             result = sweep(cfg, tracker, layout, exclude={os.getpid()})
             clear = not result["survivor_pids"] and not result["inconclusive"]
-            if clear and docker_label:
-                ids, _error = docker_containers(cfg, docker_label)
-                clear = ids == []
+            if docker is not None:
+                ids = docker.poll(force=True)
+                clear = clear and docker.label_matched and ids == []
         except Exception:  # noqa: BLE001 - never release on an unexpected error
             clear = False
         quiet = quiet + 1 if clear else 0
@@ -2442,15 +2469,13 @@ def guardian_keep(cfg, layout, kind, mode, baseline, docker_label, sidecar):
             time.sleep(cfg.keeper_poll_seconds)
     outcome = {"schema": "gptgrep.codex-auth.guardian.v1", "mode": mode, "kind": kind,
                "guardian_pid": os.getpid(), "polls": polls, "released_at": utc_iso(),
-               "docker_label": docker_label}
+               "docker_label": docker_label,
+               "docker_label_matched": docker.label_matched if docker is not None else None,
+               "docker_first_seen_at": docker.first_seen_at if docker is not None else None,
+               "docker_query_errors": docker.errors if docker is not None else 0}
     after = canonical_metadata(cfg)
     changed = baseline is None or canonical_changed(baseline, after)
     outcome.update(canonical_after=after, canonical_changed_since_baseline=changed)
-    if changed:
-        reason = ("OWNER_REFRESH_UNRECORDED" if kind == "owner" and mode == "takeover"
-                  else "CANONICAL_CHANGED_AFTER_SUPERVISOR")
-        outcome["quarantine"] = write_quarantine(cfg, reason, layout.run_id, {
-            "operation": kind, "guardian_mode": mode})
     if kind == "owner" and mode == "takeover":
         ledger(cfg, {"run_id": layout.run_id, "decision": "OWNER_INTERRUPTED", "canonical_changed": changed,
                      "canonical_before": baseline, "canonical_after": after})
@@ -2472,6 +2497,13 @@ def guardian_keep(cfg, layout, kind, mode, baseline, docker_label, sidecar):
         outcome["credential_link_quarantine"] = write_quarantine(cfg, reason, layout.run_id, {
             "operation": kind, "guardian_mode": mode, "found": links["found"], "removed": links["removed"],
             "scan_errors": links["scan_errors"], "canonical_nlink": links["canonical_nlink_after"]})
+    # A hard link changes ctime too. Record the specific link incident before the
+    # generic metadata finding: quarantine markers keep their first reason.
+    if changed:
+        reason = ("OWNER_REFRESH_UNRECORDED" if kind == "owner" and mode == "takeover"
+                  else "CANONICAL_CHANGED_AFTER_SUPERVISOR")
+        outcome["quarantine"] = write_quarantine(cfg, reason, layout.run_id, {
+            "operation": kind, "guardian_mode": mode})
     link = layout.release_auth_link(cfg)
     outcome["auth_link_final"] = link
     if link.get("present") and not link.get("released"):
@@ -2931,13 +2963,15 @@ def _owner_session(cfg, run_id, force, receipt, layout, proc, tracker, guardian,
     link = layout.link_state(cfg)
     receipt["auth_link_after"] = link
     changed = canonical_changed(before, after)
+    content_changed = canonical_content_changed(before, after)
     integrity = (after.get("exists") and after.get("regular") and not after.get("symlink") and
                  after.get("mode") == "0o600" and after.get("uid_matches") and
                  after.get("ino") == before.get("ino") and after.get("dev") == before.get("dev") and
                  link.get("symlink") and link.get("target_matches"))
     account_ok = len(steps) >= 3 and steps[2].get("ok") and steps[2].get("account_type") == "chatgpt"
     failure_class, failure_kind = classify_owner_log(layout.log_dir / "owner-app-server.stderr.log")
-    receipt["refresh"].update({"canonical_changed": changed, "inode_preserved": after.get("ino") == before.get("ino"),
+    receipt["refresh"].update({"canonical_changed": changed, "canonical_content_changed": content_changed,
+                               "inode_preserved": after.get("ino") == before.get("ino"),
                                "integrity_ok": bool(integrity), "account_chatgpt": bool(account_ok),
                                "owner_log_failure_class": failure_class, "owner_log_failure_kind": failure_kind})
     survivors = bool(result["survivor_pids"]) or result["inconclusive"]
@@ -2946,9 +2980,9 @@ def _owner_session(cfg, run_id, force, receipt, layout, proc, tracker, guardian,
     elif changed and not integrity:
         decision, state, reason = "ANOMALY", "QUARANTINED", "CANONICAL_INTEGRITY_CHANGED"
         receipt["anomalies"].append({"code": reason})
-    elif changed and integrity and account_ok:
+    elif content_changed and integrity and account_ok:
         decision, state, reason = "REFRESHED", "PASS", None
-    elif not changed and failure_kind == "transient" and account_ok:
+    elif not content_changed and failure_kind == "transient" and account_ok:
         # Network, rate limit or authority 5xx: the credential was not judged
         # invalid and still reads as a chatgpt account. No quarantine and no
         # re-login; retry the refresh later.
@@ -2958,7 +2992,7 @@ def _owner_session(cfg, run_id, force, receipt, layout, proc, tracker, guardian,
     if reason:
         receipt["quarantine"] = write_quarantine(cfg, reason, run_id, {
             "operation": "refresh", "owner_log_failure_class": failure_class, "failure_kind": failure_kind,
-            "canonical_changed": changed})
+            "canonical_changed": changed, "canonical_content_changed": content_changed})
     if decision == "REFRESHED" and auth_block:
         receipt["auth_block_cleared"] = archive_marker(cfg.auth_block_path, run_id)
     if survivors:
@@ -2966,7 +3000,8 @@ def _owner_session(cfg, run_id, force, receipt, layout, proc, tracker, guardian,
     receipt["refresh"]["decision"] = decision
     ledger(cfg, {"run_id": run_id, "decision": decision, "forced": bool(force),
                  "canonical_age_seconds": round(age, 3), "canonical_before": before, "canonical_after": after,
-                 "canonical_changed": changed, "inode_preserved": after.get("ino") == before.get("ino"),
+                 "canonical_changed": changed, "canonical_content_changed": content_changed,
+                 "inode_preserved": after.get("ino") == before.get("ino"),
                  "owner_exit_code": proc.returncode, "owner_stop": stop, "failure_class": failure_class,
                  "failure_kind": failure_kind, "auth_block_cleared": bool(receipt.get("auth_block_cleared")),
                  "binary": {"path": str(cfg.codex_bin), "sha256": cfg.codex_bin_sha256}})
@@ -3151,7 +3186,8 @@ def _run_consumer(cfg, args, spec, layout, lease, receipt, signals, deadline):
     receipt.update({"argv": argv, "cwd": str(layout.work_dir), "env_keys": sorted(env),
                     "passthrough_env": passed, "stripped_env": list(STRIPPED_ALWAYS)})
     write_json_atomic(layout.run_dir / "manifest.json", dict(receipt, state="RUNNING"))
-    docker = DockerWatch(cfg, args.harbor_job_label) if args.harbor_job_label else None
+    docker = (DockerWatch(cfg, args.harbor_job_label, layout.state_dir / "lease-guardian-docker.json")
+              if args.harbor_job_label else None)
     guardian = Guardian(cfg, layout, lease, "consumer", baseline=before, docker_label=args.harbor_job_label)
     receipt["lease"]["guardian_pid"] = guardian.pid
     marker_fd = os.open(layout.marker, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -3311,7 +3347,10 @@ def _supervise(cfg, args, spec, layout, receipt, proc, tracker, guardian, docker
         elif reason != "BLOCKER_LISTENER_APPEARED":
             receipt["anomalies"].append({"code": reason})
     if reasons:
-        receipt["quarantine"] = write_quarantine(cfg, reasons[0], args.run_id, {
+        # A found credential link explains a ctime change, while the reasons list
+        # still retains the independent canonical metadata finding.
+        primary = "CREDENTIAL_LINK_IN_RUN_DIR" if changed and links["found"] else reasons[0]
+        receipt["quarantine"] = write_quarantine(cfg, primary, args.run_id, {
             "role": args.role, "operation": "run", "reasons": reasons})
     # Exit 77 is also sysexits EX_NOPERM: it blocks other consumers only together with
     # the consumer's auth-failure record.

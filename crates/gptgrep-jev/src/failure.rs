@@ -25,6 +25,41 @@ pub enum DecisionFailureKind {
     /// handling. The provider may have completed and billed it. A validated
     /// response's usage is kept in `reported_usage`; otherwise usage is unknown.
     RetryPostSend,
+    /// A caller observer failed on the initial submission. The typed observer
+    /// diagnostic records whether HTTP send or response validation occurred.
+    ObserverCallback,
+}
+
+/// The closed set of observer callbacks; arbitrary callback error text is never kept.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionObserverCallback {
+    SendStarted,
+    ValidatedResponse,
+    Failed,
+}
+
+impl DecisionObserverCallback {
+    fn name(self) -> &'static str {
+        match self {
+            Self::SendStarted => "send_started",
+            Self::ValidatedResponse => "validated_response",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Safe progress observations retained when one or more callbacks fail.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct DecisionObserverFailure {
+    /// Failed callbacks in invocation order for the final submission.
+    pub callbacks: Vec<DecisionObserverCallback>,
+    /// The validated model identifier requested by the caller.
+    pub requested_model: String,
+    /// HTTP send began; the reservation's earlier local observation alone is insufficient.
+    pub send_started: bool,
+    /// A reply passed validation before a local failure; its usage is retained separately.
+    pub response_validated: bool,
 }
 
 /// Why a received transient status was not retried because of its
@@ -219,7 +254,8 @@ pub struct DecisionFailureDiagnostic {
     pub response_bytes: Option<usize>,
     pub validation_code: Option<&'static str>,
     pub reported_usage: Option<FailedResponseUsage>,
-    /// Served model, response ID and provider of a parsed but rejected response.
+    /// Served model, response ID and provider of a parsed response, including a
+    /// validated reply followed by a local failure.
     /// Absent when no unique JSON response body was available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_metadata: Option<FailedResponseMetadata>,
@@ -233,11 +269,15 @@ pub struct DecisionFailureDiagnostic {
     /// honoured, so the request was not retried. Omitted otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_refusal: Option<RetryAfterRefusal>,
+    /// Explicit callback failures and final submission progress. An existing
+    /// provider failure keeps its kind, status and checked response observations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observer_failure: Option<DecisionObserverFailure>,
 }
 
 /// Downcast an unsuccessful client result to retain safe typed observations.
-/// No request, URL, headers, provider text or underlying error is stored; a parsed
-/// rejected response contributes only numeric usage and bounded identity metadata.
+/// No request contents, URL, headers, provider text or underlying error is stored;
+/// only the requested model and numeric usage and bounded response identity metadata.
 #[derive(Debug, Clone)]
 pub struct DecisionFailure {
     diagnostic: DecisionFailureDiagnostic,
@@ -343,6 +383,28 @@ impl DecisionFailure {
         failure
     }
 
+    pub(crate) fn observer_callback() -> Self {
+        Self::new(
+            DecisionFailureKind::ObserverCallback,
+            "Jev submission failed during an observer callback; request was not retried",
+            None,
+            None,
+        )
+    }
+
+    pub(crate) fn with_observer_failure(
+        mut self,
+        observer: DecisionObserverFailure,
+        validated: Option<(FailedResponseUsage, FailedResponseMetadata)>,
+    ) -> Self {
+        self.diagnostic.observer_failure = Some(observer);
+        if let Some((usage, metadata)) = validated {
+            self.diagnostic.reported_usage = Some(usage);
+            self.diagnostic.response_metadata = Some(metadata);
+        }
+        self
+    }
+
     /// Attach the failed earlier submissions that the bounded retry repeated.
     pub(crate) fn with_prior_attempts(mut self, prior: Vec<DecisionRetriedAttempt>) -> Self {
         self.diagnostic.prior_attempts = prior;
@@ -383,6 +445,7 @@ impl DecisionFailure {
                 response_metadata: None,
                 prior_attempts: Vec::new(),
                 retry_after_refusal: None,
+                observer_failure: None,
             },
             message,
             retry_after: RetryAfter::Absent,
@@ -527,6 +590,7 @@ impl DecisionFailure {
                     "sent, then a local accounting or observer step failed, the provider may have completed it and its usage is unknown"
                 },
             ),
+            DecisionFailureKind::ObserverCallback => f.write_str("observer callback failed"),
         }
     }
 }
@@ -549,13 +613,12 @@ impl fmt::Display for DecisionFailure {
                 .prior_attempts
                 .iter()
                 .any(|prior| prior.reported_usage.is_none());
-            return f.write_str(if unknown {
+            f.write_str(if unknown {
                 "); earlier failed attempt usage is unknown; no further retry"
             } else {
                 "); no further retry"
-            });
-        }
-        if self.diagnostic.kind == DecisionFailureKind::HttpStatus {
+            })?;
+        } else if self.diagnostic.kind == DecisionFailureKind::HttpStatus {
             match self.diagnostic.http_status {
                 Some(status) => {
                     write!(f, "{} {status}; request was not retried", self.message)?;
@@ -567,10 +630,20 @@ impl fmt::Display for DecisionFailure {
                 None => f.write_str(
                     "Jev provider returned an unavailable HTTP status; request was not retried",
                 ),
-            }
+            }?;
         } else {
-            f.write_str(self.message)
+            f.write_str(self.message)?;
         }
+        if let Some(observer) = &self.diagnostic.observer_failure {
+            f.write_str("; observer callbacks failed: ")?;
+            for (index, callback) in observer.callbacks.iter().enumerate() {
+                if index > 0 {
+                    f.write_str(", ")?;
+                }
+                f.write_str(callback.name())?;
+            }
+        }
+        Ok(())
     }
 }
 

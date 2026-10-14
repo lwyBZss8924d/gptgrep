@@ -157,6 +157,12 @@ def archive_bundle(bundle: Path, output: Path) -> None:
                 info.uid = info.gid = 0
                 info.uname = info.gname = ""
                 info.mtime = 0
+                # Portable archive modes are independent of the private staging
+                # umask. Preserve member types and leave filesystem modes alone.
+                if info.isdir():
+                    info.mode = 0o755
+                elif info.isfile():
+                    info.mode = 0o755 if info.mode & 0o111 else 0o644
                 if item.is_file():
                     with item.open("rb") as stream:
                         archive.addfile(info, stream)

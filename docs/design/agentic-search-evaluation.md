@@ -49,8 +49,10 @@ GPTgrep's reader contract is a declared part of the treatment (owner direction,
 2026-10-13 UTC). A result therefore compares the GPTgrep harness, including that
 contract, with bare Codex; it does not isolate retrieval. For the paired run, the
 raw-only arm receives only the common task prompt and Codex's default base
-instructions. The full62 adapter's current `legacy_text` copy of the answer rules
-into the raw-only prompt must be removed before that run. An optional
+instructions, without GPTgrep's answer rules or Skills in either reader mode.
+Freeze actual adapter input fingerprints and distinguish them from expected
+product contracts or effective native base instructions that are not observable.
+An optional
 bare-Codex-plus-answer-rules diagnostic arm can separate prompt-contract effects;
 it is not part of the primary claim.
 

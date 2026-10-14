@@ -41,8 +41,8 @@ pub(crate) const MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 /// Generic answer rules for the retrieval reader. They add to, and never
 /// replace or relax, the evidence and citation rules around them: they say
 /// when to commit to an answer, never when to stop abstaining. The text is
-/// arm-neutral, and the full62 adapter gives the raw-only arm of a legacy_text
-/// run the same bytes (workspace/harness-tooling/harbor-ablation/full62).
+/// part of the GPTgrep treatment. The full62 primary raw-only arm does not
+/// receive these rules (workspace/harness-tooling/harbor-ablation/full62).
 pub(crate) const READER_ANSWER_RULES: &str = "Answer rules: Lead with the direct answer in the form the question asks for. When the evidence you have read answers the question as asked, commit to that answer and cite it rather than hedging. When the question depends on a specific passage, resolve the in-text references it relies on before answering by reading the referenced note or section, for example footnote or endnote markers, citation numbers, and see Table or see Section pointers.";
 pub(crate) const SOURCE_CONTINUATION_GUIDANCE: &str = "Source continuation policy: next_offset=null on an issued window means that node's EOF, not that the requested evidence is complete. If a requested claim, relation, or referent remains unresolved, inspect verified tree information and adjacent or related nodes within the same document scope, then read relevant source windows before finalizing. Use only node IDs exposed by the existing tools; never invent IDs, widen the document scope, infer unread text, or rely on stale source. Only issued source spans support citations; tree descriptors and navigation hints are not citable evidence. Stay within the existing tool-call, deadline, and output budgets. If a required claim remains unresolved when those budgets prevent further verification, state the unresolved limitation and return insufficient_evidence=true.";
 

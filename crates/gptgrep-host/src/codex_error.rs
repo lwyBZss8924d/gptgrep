@@ -178,6 +178,168 @@ impl fmt::Display for OcrRuntimeError {
 }
 impl std::error::Error for OcrRuntimeError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentRuntimeStage {
+    Startup,
+    TurnStart,
+    ActiveTurn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum DocumentStartupMethod {
+    #[serde(rename = "initialize")]
+    Initialize,
+    #[serde(rename = "account/read")]
+    AccountRead,
+    #[serde(rename = "config/read")]
+    ConfigRead,
+    #[serde(rename = "skills/list")]
+    SkillsList,
+    #[serde(rename = "thread/start")]
+    ThreadStart,
+}
+
+impl DocumentStartupMethod {
+    pub(crate) fn parse(method: &str) -> Option<Self> {
+        Some(match method {
+            "initialize" => Self::Initialize,
+            "account/read" => Self::AccountRead,
+            "config/read" => Self::ConfigRead,
+            "skills/list" => Self::SkillsList,
+            "thread/start" => Self::ThreadStart,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum DocumentRuntimeEvent {
+    #[serde(rename = "error")]
+    Error,
+    #[serde(rename = "configWarning")]
+    ConfigWarning,
+    #[serde(rename = "config/warning")]
+    ConfigWarningSlash,
+    #[serde(rename = "model/rerouted")]
+    ModelRerouted,
+}
+
+impl DocumentRuntimeEvent {
+    pub(crate) fn parse(method: &Value) -> Option<Self> {
+        Some(match method.as_str()? {
+            "error" => Self::Error,
+            "configWarning" => Self::ConfigWarning,
+            "config/warning" => Self::ConfigWarningSlash,
+            "model/rerouted" => Self::ModelRerouted,
+            _ => return None,
+        })
+    }
+}
+
+/// Completed RPC writes and matching replies only; not provider admission or usage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct DocumentRuntimeTransport {
+    pub thread_start_sent: bool,
+    pub thread_start_acknowledged: bool,
+    pub turn_start_sent: bool,
+    pub turn_start_acknowledged: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentRuntimeIdentity {
+    Startup,
+    GlobalNotification,
+    Matched,
+    Mismatch,
+}
+
+/// A fail-closed Document notification with no provider text or native identities.
+/// Observed usage is numeric and identity-bound; absent evidence stays unknown.
+#[derive(Debug, Clone, Serialize)]
+pub struct DocumentRuntimeError {
+    pub stage: DocumentRuntimeStage,
+    pub startup_method: Option<DocumentStartupMethod>,
+    pub event: DocumentRuntimeEvent,
+    pub identity: DocumentRuntimeIdentity,
+    pub transport: DocumentRuntimeTransport,
+    pub codex_error_info: Option<CodexErrorInfo>,
+    pub http_status_code: Option<u16>,
+    pub will_retry: Option<bool>,
+    /// Last valid identity-bound numeric observation, not cumulative billing.
+    pub usage: Option<Value>,
+    /// Matching updates without numeric fields do not erase the last observation.
+    /// Absent when the refusal notification's identity does not match.
+    pub usage_updates_without_numeric: Option<usize>,
+    pub provider_request_count: Option<usize>,
+    pub accounting_complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<Value>,
+}
+
+impl DocumentRuntimeError {
+    pub fn code(&self) -> &'static str {
+        "document_runtime_refused_no_retry"
+    }
+
+    pub(crate) fn new(
+        stage: DocumentRuntimeStage,
+        startup_method: Option<DocumentStartupMethod>,
+        event: DocumentRuntimeEvent,
+        identity: DocumentRuntimeIdentity,
+        params: &Value,
+        transport: DocumentRuntimeTransport,
+        usage: Option<&Value>,
+    ) -> Self {
+        let parsed = if identity == DocumentRuntimeIdentity::Mismatch {
+            ParsedError::default()
+        } else if matches!(
+            event,
+            DocumentRuntimeEvent::ConfigWarning | DocumentRuntimeEvent::ConfigWarningSlash
+        ) {
+            // Native ConfigWarningNotification has summary/details, not the
+            // error DTO's message/additionalDetails. Only these strings enter
+            // the existing bounded projection; path/range are never retained.
+            ParsedError {
+                diagnostics: diagnostics::project_warning(params),
+                ..ParsedError::default()
+            }
+        } else if event == DocumentRuntimeEvent::Error {
+            ParsedError::parse(&params["error"])
+        } else {
+            ParsedError::default()
+        };
+        Self {
+            stage,
+            startup_method,
+            event,
+            identity,
+            transport,
+            codex_error_info: parsed.valid.then_some(parsed.info).flatten(),
+            http_status_code: parsed.valid.then_some(parsed.http_status_code).flatten(),
+            will_retry: (event == DocumentRuntimeEvent::Error
+                && identity != DocumentRuntimeIdentity::Mismatch)
+                .then(|| params["willRetry"].as_bool())
+                .flatten(),
+            usage: (identity != DocumentRuntimeIdentity::Mismatch)
+                .then(|| usage.and_then(observed_usage))
+                .flatten(),
+            usage_updates_without_numeric: None,
+            provider_request_count: None,
+            accounting_complete: false,
+            diagnostics: parsed.diagnostics,
+        }
+    }
+}
+
+impl fmt::Display for DocumentRuntimeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.code())
+    }
+}
+impl std::error::Error for DocumentRuntimeError {}
+
 #[derive(Default)]
 pub(crate) struct ParsedError {
     pub info: Option<CodexErrorInfo>,
@@ -268,7 +430,7 @@ impl ParsedError {
     }
 }
 
-fn observed_usage(value: &Value) -> Option<Value> {
+pub(crate) fn observed_usage(value: &Value) -> Option<Value> {
     let mut result = Map::new();
     for scope in ["total", "last"] {
         let mut tokens = Map::new();

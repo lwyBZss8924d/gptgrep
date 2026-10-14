@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import pwd
 import secrets
+import signal
 import socket
 import stat
 import subprocess
@@ -560,6 +561,7 @@ class Env:
         self.home.mkdir(mode=0o700)
         self.lease_path = self.root / "locks" / "fake.lease"
         self.runs_root = self.root / "runs"
+        self.processes = []
         values = {"auth_source_id": "fake", "canonical_auth_home": str(self.credential.home),
                   "lease_path": str(self.lease_path), "runs_root": str(self.runs_root),
                   "codex_bin": "/usr/bin/false", "lease_wait_seconds": 0, "term_grace_seconds": 2,
@@ -604,8 +606,65 @@ class Env:
         return proc.returncode, last_json(proc.stdout), proc
 
     def popen(self, *args, env=None):
-        return subprocess.Popen(self.supervisor_argv(*args), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        proc = subprocess.Popen(self.supervisor_argv(*args), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, env=env or self.parent_env(), cwd=str(self.root))
+        self.processes.append(proc)
+        return proc
+
+    def cleanup_processes(self, record_name="process-cleanup.json"):
+        """Reap this fake world's supervisors and detached guardians/consumers only.
+
+        Unknown-label tests deliberately retain the lease forever. The outer test
+        runner's process group cannot clean up a guardian in its separate session.
+        Ownership comes from our Popen handles, scoped fake-root/lease holders,
+        and the supervisor's persisted pid/start identities, never a global kill.
+        """
+        assert_fake_path(self.root)
+        cfg = sup.Config(dict(self.values, schema=sup.CONFIG_SCHEMA), str(self.config_path))
+        killed = set()
+        for proc in self.processes:
+            if proc.poll() is None:
+                proc.kill()
+                killed.add(proc.pid)
+            proc.communicate(timeout=10)
+
+        def owned_live():
+            holders, error = sup.lsof_holders(cfg, self.root, self.lease_path, self.lease_path)
+            if error:
+                raise AssertionError("fake cleanup cannot inspect its owned holders: " + error)
+            owned = {}
+            for pid in set().union(*holders.values()) - {os.getpid()}:
+                entry = sup._process_entry(pid)
+                if entry is not None:
+                    owned[pid] = entry[2]
+            for path in self.runs_root.glob("*/*/state/lease-guardian-state.json"):
+                for value, start in json.loads(path.read_text()).get("known", {}).items():
+                    pid = int(value)
+                    entry = sup._process_entry(pid)
+                    if pid != os.getpid() and entry is not None and entry[2] == start:
+                        owned[pid] = start
+            return owned
+
+        deadline = time.monotonic() + 20
+        remaining = owned_live()
+        while remaining and time.monotonic() < deadline:
+            for pid, start in remaining.items():
+                entry = sup._process_entry(pid)
+                if entry is not None and entry[2] == start:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                        killed.add(pid)
+                    except ProcessLookupError:
+                        pass
+            time.sleep(0.05)
+            remaining = owned_live()
+        record = {"schema": "gptgrep.codex-auth.fake-cleanup.v1", "root": str(self.root),
+                  "killed_owned_pids": sorted(killed), "remaining_owned_pids": sorted(remaining),
+                  "lease_probe": sup.probe_lease(cfg)}
+        sup.write_json_atomic(self.root / record_name, record)
+        observe("fake_process_cleanup", **record)
+        if remaining or record["lease_probe"] not in ("absent", "free"):
+            raise AssertionError("fake cleanup left owned live processes or a held lease")
 
     def ledger(self):
         path = Path(str(self.lease_path) + ".ledger.jsonl")

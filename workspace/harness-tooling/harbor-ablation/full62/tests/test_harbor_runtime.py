@@ -162,7 +162,9 @@ class HarborMaterializationTests(unittest.TestCase):
         return Full62Adapter(manifest["path"], manifest["sha256"])
 
     def test_full124_tasks_parse_in_real_harbor_and_keep_role_isolation(self):
-        self.cohort["tasks"][0]["question"] = "é" * (MAX_READER_QUESTION_BYTES // 2)
+        prefix = b"Document: /data/corpus/raw-0.txt\nQuestion: "
+        question_bytes = MAX_READER_QUESTION_BYTES - len(prefix)
+        self.cohort["tasks"][0]["question"] = "é" * (question_bytes // 2) + "x" * (question_bytes % 2)
         adapter = self.materializer()
         output = self.root / "dataset"
         result = adapter.run(output)
@@ -489,6 +491,22 @@ class HarborMaterializationTests(unittest.TestCase):
         self.cohort["tasks"][-1]["question"] = "x" * 1025
         with self.assertRaisesRegex(ValueError, "selected_cohort_reader_question_bound"):
             self.materializer()
+
+    def test_complete_task_payload_over_cap_rejects_before_materialization(self):
+        for maximum in (1024, MAX_READER_QUESTION_BYTES):
+            self.runtime["max_input_bytes"] = maximum
+            # The original question fits; the common document/question payload
+            # exceeds the same cap and must fail before either arm can exist.
+            self.cohort["tasks"][0]["question"] = "é" * (maximum // 2)
+            with self.subTest(max_input_bytes=maximum), \
+                 patch.object(Full62Adapter, "_task") as materialize, \
+                 patch("gptgrep_harbor.adapter.copy_asset") as asset_read:
+                with self.assertRaisesRegex(ValueError, "selected_cohort_reader_task_bound"):
+                    self.materializer().run(self.root / "dataset")
+            materialize.assert_not_called()
+            asset_read.assert_not_called()
+            self.assertFalse((self.root / "dataset").exists())
+            self.assertFalse((self.root / "dataset.export.json").exists())
 
     def test_raw_elf_pin_or_missing_complete_bundle_cannot_be_enrolled(self):
         self.runtime["gptgrep_binary_pin"] = {**self.runtime["gptgrep_binary_pin"], "sha256": "0" * 64}

@@ -46,15 +46,33 @@ The retrieval reader's instructions, restricted and native, also carry two gener
 
 An identity-bound `error` notification with explicit `willRetry: true` keeps the same turn running under the original host deadline and protocol limits. The app-server owns that recovery; GPTgrep starts no replacement turn, performs no independent retry, and does not reset the timeout. Missing or malformed retry flags, foreign or missing identities, terminal errors, and failed turn completion remain failures. `HostProtocolError` exposes a typed `kind`, optional whitelisted `codex_error_info`, `will_retry`, valid `http_status_code`, already-observed numeric token `usage`, closed `diagnostics` and, for budget failures, `tool_budget`. Failed workflows retain `accounting_complete: false`; missing usage stays null. Retrieval preserves this object in `HostRetrievalError.cause`. Success reports and typed failures expose `server_retry_notifications`, which counts server events, not physical or billed provider requests.
 
+Observer failures retain requested/served model identity, send and validation
+state, known usage and prior attempts even if both persistence callbacks fail.
+An already validated initial response (`observer_callback`) is also counted;
+callbacks that fail after a provider error retain its typed cause. Packing updates
+the delivered fallback count in the payload and ledger without rewriting original
+candidate totals or provider metrics.
+
 ## Native parsing and OCR roles
 
 `parse_agent_driver` coordinates one prepared-document turn and delegates required
 OCR to the separately qualified Page executor. The source-bound region schema
 and validation reject missing, duplicate or unplanned region identities and
 mismatched bounding boxes; a complete model response alone is not an accepted
-OCR product. The default Document duration is 900 seconds, with explicit bound
-profiles up to 3,600 seconds; Page limits remain eight tools, one turn and 180
-seconds. Parent frontend/session and phase deadlines remain effective.
+OCR product. Native PTC Document and OCR use caller-selected job tool counts and
+durations in their controls/runtime profiles. Parent frontend/session and phase
+deadlines remain effective. The retained fixed transport defaults to 900 seconds
+for Document, with explicit native-viewer profiles up to 3,600 seconds, and eight
+tools, one turn and 180 seconds for Page; these are not native PTC job limits.
+
+`DocumentRuntimeError` preserves the startup method or active-turn stage, event,
+transport send/acknowledgement flags and bounded warning fingerprints through
+cleanup. Flags describe RPC observations, not provider requests. The last valid
+identity-bound numeric usage survives later empty or nonnumeric updates; the
+counter `usage_updates_without_numeric` records those updates. Total billing stays
+unknown, `provider_request_count` is null and `accounting_complete` is false.
+CLI JSON errors include this object as `document_runtime`, without native IDs,
+private paths or provider text. Historical discarded errors remain unrecoverable.
 
 The selected standalone app-server derivative and private runtime qualification
 are separate from the stock CLI reader/login route. Follow [setup](../../docs/development.md)

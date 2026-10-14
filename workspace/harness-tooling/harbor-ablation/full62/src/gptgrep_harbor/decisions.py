@@ -234,7 +234,7 @@ def acquire_writer():
         raise
 
 
-def prepare(config, binding, question, argv, *, started, deadline_unix_ms, environ):
+def prepare(config, binding, question, task_input, argv, *, started, deadline_unix_ms, environ):
     selected = config["decisions_preparation"]
     require(binding["arm"] == "gptgrep" and config["reader_mode"] == "rich_multimodal"
             and selected["max_concurrent_batches"] == 1, "decisions_treatment_preparation")
@@ -244,8 +244,11 @@ def prepare(config, binding, question, argv, *, started, deadline_unix_ms, envir
     require(Path(TRIAL_ROOT).is_dir() and Path(TRIAL_ROOT).resolve() == Path(TRIAL_ROOT),
             "decisions_trial_mount")
     binding_sha256 = sha(canonical(binding))
-    query_sha256 = sha(question.encode())
-    require(query_sha256 == binding["question_sha256"], "decisions_question_binding")
+    require(sha(question.encode()) == binding["question_sha256"], "decisions_question_binding")
+    # The cohort still binds the original question; Decisions binds the complete
+    # common task payload that the product actually receives as its query.
+    require(argv[-3:] == ["--", task_input.decode("utf-8"), "/data/corpus"], "decisions_query_binding")
+    query_sha256 = sha(task_input)
     trial_input = {"schema": "gptgrep.current_decisions.trial_input.v1", "seed": seed_pin,
         "binding_sha256": binding_sha256, "query_sha256": query_sha256,
         "run_id": selected["run_id"], "phase_id": "current-ask",

@@ -44,6 +44,32 @@ struct Evidence {
 
 pub(super) fn project(error: &Value, info: Option<CodexErrorInfo>, valid: bool) -> Option<Value> {
     let object = error.as_object()?;
+    Some(project_fields(
+        object.get("message"),
+        object.get("additionalDetails"),
+        info,
+        valid,
+    ))
+}
+
+pub(super) fn project_warning(params: &Value) -> Option<Value> {
+    let object = params.as_object()?;
+    let valid = object.get("summary").is_some_and(Value::is_string)
+        && matches!(
+            object.get("details"),
+            None | Some(Value::Null | Value::String(_))
+        );
+    let mut projection = project_fields(object.get("summary"), object.get("details"), None, false);
+    projection["warning_shape_valid"] = json!(valid);
+    Some(projection)
+}
+
+fn project_fields(
+    message: Option<&Value>,
+    additional_details: Option<&Value>,
+    info: Option<CodexErrorInfo>,
+    valid: bool,
+) -> Value {
     let mut evidence = Vec::with_capacity(3);
     if valid {
         let class = native_class(info);
@@ -62,9 +88,11 @@ pub(super) fn project(error: &Value, info: Option<CodexErrorInfo>, valid: bool) 
             });
         }
     }
-    for field in ["message", "additionalDetails"] {
-        if let Some(text) = object
-            .get(field)
+    for (field, value) in [
+        ("message", message),
+        ("additionalDetails", additional_details),
+    ] {
+        if let Some(text) = value
             .and_then(Value::as_str)
             .filter(|text| text.len() <= FIELD_LIMIT)
             && let Some(observed) = inspect(text, field)
@@ -74,15 +102,15 @@ pub(super) fn project(error: &Value, info: Option<CodexErrorInfo>, valid: bool) 
     }
     let (class, conflict) = merge(evidence.iter().map(|item| item.classification));
     let conflict = conflict || evidence.iter().any(|item| item.conflicting);
-    Some(json!({
+    json!({
         "schema_version":"gptgrep.codex.error-diagnostics.v1",
         "classification":if conflict { Class::Unknown } else { class },
         "conflicting_evidence":conflict,"native_error_shape_valid":valid,
-        "message":fingerprint(object.get("message")),
-        "additional_details":fingerprint(object.get("additionalDetails")),
+        "message":fingerprint(message),
+        "additional_details":fingerprint(additional_details),
         "evidence":evidence,
         "field_limit_bytes":FIELD_LIMIT
-    }))
+    })
 }
 
 fn fingerprint(value: Option<&Value>) -> Value {

@@ -242,11 +242,15 @@ def model_config(profile, role):
                   "direct_only_tool_namespaces = []",
                   "", "[features.code_mode_host]", "enabled = false",
                   "disable_in_process_fallback = true"]
-    lines += ["", "[permissions." + name + ".filesystem]", '":minimal" = "read"']
+    lines += ["", "[permissions." + name + ".filesystem]"]
     if role == "reader":
-        lines += ['"/data/corpus" = "read"', json.dumps(WORK_DIR) + ' = "write"']
+        lines += ['"/" = "write"', '"/data/corpus" = "read"']
+    else:
+        lines.append('":minimal" = "read"')
     for path in (CODEX_HOME, "/root", "/home", "/tests", "/solution", "/logs", "/answer",
                  "/opt/full62", "/opt/full62-private", "/proc", "/run/secrets"):
+        if role == "reader" and path in ("/root", "/home", "/proc"):
+            continue
         lines.append(json.dumps(path) + ' = "deny"')
     if role == "judge":
         lines.append('"/data" = "deny"')

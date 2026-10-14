@@ -4,6 +4,10 @@ import gzip
 import json
 import os
 from pathlib import Path
+import shlex
+import shutil
+import stat
+import subprocess
 import tarfile
 import tempfile
 import sys
@@ -56,7 +60,9 @@ class ProductBundleTests(unittest.TestCase):
             self.assertEqual((dest / name).read_bytes(), (self.root / "runtime-copy" / name).read_bytes())
 
     def test_packager_checksum_walk_and_archive_writer_are_accepted(self):
-        """The packager's own SHA256SUMS walk and archive writer over the runtime skill paths."""
+        """Private staging modes produce a portable archive without source chmods."""
+        previous_umask = os.umask(0o077)
+        self.addCleanup(os.umask, previous_umask)
         module, repo = self.packager()
         target = "x86_64-unknown-linux-gnu"
         bundle = self.root / "staging" / ("gptgrep-1.2.3-synthetic-" + target)
@@ -94,11 +100,23 @@ class ProductBundleTests(unittest.TestCase):
         # Pathlib order differs from a plain string sort for these real runtime paths.
         self.assertLess(listed.index("skills/gptgrep/SKILL.md"), listed.index("skills/gptgrep-document/SKILL.md"))
         self.assertNotEqual(listed, sorted(listed))
-        for item in [bundle, *bundle.rglob("*")]:
-            if item.is_dir():
-                item.chmod(0o755)
+        before_modes = {item.relative_to(bundle).as_posix(): stat.S_IMODE(item.stat().st_mode)
+                        for item in [bundle, *bundle.rglob("*")]}
+        self.assertEqual(before_modes["."], 0o700)
+        self.assertEqual(before_modes["RELEASE.json"], 0o600)
+        self.assertEqual(before_modes["SHA256SUMS"], 0o600)
         archive = self.root / "packaged.tar.gz"
         module.archive_bundle(bundle, archive)
+        self.assertEqual({item.relative_to(bundle).as_posix(): stat.S_IMODE(item.stat().st_mode)
+                          for item in [bundle, *bundle.rglob("*")]}, before_modes)
+        self.assertEqual(stat.S_IMODE(archive.stat().st_mode), 0o600)
+        with tarfile.open(archive) as packed:
+            self.assertEqual(packed.getmember(bundle.name).mode, 0o755)
+            for member in packed:
+                self.assertTrue(member.isdir() or member.isfile())
+                relative = Path(member.name).relative_to(bundle.name).as_posix()
+                expected = 0o755 if member.isdir() or before_modes[relative] & 0o111 else 0o644
+                self.assertEqual(member.mode, expected)
         sidecar = self.root / "packaged.release.json"
         sidecar.write_text(encoded, encoding="utf-8")
         dest = self.root / "installed"
@@ -266,6 +284,42 @@ class ProductBundleTests(unittest.TestCase):
         provenance = json.loads((self.root / "context/product-provenance.json").read_text())
         self.assertEqual(result["runtime_product"]["gptgrep_binary_pin"], provenance["entrypoint"])
         self.assertEqual(provenance["common_image"], common)
+
+        # Replay only the generated mode step on synthetic COPY destinations.
+        # Root can read mode0600 inputs, so the build-time verifier alone cannot
+        # establish that a different runtime UID can read this public payload.
+        context = self.root / "context"
+        staging_modes = {p: stat.S_IMODE(p.stat().st_mode) for p in context.rglob("*")}
+        image = self.root / "image"
+        bundle = image / product.PRODUCT_ROOT.lstrip("/")
+        public = image / "usr/local/share/full62-product"
+        shutil.copytree(context / "bundle", bundle)
+        public.mkdir(parents=True)
+        for name in ("product-provenance.json", "product-check.json"):
+            shutil.copy2(context / name, public / name)
+        shutil.copytree(context / "verifier", public / "verifier")
+        private = image / "private-marker"
+        private.write_bytes(b"private staging is outside the copied public roots")
+        private.chmod(0o600)
+        payload = {}
+        executable = {bundle / "gptgrep", bundle / "gptgrep.bin"}
+        for root in (bundle, public):
+            for path in (root, *root.rglob("*")):
+                path.chmod(0o700 if path.is_dir() else 0o500 if path in executable else 0o600)
+                if path.is_file():
+                    payload[path] = path.read_bytes()
+        mode_step = shlex.split(next(line for line in docker.splitlines()
+                                     if line.startswith("RUN ")).split(" && ", 1)[0])
+        self.assertEqual(mode_step, ["RUN", "chmod", "-R", "a=rX", product.PRODUCT_ROOT,
+                                     "/usr/local/share/full62-product"])
+        subprocess.run([*mode_step[1:-2], str(bundle), str(public)], check=True)
+        for root in (bundle, public):
+            for path in (root, *root.rglob("*")):
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode),
+                                 0o555 if path.is_dir() or path in executable else 0o444)
+        self.assertEqual({p: p.read_bytes() for p in payload}, payload)
+        self.assertEqual(stat.S_IMODE(private.stat().st_mode), 0o600)
+        self.assertEqual({p: stat.S_IMODE(p.stat().st_mode) for p in staging_modes}, staging_modes)
 
 
 if __name__ == "__main__":

@@ -158,7 +158,8 @@ def prepare_treatment(config, output):
               "COPY product-provenance.json " + PRODUCT_PROVENANCE + "\n"
               "COPY product-check.json /usr/local/share/full62-product/\n"
               "COPY verifier /usr/local/share/full62-product/verifier\n"
-              "RUN PYTHONPATH=/usr/local/share/full62-product/verifier python3 -c "
+              "RUN chmod -R a=rX " + PRODUCT_ROOT + " /usr/local/share/full62-product && "
+              "PYTHONPATH=/usr/local/share/full62-product/verifier python3 -c "
               "'import json; from gptgrep_harbor.product_bundle import check_product_bundle; "
               "check_product_bundle(json.load(open(\"/usr/local/share/full62-product/product-check.json\")))' "
               "&& " + PRODUCT_ENTRYPOINT + " --version\n")

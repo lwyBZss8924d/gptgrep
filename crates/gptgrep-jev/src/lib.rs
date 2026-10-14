@@ -22,9 +22,9 @@ pub use execution::{
 };
 use failure::RetryAfter;
 pub use failure::{
-    DecisionFailure, DecisionFailureDiagnostic, DecisionFailureKind, DecisionRetriedAttempt,
-    FailedResponseMetadata, FailedResponseUsage, RetryAfterRefusal, UsageObservation,
-    UsagePresence,
+    DecisionFailure, DecisionFailureDiagnostic, DecisionFailureKind, DecisionObserverCallback,
+    DecisionObserverFailure, DecisionRetriedAttempt, FailedResponseMetadata, FailedResponseUsage,
+    RetryAfterRefusal, UsageObservation, UsagePresence,
 };
 pub use input::{
     DecisionInput, ImageEvidence, MAX_IMAGE_BASE64_BYTES, MAX_IMAGE_BYTES,
@@ -252,6 +252,7 @@ struct SendProgress {
     /// Usage and identity of a validated response, kept if a later local
     /// accounting or observer step fails.
     validated: Option<(FailedResponseUsage, FailedResponseMetadata)>,
+    observer_failures: Vec<DecisionObserverCallback>,
 }
 
 /// Bounded usage and identity of a validated response; no answer content.
@@ -404,8 +405,59 @@ impl PreparedRerank {
     }
 }
 
+const MAX_CA_BUNDLE_BYTES: usize = 1024 * 1024;
+
+/// Add caller-selected process CA roots without changing default trust or routing.
+fn add_process_ca_roots(builder: reqwest::ClientBuilder) -> Result<reqwest::ClientBuilder> {
+    let Some(path) = std::env::var_os("SSL_CERT_FILE").filter(|path| !path.is_empty()) else {
+        return Ok(builder);
+    };
+    add_ca_bundle_roots(builder, std::path::Path::new(&path))
+}
+
+fn add_ca_bundle_roots(
+    mut builder: reqwest::ClientBuilder,
+    path: &std::path::Path,
+) -> Result<reqwest::ClientBuilder> {
+    use std::io::Read;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A selected FIFO must not block client initialization before the file-type check.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| anyhow!("Could not open SSL_CERT_FILE certificate bundle"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| anyhow!("Could not inspect SSL_CERT_FILE certificate bundle"))?;
+    ensure!(metadata.is_file(), "SSL_CERT_FILE must be a regular file");
+    let mut bytes = Vec::new();
+    file.take((MAX_CA_BUNDLE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| anyhow!("Could not read SSL_CERT_FILE certificate bundle"))?;
+    ensure!(
+        bytes.len() <= MAX_CA_BUNDLE_BYTES,
+        "SSL_CERT_FILE certificate bundle exceeds byte limit"
+    );
+    let certificates = reqwest::Certificate::from_pem_bundle(&bytes)
+        .map_err(|_| anyhow!("Invalid SSL_CERT_FILE certificate bundle"))?;
+    ensure!(
+        !certificates.is_empty(),
+        "SSL_CERT_FILE contains no certificates"
+    );
+    for certificate in certificates {
+        builder = builder.add_root_certificate(certificate);
+    }
+    Ok(builder)
+}
+
 impl JevClient {
-    /// Read only OPENROUTER_API_KEY from the process environment.
+    /// Read OPENROUTER_API_KEY and optional SSL_CERT_FILE from the process environment.
     pub fn from_env(model: Option<&str>) -> Result<Self> {
         let key = std::env::var("OPENROUTER_API_KEY")
             .map_err(|_| anyhow!("OPENROUTER_API_KEY is not available"))?;
@@ -448,11 +500,13 @@ impl JevClient {
         let mut authorization = HeaderValue::from_str(&format!("Bearer {api_key}"))
             .map_err(|_| anyhow!("Invalid Jev API key header"))?;
         authorization.set_sensitive(true);
-        let mut http = Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .redirect(Policy::none())
-            .retry(reqwest::retry::never())
-            .user_agent("gptgrep");
+        let mut http = add_process_ca_roots(
+            Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .redirect(Policy::none())
+                .retry(reqwest::retry::never())
+                .user_agent("gptgrep"),
+        )?;
         if loopback {
             // This client has one verified loopback endpoint. Internet clients retain
             // managed proxy/routing policy; no process-wide network setting changes.
@@ -609,8 +663,8 @@ impl JevClient {
         };
         let mut observer_started = false;
         let mut prior: Vec<DecisionRetriedAttempt> = Vec::new();
-        // How far the retry submission got, to label a later local failure.
-        let mut retry_progress = SendProgress::default();
+        // Keep observations for the current submission, including the first.
+        let mut progress = SendProgress::default();
         let submitted = async {
             // Only a retrying client keeps a second copy of the exact bytes.
             let (first_body, retry_body) = if retry.is_some() {
@@ -626,7 +680,7 @@ impl JevClient {
                     &observation,
                     deadline,
                     &mut observer_started,
-                    &mut SendProgress::default(),
+                    &mut progress,
                 )
                 .await
             {
@@ -657,8 +711,14 @@ impl JevClient {
             // before the separately admitted retry starts.
             if std::mem::take(&mut observer_started)
                 && let Some(observer) = &self.observer
+                && observer.failed(&observation).is_err()
             {
-                observer.failed(&observation)?;
+                progress
+                    .observer_failures
+                    .push(DecisionObserverCallback::Failed);
+                // Keep the provider failure that triggered this callback.
+                // No retry was sent, and its first-attempt evidence survives.
+                return Err(error);
             }
             // Write-ahead: the caller records the admitted retry before its
             // backoff, reservation and send. A refusal stops the retry and is
@@ -667,6 +727,7 @@ impl JevClient {
                 notice(&failed)?;
             }
             prior.push(failed);
+            progress = SendProgress::default();
             tokio::time::sleep(wait).await;
             let mut response = self
                 .submit_once(
@@ -676,7 +737,7 @@ impl JevClient {
                     &observation,
                     deadline,
                     &mut observer_started,
-                    &mut retry_progress,
+                    &mut progress,
                 )
                 .await?;
             response.retried_attempts = prior.clone();
@@ -689,22 +750,41 @@ impl JevClient {
         if observer_started
             && result.is_err()
             && let Some(observer) = &self.observer
+            && observer.failed(&observation).is_err()
         {
-            observer.failed(&observation)?;
+            progress
+                .observer_failures
+                .push(DecisionObserverCallback::Failed);
         }
         match result {
-            Err(error) if !prior.is_empty() => {
+            Err(error) if !prior.is_empty() || !progress.observer_failures.is_empty() => {
                 // A failure after the retry keeps the earlier attempt. Any other
                 // error of the retry is reduced to a fixed kind: before its HTTP
                 // send it was not admitted; after the send the provider may have
                 // completed it, and a validated response keeps its usage.
-                let failure = match error.downcast::<DecisionFailure>() {
-                    Ok(failure) => failure,
-                    Err(_) if retry_progress.sent => {
-                        DecisionFailure::retry_post_send(retry_progress.validated.take())
+                let mut failure = match error.downcast::<DecisionFailure>() {
+                    Ok(failure)
+                        if failure.diagnostic().kind != DecisionFailureKind::ObserverCallback =>
+                    {
+                        failure
                     }
-                    Err(_) => DecisionFailure::retry_admission(),
+                    _ if prior.is_empty() => DecisionFailure::observer_callback(),
+                    _ if progress.sent => {
+                        DecisionFailure::retry_post_send(progress.validated.clone())
+                    }
+                    _ => DecisionFailure::retry_admission(),
                 };
+                if !progress.observer_failures.is_empty() {
+                    failure = failure.with_observer_failure(
+                        DecisionObserverFailure {
+                            callbacks: progress.observer_failures,
+                            requested_model: self.model.clone(),
+                            send_started: progress.sent,
+                            response_validated: progress.validated.is_some(),
+                        },
+                        progress.validated,
+                    );
+                }
                 Err(failure.with_prior_attempts(prior).into())
             }
             result => result,
@@ -779,7 +859,14 @@ impl JevClient {
         );
         if let Some(observer) = &self.observer {
             *observer_started = true;
-            observer.send_started_with_body(observation, &body)?;
+            observer
+                .send_started_with_body(observation, &body)
+                .map_err(|_| {
+                    progress
+                        .observer_failures
+                        .push(DecisionObserverCallback::SendStarted);
+                    DecisionFailure::observer_callback()
+                })?;
             ensure!(
                 tokio::time::Instant::now() < deadline,
                 "Jev request deadline expired during send admission; reservation remains charged"
@@ -830,7 +917,14 @@ impl JevClient {
         }
         reservation.terminal().await?;
         if let (Some(observer), Ok(response)) = (&self.observer, &result) {
-            observer.validated_response(observation, response)?;
+            observer
+                .validated_response(observation, response)
+                .map_err(|_| {
+                    progress
+                        .observer_failures
+                        .push(DecisionObserverCallback::ValidatedResponse);
+                    DecisionFailure::observer_callback()
+                })?;
         }
         result
     }
@@ -1310,6 +1404,7 @@ mod tests {
             DecisionFailureKind::ResponseValidation,
             DecisionFailureKind::RetryAdmission,
             DecisionFailureKind::RetryPostSend,
+            DecisionFailureKind::ObserverCallback,
         ] {
             let failure = DecisionFailure::new(kind, "synthetic", Some(502), None);
             assert!(
@@ -1395,5 +1490,96 @@ mod tests {
         assert!(JevClient::new("bad\nsecret-sentinel", None).is_err());
         assert!(JevClient::with_endpoint(secret, None, "http://127.0.0.1:12345/decisions").is_ok());
         assert!(JevClient::with_endpoint(secret, None, "http://[::1]:12345/decisions").is_ok());
+    }
+
+    #[test]
+    fn ca_bundle_rejects_empty_malformed_and_oversized_input_without_echoing_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("private-ca-path-sentinel.pem");
+        for (contents, expected) in [
+            (Vec::new(), "SSL_CERT_FILE contains no certificates"),
+            (
+                vec![b' '; MAX_CA_BUNDLE_BYTES],
+                "SSL_CERT_FILE contains no certificates",
+            ),
+            (
+                b"-----BEGIN CERTIFICATE-----\n%%%private-ca-content-sentinel\n-----END CERTIFICATE-----\n"
+                    .to_vec(),
+                "Invalid SSL_CERT_FILE certificate bundle",
+            ),
+            (
+                vec![b' '; MAX_CA_BUNDLE_BYTES + 1],
+                "SSL_CERT_FILE certificate bundle exceeds byte limit",
+            ),
+        ] {
+            std::fs::write(&path, contents).unwrap();
+            let error = add_ca_bundle_roots(Client::builder().no_proxy(), &path)
+                .expect_err("invalid bundle must fail")
+                .to_string();
+            assert_eq!(error, expected);
+            assert!(!error.contains("sentinel"));
+        }
+    }
+
+    #[test]
+    fn ca_bundle_rejects_missing_and_nonregular_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = add_ca_bundle_roots(
+            Client::builder().no_proxy(),
+            &directory.path().join("missing-private-ca-path-sentinel"),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert_eq!(error, "Could not open SSL_CERT_FILE certificate bundle");
+        let error = add_ca_bundle_roots(Client::builder().no_proxy(), directory.path())
+            .err()
+            .unwrap()
+            .to_string();
+        // Some platforms reject a directory at open; others expose its file type.
+        assert!(
+            error == "Could not open SSL_CERT_FILE certificate bundle"
+                || error == "SSL_CERT_FILE must be a regular file"
+        );
+    }
+
+    #[test]
+    fn ca_bundle_invalid_der_cannot_build_a_client() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("invalid-der-private-ca-sentinel.pem");
+        std::fs::write(
+            &path,
+            b"-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        let builder = add_ca_bundle_roots(Client::builder().no_proxy(), &path)
+            .expect("PEM decoding alone does not validate DER");
+        assert!(builder.build().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ca_bundle_fifo_refuses_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ca.fifo");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: c_path owns the NUL-terminated bytes throughout this call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _directory = directory;
+            let result = add_ca_bundle_roots(Client::builder().no_proxy(), &path)
+                .err()
+                .map(|error| error.to_string());
+            let _ = sender.send(result);
+        });
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("FIFO open must not wait for a writer"),
+            Some("SSL_CERT_FILE must be a regular file".to_owned())
+        );
     }
 }

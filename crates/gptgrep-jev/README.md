@@ -39,6 +39,15 @@ the HTTP send while preserving the charged reservation; a send-start observation
 does not prove provider receipt. Keep source-bearing bytes out of generic logs
 and retain unresolved liabilities if a request future is cancelled.
 
+Observer errors are returned as sanitized typed failures. `diagnostic().observer_failure`
+records the failed callbacks (`send_started`, `validated_response`, `failed`), requested
+model, whether HTTP send began, and whether the reply validated. A failing `failed`
+callback preserves the original provider failure. If a reply validated before a
+callback failed, its checked usage and served model, response ID and provider remain
+available even when the terminal callback also fails. Initial callback errors use
+kind `observer_callback`; retries keep `retry_admission` or `retry_post_send` and
+their earlier attempt observations. Arbitrary callback error text is discarded.
+
 Submission has a 20-second admission/request timeout, a 64-question cap, a 64 KiB serialized input cap and a 1 MiB response cap. Client clones share four slots and a maximum of 200 charged submissions. These are local application bounds, not token counts or a billing guarantee. By default the client makes no application retries; it follows no redirects and explicitly disables provider fallback. Callers own shortlisting, further batches, result-output reservation and any explicit local fallback.
 
 `JevClient::with_transient_retry(TransientRetry::standard())` opts a client into one bounded retry of transient provider failures. Only a received HTTP status in `TRANSIENT_RETRY_STATUSES` (429, 500, 502, 503, 504) admits it, at most once per logical request, with the identical prepared bytes. Timeouts, deadlines, connection and mid-body transport errors, response-size, JSON and validation failures, other 4xx/5xx statuses and admission errors are never retried: the provider may have completed the request or the failure is not transient. The wait is a jittered backoff in 250–1000 ms (`TransientRetry::with_jitter` injects the jitter source) or a longer `Retry-After` of one non-negative integer number of seconds (at most ten digits). A `Retry-After` returned in any other form (an HTTP-date, a repeated field, or a negative, fractional or longer value) refuses the retry instead of being ignored, and `diagnostic().retry_after_refusal` records why (`repeated`, `out_of_range` or `not_delta_seconds`). The retry is also refused unless the original request deadline still leaves the wait plus 2 seconds (`RETRY_MIN_ATTEMPT_TIME`); the deadline is never renewed. Each attempt is a separate reservation, send-start observation and terminal outcome in the same `ExecutionContext`, and no retry is made when the context has no submission left. A successful retried request returns `retried_attempts` on `DecisionResponse`/`RerankResponse`; a failure after the retry keeps the earlier attempt in `diagnostic().prior_attempts`. A retry stopped before its HTTP send is reported as kind `retry_admission`; a local failure after the retry was sent (its terminal ledger record or an observer) is kind `retry_post_send`, because the provider may have completed it. When the retry's reply had already validated, that diagnostic keeps its checked numeric `reported_usage` and `response_metadata` (served model, response ID, provider) for the caller to account; otherwise its usage is unknown. `submit_rerank_with_retry_notice`/`rerank_with_retry_notice` take a write-ahead `RetryNotice`: it receives the failed attempt after the retry is admitted and before the retry's backoff, reservation and send, and an error from it stops the retry unsent and is returned unchanged. A failed attempt keeps its kind and HTTP status; its usage stays as reported, or unknown, never zero (an HTTP error body is not read). Observers receive `send_started_with_body` and a terminal callback for each attempt. `without_transient_retry` restores exact single submission; `decide_evidence_roles` always submits once.
@@ -98,6 +107,14 @@ Persistent ledgers retain the original run's uncapped time anchor. Fresh process
 `JevClient::new(api_key, model)` supports an explicitly supplied key. `with_endpoint(api_key, model, endpoint)` supports compatible HTTPS endpoints and loopback HTTP test servers; it rejects URL credentials, query strings and fragments.
 
 An explicitly loopback endpoint connects directly at the application proxy layer. Internet endpoints retain the configured proxy and OS-managed routing policy. Tests bind same-process `127.0.0.1` only and never call a model provider.
+
+The optional process variable `SSL_CERT_FILE` adds roots from one regular PEM
+certificate bundle of at most 1 MiB. An unset or empty variable preserves the
+existing WebPKI roots; a selected bundle must contain certificates and pass
+parsing and root validation. Read, size and validation failures stop client
+initialization with redacted errors. The existing WebPKI roots, certificate and
+hostname verification, endpoint, proxy policy, timeout and retry policy remain
+in effect. This does not read `SSL_CERT_DIR` or change the system trust store.
 
 The wire contract was checked against [OpenRouter's Decisions schema](https://openrouter.ai/openapi.json), the [Jev model page](https://openrouter.ai/typesafe/jev-1.13), and [TypeSafe's API documentation](https://docs.typesafe.ai/api.md). Jev is a text-only decision model; it does not generate text. Unit and loopback transport tests require no API key and make no paid model calls.
 

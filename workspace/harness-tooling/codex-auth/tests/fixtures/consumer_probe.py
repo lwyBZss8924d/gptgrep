@@ -43,12 +43,16 @@ Modes (argv[1]):
                                  the run's work dir), write its pid, return. After
                                  SECONDS the grandchild runs ACTION, then exits:
                                    canonical-append      append to $CODEX_HOME/auth.json
-                                   docker-add STATE ID   add a fake container id, sleep 1
+                                   docker-add STATE LABEL ID
+                                                         add a labelled fake container, sleep 1
+                                   canonical-chmod MODE...
+                                                         chmod the fake credential (octal modes)
                                    hard-link NAME        hard-link the credential into results
                                    hidden-link NAME      as the hidden-link mode
   chmod-home PIDFILE SECONDS     an escaped grandchild as above, then chmod $CODEX_HOME 000
   write-canonical                append to $CODEX_HOME/auth.json through the run's link
                                  (a misbehaving consumer rewriting the fake credential)
+  chmod-canonical MODE...        chmod the fake credential through its link; never opens it
   replace-link                   replace the run's auth.json link with a regular file
                                  holding a synthetic credential document (a per-run login)
   bind-port PORT SECONDS READY   listen on 127.0.0.1:PORT (a would-be token harvester)
@@ -155,9 +159,17 @@ def escape(pidfile, seconds, action=None, args=()):
                 os.write(fd, b"\n")
                 os.close(fd)
             elif action == "docker-add":
-                with open(args[0], "a") as handle:
-                    handle.write("\n" + args[1] + "\n")
+                with open(args[0]) as handle:
+                    state = json.load(handle)
+                state.setdefault("labels", {}).setdefault(args[1], []).append(args[2])
+                temp = args[0] + ".tmp-" + str(os.getpid())
+                with open(temp, "w") as handle:
+                    json.dump(state, handle)
+                os.replace(temp, args[0])
                 time.sleep(1.0)
+            elif action == "canonical-chmod":
+                for mode in args:
+                    os.chmod(os.path.join(home, "auth.json"), int(mode, 8))
             elif action == "hard-link":
                 os.link(os.readlink(os.path.join(home, "auth.json")),
                         os.path.join(os.path.dirname(home), "results", args[0]))
@@ -209,6 +221,10 @@ def main(argv):
         return 0
     if mode == "exit":
         return int(argv[2])
+    if mode == "chmod-canonical":
+        for value in argv[2:]:
+            os.chmod(os.path.join(os.environ["CODEX_HOME"], "auth.json"), int(value, 8))
+        return 0
     if mode == "auth-fail":
         write_record(json.dumps({"schema": "gptgrep.codex-auth.auth-failure.v1", "class": argv[2]}))
         return 77

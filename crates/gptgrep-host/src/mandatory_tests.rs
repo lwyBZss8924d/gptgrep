@@ -412,6 +412,105 @@ async fn seed_below_floor_delivers_flagged_low_confidence_candidates() {
     assert_eq!(summary.searches[0].delivered_hits, hits.len());
 }
 
+async fn assert_packed_fallback_coverage_matches_ledger(planned: bool) {
+    let root = tempfile::tempdir().unwrap();
+    // Large escaped headings force the host to omit whole hits from the seed.
+    // The question has no literal anchor; every synthetic score is below floor.
+    for ordinal in 0..3 {
+        std::fs::write(
+            root.path().join(format!("material-{ordinal}.md")),
+            format!(
+                "# Section {ordinal} {}\nGeneric material stored on a shelf.\n",
+                "\"".repeat(1000)
+            ),
+        )
+        .unwrap();
+    }
+    gptgrep_core::index(root.path(), 10).await.unwrap();
+    let (client, server, _) = mock_jev(vec![(200, 0.0); 2]).await;
+    let config = HostConfig {
+        query_plan: planned.then(crate::QueryPlanConfig::default),
+        ..HostConfig::default()
+    };
+    let mut evidence = Evidence::open(root.path(), None).unwrap();
+    let accounting = Accounting::create(root.path(), &evidence.generation).unwrap();
+    evidence
+        .configure(&config, accounting.clone(), Some(client))
+        .unwrap();
+    let question = "How are supplies organized?";
+    accounting.bind_workflow(question, None).unwrap();
+    if planned {
+        evidence.bootstrap_planned(question, &[]).await.unwrap();
+    } else {
+        evidence.bootstrap(question).await.unwrap();
+    }
+    assert_eq!(server.await.unwrap().len(), 2);
+    let seed = evidence.initial_payload.as_ref().unwrap();
+    let hits = seed["hits"].as_array().unwrap();
+    assert!(
+        !hits.is_empty() && hits.len() < 3,
+        "packing fixture must omit fallback hits"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit["below_threshold"] == true && hit["literal_anchor"] == false)
+    );
+    assert_eq!(seed["coverage"]["below_threshold_fallback"], hits.len());
+    assert_eq!(seed["host_delivery"]["omitted_hits"], 3 - hits.len());
+    let envelope =
+        json!({"contentItems":[{"type":"inputText","text":seed.to_string()}],"success":true});
+    assert!(serde_json::to_vec(&envelope).unwrap().len() <= crate::retrieval::MAX_TOOL_BYTES);
+    let receipt = &evidence.receipts[0];
+    assert_eq!(receipt.evidence.len(), hits.len());
+    let summary = accounting.summary();
+    assert_eq!(summary.initial_status, "filtered_all");
+    assert_eq!((summary.attempted_calls, summary.requests), (2, 2));
+    let events = ledger_events(&accounting.path());
+    let before_event = if planned {
+        "plan_fused"
+    } else {
+        "search_finished"
+    };
+    let before = &events
+        .iter()
+        .find(|event| event["event"] == before_event)
+        .unwrap()["search"];
+    let delivery = &events
+        .iter()
+        .find(|event| event["event"] == "delivery")
+        .unwrap()["search"];
+    let pointer = if planned {
+        "/plan/coverage"
+    } else {
+        "/coverage"
+    };
+    let mut expected_coverage = before.pointer(pointer).unwrap().clone();
+    assert_eq!(expected_coverage["below_threshold_fallback"], 3);
+    assert_eq!(expected_coverage["reranked_candidates"], 3);
+    assert_eq!(expected_coverage["filtered_candidates"], 3);
+    expected_coverage["below_threshold_fallback"] = json!(hits.len());
+    let receipt_search = serde_json::to_value(receipt.search.as_ref().unwrap()).unwrap();
+    let summary_search = serde_json::to_value(&summary.searches[0]).unwrap();
+    for search in [&receipt_search, &summary_search, delivery] {
+        assert_eq!(search["delivered_hits"], hits.len());
+        assert_eq!(search["output_truncated"], true);
+        assert_eq!(search.pointer(pointer).unwrap(), &expected_coverage);
+        // Packing changes only the delivered fallback count; candidate totals
+        // and observed provider metrics retain their pre-delivery values.
+        assert_eq!(search["metrics"], before["metrics"]);
+    }
+}
+
+#[tokio::test]
+async fn packed_seed_fallback_coverage_matches_receipt_and_ledger() {
+    assert_packed_fallback_coverage_matches_ledger(false).await;
+}
+
+#[tokio::test]
+async fn packed_planned_seed_fallback_coverage_matches_receipt_and_ledger() {
+    assert_packed_fallback_coverage_matches_ledger(true).await;
+}
+
 #[tokio::test]
 async fn partial_rerank_failure_preserves_routing_usage_in_typed_error_and_ledger() {
     let root = corpus().await;

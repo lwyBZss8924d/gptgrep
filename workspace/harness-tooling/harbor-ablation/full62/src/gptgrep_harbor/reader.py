@@ -7,7 +7,7 @@ from pathlib import Path
 from .product_bundle import PRODUCT_PROVENANCE, PRODUCT_ROOT, check_product_bundle
 import time
 
-from .common import MAX_ANSWER, MAX_READER_QUESTION_BYTES, PROFILE, canonical, copy_asset, finite_number, parse, pinned, put, read, require, sha, validate_binding
+from .common import MAX_ANSWER, MAX_READER_QUESTION_BYTES, PROFILE, canonical, copy_asset, finite_number, integer, parse, pinned, put, read, require, sha, validate_binding
 from .native import codex_accounting, codex_argv, codex_result, prompt_bytes
 from .process import run
 from .runtime import CODEX_VERSION, DECISIONS_BUDGET, DECISIONS_LEDGER_DIR, check_config, native_environment
@@ -21,8 +21,8 @@ from .decisions import (TRIAL_BUDGET, acquire_writer, claim_invocation, prepare 
 LEGACY_ANSWER_STATUSES = ("completed", "insufficient_evidence")
 
 
-def reader_argv(config, binding, question):
-    require(len(question.encode()) <= min(MAX_READER_QUESTION_BYTES, config["max_input_bytes"]),
+def reader_argv(config, binding, task):
+    require(len(task.encode()) <= min(MAX_READER_QUESTION_BYTES, config["max_input_bytes"]),
             "instruction_bytes_limit")
     if binding["arm"] == "gptgrep":
         require(config.get("native_ptc") is True and config.get("codex_permissions") == "full62_reader",
@@ -54,39 +54,40 @@ def reader_argv(config, binding, question):
                 "--timeout", str(config["deadline_seconds"]),
                 "--max-tool-calls", str(config["max_tool_calls"]),
                 "--max-input-bytes", str(config["max_input_bytes"]),
-                "--json", "--", question, "/data/corpus"]
+                "--json", "--", task, "/data/corpus"]
     require(binding["arm"] == "raw_only", "arm")
     return codex_argv(config["codex_binary"])
 
 
-# Generic answer rules, byte-identical to READER_ANSWER_RULES in
-# crates/gptgrep-host/src/protocol.rs. The legacy_text GPTgrep reader receives
-# them in its base instructions, so the raw-only arm of a legacy_text run
-# receives the same text: answer strategy is matched between the arms and is
-# not credited to retrieval. The rich_multimodal reader has no such rules, so
-# neither arm receives them in that mode.
-READER_ANSWER_RULES = (
-    "Answer rules: Lead with the direct answer in the form the question asks for. "
-    "When the evidence you have read answers the question as asked, commit to that "
-    "answer and cite it rather than hedging. When the question depends on a specific "
-    "passage, resolve the in-text references it relies on before answering by reading "
-    "the referenced note or section, for example footnote or endnote markers, citation "
-    "numbers, and see Table or see Section pointers.")
-
-
-def shared_answer_rules(config):
-    """The answer rules both arms receive for the run's reader mode, if any."""
+def task_prompt(config, question):
+    # Both front doors receive these exact task bytes. Native default base
+    # instructions remain the bare arm's; GPTgrep's reader contract is treatment.
     require(config.get("reader_mode") in ("rich_multimodal", "legacy_text"), "explicit_reader_mode")
-    return READER_ANSWER_RULES if config["reader_mode"] == "legacy_text" else None
+    return prompt_bytes("Document: " + config["raw_document"] + "\nQuestion: " + question)
 
 
-def raw_prompt(config, question):
-    # States the enforced reader policy: web search and model-tool network are disabled.
-    rules = shared_answer_rules(config)
-    return prompt_bytes("Answer the question using only the protocol-scoped raw document at "
-              + config["raw_document"] + ". You may inspect that document with native tools. "
-              "No external search or network access is available. Give the complete answer and source locations "
-              "when available. " + (rules + " " if rules else "") + "Question:\n" + question)
+def prompt_observation(config, binding, question, task_input):
+    """Retain the exact adapter input, without claiming an observed model prompt."""
+    bare = binding["arm"] == "raw_only"
+    data = task_input
+    path = "/logs/agent/frontdoor-input.txt"
+    put(path, data)
+    return {"common_question": {"bytes": len(question.encode("utf-8")),
+                                 "sha256": sha(question.encode("utf-8"))},
+            "frontdoor_input": {"path": path, "bytes": len(data), "sha256": sha(data),
+                                "transport": "native_stdin" if bare else "gptgrep_question_argument"},
+            "scope": "exact_adapter_input_not_effective_native_model_prompt",
+            "base_instructions": {
+                "selection": "native_default" if bare else "gptgrep_reader_contract",
+                "adapter_override": False,
+                "expected_full_sha256": None, "effective_sha256": None,
+                "effective_bytes_observed": False,
+                "availability_binding": {"reader_binary": config["reader_base_binary"],
+                                         "native_config_sha256": config["native_config_sha256"],
+                                         "product_provenance": (config.get("gptgrep_bundle", {}).get("provenance")
+                                                                if not bare else None)},
+                "limit": "Binary/configuration pins do not reveal effective base-instruction bytes."},
+            "treatment_contract_applied_to_bare": False}
 
 
 def product_accounting(report):
@@ -216,27 +217,22 @@ def main():
     args = parser.parse_args()
     config = parse(read("/opt/full62/reader.json"))
     binding = validate_binding(config["binding"])
-    question = read(args.instruction, min(MAX_READER_QUESTION_BYTES, config["max_input_bytes"])).decode("utf-8")
-    require(sha(question.encode()) == binding["question_sha256"], "question_binding")
-    require(config["profile"] == PROFILE, "profile")
-    check_config(config, "reader")
-    require(config["reader_base_binary"]["path"] == config["codex_binary"], "reader_binary_path")
-    copy_asset(config["reader_base_binary"], 2**30)
-    if binding["arm"] == "raw_only":
-        require(not any(Path(path).exists() for path in
-                        (config["gptgrep_binary"], PRODUCT_ROOT, PRODUCT_PROVENANCE)),
-                "bare_image_has_treatment_binary")
-    else:
-        check_product_bundle(config)
-    require(not Path("/answer/answer.json").exists() and not Path("/logs/agent/operational.json").exists(),
+    # These question-independent checks establish the receipt identity and its
+    # finite budget. Question reading through complete answer-envelope
+    # construction/hashing belongs to it; immutable terminal observer writes do not.
+    timeout = integer(config["deadline_seconds"], 1, 86400)
+    question_limit = min(MAX_READER_QUESTION_BYTES, integer(config["max_input_bytes"], 1))
+    require(not any(Path(path).exists() for path in
+                    ("/answer/answer.json", "/logs/agent/operational.json", "/logs/agent/attempt-start.json")),
             "reader_outputs_already_exist")
-    put("/logs/agent/attempt-start.json", {"binding": binding, "profile": PROFILE})
     started = time.monotonic()
-    deadline_unix_ms = time.time_ns() // 1000000 + config["deadline_seconds"] * 1000
+    deadline_unix_ms = time.time_ns() // 1000000 + timeout * 1000
     outcome = {"schema": "gptgrep.harbor.answer.v1", "binding": binding,
                "status": "operational_failure", "answer": None}
     operation = {"schema": "gptgrep.harbor.operation.v1", "binding": binding,
-                 "requested_profile": PROFILE, "attempts": [], "deadline_ms": config["deadline_seconds"] * 1000,
+                 "requested_profile": PROFILE, "attempts": [], "deadline_ms": timeout * 1000,
+                 "original_deadline_unix_ms": deadline_unix_ms,
+                 "clock_started_before_question_read": True,
                  "reader_base_binary": config["reader_base_binary"],
                  "native_cli": config["native_cli"], "native_config_sha256": config["native_config_sha256"],
                  "base_tool_environment": config["base_tool_environment"],
@@ -248,25 +244,57 @@ def main():
                  "budget_scope": config["budget_scope"],
                  "outer_retry_count": 0, "provider_internal_retry_count": None,
                  "index_excluded": True, "grounding": "unassessed"}
+    put("/logs/agent/attempt-start.json", {"binding": binding, "profile": PROFILE,
+                                          "original_deadline_unix_ms": deadline_unix_ms,
+                                          "clock_started_before_question_read": True})
+
+    def remaining():
+        seconds = timeout - (time.monotonic() - started)
+        require(seconds > 0, "reader_deadline")
+        return seconds
+
     writer = None
+    stage = "question_validation"
     try:
+        question_data = read(args.instruction, question_limit)
+        question = question_data.decode("utf-8")
+        require(sha(question_data) == binding["question_sha256"], "question_binding")
+        remaining()
+        stage = "common_config_validation"
+        require(config["profile"] == PROFILE, "profile")
+        check_config(config, "reader")
+        remaining()
+        stage = "common_binary_validation"
+        require(config["reader_base_binary"]["path"] == config["codex_binary"], "reader_binary_path")
+        copy_asset(config["reader_base_binary"], 2**30)
+        remaining()
+        stage = "arm_bundle_validation"
+        if binding["arm"] == "raw_only":
+            require(not any(Path(path).exists() for path in
+                            (config["gptgrep_binary"], PRODUCT_ROOT, PRODUCT_PROVENANCE)),
+                    "bare_image_has_treatment_binary")
+        else:
+            check_product_bundle(config)
+        remaining()
+        stage = "native_version_validation"
         env = native_environment(os.environ, product=binding["arm"] == "gptgrep")
         version = run([config["codex_binary"], "--version"], cwd="/data/corpus",
-                      timeout=min(5, config["deadline_seconds"]), env=native_environment(os.environ))
+                      timeout=min(5, remaining()), env=native_environment(os.environ))
         require(version["return_code"] == 0 and version["failure"] is None and
                 version["stdout"].strip() == ("codex-cli " + CODEX_VERSION).encode(), "native_version_mismatch")
         operation["observed_native_version"] = version["stdout"].decode().strip()
         decisions = None
         if binding["arm"] == "gptgrep":
             decisions = operation["decisions_mode"] = selected_mode(config)
-        argv = reader_argv(config, binding, question)
-        # Both arms record the same shared answer rules, or none, for the run.
-        rules = shared_answer_rules(config)
-        operation["shared_answer_rules_sha256"] = sha(rules.encode()) if rules else None
+        stage = "query_preparation"
+        task_input = task_prompt(config, question)
+        argv = reader_argv(config, binding, task_input.decode("utf-8"))
+        native_input = task_input if binding["arm"] == "raw_only" else None
+        operation["prompt_observation"] = prompt_observation(config, binding, question, task_input)
         if decisions == "preparation":
             writer = acquire_writer()
             env, operation["decisions_preparation"] = prepare_decisions(
-                config, binding, question, argv, started=started,
+                config, binding, question, task_input, argv, started=started,
                 deadline_unix_ms=deadline_unix_ms, environ=os.environ)
         elif decisions == "existing_context":
             budget = parse(pinned(config["decisions_budget"], 16384))
@@ -274,14 +302,12 @@ def main():
                     "decisions_ledger_mount_contract")
         # invocation_bounded joins no ledger: the Ask creates its own context and
         # its reported Decisions cost receipt is kept per trial below.
-        native_input = raw_prompt(config, question) if binding["arm"] == "raw_only" else None
-        remaining = config["deadline_seconds"] - (time.monotonic() - started)
-        require(remaining > 0, "reader_deadline")
         if decisions == "invocation_bounded":
             # Create-new, immediately before the one Ask: a re-executed trial
             # stops here as an operational failure with no Decisions spend.
             operation["decisions_claim"] = claim_invocation(binding, deadline_unix_ms)
-        result = run(argv, cwd="/data/corpus", timeout=remaining, env=env, input_bytes=native_input)
+        stage = "reader_process"
+        result = run(argv, cwd="/data/corpus", timeout=remaining(), env=env, input_bytes=native_input)
         attempt = {"ordinal": 0, "elapsed_ms": result["elapsed_ms"],
                    "return_code": result["return_code"], "failure": result["failure"],
                    "stdout_sha256": sha(result["stdout"]), "stdout_bytes": len(result["stdout"]),
@@ -315,26 +341,34 @@ def main():
             except (OSError, ValueError, TypeError):
                 operation["decisions_receipt"] = None
         require(result["failure"] is None and result["return_code"] == 0, "reader_process")
+        stage = "answer_validation"
         answer, metadata = (product_result(result["stdout"], config["reader_mode"]) if binding["arm"] == "gptgrep"
-                            else codex_result(result["stdout"]))
+                            else codex_result(result["stdout"], allow_missing_usage=True))
         attempt.update(metadata)
         if binding["arm"] == "gptgrep":
             # A completed intentional abstention crosses as an ordinary response
             # for judging; the flag stays in the private operation record.
             operation["insufficient_evidence"] = metadata["insufficient_evidence"]
         outcome.update(status="response", answer=answer)
+        operation["answer_sha256"] = sha(canonical(outcome))
+        remaining()
     except Exception:
         # Redacted code only: exception text may contain task/provider/private data.
+        outcome.update(status="operational_failure", answer=None)
+        operation["answer_sha256"] = sha(canonical(outcome))
         operation["failure"] = "reader_failed"
+        operation["failure_stage"] = stage
     finally:
         if writer is not None:
             os.close(writer)
-    operation["cumulative_query_wall_ms"] = round((time.monotonic() - started) * 1000)
     operation["status"] = outcome["status"]
-    operation["answer_sha256"] = sha(canonical(outcome))
-    put("/logs/agent/operational.json", operation)
+    operation["cumulative_query_wall_ms"] = round((time.monotonic() - started) * 1000)
+    operation["query_wall_scope"] = "question_read_through_answer_envelope_hash; terminal_writes_excluded"
     # Only this bounded envelope crosses to the separate primary verifier.
+    persistence_started = time.monotonic()
     put("/answer/answer.json", outcome)
+    operation["answer_persistence_wall_ms"] = round((time.monotonic() - persistence_started) * 1000)
+    put("/logs/agent/operational.json", operation)
 
 
 if __name__ == "__main__":

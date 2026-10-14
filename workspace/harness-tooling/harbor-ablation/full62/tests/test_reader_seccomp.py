@@ -197,24 +197,30 @@ class ReaderSeccompReadmeTests(unittest.TestCase):
     def setUp(self):
         text = README.read_text(encoding="utf-8")
         section = text.split("\n### Reader seccomp profile\n", 1)[1].split("\n### ", 1)[0]
-        record = section.split("\n**Acceptance probes.**", 1)[1]
+        record = section.split("\n**Required acceptance checks.**", 1)[1]
         self.probes = dict(re.findall(r"^(\d)\. (.+)$", record, flags=re.M))
-        self.status = record.rstrip().rsplit("\n\n", 1)[1]
+        self.status = record.split("**Reported status, 2026-10-13 UTC.**", 1)[1].split("<!-- BEGIN", 1)[0]
 
-    def test_amended_probe_keeps_the_approved_form_and_is_not_reported_as_passed_as_approved(self):
+    def test_amended_probe_retains_original_failure_and_unverified_reported_status(self):
         self.assertEqual(sorted(self.probes), ["1", "2", "3", "4", "5"])
         first = self.probes["1"]
         self.assertTrue(first.startswith("**Amended"), first)
         # Both forms stay visible: the approved one with its observed refusal, and the amendment.
         self.assertIn("`%s`" % APPROVED_PROBE_1, first)
         self.assertIn("`%s`" % AMENDED_PROBE_1, first)
-        self.assertIn("refuses", first)
-        # The owner's acknowledgement of the amended criterion is stated, whichever way it stands.
-        self.assertRegex(first, r"owner[^.]*acknowledg")
+        self.assertIn("refused", first)
+        # The historical acceptance report does not substitute for the exact receipt.
+        self.assertIn("reports owner acceptance of this amendment", first)
+        self.assertIn("failure remains retained", first)
+        self.assertIn("exact acceptance-receipt provenance is unverified here", first)
         # The status never counts probe 1 among the probes that passed as approved.
         self.assertNotRegex(self.status, r"Probes 1\s*(?:[-–]|to)\s*\d passed")
-        self.assertRegex(self.status, r"Probe 1 passed[^.]*\bamended form")
-        self.assertRegex(self.status, r"owner[^.]*acknowledg")
+        self.assertIn("reports adapter integration and acceptance of probes 1–3", self.status)
+        self.assertIn("preserves the original `--proc` failure", self.status)
+        self.assertIn("No exact acceptance receipt was supplied", self.status)
+        self.assertIn("Those joins remain independently unverified", self.status)
+        self.assertIn("Probe 4 (actual Judge/verifier default profile) and probe 5 (paired native-tool smoke) remain pending",
+                      self.status)
 
 
 class ReaderSeccompMaterializationTests(unittest.TestCase):

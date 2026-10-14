@@ -82,7 +82,7 @@ def _projection(data):
     answer = None
     completions = 0
     tool_calls = 0
-    events = malformed = invalid_usage = omitted_usage = 0
+    events = malformed = missing_usage = invalid_usage = omitted_usage = 0
     failed = False
     observations = []
     for raw in data.splitlines():
@@ -112,6 +112,9 @@ def _projection(data):
         if kind == "turn.completed":
             completions += 1
             usage = event.get("usage")
+            if usage is None:
+                missing_usage += 1
+                continue
             try:
                 require(isinstance(usage, dict), "native_usage_missing")
                 totals = {key: integer(usage.get(key)) for key in
@@ -128,15 +131,16 @@ def _projection(data):
         answer_valid = isinstance(answer, str) and bool(answer.strip()) and len(answer.encode("utf-8")) <= MAX_ANSWER
     except UnicodeError:
         answer_valid = False
-    complete = completions == 1 and not (failed or malformed or invalid_usage or omitted_usage) and answer_valid
+    complete = completions == 1 and not (failed or malformed or missing_usage or invalid_usage or omitted_usage) and answer_valid
     return answer, {"usage": observations[0]["usage"] if completions == 1 and len(observations) == 1 else None,
                     "native_completed_turn_usage": observations,
                     "native_usage_observations_omitted": omitted_usage,
                     "native_completed_turns": completions, "native_completion_ambiguous": completions > 1,
+                    "native_missing_usage_events": missing_usage,
                     "native_malformed_events": malformed, "native_invalid_usage_events": invalid_usage,
                     "native_error_observed": failed, "native_answer_valid": answer_valid,
                     "native_stream_incomplete": not complete,
-                    "accounting_projection_complete": not (malformed or invalid_usage or omitted_usage),
+                    "accounting_projection_complete": not (malformed or missing_usage or invalid_usage or omitted_usage),
                     "usage_scope": "observed_completed_turns_not_total_provider_usage",
                     "tool_calls": tool_calls, "physical_provider_requests": None,
                     "cost_usd": None, "cost_complete": False,
@@ -147,9 +151,18 @@ def codex_accounting(data):
     return _projection(data)[1]
 
 
-def codex_result(data):
+def codex_result(data, *, allow_missing_usage=False):
     answer, metadata = _projection(data)
     require(not metadata["native_completion_ambiguous"], "duplicate_native_completion")
     require(not metadata["native_error_observed"], "native_turn_failed")
-    require(not metadata["native_stream_incomplete"], "native_final_missing_or_invalid")
+    # Reader quality acceptance is independent of absent accounting, as for
+    # product_result. Judge callers keep the strict default. Invalid reported
+    # usage, malformed events and missing/ambiguous terminals remain failures.
+    missing_accounting_only = (
+        allow_missing_usage and metadata["native_completed_turns"] == 1
+        and metadata["native_answer_valid"] and metadata["native_missing_usage_events"] == 1
+        and not (metadata["native_malformed_events"] or metadata["native_invalid_usage_events"]
+                 or metadata["native_usage_observations_omitted"]))
+    require(not metadata["native_stream_incomplete"] or missing_accounting_only,
+            "native_final_missing_or_invalid")
     return answer, metadata

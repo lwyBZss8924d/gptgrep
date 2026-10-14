@@ -5,7 +5,8 @@
 without sharing any other Codex state. It is a single Python 3.12+ standard-library file. It never
 opens, reads, hashes or decodes the credential: every check uses `lstat` metadata.
 
-Status: implemented and qualified against fake credentials and loopback fakes (see
+Status at 2026-10-14 UTC: implemented, with scoped fake-credential checks accepted
+and the complete current runtime chain still pending (see
 [Qualification](#qualification)). Live behaviour against a real login is not established by this
 document. Follow the [live runbook](#live-runbook) and record its results separately. The
 [limitations](#limitations-and-unmanaged-entry-points) are part of the contract: the related
@@ -29,7 +30,7 @@ acceptance items stay `BLOCKED` until each is qualified.
 | Owner failure classes | The owner runs with `RUST_LOG=error,codex_login=warn,codex_app_server=warn`, because by default the app-server logs only errors and hides transient refresh failures. Its log is classified by the 0.162.1 error codes and messages. **Permanent** (`REFRESH_TOKEN_REUSED`, `_EXPIRED`, `_REVOKED`, `INVALID_GRANT`, `ACCOUNT_MISMATCH`, `REFRESH_REJECTED` for any other 401) gives `BLOCKED_AUTH` (77) and a quarantine whose details carry `failure_kind=permanent`. **Transient** (`TRANSPORT`, `RATE_LIMITED`, `AUTHORITY_SERVER_ERROR`) with an unchanged credential that still reads as a chatgpt account gives `REFRESH_UNAVAILABLE` (69): no quarantine, retry later. An unclassified failure is `BLOCKED_AUTH` with a quarantine, but is never treated as permanent. |
 | Owner stop | Close stdin and wait. If the owner is still running, SIGTERM its group with a long grace. SIGKILL is sent only after the grace, and is then recorded as `OWNER_SIGKILLED_AFTER_GRACE` with a quarantine, because the save may have been torn. If the supervisor is killed during a refresh, the guardian waits for the owner and quarantines any credential change it could not judge (`OWNER_REFRESH_UNRECORDED`, ledger `OWNER_INTERRUPTED`). |
 | Consumer auth failures | Consumers report an explicit auth failure (unauthorized, not logged in, refresh rejected) by **writing the auth-failure record and exiting 77**. The record is `$GPTGREP_AUTH_FAILURE_RECORD` (`{results}/auth-failure.json`): `{"schema": "gptgrep.codex-auth.auth-failure.v1", "class": "AUTH_UNAUTHORIZED"}`, where the class is `AUTH_UNAUTHORIZED`, `AUTH_NOT_LOGGED_IN`, `AUTH_UNEXPECTED_ACCOUNT_TYPE` or `AUTH_REFRESH_REJECTED`. It counts only as this uid's regular file with one link that is not the credential, at most 4 KiB (read with `O_NOFOLLOW`). The run is then `BLOCKED_AUTH`, and an auth-block marker refuses new consumer runs until an owner refresh succeeds (it forces the refresh even when the file is fresh), a re-login succeeds, or a human runs `clear-quarantine --auth-block`. Exit 77 alone is also sysexits `EX_NOPERM`: it gives `FAILED` with the anomaly `CONSUMER_EXIT_77_WITHOUT_AUTH_FAILURE_RECORD` and blocks nothing. Network, rate-limit and server failures must use other codes and never block. `account-probe` implements the contract: 0 OK, 77 with the record for an auth failure, 69 service unavailable. |
-| Canonical integrity | Every run records canonical metadata before and after, and the guardian re-checks it before a late release. Any change during or after a consumer run is `CANONICAL_CHANGED_BY_CONSUMER` or `CANONICAL_CHANGED_AFTER_SUPERVISOR`: state `QUARANTINED` (78) plus the quarantine marker. |
+| Canonical integrity | Every run records canonical metadata before and after, and the guardian re-checks it before a late release. Existence, device/inode, size, mtime, ctime and permission mode are compared using `lstat` only. A mode-only change, including a change restored to its original mode with a different ctime, quarantines. Any detected change during or after a consumer run is `CANONICAL_CHANGED_BY_CONSUMER` or `CANONICAL_CHANGED_AFTER_SUPERVISOR`: state `QUARANTINED` (78) plus the quarantine marker. |
 | Credential links | Codex saves in place and a re-login installs by rename, so the canonical file always has one link. The canonical preflight of `run` and `refresh` refuses a second link (`canonical_auth_hardlinked`, `QUARANTINED`, marker `CANONICAL_HARDLINKED`): a hard link elsewhere is a credential copy that survives rotation. After every consumer run, and again in the guardian before a late release, the supervisor scans the run directory. It never opens a file, and its walk never descends through a symlink. It lists the run's directories one at a time, entering each by name and returning through `..`, both checked by device and inode; it never builds a path string, so neither the tree's depth, `PATH_MAX` nor the open-file limit stops it. It looks for a hard link to the credential and, other than the run's own `codex-home/auth.json`, for a symlink whose target is the canonical file, the auth home or a directory above it, anything inside the auth home, a run's `codex-home` or anything inside one, or the runs root, a role directory or a run directory (these hold codex-homes). A symlink target is resolved one component and one link at a time, relative to directory descriptors opened for lookups only (`O_SEARCH` on macOS), and compared by device and inode. Each finding is removed by name within its own directory descriptor, so the removal can never reach the credential. A hard link is removed only while the canonical path, through a physical auth home, still names that file. If the consumer replaced the canonical path or the auth home, the link may be the only copy of the original, and it is kept for review (`kept`). Any finding gives `QUARANTINED` with `CREDENTIAL_LINK_IN_RUN_DIR`, listed in the receipt's `credential_links` (run-relative paths; for a symlink, what it `reaches`). A second link that remains outside the run directory gives `CANONICAL_HARDLINKED`. A directory the scan cannot read, or a symlink it cannot resolve (a loop, or a directory without search permission on the way), makes the scan incomplete. The scan then fails closed: `QUARANTINED` with `CREDENTIAL_LINK_SCAN_INCOMPLETE`, and `credential_links.scan_error_items` lists each path and error. |
 | Re-login | Only for an unusable credential, in an empty staging home, installed by an atomic rename after success. See [Re-login](#re-login-maintenance). |
 | Non-secret records | `manifest.json`, `receipt.json` and `state/supervisor-events.jsonl` in the run directory, plus `state/lease-guardian-*.json`. Lease sidecars hold only pid, guardian pid, host id, process start time, run id, role, operation, mode and acquired/released times. The owner ledger `<lease_path>.ledger.jsonl`, the quarantine marker `<lease_path>.quarantine`, the auth-block marker `<lease_path>.auth-blocked` and the binding marker hold no secrets. Child stdout/stderr go to `state/logs/` and are never parsed into receipts. |
@@ -196,9 +197,14 @@ and both are recorded.
   gptgrep.auth-job=<run_id>`. Never launch through a wrapper that re-exports the canonical
   `CODEX_HOME`.
 - The supervisor polls the label while Harbor runs and requires at least one matching container
-  before it accepts "cleared". A label that never matched gives `UNKNOWN`, so a wrong label cannot
-  release the lease early. After Harbor exits, the supervisor waits for the label to clear. The
-  guardian keeps watching it after an `UNKNOWN` result, even when the first check was clear.
+  before it accepts "cleared". The first positive observation is written atomically to
+  `state/lease-guardian-docker.json`, bound to the exact label, before the supervisor relies on it.
+  The guardian loads that record after handoff, restart or supervisor death. It can also record a
+  later positive observation itself. A label that never matched gives `UNKNOWN` and keeps the
+  lease indefinitely: repeated empty results and query errors cannot prove detached consumers
+  are gone. After a positive observation, the guardian requires clear process sweeps and two
+  consecutive empty label polls before release. It keeps watching after `UNKNOWN`, even when
+  the supervisor's first check was clear.
 - The `harbor` role uses `stop_scope=root-first` with a long `term_grace_seconds`. Harbor turns
   SIGTERM into its own cancel path, which removes the trial containers.
 - **Qualified with a real Docker engine, not with Harbor:** the optional container pass ran plain
@@ -368,8 +374,12 @@ shared-login use until each is routed through `run`:
   the shared login only under `run`.
 - Scripts with built-in concurrency (system eval, PageIndex) and OCR's two app-servers need
   in-job concurrency 1 under the exclusive lease.
-- No GPTgrep product, OCR, Document or Judge call chain, and no Harbor trial (only plain containers
-  from a local image), has been run under the supervisor yet. CRED-11 and CTR-05 stay open.
+- The 2026-10-13 producer checkpoint reports supervised host-side GPTgrep pilot and Opt-1
+  runs on 1.3.1; exact remote receipts have not been independently verified in the integration
+  review. Those reports do not qualify the complete nested Harbor reader, GPTgrep, OCR,
+  Document and Judge chain. Plain-container tests cover only their selected container lifecycle.
+  CRED-11 and CTR-05 remain open for that complete chain; the repaired lease must first pass
+  fake-credential, no-network qualification before shared-login Harbor use.
 - The owner attributes every canonical change made while it holds the exclusive lease to itself. An
   unmanaged writer active at the same time cannot be told apart.
 - Process tracking cannot see a daemon that escapes between samples, closes inherited descriptors
@@ -457,8 +467,11 @@ files. Record receipts under your private evidence location.
   afterwards (`lease_file_missing`) until `rebind-lease` is run with no live holders.
 - `UNKNOWN`: inspect `receipt.json` → `sweep` and `docker`, and `state/lease-guardian-*.json`.
   - Verify that the listed pids and containers belong to this run before stopping them.
-  - The guardian releases the lease once they are gone. It works from a config snapshot taken when
-    it started, so later config edits cannot release the lease early.
+  - The guardian releases once they are gone and any configured label has been positively
+    observed and then cleared. If the label never matched, reconcile the actual job's detached
+    consumers and label with the owner; empty polls, changing config or clearing quarantine do
+    not release the lease. Keep the retained guardian until that reconciliation is complete.
+    It works from a config snapshot taken when it started.
   - Never rerun automatically: check for duplicate side effects or charges first.
 - `QUARANTINED`: something changed the credential, replaced a run's link, linked the credential,
   listened on the blocker, or an owner was interrupted or killed. Find the cause, such as an
@@ -525,6 +538,17 @@ Procedure:
 
 ## Qualification
 
+The current integration retains an earlier 16-test focused pass and a separate
+97-test run with 3 failures and 4 errors; its storage inventory also hit a
+path-length limit. A subsequent 9-test credential-link follow-up passed and
+received independent source/receipt acceptance for that repair and its scoped
+cleanup. A further five-case run passed after the canonical-file change-detection
+repair, with all five fake worlds released and the selected cleanup receipts
+independently reviewed. These focused passes do not replace a passed full-suite
+qualification or prove the complete nested runtime chain. See the dated
+[public integration results](../../../docs/experimental-status.md) for current
+aggregate status; exact receipts remain local.
+
 ```text
 python3 -I -B tests/run_qualification.py --results-dir /path/to/results \
     [--codex-bin /path/to/official/codex --codex-sha256 <pin>] [--unguarded-tool-sandbox \
@@ -534,8 +558,11 @@ python3 -I -B tests/run_qualification.py --results-dir /path/to/results \
 The runner writes `<results>/<UTC>/` containing `logs/unittest.log`, `summary.json` (counts,
 per-test outcomes, non-secret observations), `runner-meta.json` and `sandbox.sb`.
 
-- On macOS it re-executes under `sandbox-exec`. Outbound network is allowed only to its reserved
-  loopback ports and port 9, so system proxies, DNS and every real endpoint are unreachable.
+- On macOS it re-executes under `sandbox-exec` with a profile intended to allow
+  only its reserved loopback ports and port 9. The actual denial control below
+  must pass before that profile is accepted. Current-host checks found that a
+  loopback exception could still permit a connection to the local proxy; a
+  declared profile alone does not establish external-network isolation.
 - Any access under the real `~/.gptgrep` and `~/.codex` is denied.
 - Tests that run a real Codex binary refuse to run without this guard. A declared guard is not
   enough: they require a loopback connect to a port the runner did not reserve to be denied.
@@ -582,6 +609,11 @@ Covered:
   - a killed supervisor, after the child exits and during an owner refresh;
   - the post-launch exception path;
   - the guardian's canonical re-check and its continued label watch;
+  - label-aware fake Docker with surviving A/wrong B, supervisor death, guardian restart,
+    query errors, durable positive observation and later clear; the real exclusive lease stays
+    blocked until the observation and cleanup conditions hold;
+  - mode-only and restored-mode/ctime mutations of the synthetic canonical file, including a
+    late survivor; lifecycle fixture cleanup records no remaining owned live processes;
   - the guardian does not adopt a reused root pid;
   - a listener appearing on the blocker port.
 - (i) `CODEX_API_KEY` stripped. The unsupervised negative control shows `codex exec` would log out,

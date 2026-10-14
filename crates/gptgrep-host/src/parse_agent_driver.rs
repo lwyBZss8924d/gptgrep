@@ -1190,6 +1190,30 @@ struct Incoming {
     value: Value,
     _lease: DocumentWorkingLease,
 }
+
+struct DocumentRuntimeFailure {
+    diagnostic: crate::DocumentRuntimeError,
+    _retained: DocumentWorkingLease,
+}
+impl std::fmt::Debug for DocumentRuntimeFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("DocumentRuntimeFailure")
+            .field(&self.diagnostic)
+            .finish()
+    }
+}
+impl std::fmt::Display for DocumentRuntimeFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.diagnostic, formatter)
+    }
+}
+impl std::error::Error for DocumentRuntimeFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.diagnostic)
+    }
+}
+
 struct Rpc<R, W> {
     reader: R,
     writer: W,
@@ -1199,8 +1223,73 @@ struct Rpc<R, W> {
     deadline: Instant,
     messages: usize,
     native_execution: bool,
+    observation: crate::DocumentRuntimeTransport,
+    usage: Option<Value>,
+    usage_retained: Option<DocumentWorkingLease>,
+    usage_updates_without_numeric: usize,
 }
 impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Rpc<R, W> {
+    fn observe_usage(
+        &mut self,
+        message: &Value,
+        thread_id: &str,
+        turn_id: &mut Option<String>,
+    ) -> Result<()> {
+        same_thread(message, thread_id)?;
+        bounded_json(&message["params"]["tokenUsage"], 4096)?;
+        if let Some(usage_turn) = message["params"].get("turnId") {
+            bind_turn(turn_id, usage_turn)?;
+            if self.usage_retained.is_none() {
+                self.usage_retained = Some(self.working.reserve(4096)?);
+            }
+            if let Some(usage) =
+                crate::codex_error::observed_usage(&message["params"]["tokenUsage"])
+                    .filter(|usage| usage.get("total").is_some() || usage.get("last").is_some())
+            {
+                self.usage = Some(usage);
+            } else {
+                self.usage_updates_without_numeric = self
+                    .usage_updates_without_numeric
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("document_usage_observation_limit"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn refusal(
+        &self,
+        stage: crate::DocumentRuntimeStage,
+        startup_method: Option<crate::DocumentStartupMethod>,
+        event: crate::DocumentRuntimeEvent,
+        identity: crate::DocumentRuntimeIdentity,
+        params: &Value,
+    ) -> anyhow::Error {
+        // Keep the bounded closed projection charged until the returned error
+        // is dropped, including across awaited process and OCR cleanup.
+        let retained = match self.working.reserve(65_536) {
+            Ok(retained) => retained,
+            Err(error) => return error,
+        };
+        let mut diagnostic = crate::DocumentRuntimeError::new(
+            stage,
+            startup_method,
+            event,
+            identity,
+            params,
+            self.observation,
+            self.usage.as_ref(),
+        );
+        diagnostic.usage_updates_without_numeric = (identity
+            != crate::DocumentRuntimeIdentity::Mismatch)
+            .then_some(self.usage_updates_without_numeric);
+        DocumentRuntimeFailure {
+            diagnostic,
+            _retained: retained,
+        }
+        .into()
+    }
+
     async fn send(&mut self, value: Value) -> Result<(String, usize)> {
         let _lease = self
             .working
@@ -1277,8 +1366,13 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Rpc<R, W> {
         Ok(())
     }
     async fn request(&mut self, id: u64, method: &str, params: Value) -> Result<Incoming> {
+        let startup_method = crate::DocumentStartupMethod::parse(method)
+            .ok_or_else(|| anyhow!("document_unknown_startup_method"))?;
         self.send(json!({"id":id,"method":method,"params":params}))
             .await?;
+        if startup_method == crate::DocumentStartupMethod::ThreadStart {
+            self.observation.thread_start_sent = true;
+        }
         loop {
             let mut reply = self.receive().await?;
             if reply.value.get("method").is_some() {
@@ -1286,6 +1380,15 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Rpc<R, W> {
                     ensure!(rpc_id(server), "document_rpc_id");
                     self.deny(server.clone()).await?;
                     return Err(anyhow!("document_startup_request"));
+                }
+                if let Some(event) = crate::DocumentRuntimeEvent::parse(&reply.value["method"]) {
+                    return Err(self.refusal(
+                        crate::DocumentRuntimeStage::Startup,
+                        Some(startup_method),
+                        event,
+                        crate::DocumentRuntimeIdentity::Startup,
+                        &reply.value["params"],
+                    ));
                 }
                 ensure!(
                     (self.native_execution && native_metadata(&reply.value)?)
@@ -1303,6 +1406,9 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Rpc<R, W> {
                 .as_object_mut()
                 .and_then(|object| object.remove("result"))
                 .ok_or_else(|| anyhow!("document_startup_reply"))?;
+            if startup_method == crate::DocumentStartupMethod::ThreadStart {
+                self.observation.thread_start_acknowledged = true;
+            }
             return Ok(reply);
         }
     }
@@ -1388,6 +1494,10 @@ async fn run_protocol<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         deadline,
         messages: 0,
         native_execution: native_execution.is_some(),
+        observation: crate::DocumentRuntimeTransport::default(),
+        usage: None,
+        usage_retained: None,
+        usage_updates_without_numeric: 0,
     };
     let initialized=rpc.request(1,"initialize",json!({"clientInfo":{"name":"gptgrep_document_parse","title":"GPTgrep document parse agent","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true,"explicitGatewayOauth":true}})).await?;
     if let Some(native) = native.as_mut() {
@@ -1589,6 +1699,7 @@ async fn run_protocol<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         "outputSchema":output_schema}}),
     )
     .await?;
+    rpc.observation.turn_start_sent = true;
     drop(output_schema);
     drop(qualification_enum_lease);
     let mut turn_id = None;
@@ -1709,7 +1820,32 @@ async fn run_protocol<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 "document_turn_start"
             );
             bind_turn(&mut turn_id, &message.value["result"]["turn"]["id"])?;
+            rpc.observation.turn_start_acknowledged = true;
             continue;
+        }
+        if let Some(event) = crate::DocumentRuntimeEvent::parse(&message.value["method"]) {
+            let stage = if rpc.observation.turn_start_acknowledged {
+                crate::DocumentRuntimeStage::ActiveTurn
+            } else {
+                crate::DocumentRuntimeStage::TurnStart
+            };
+            let params = &message.value["params"];
+            let global_warning = matches!(
+                event,
+                crate::DocumentRuntimeEvent::ConfigWarning
+                    | crate::DocumentRuntimeEvent::ConfigWarningSlash
+            ) && params.get("threadId").is_none()
+                && params.get("turnId").is_none();
+            let identity = if global_warning {
+                crate::DocumentRuntimeIdentity::GlobalNotification
+            } else if same_thread(&message.value, &thread_id).is_ok()
+                && bind_turn(&mut turn_id, &params["turnId"]).is_ok()
+            {
+                crate::DocumentRuntimeIdentity::Matched
+            } else {
+                crate::DocumentRuntimeIdentity::Mismatch
+            };
+            return Err(rpc.refusal(stage, None, event, identity, params));
         }
         if native_execution.is_some() && native_metadata(&message.value)? {
             if !message.value["params"]["threadId"].is_null() {
@@ -1752,11 +1888,7 @@ async fn run_protocol<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 }
             }
             Some("thread/tokenUsage/updated") => {
-                same_thread(&message.value, &thread_id)?;
-                if message.value["params"].get("turnId").is_some() {
-                    bind_turn(&mut turn_id, &message.value["params"]["turnId"])?;
-                }
-                bounded_json(&message.value["params"]["tokenUsage"], 4096)?;
+                rpc.observe_usage(&message.value, &thread_id, &mut turn_id)?;
             }
             Some("turn/completed") => {
                 same_thread(&message.value, &thread_id)?;
@@ -1825,9 +1957,6 @@ async fn run_protocol<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     qualification_image_observations: answer.image_observations.unwrap_or_default(),
                     _retained: calls.retained,
                 });
-            }
-            Some("error" | "configWarning" | "config/warning" | "model/rerouted") => {
-                return Err(anyhow!("document_runtime_refused_no_retry"));
             }
             _ => return Err(anyhow!("document_unknown_protocol_event")),
         }
@@ -2013,9 +2142,6 @@ fn automatic(message: &Value) -> Result<bool> {
             | "item/reasoning/textDelta"
             | "item/agentMessage/delta",
         ) => Ok(true),
-        Some("configWarning" | "config/warning" | "model/rerouted" | "error") => {
-            Err(anyhow!("document_runtime_refused_no_retry"))
-        }
         _ => Ok(false),
     }
 }

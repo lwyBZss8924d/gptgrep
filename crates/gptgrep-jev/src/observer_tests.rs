@@ -328,11 +328,26 @@ async fn borrowed_body_rejection_or_elapsed_admission_prevents_http_and_keeps_at
             .decide(json!({"source":"ceramic"}), questions())
             .await
             .unwrap_err();
-        assert!(error.to_string().contains(if elapsed {
-            "expired during send admission"
+        if elapsed {
+            assert!(error.to_string().contains("expired during send admission"));
         } else {
-            "body_admission_rejected"
-        }));
+            let diagnostic = error
+                .downcast_ref::<DecisionFailure>()
+                .unwrap()
+                .diagnostic();
+            assert_eq!(diagnostic.kind, DecisionFailureKind::ObserverCallback);
+            let observer = diagnostic.observer_failure.as_ref().unwrap();
+            assert_eq!(observer.callbacks, [DecisionObserverCallback::SendStarted]);
+            assert!(!observer.send_started);
+            assert!(!observer.response_validated);
+            assert!(!error.to_string().contains("body_admission_rejected"));
+            assert!(!format!("{error:?}").contains("body_admission_rejected"));
+            assert!(
+                !serde_json::to_string(diagnostic)
+                    .unwrap()
+                    .contains("body_admission_rejected")
+            );
+        }
         assert!(
             tokio::time::timeout(Duration::from_millis(50), listener.accept())
                 .await

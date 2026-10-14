@@ -131,6 +131,10 @@ Reader 的 `DeliveredEvidence` 登记本绑定本次已交付的文本窗口／�
 
 ### 5.2 自动分流与任务合同
 
+本节保留最初固定 transport 的设计背景。下文 8 次调用／180 秒及严格 native-viewer guard 的约束
+适用于该历史模式；当前 native PTC Document/OCR 使用调用方选定的权限、能力和 job 预算，
+以 [architecture](../architecture.md#prepared-document-agent) 的当前合同为准。历史设计不构成当前 live 验收。
+
 拟新增：`gptgrep index ROOT --ocr auto --plan-only --json`。plan-only 可以执行本地转换、native parse 与截图来形成准确计划，并将结果写入未发布候选；零模型调用、不发布 CURRENT。默认 `--ocr off` 不启动任何模型，原有无法完整提取时的失败语义保留。
 
 逐页记录 native 字符／区域覆盖、可见 raster／矢量证据、garbled/broken-font 信号、复杂度、选定区域与原因。无文本且存在内容、明显文字缺损、无法可靠提取的区域优先；复杂布局本身只增加检查信号，不强制 OCR。真正空白页必须有可解释的空白证据，不能因解析失败被归类为空白。

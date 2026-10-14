@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict'
-import { spawn, execFileSync } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { after, before, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { setTimeout as delay } from 'node:timers/promises'
 
 const entry = fileURLToPath(new URL('../src/cli.js', import.meta.url))
 let temporary
@@ -238,14 +239,20 @@ test('foreground group cleanup survives native exit before a signal-ignoring gra
     assert.equal(result.code,signal === 'SIGINT' ? 130 : signal === 'SIGTERM' ? 143 : 124)
     const {descendant_pid:pid}=JSON.parse(result.stdout.trim())
     assert.ok(Number.isInteger(pid))
-    let state=''
-    try { state=execFileSync('ps',['-p',String(pid),'-o','stat='],{encoding:'utf8'}).trim() } catch (error) {
-      assert.equal(error.status,1)
+    // Signal 0 needs no setuid process-list utility. Await OS reaping too;
+    // only ESRCH proves absence, while a denied query remains a test failure.
+    let stopped=false
+    const reapDeadline=Date.now()+2000
+    while (Date.now()<reapDeadline) {
+      try { process.kill(pid,0) } catch (error) {
+        assert.equal(error.code,'ESRCH')
+        stopped=true
+        break
+      }
+      await delay(25)
     }
-    // An orphan may briefly await OS reaping as a zombie, but cannot execute.
-    const stopped=state === '' || state.startsWith('Z')
     if (!stopped) { try { process.kill(pid,'SIGKILL') } catch {} }
-    assert.ok(stopped,`Owned descendant remained live after foreground completion: ${state}`)
+    assert.ok(stopped,'Owned descendant still existed after foreground completion and OS reaping deadline')
   }
 })
 

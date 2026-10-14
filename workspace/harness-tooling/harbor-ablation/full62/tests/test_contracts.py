@@ -14,7 +14,7 @@ from gptgrep_harbor.adapter import Full62Adapter, validate_cohort, env_templates
 import gptgrep_harbor.adapter as adapter_module
 from gptgrep_harbor.aggregate import paired, summarize, time_bounds
 from gptgrep_harbor.common import MAX_ANSWER, MAX_NATIVE_PROMPT_BYTES, PROFILE, canonical, parse, sha
-from gptgrep_harbor.native import codex_accounting, codex_result, output_schema_bytes, prompt_bytes
+from gptgrep_harbor.native import codex_accounting, codex_argv, codex_result, output_schema_bytes, prompt_bytes
 from gptgrep_harbor.reader import product_accounting
 from gptgrep_harbor import reader, verifier
 from gptgrep_harbor.runtime import CODEX_VERSION, READER_SECCOMP_BYTES, READER_SECCOMP_SHA256
@@ -287,6 +287,67 @@ class NativeAccountingTests(unittest.TestCase):
         self.assertEqual(repeated["native_usage_observations_omitted"], 1)
         self.assertFalse(repeated["accounting_projection_complete"])
 
+    def test_reader_missing_usage_matches_treatment_quality_and_keeps_unknown_accounting(self):
+        text = "A complete synthetic answer."
+        for completion in ({"type": "turn.completed"}, {"type": "turn.completed", "usage": None}):
+            with self.subTest(completion=completion):
+                data = b"\n".join(canonical(event) for event in [
+                    {"type": "item.completed", "item": {"type": "agent_message", "text": text}}, completion])
+                output = self.reader_main(data)
+                answer = output["/answer/answer.json"]
+                self.assertEqual((answer["status"], answer["answer"]), ("response", text))
+                info = output["/logs/agent/operational.json"]["attempts"][0]
+                self.assertIsNone(info["usage"])
+                self.assertEqual(info["native_completed_turn_usage"], [])
+                self.assertEqual(info["native_missing_usage_events"], 1)
+                self.assertEqual(info["native_invalid_usage_events"], 0)
+                self.assertFalse(info["accounting_projection_complete"])
+                self.assertIsNone(info["cost_usd"])
+                self.assertIsNone(info["physical_provider_requests"])
+                self.assertFalse(info["cost_complete"])
+                treatment, _ = LegacyTreatmentReaderTests().run_reader(legacy_report(answer=text))
+                self.assertEqual(treatment["/answer/answer.json"]["status"], answer["status"])
+                self.assertEqual(treatment["/answer/answer.json"]["answer"], answer["answer"])
+                self.assertIsNone(treatment["/logs/agent/operational.json"]["attempts"][0]["usage"])
+                # A reader-only exception does not widen Judge acceptance.
+                with self.assertRaisesRegex(ValueError, "native_final_missing_or_invalid"):
+                    codex_result(data)
+                judge_data = b"\n".join(canonical(event) for event in [
+                    {"type": "item.completed", "item": {"type": "agent_message",
+                     "text": '{"equivalent":true}'}}, completion])
+                judged = self.judge_main(judge_data)
+                self.assertEqual(judged["/logs/verifier/judgment.json"]["status"], "judge_unavailable")
+                self.assertIsNone(judged["/logs/verifier/judgment.json"]["label"])
+
+    def test_reader_missing_usage_does_not_relax_other_failure_gates(self):
+        message = canonical({"type": "item.completed", "item": {"type": "agent_message", "text": "synthetic"}})
+        completion = canonical({"type": "turn.completed"})
+        valid = message + b"\n" + completion
+        streams = [message, completion, valid + b"\n" + completion,
+                   valid + b'\n{"type":"turn.failed"}', valid + b'\n{"type":"error"}',
+                   valid + b'\n{"type":', valid.replace(b'"synthetic"', b'" "')]
+        for usage in ([], {}, {**self.usage, "cached_input_tokens": 101}, {"input_tokens": 1}):
+            streams.append(message + b"\n" + canonical({"type": "turn.completed", "usage": usage}))
+        for data in streams:
+            with self.subTest(data=data):
+                with self.assertRaises(ValueError):
+                    codex_result(data, allow_missing_usage=True)
+        for change in ({"return_code": 7}, {"failure": "timeout"}):
+            with self.subTest(change=change):
+                result = self.reader_main(valid, **change)
+                self.assertEqual(result["/answer/answer.json"]["status"], "operational_failure")
+
+    def test_rich_valid_answer_without_usage_remains_accounting_unknown(self):
+        report = {"schema_version": "gptgrep.rich_multimodal.host.v1", "answer": "synthetic",
+                  "insufficient_evidence": False, "citations": [], "initial_retrieval": {},
+                  "model_attempts": [{"requested_model": PROFILE["model"],
+                                      "requested_reasoning_effort": "max", "requested_service_tier": "fast"}]}
+        answer, info = reader.product_result(canonical(report), "rich_multimodal")
+        self.assertEqual(answer, "synthetic")
+        self.assertIsNone(info["usage"])
+        self.assertIsNone(info["cost_usd"])
+        self.assertFalse(info["cost_complete"])
+
     def binding(self):
         return {"arm": "raw_only", "pair_id": "synthetic", "document_id": "synthetic-document",
                 "cohort_sha256": "a" * 64, "runtime_sha256": "b" * 64, "judge_sha256": "c" * 64,
@@ -317,11 +378,16 @@ class NativeAccountingTests(unittest.TestCase):
         argv = child.call_args.args[0]
         self.assertEqual(argv[-2:], ["--", "-"])
         self.assertNotIn("synthetic question", argv)
-        self.assertTrue(child.call_args.kwargs["input_bytes"].endswith(b"synthetic question"))
-        # A legacy_text run gives the raw-only arm the reader's generic answer rules.
-        self.assertIn(reader.READER_ANSWER_RULES.encode(), child.call_args.kwargs["input_bytes"])
-        self.assertEqual(outputs["/logs/agent/operational.json"]["shared_answer_rules_sha256"],
-                         sha(reader.READER_ANSWER_RULES.encode()))
+        self.assertEqual(child.call_args.kwargs["input_bytes"],
+                         b"Document: /data/corpus/synthetic.txt\nQuestion: synthetic question")
+        self.assertNotIn(b"Answer rules:", child.call_args.kwargs["input_bytes"])
+        observation = outputs["/logs/agent/operational.json"]["prompt_observation"]
+        submitted = outputs[observation["frontdoor_input"]["path"]]
+        self.assertEqual(submitted, child.call_args.kwargs["input_bytes"])
+        self.assertEqual(observation["frontdoor_input"]["sha256"], sha(submitted))
+        self.assertEqual(observation["base_instructions"]["selection"], "native_default")
+        self.assertIsNone(observation["base_instructions"]["effective_sha256"])
+        self.assertNotIn("shared_answer_rules_sha256", outputs["/logs/agent/operational.json"])
         self.assertLess(child.call_args.kwargs["timeout"], config["deadline_seconds"])
         return outputs
 
@@ -521,7 +587,7 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
                 "base_tool_environment": {}, "permitted_tools": [], "generic_capabilities": [],
                 "qualification_mismatches": [], "budget_scope": {}, "reader_mode": "legacy_text",
                 "jev_model": "synthetic-decisions", "native_ptc": True, "codex_permissions": "full62_reader",
-                "source_relative_path": "synthetic.txt",
+                "source_relative_path": "synthetic.txt", "raw_document": "/data/corpus/synthetic.txt",
                 "decisions_budget": {"path": "/opt/full62-private/decisions-budget.json", "bytes": 1,
                                      "sha256": "f" * 64}}
 
@@ -668,16 +734,13 @@ class LegacyTreatmentReaderTests(unittest.TestCase):
         self.assertEqual(outputs["/answer/answer.json"]["status"], "operational_failure")
         self.assertFalse(missing.exists())
 
-    def test_bare_prompt_states_the_enforced_no_external_search_policy(self):
-        # raw_prompt requires an explicit reader_mode (explicit_reader_mode), so the
-        # policy wording is checked in both modes.
+    def test_common_task_prompt_preserves_question_bytes_without_extra_instructions(self):
+        question = "  A synthetic Unicode question: café?\nSecond line.  "
         for mode in ("legacy_text", "rich_multimodal"):
             with self.subTest(reader_mode=mode):
-                prompt = reader.raw_prompt({"raw_document": "/data/corpus/synthetic.txt", "reader_mode": mode},
-                                           self.question).decode()
-                self.assertIn("No external search or network access is available.", prompt)
-                self.assertNotIn("Do not use external search", prompt)
-                self.assertTrue(prompt.endswith("Question:\n" + self.question))
+                prompt = reader.task_prompt({"raw_document": "/data/corpus/synthetic.txt", "reader_mode": mode},
+                                            question)
+                self.assertEqual(prompt, ("Document: /data/corpus/synthetic.txt\nQuestion: " + question).encode())
 
     def test_other_legacy_statuses_are_zero_and_never_judged(self):
         for status, answer in (("failed", "partial synthetic text"), ("interrupted", "partial synthetic text"),
@@ -784,11 +847,11 @@ class NativeDirectToolPolicyTests(unittest.TestCase):
         self.assertEqual(config["service_tier"], PROFILE["service_tier"])
         policy = config["permissions"]["full62_reader"]
         self.assertFalse(policy["network"]["enabled"])
-        self.assertEqual(policy["filesystem"]["/data/corpus"], "read")
-        self.assertEqual(policy["filesystem"]["/tmp/full62-work"], "write")
-        self.assertEqual(policy["filesystem"]["/opt/full62-home"], "deny")
-        self.assertEqual(policy["filesystem"]["/tests"], "deny")
-        self.assertEqual(policy["filesystem"]["/logs"], "deny")
+        self.assertEqual(policy["filesystem"], {
+            "/": "write", "/data/corpus": "read",
+            "/opt/full62-home": "deny", "/tests": "deny", "/solution": "deny",
+            "/logs": "deny", "/answer": "deny", "/opt/full62": "deny",
+            "/opt/full62-private": "deny", "/run/secrets": "deny"})
 
     def test_judge_keeps_empty_direct_namespace_and_native_tools_disabled(self):
         import tomllib
@@ -804,31 +867,77 @@ class NativeDirectToolPolicyTests(unittest.TestCase):
         self.assertEqual(config["default_permissions"], "full62_judge")
         self.assertEqual(config["web_search"], "disabled")
         self.assertFalse(config["permissions"]["full62_judge"]["network"]["enabled"])
-        self.assertEqual(config["permissions"]["full62_judge"]["filesystem"]["/data"], "deny")
-        self.assertNotIn("/tmp/full62-work",
-                         config["permissions"]["full62_judge"]["filesystem"])
+        self.assertEqual(config["permissions"]["full62_judge"]["filesystem"], {
+            ":minimal": "read", "/opt/full62-home": "deny", "/root": "deny",
+            "/home": "deny", "/tests": "deny", "/solution": "deny", "/logs": "deny",
+            "/answer": "deny", "/opt/full62": "deny", "/opt/full62-private": "deny",
+            "/proc": "deny", "/run/secrets": "deny", "/data": "deny"})
 
 
 
-class SharedAnswerRuleTests(unittest.TestCase):
-    def test_legacy_text_raw_prompt_carries_the_reader_answer_rules_verbatim(self):
-        # The constant must stay byte-identical to the product reader's rules.
+class ArmPromptContractTests(unittest.TestCase):
+    def test_primary_bare_prompt_omits_product_rules_and_keeps_default_base(self):
+        # The product's rules remain a treatment feature, including their exact
+        # source wording. They are never copied into the primary bare prompt.
         protocol = Path(__file__).resolve().parents[5] / "crates/gptgrep-host/src/protocol.rs"
         match = re.search(r'pub\(crate\) const READER_ANSWER_RULES: &str = "((?:[^"\\]|\\.)*)";',
                           protocol.read_text(encoding="utf-8"))
         self.assertIsNotNone(match)
-        self.assertEqual(json.loads('"' + match.group(1) + '"'), reader.READER_ANSWER_RULES)
+        rules = json.loads('"' + match.group(1) + '"')
+        self.assertIn("config.max_tool_calls, READER_ANSWER_RULES", protocol.read_text(encoding="utf-8"))
         config = {"raw_document": "/data/corpus/generic.txt"}
-        legacy = reader.raw_prompt({**config, "reader_mode": "legacy_text"}, "Generic question?").decode()
-        rich = reader.raw_prompt({**config, "reader_mode": "rich_multimodal"}, "Generic question?").decode()
-        self.assertEqual(legacy.count(reader.READER_ANSWER_RULES), 1)
-        self.assertTrue(legacy.endswith("Question:\nGeneric question?"))
-        # The rich_multimodal reader has no answer rules, so neither arm gets them.
-        self.assertNotIn("Answer rules:", rich)
-        self.assertEqual(legacy.replace(reader.READER_ANSWER_RULES + " ", ""), rich)
-        self.assertIsNone(reader.shared_answer_rules({"reader_mode": "rich_multimodal"}))
+        expected = b"Document: /data/corpus/generic.txt\nQuestion: Generic question?"
+        for mode in ("legacy_text", "rich_multimodal"):
+            actual = reader.task_prompt({**config, "reader_mode": mode}, "Generic question?")
+            self.assertEqual(actual, expected)
+            self.assertEqual(sha(actual), sha(expected))
+            self.assertNotIn(rules.encode(), actual)
+            self.assertNotIn(b"insufficient_evidence", actual)
+            self.assertNotIn(b"SKILL", actual)
+        argv = codex_argv("/synthetic/codex")
+        self.assertFalse(any("base_instructions" in part for part in argv))
+        self.assertNotIn("--max-tool-calls", argv)
         with self.assertRaisesRegex(ValueError, "explicit_reader_mode"):
-            reader.raw_prompt(config, "Generic question?")
+            reader.task_prompt(config, "Generic question?")
+
+    def test_treatment_frontdoor_fingerprint_is_exact_common_task_not_native_base(self):
+        case = LegacyTreatmentReaderTests()
+        outputs, child = case.run_reader(legacy_report())
+        observation = outputs["/logs/agent/operational.json"]["prompt_observation"]
+        submitted = outputs[observation["frontdoor_input"]["path"]]
+        argv = child.call_args.args[0]
+        self.assertEqual(submitted, argv[-2].encode("utf-8"))
+        self.assertEqual(submitted, b"Document: /data/corpus/synthetic.txt\nQuestion: synthetic question")
+        self.assertEqual(observation["frontdoor_input"]["sha256"], sha(submitted))
+        self.assertEqual(observation["frontdoor_input"]["bytes"], len(submitted))
+        self.assertEqual(observation["common_question"]["sha256"], case.binding()["question_sha256"])
+        self.assertEqual(observation["base_instructions"]["selection"], "gptgrep_reader_contract")
+        self.assertIsNone(observation["base_instructions"]["expected_full_sha256"])
+        self.assertIsNone(observation["base_instructions"]["effective_sha256"])
+        self.assertFalse(observation["base_instructions"]["effective_bytes_observed"])
+
+    def test_both_front_doors_submit_and_observe_byte_identical_task_payloads(self):
+        bare = NativeAccountingTests()
+        bare_outputs = bare.reader_main(bare.events())
+        treatment_outputs, child = LegacyTreatmentReaderTests().run_reader(legacy_report())
+        observations = [outputs["/logs/agent/operational.json"]["prompt_observation"]
+                        for outputs in (bare_outputs, treatment_outputs)]
+        bare_input = bare_outputs[observations[0]["frontdoor_input"]["path"]]
+        treatment_input = treatment_outputs[observations[1]["frontdoor_input"]["path"]]
+        self.assertEqual(bare_input, treatment_input)
+        self.assertEqual(treatment_input, child.call_args.args[0][-2].encode("utf-8"))
+        self.assertEqual(observations[0]["frontdoor_input"]["sha256"],
+                         observations[1]["frontdoor_input"]["sha256"])
+        self.assertEqual(observations[0]["common_question"], observations[1]["common_question"])
+        self.assertNotEqual(observations[0]["frontdoor_input"]["sha256"],
+                            observations[0]["common_question"]["sha256"])
+
+    def test_complete_task_payload_byte_limit_is_shared(self):
+        config = LegacyTreatmentReaderTests().config()
+        task = reader.task_prompt(config, "é" * (config["max_input_bytes"] // 2)).decode("utf-8")
+        for arm in ("raw_only", "gptgrep"):
+            with self.subTest(arm=arm), self.assertRaisesRegex(ValueError, "instruction_bytes_limit"):
+                reader.reader_argv(config, {"arm": arm}, task)
 
 
 if __name__ == "__main__":

@@ -66,8 +66,9 @@ class OwnerFakeTests(FakeCodexMixin, unittest.TestCase):
             self.assertNotIn(name, record["env_names"])
         self.assertEqual(record["argv"], ["app-server", "--listen", "stdio://", "--strict-config"])
         entry = self.env.ledger()[-1]
-        self.assertEqual((entry["decision"], entry["canonical_changed"], entry["inode_preserved"]),
-                         ("REFRESHED", True, True))
+        self.assertEqual((entry["decision"], entry["canonical_changed"], entry["canonical_content_changed"],
+                          entry["inode_preserved"]), ("REFRESHED", True, True, True))
+        self.assertTrue(receipt["refresh"]["canonical_content_changed"])
         code, receipt, _ = self.env.supervisor("refresh", "--run-id", "own2")
         self.assertEqual((code, receipt["refresh"]["decision"]), (0, "SKIPPED_FRESH"))
         self.assertEqual(self.records(self.env.run_dir("_owner", "own2")), [], "fresh: no app-server launch")
@@ -99,6 +100,50 @@ class OwnerFakeTests(FakeCodexMixin, unittest.TestCase):
         marker = json.loads(self.env.quarantine_marker().read_text())
         self.assertEqual((marker["reason"], marker["details"]["failure_kind"]), ("AUTH_REFRESH_FAILED", "permanent"))
         support.observe("owner_permanent_failure_fake", failure_class="REFRESH_TOKEN_REUSED", quarantined=True)
+
+    def test_metadata_only_owner_change_does_not_refresh_or_clear_auth_block(self):
+        self.install_fake_codex(app_server="no_write", refresh_mode_cycle=True)
+        code, _, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "mc-block",
+                                         *probe("auth-fail", "AUTH_UNAUTHORIZED"))
+        self.assertEqual(code, sup.EXIT_BLOCKED_AUTH)
+        marker = self.env.auth_block_marker().read_bytes()
+        before = self.env.credential.meta()
+        code, receipt, _ = self.env.supervisor("refresh", "--run-id", "mc-owner")
+        self.assertEqual((code, receipt["state"], receipt["refresh"]["decision"]),
+                         (sup.EXIT_BLOCKED_AUTH, "BLOCKED_AUTH", "AUTH_REFRESH_FAILED"))
+        self.assertEqual(self.env.credential.meta(), before)
+        self.assertNotEqual(receipt["canonical_before"]["ctime_ns"], receipt["canonical_after"]["ctime_ns"])
+        self.assertTrue(receipt["refresh"]["canonical_changed"])
+        self.assertFalse(receipt["refresh"]["canonical_content_changed"])
+        self.assertTrue(receipt["refresh"]["integrity_ok"])
+        self.assertTrue(receipt["refresh"]["account_chatgpt"])
+        self.assertNotIn("auth_block_cleared", receipt)
+        self.assertEqual(self.env.auth_block_marker().read_bytes(), marker)
+        self.assertTrue(self.env.quarantine_marker().exists())
+        entry = self.env.ledger()[-1]
+        self.assertEqual((entry["canonical_changed"], entry["canonical_content_changed"],
+                          entry["auth_block_cleared"]), (True, False, False))
+
+    def test_transient_metadata_only_owner_change_preserves_auth_block(self):
+        self.install_fake_codex(app_server="transient_fail", refresh_mode_cycle=True)
+        code, _, _ = self.env.supervisor("run", "--role", "dev", "--run-id", "tm-block",
+                                         *probe("auth-fail", "AUTH_UNAUTHORIZED"))
+        self.assertEqual(code, sup.EXIT_BLOCKED_AUTH)
+        marker = self.env.auth_block_marker().read_bytes()
+        before = self.env.credential.meta()
+        code, receipt, _ = self.env.supervisor("refresh", "--run-id", "tm-owner")
+        self.assertEqual((code, receipt["state"], receipt["refresh"]["decision"]),
+                         (sup.EXIT_UNAVAILABLE, "REFRESH_UNAVAILABLE", "REFRESH_DEFERRED_TRANSIENT"))
+        self.assertEqual(self.env.credential.meta(), before)
+        self.assertNotEqual(receipt["canonical_before"]["ctime_ns"], receipt["canonical_after"]["ctime_ns"])
+        self.assertTrue(receipt["refresh"]["canonical_changed"])
+        self.assertFalse(receipt["refresh"]["canonical_content_changed"])
+        self.assertEqual(self.env.auth_block_marker().read_bytes(), marker)
+        self.assertNotIn("auth_block_cleared", receipt)
+        self.assertFalse(self.env.quarantine_marker().exists())
+        entry = self.env.ledger()[-1]
+        self.assertEqual((entry["canonical_changed"], entry["canonical_content_changed"],
+                          entry["auth_block_cleared"]), (True, False, False))
 
     def test_transient_owner_failure_is_not_quarantined(self):
         self.install_fake_codex(app_server="transient_fail")

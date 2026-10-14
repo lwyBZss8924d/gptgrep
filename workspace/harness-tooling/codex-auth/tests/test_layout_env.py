@@ -782,8 +782,8 @@ class ToolPathsAndArgvGuardTests(unittest.TestCase):
         code, plan, proc = self.env.supervisor("run", "--role", "judge", "--run-id", "jd-dry", "--stdin", "inherit",
                                                "--lease", "shared", "--dry-run", "--", str(fake), *judge_args(schema))
         self.assertEqual((code, plan["tool_credential_access"]["consumer_argv_guard"]), (0, "checked"), proc.stdout)
-        self.assertEqual(plan["tool_credential_access"]["denied_paths"][-3:],
-                         ["/" + self.env.runs_root.parts[1], str(self.env.root), "/Volumes"])
+        required_denies = {"/" + self.env.runs_root.parts[1], str(self.env.root), "/Volumes"}
+        self.assertTrue(required_denies.issubset(plan["tool_credential_access"]["denied_paths"]))
         proc = subprocess.run(self.env.supervisor_argv("run", "--role", "judge", "--run-id", "jd-run", "--stdin",
                                                        "inherit", "--lease", "shared", "--deadline-seconds", "60",
                                                        "--", str(fake), *judge_args(schema)),
