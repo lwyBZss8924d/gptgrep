@@ -74,7 +74,11 @@ comparison.
 | Current offline evaluation | Fresh CLI passed 11 cases, 33 search samples, 42 citation checks and freshness checks; zero provider requests; synthetic invariant coverage only |
 | Native reader filesystem candidate | One model-free native child passed 41 assertions (40 distinct names); source adoption now generates identical configuration bytes |
 | Generated product-image permission regression | One selected test passed; the generated mode step preserves payload bytes and private host staging; actual runtime-user image access remains pending |
-| Linux product build | Offline release compilation passed; packaging stopped on a build-output path mismatch; helper build, package and relocation smoke remain pending |
+| Current packager regressions | Nine tests passed, including missing-Git provenance and missing-working-directory error handling; synthetic fixtures only |
+| Linux product build, first attempt | Offline release compilation passed; packaging stopped on a build-output path mismatch; failure retained |
+| Linux helper build, first attempt | Offline dependency resolution failed before helper compilation; failure retained |
+| Linux helper build, repaired attempt | Offline locked release compilation passed with the original dependency versions and checksums; packaging then failed because Git was unavailable, before archive creation or relocation smoke; failure retained |
+| Linux native package, repaired packager | Archive created with a complete license inventory; relocated plain-text and PDF smoke passed; source revision remains unknown and dirty; local preparation only |
 
 The wrapper failure exposed archive modes inherited from a private staging
 umask. The packager now assigns portable TAR modes without changing staging

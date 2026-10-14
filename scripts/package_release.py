@@ -140,7 +140,12 @@ def verify_pdfium(directory: Path, target: str) -> dict[str, str]:
 
 
 def source_state(repo: Path) -> tuple[str | None, bool]:
-    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+    try:
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+    except FileNotFoundError as error:
+        if error.filename != "git":
+            raise
+        return None, True
     if head.returncode:
         return None, True
     status = subprocess.run(["git", "status", "--porcelain", "--untracked-files=normal"], cwd=repo, check=True, capture_output=True, text=True)
@@ -486,7 +491,22 @@ def package(args: argparse.Namespace) -> dict:
 
 
 def self_test() -> None:
+    from unittest.mock import patch
+
     class PackagingTests(unittest.TestCase):
+        def test_source_state_without_git_is_unknown_and_dirty(self):
+            with tempfile.TemporaryDirectory() as directory:
+                with patch.dict(os.environ, {"PATH": directory}):
+                    self.assertEqual(source_state(Path(directory)), (None, True))
+
+        def test_source_state_missing_directory_is_not_missing_git(self):
+            with tempfile.TemporaryDirectory() as directory:
+                missing = Path(directory) / "missing"
+                with patch.dict(os.environ, {"PATH": directory}):
+                    with self.assertRaises(FileNotFoundError) as error:
+                        source_state(missing)
+                self.assertEqual(Path(error.exception.filename), missing)
+
         def test_launcher_spaces_symlink_and_arguments(self):
             with tempfile.TemporaryDirectory(prefix="gptgrep launcher test ") as directory:
                 root = Path(directory).resolve()
