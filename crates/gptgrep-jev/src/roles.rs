@@ -70,18 +70,17 @@ pub fn evidence_role_contract() -> Value {
 /// Fully serialized and validated before transport. Fields are private so a
 /// caller cannot change the admitted request between preflight and sending it.
 pub struct PreparedEvidenceRoles {
-    body: Vec<u8>,
-    questions: Value,
+    request: PreparedDecision,
     ids: Vec<String>,
     candidate_bytes: usize,
 }
 impl PreparedEvidenceRoles {
     pub fn request_bytes(&self) -> usize {
-        self.body.len()
+        self.request.body.len()
     }
     /// Source-bearing request bytes, for hashing only; never a credential.
     pub fn encoded_request(&self) -> &[u8] {
-        &self.body
+        &self.request.body
     }
     pub fn question_count(&self) -> usize {
         self.ids.len() * 2
@@ -139,10 +138,9 @@ impl JevClient {
         }
         let questions = Value::Object(questions);
         let state = json!({"query":query,"role_definitions":definitions,"candidates":candidates});
-        let body = self.request_body(state, &questions)?;
+        let request = self.prepare_decision(state, questions)?;
         Ok(PreparedEvidenceRoles {
-            body,
-            questions,
+            request,
             ids: candidates
                 .iter()
                 .map(|candidate| candidate.id.clone())
@@ -154,13 +152,14 @@ impl JevClient {
         })
     }
 
-    /// Exactly one request using the prepared, byte-checked body; no retries,
-    /// response dropping, candidate reduction, or automatic batching.
+    /// Exactly one request using the prepared, byte-checked body; no retries
+    /// (an attached [`TransientRetry`] is not applied), response dropping,
+    /// candidate reduction, or automatic batching.
     pub async fn decide_evidence_roles(
         &self,
         prepared: PreparedEvidenceRoles,
     ) -> Result<EvidenceRoleResponse> {
-        let response = self.decide_body(prepared.body, &prepared.questions).await?;
+        let response = self.submit_prepared_once(prepared.request).await?;
         let mut candidates = Vec::with_capacity(prepared.ids.len());
         for (index, id) in prepared.ids.into_iter().enumerate() {
             let Some(DecisionAnswer::Score {

@@ -9,8 +9,17 @@ description = "Native plaintext and LiteParse document ingestion for GPTgrep"
 [dependencies]
 anyhow = "1"
 gptgrep-pageindex = { path = "../gptgrep-pageindex" }
-liteparse = { git = "https://github.com/run-llama/liteparse", rev = "a7105d3e3cfaf001970578c6615f6e71015aa483", default-features = false }
-tokio = { version = "1", features = ["rt", "fs", "time", "process", "sync"] }
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg"] }
+png = "=0.18.1"
+liteparse = { git = "https://github.com/run-llama/liteparse", rev = "ab8879623ee45a0b7a775d12b42a9a7ae9dab16b", default-features = false }
+serde = { version = "1", features = ["derive"] }
+# Retained f32 observations and composed f64 geometry require exact JSON
+# roundtrips before strict recomposition validation.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt", "fs", "time", "process", "sync", "io-util", "macros"] }
+
+zune-jpeg = { version = "=0.5.15", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"

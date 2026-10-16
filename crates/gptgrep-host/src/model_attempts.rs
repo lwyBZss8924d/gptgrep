@@ -28,6 +28,9 @@ pub struct ModelAttempt {
     pub usage: Option<Value>,
     pub elapsed_ms: u128,
     pub server_retry_notifications: usize,
+    /// Opt-in, payload-free tool observations retained on success and failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_ptc: Option<crate::NativePtcReport>,
     pub accounting_complete: bool,
     /// Bounded host codes or sanitized structured protocol errors; never provider text.
     pub error: Option<Value>,
@@ -174,6 +177,10 @@ struct Tracking {
 
 impl ModelAttemptTracker {
     pub fn reserve(accounting: &Accounting, role: &str, config: &HostConfig) -> Result<Self> {
+        anyhow::ensure!(
+            !config.native_ptc || role == "final_reader",
+            "host_native_ptc_requires_final_reader"
+        );
         let attempt = ModelAttempt {
             attempt_id: format!("{role}-1"),
             role: role.into(),
@@ -190,6 +197,9 @@ impl ModelAttemptTracker {
             usage: None,
             elapsed_ms: 0,
             server_retry_notifications: 0,
+            native_ptc: config
+                .native_ptc
+                .then(|| crate::NativePtcReport::empty(config.max_tool_calls)),
             accounting_complete: false,
             error: None,
         };
@@ -209,6 +219,7 @@ impl ModelAttemptTracker {
     }
 
     pub fn finish(&mut self, error: Option<&anyhow::Error>) -> Result<()> {
+        self.finished = true;
         self.observer.update(|attempt| {
             attempt.status = if error.is_some() {
                 "failed"
@@ -226,7 +237,6 @@ impl ModelAttemptTracker {
                         .all(|field| usage["total"][*field].as_u64().is_some())
                 });
         })?;
-        self.finished = true;
         Ok(())
     }
 }
@@ -281,19 +291,10 @@ impl ModelAttemptObserver {
     }
 
     pub fn usage(&self, usage: Option<&Value>) -> Result<()> {
-        let usage = usage.and_then(observed_usage);
-        if let Some(usage) = usage {
+        let mut merged = None;
+        if merge_observed_usage(&mut merged, usage) {
             self.update(|attempt| {
-                let previous = attempt.usage.get_or_insert_with(|| json!({}));
-                for (scope, value) in usage.as_object().expect("projected usage") {
-                    if let Some(fields) = value.as_object() {
-                        for (key, value) in fields {
-                            previous[scope][key] = value.clone();
-                        }
-                    } else {
-                        previous[scope] = value.clone();
-                    }
-                }
+                merge_observed_usage(&mut attempt.usage, merged.as_ref());
             })?;
         }
         Ok(())
@@ -301,6 +302,10 @@ impl ModelAttemptObserver {
 
     pub fn retries(&self, count: usize) -> Result<()> {
         self.update(|attempt| attempt.server_retry_notifications = count)
+    }
+
+    pub fn native_ptc(&self, report: crate::NativePtcReport) -> Result<()> {
+        self.update(|attempt| attempt.native_ptc = Some(report))
     }
 
     pub fn process_completed(&self) -> Result<()> {
@@ -325,17 +330,44 @@ fn safe_error(error: &anyhow::Error) -> Value {
     if let Some(completion) = error.downcast_ref::<crate::CompletionError>() {
         return json!({"code":completion.code()});
     }
-    let code = error.to_string();
-    if code.starts_with("host_")
-        && code.len() <= 128
-        && code
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+    // A fatal reader search keeps its ask-level code; the typed cause stays in the ledger.
+    if error.is::<gptgrep_core::JevSearchError>() || error.is::<gptgrep_core::PlannedSearchError>()
     {
+        return json!({"code":"host_jev_search_failed"});
+    }
+    let code = error.to_string();
+    if is_host_code(&code) {
         json!({"code":code})
     } else {
         json!({"code":"host_model_attempt_failed"})
     }
+}
+
+/// A stable host failure code: `host_` and lowercase ASCII letters or
+/// underscores, at most 128 bytes. Any other error text is never recorded.
+pub(crate) fn is_host_code(text: &str) -> bool {
+    text.starts_with("host_")
+        && text.len() <= 128
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+}
+
+pub(crate) fn merge_observed_usage(target: &mut Option<Value>, value: Option<&Value>) -> bool {
+    let Some(usage) = value.and_then(observed_usage) else {
+        return false;
+    };
+    let previous = target.get_or_insert_with(|| json!({}));
+    for (scope, value) in usage.as_object().expect("projected usage") {
+        if let Some(fields) = value.as_object() {
+            for (key, value) in fields {
+                previous[scope][key] = value.clone();
+            }
+        } else {
+            previous[scope] = value.clone();
+        }
+    }
+    true
 }
 
 fn observed_usage(value: &Value) -> Option<Value> {

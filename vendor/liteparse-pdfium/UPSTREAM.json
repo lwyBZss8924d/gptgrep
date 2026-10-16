@@ -1,0 +1,31 @@
+{
+  "schema_version": "gptgrep.vendor_source.v1",
+  "repository": "https://github.com/run-llama/liteparse",
+  "revision": "ab8879623ee45a0b7a775d12b42a9a7ae9dab16b",
+  "source_directory": "crates/pdfium",
+  "package": "liteparse-pdfium",
+  "version": "1.11.0",
+  "license": "Apache-2.0",
+  "upstream_license_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+  "upstream_source_sha256": {
+    "src/bitmap.rs": "4100fe8d9e54c3fcc1495f4bb10804851618f6d3d02605f9cc6e949216df2934",
+    "src/document.rs": "eda5f361eed0879c4934f1d274502cd8c25240fd94b9cf5db460d1950384833c",
+    "src/error.rs": "e8278ed628fad09302b3ae0dfb402c17d5f2070f809f66247c86fc1086926053",
+    "src/font.rs": "9258d5fd0351eec755f55a69ea9c61e686030d0e96adfcb1c1adcad9a7d38965",
+    "src/lib.rs": "1f6b4d9af6afe6d72f4853fad0a66468c704dfdf1706be97ef306a9ea1ba9c12",
+    "src/library.rs": "70b41c4f9771bffa6a99f2aa03660a66880c4543dbe37448b79255cb582a1d7b",
+    "src/page.rs": "4472072a3e8b7828659845e084ec3b3fd57349f74d7e087d81d168867214261f",
+    "src/page_object.rs": "fe409884d2ce53e8bd18696fc81b585f9b4e469aab73148706fd6eead2c349f2",
+    "src/struct_tree.rs": "1552d6d09344332fb4bd2e674558a2f83f70ad534c5319d7fa83959be367d8c8",
+    "src/text_page.rs": "9a88b9d97355a71c5d60a08b7dfd24c3cc74d3bd67849cddd5eb9877ba478c75",
+    "src/types.rs": "0d303bb44497226096bf82ec324150cec4d3e2c62b35492751f4c56896946ce7",
+    "src/user_unit.rs": "c5b01984032e94488bfbbbbf2d9c61a2c94f3977a8396e766e324f56f13628de"
+  },
+  "modifications": [
+    "Standalone Cargo manifest with the original pinned pdfium-sys dependency",
+    "Allocation-free Page::annotation_count accessor for conservative coverage admission",
+    "Count/length-admitted document Info/page-label/outline getters with exact UTF-16 write validation and bounded cycle-safe traversal; legacy getters unchanged",
+    "Length-admitted TextChar::font_info_admitted with exact raw bytes/flags and native write/NUL validation; legacy font getters unchanged",
+    "Allocation-free checked page-object count, exact raw object kind/fill rule and closed segment discriminant helpers for complete count-admitted native graphics; original compatibility getters unchanged"
+  ]
+}

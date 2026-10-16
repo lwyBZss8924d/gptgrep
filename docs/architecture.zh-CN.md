@@ -9,9 +9,11 @@ GPTgrep 为推理智能体提供快速、可核查的本地文档访问能力。
 ```mermaid
 flowchart TD
   A[显式指定的文档根目录] --> B[纯文本或 LiteParse Rust 解析器]
-  B --> C[规范化文本、物理页、布局与书签]
+  B --> C[完整原生文本、元数据与页图像]
+  C --> P[显式 Document agent 与必需 Page OCR]
+  P --> D
   C --> D[GPTgrep PageIndex Rust 文档树与可选合并优化器]
-  D --> E[不可变索引版本：清单、文本、tgrep 索引]
+  D --> E[不可变索引版本：文本、OCR、视觉产物与 tgrep 索引]
   Q[查询] --> F[原生正则或词法检索]
   E --> F
   Q --> G[Jev 强类型文档路由与证据重排]
@@ -27,23 +29,131 @@ flowchart TD
   I --> K[经过验证的引用与可选摘要]
 ```
 
+当前实现见[实验状态](experimental-status.md)，可移植构建、独立 Codex 登录和原生 runtime
+见[开发说明](development.md)。0.2 开发线按 [XL-DocBench 评估协议](evaluation.md)比较同一原生
+Codex 智能体使用 GPTgrep 与裸 Codex；[基准工具包](../benchmark/UPSTREAM.md)与
+[自优化工具包](../self-opt/src/evaluate.ts)分别负责评估和开发迭代选择。
+监督模型为 `gpt-6.1-sol`，worker／OCR 为 `gpt-6-luna`，辅助模型显式选择 Luna Decisions 或 Jev 1.14。
+准备、SEARCH 与判分分别计量。旧 PageIndex／full62 评估与首发门槛已退役；小规模 live／调试检查不能
+代表完整 XL 结果或 canary 验收，后者需要事先固定的完整确认集合、匹配比较优势及独立审查。
+
 ## 模块职责
 
 | Crate／接口 | 职责 | 外部运行时 |
 | --- | --- | --- |
 | `gptgrep-pageindex` | 纯 Rust 的页／节坐标、标题层级、书签组合与结构优化 | 无 |
-| `gptgrep-parse` | 保留 UTF-8 源文本，并通过固定源码版本的 LiteParse 进行转换 | 原生文档需要 PDFium；Office 转换需要 LibreOffice |
+| `gptgrep-parse` | 完整文档批处理、UTF-8／原生元数据、页图像准备、OCR 定稿与产物来源记录 | 原生文档需要 PDFium；Office 转换需要 LibreOffice |
 | `gptgrep-index` | 内嵌 tgrep-core、保守的 trigram 候选生成、精确的 Rust-regex 验证 | 无；不使用守护进程 |
 | `gptgrep-jev` | Choice/Noul/Score Decisions 传输、schema 校验、受预算约束的推理 | 显式发起的 OpenRouter 请求 |
-| `gptgrep-core` | 快照发布、源文件新鲜度、检索组合与证据契约 | 默认 hybrid 与 semantic 检索必须使用 Jev |
-| `gptgrep-host` | 受限的本地 Codex stdio app-server 工作流、工具分发与最终引用验证 | 由调用方选择的 Codex 安装与账户 |
+| `gptgrep-core` | 已准备文档工具箱、完整 rich 索引版本发布、源文件新鲜度、检索与证据契约 | 默认 hybrid 与 semantic 检索必须使用 Jev |
+| `gptgrep-host` | 原生 Page OCR 与 Document 驱动、本地 Codex 阅读器、工具分发与最终引用验证 | 由调用方选择的 Codex 安装与账户 |
 | `gptgrep-cli` | 原生命令行参数、JSON、schema 与 grep 结果展示 | 本地命令无需额外运行时 |
 | `packages/cli` | 可选的 incur 展示与接口发现包装层 | Node 和已发布的 incur 0.5.1 |
 
-宿主配置的默认值为本项目选定的 `model = "gpt-5.6-luna"` 和
+Decisions 默认使用 `openai/gpt-6-luna-decisions`，支持有明确上限的扁平 typed
+PNG/JPEG 输入，并严格校验返回的模型标识。`typesafe/jev-1.13` 保留为显式选择的
+纯文本选项。显式的 `~author/family-latest` 别名同样只支持纯文本，且只接受同一作者、
+同一系列的具体版本。报告分别保留请求的选择器与实际返回的模型。routing、reranking 与
+宿主后续调用共享一个可选的已有账本 `ExecutionContext`；加入它不会重设原始时钟或已消耗的
+额度。新账本只能由 `gptgrep decisions-budget init` 创建一次，`status` 以只读方式查看。
+原生 Codex 的模型选择独立配置。
+
+宿主配置的默认值为本项目选定的 `model = "gpt-6-luna"` 和
 `model_reasoning_effort = "max"`，以及 `service_tier = "fast"`。这些设置仅用于本地辅助模型，不会改变开发智能体的模型。
 运行时的 `CODEX_HOME` 用于选择已有的账户隔离环境。
 程序不读取或复制认证文件、不修改全局配置，也不执行交互式登录。
+原生 OCR 与 document-agent 子进程显式选择由 Codex 管理的 ChatGPT 认证，以及该账户主目录中的
+文件凭据存储。已授权的设备登录缓存会被复用，而每次运行的状态、日志和临时文件保持独立。
+令牌续期由所选 Codex 运行时负责。命名的文件系统权限向模型工具开放源图像，并把凭据主目录
+排除在授权之外；启动时绝不会把它们与旧版沙箱设置混用。可选的 `--codex-state-dir` 为原生
+SQLite 状态选择另一个已存在的规范目录，并使用其中已存在的 `logs` 子目录存放日志。认证仍使用
+`--codex-home`；临时文件和协议跟踪文件由调用方另行指定位置。`--codex-permissions PROFILE`
+在 thread 和 turn 上都显式选择一个已存在的命名权限 profile。宿主在开始 turn 之前要求取得该
+profile 已被确认的 ID，并为这一选择省略旧版沙箱覆盖设置。它要求网络访问保持禁用，并接受
+原生只读投影，或不含旧版可写根目录、且两项临时目录排除均已启用的 workspace-write 投影。
+确认与投影检查只能识别所选策略；实际的文件系统拒绝仍需在运行时验证。
+
+活动 turn 的失败会保留 `host_protocol.diagnostics`（在模型尝试的协议错误中同样可见）以及
+对应的私有跟踪 `error_diagnostics`。OCR 运行时错误在 `diagnostics` 中保留同样的封闭投影。
+`gptgrep.codex.error-diagnostics.v1` 区分强类型的原生错误变体、来自结构化提供方错误的固定
+白名单错误代码／类型／参数族，以及明确标注的锚定消息签名。当观察到的错误提供了相应证据时，
+它可以识别工具定义、输出 schema、模型选择、认证、传输和服务器方面的失败。分类只描述观察到的
+错误证据，并非经过独立验证的根本原因；相互矛盾或无法识别的证据保持为 `unknown`。
+
+该投影从不保存任意错误文本、header 值、URL、请求体、错误字符串中的模型名或被拒绝的属性名。
+它记录字段的结构和字节长度，仅在整个字符串不超过 16 KiB 时才记录 SHA256；超长字段既不扫描
+也不计算哈希。唯一允许的文本语法是完整的 JSON 错误、有界的 `unexpected status` HTTP 错误封装，
+以及固定的锚定错误签名。HTTP 封装只允许空后缀，或 `, url: ` 后接一个不含空白、不超过 2,048
+字节的 HTTP(S) URL，其后可选 `, request id: ` 加 1–128 个仅由字母、数字、下划线或连字符组成的
+ASCII 标识；URL 中的引号、反斜杠、JSON 花括号和尖括号会被拒绝，其他任何后缀或第二个 JSON 值
+都会使错误保持未知。原因分类不做任意子串 JSON 或关键词搜索。结构化的 `invalid_request_error`
+消息还可以把来自固定 API 参数白名单、去重后的词报告为 `request_subject_hints`；这些提示不能确定
+原因，也从不保留任意词语。原生重试处理、原始截止时间、工具上限和未知用量的核算均保持不变。
+对于错误内容早已被丢弃的历史运行，这些诊断无法恢复其原因。
+
+## 原生解析与 OCR
+
+`gptgrep-core::parse_agent` 负责一次调用中已登记的源文件 pin、不透明的文档／产物／任务句柄、
+完整的原生提取和共享的解析器预算。其前台 NDJSON 接口支持完整的分页清单和有界窗口。关闭句柄会使其
+裁剪托管失效，即使重新打开相同的源字节会得到同一个内容绑定的任务摘要。JSON 不能提供付费 OCR 结果，
+也不能准入新的源路径。`gptgrep-host::parse_agent_driver` 在这一强类型后端之上协调所选独立 Codex
+app-server 的文档 turn。
+
+`parse-agent serve` 提供前台 NDJSON toolbox，`run` 执行完整确定性解析和可选的 OCR（显式 `--mode auto`），
+`agent` 执行一个原生 Document turn，`qualify` 记录私有的图像证据而不自动验收 profile；显式 index registry
+才将已验证的完整产物移交给 generation writer。writer 不重新解析，共享原始解析器／OCR 上下文，重新检查
+源文件 pin 与清单，并且只在完整准入后发布。
+当前 native PTC 路径使用调用方的 job 预算：Document 控制文件绑定工具次数与时长，native OCR
+执行器从所选 runtime profile 读取工具次数与时长；frontend／session／原始 phase 的期限仍可更早到期。
+保留的固定 transport 中，Document 默认 64 tools／1 turn／900 秒，显式绑定的 native-viewer
+profile 可选 1–3600 秒；Page OCR 为 8 tools／1 turn／180 秒。这些固定限制不适用于 native PTC 路径。
+完整原生提取和元数据覆盖每个原始页，模型观察覆盖另行记录。页窗口不是整份文档页数上限。
+payload、metadata 和 staging 的逻辑预留不能当作整个进程 RSS 或物理磁盘实测。
+原生 `view_image` 使用[固定源码 derivative](../patches/codex-native-viewer/README.md)，Page 与 Document
+资格分别绑定实际 binary／profile，不能从编译成功推断 live 验收。
+
+Document 失败保留强类型 `DocumentRuntimeError`，记录启动方法或活动 turn 阶段、事件类型及有界
+warning 指纹。RPC 发送与匹配确认只证明 transport 观察，不证明提供方准入或请求次数。后续空的或
+非数值 usage 更新不会覆盖最后一个身份匹配的有效数值观察；总账单仍可能未知，
+`provider_request_count` 为 null，`accounting_complete` 为 false。清理保留 typed cause，
+CLI JSON 在 `document_runtime` 中输出该对象，不复制提供方原文、原生身份或私有路径。
+这些诊断不能恢复历史失败中已丢弃的错误内容。
+
+编码后的页图像容量在现有 parse-agent 控制文件的 `resources` 对象中配置。CLI 通过 `--config`
+和 `--expected-control-sha256` 读取该控制文件；`index` 使用固定摘要的 `--parse-agent-config`
+控制文件。默认值为 1,048,576 字节的图像文件、1,398,104 字节的 base64 和每页 4,194,304 字节的
+图像文件。若要准入 4 MiB 的页图像，请在完整控制文件中设置以下三个字段，保留其他已选的资源字段，
+并重新计算控制文件摘要：
+
+```json
+{
+  "image_file_bytes": 4194304,
+  "image_base64_bytes": 5592408,
+  "image_file_bytes_per_page": 4194304
+}
+```
+
+这些是可配置的容量。base64 容量必须覆盖所选的文件容量，文件容量又必须不超过每页容量。实际工作
+仍须通过像素、解码、工作内存以及文档／运行级 staging 的准入检查；设置更大的编码容量不能提高原始
+调用的服务端限制，也不能替换其共享的 staging 计数器。像素／解码限制保持原有默认值和上限。文档与
+运行级 staging 容量可由调用方配置；保留的产物共享原始调用的计数器。纯文本工作可以选择更小的
+内存或 staging 范围，而无需预留不会用到的图像容量。
+
+原生 Page profile 从这些资源推导出 `image_limits`，分别包含 `image_file_bytes`、
+`image_base64_bytes`、`image_wire_bytes` 和 `image_transport_bytes`。在 4 MiB 示例中，每张图像的
+传输上限为 5,657,944 字节，累计图像字节为 5,854,568，后者也是该 profile 的
+`image_transport_reserved_bytes`。传输上限把有界的 JSON 封装与 base64 分开计入。原生 Document
+控制文件及其守卫 profile 携带同样的逐图像强类型限制；控制文件中的 `image_wire_bytes` 选择整个
+文档的累计额度（默认 32 MiB）。库函数 `document_native_image_limits` 将其绑定到解析器资源预算。
+两种模式都把精确的限制写入准入与就绪证据，并据此校验源文件和已准备图像的回执。RPC 帧仍保持
+独立的 4 MiB 上限，图像字节不作为 RPC 帧准入。
+
+对于保留的固定 Page/Document 模式，更换原生二进制、profile 或图像限制组合都需要针对该组合重新
+进行资格验证。`OcrRuntimeProfile::unqualified_native_with_resources` 推导 Page profile；现有的
+`native_page_probe` 示例在其两图像资格验证中接受可选的 `resources` 控制对象，省略时保留默认值。
+这些固定模式的资格验证只是限定范围的组件证据。当前 D3 工作是使用智能体原生工具和 Skill 的完整
+原生 PTC 解析／OCR；新的固定 Page/Document 资格验证不是该主线的前提。Decisions 保留独立的
+每图像 1 MiB 合同，HTTP `/ocr` 兼容端点也保留独立的 1 MiB 请求体图像上限。
 
 ## 文档摄取与快照一致性
 
@@ -72,7 +182,8 @@ flowchart TD
 
 **Hybrid 是默认模式。** 默认工作流必须执行 Jev 路由和重排，缺少凭据或推理失败会明确报错。
 显式的 regex 和 lexical 模式是本地检索原语，也可用于受控消融实验；它们不会成为 Jev 失败后的回退路径。
-解析和快照发布是确定性的本地阶段；本版本不声称已经实现模型辅助索引。
+默认 legacy 解析在本地执行；显式 OCR 和 Document-agent 索引会调用原生模型。
+发布只接受完整、来源绑定的产物；enrich 是另外的模型辅助导航层流程。
 
 可以用一个精确的文档路径，在任何候选上限生效前同时约束 trigram 候选与 Jev 路由。
 报告绑定 `document_scope`；`indexed_files` 统计整个文档集合，`scoped_files` 统计本次指定的检索范围。
@@ -85,6 +196,11 @@ Unicode 大小写折叠和 UTF-8 BOM 处理需要保守地扩大候选范围。
 
 **Lexical** 使用同一个索引查找查询词元匹配，按树节点归集证据，并根据词项覆盖率排序。
 该分数是本地词法指标，不是嵌入向量距离，也不是经过校准的语义概率。
+词法与混合查询最多使用 16 个词项：小写的字母数字词元，去重后，去掉一个固定的小型英文功能词表
+和少于三个字符的纯 ASCII 字母词元（含数字的词元和非 ASCII 词元保留；若查询只含被去掉的词元，
+则保留它们）。剩余词项超过 16 个时，按前 64 个词项在当前范围索引中的文档频率排序：
+越罕见越靠前，范围内不存在的词项排在最后，频率相同时保持问题中的先后顺序；
+匹配方式与搜索相同（经验证、不区分大小写）。对同一快照和范围，选择结果是确定的。
 
 **Hybrid** 保留词法候选，并增加一条独立的语义树检索路径。
 Jev 首先判断受长度限制的文档描述，其中包含路径、标题和开头文本。
@@ -93,6 +209,10 @@ Jev 首先判断受长度限制的文档描述，其中包含路径、标题和�
 **Semantic** 仅使用这条树检索路径，不需要词法候选作为起点。
 初始路由最多检查 32 个文档描述，最终一轮最多检查 24 个候选；这是显式的开发预算，
 并非对大规模文档集合进行穷尽式语义搜索。覆盖报告会展示实际检查的范围及截断情况。
+路由不论分数都会选中排名靠前的文档，因此当只有一个可路由文档时（例如显式的 `--document`
+范围，或只有一个新鲜的已索引文档），该文档会被直接选中，不发起路由 Decisions 调用。
+其树节点候选与重排请求保持不变，`coverage.routing_status` 报告 `skipped_single_document`
+而非 `routed`。富文本初始检索遵循同一规则。
 分层文档集合路由和可续接的扩展仍属于后续扩展性工作。
 
 Choice 分数用于比较可用选项，因此不被用作绝对相关性。
@@ -104,10 +224,44 @@ Choice 分数用于比较可用选项，因此不被用作绝对相关性。
 初始的显式相关性门槛为有序评分规则上的 0.5，这是运行时的选择策略。
 在混合模式下，单个完整词元的精确匹配仍可通过词法路径返回，并标记为 `literal_anchor`；
 模型分数不会被改写。这样可避免不确定的语义判断抹去已经验证的 grep 匹配。
+得分低于所请求门槛的已交付结果带有 `below_threshold: true`。当没有任何重排候选达到门槛
+（且没有字面锚点）时，搜索不会返回空集合：它按分数交付前三个候选，每个都标记
+`below_threshold`，计入 `coverage.below_threshold_fallback`（它们仍计入 `filtered_candidates`），
+并添加警告说明这些是低置信度候选。计数与警告只描述经过结果数上限与最终新鲜度检查后实际返回的
+带标记结果。宿主打包后还会让已交付兜底数量与 payload、ledger 保持一致；尝试次数和候选总数保留原值。
+它们从不算作通过门槛；宿主的初始检索报告 `filtered_all`。纯文本 `search` 以 grep 的
+上下文分隔符（`PATH-LINE-TEXT`）输出它们，而不是作为 `PATH:LINE:TEXT` 匹配；由于返回了结果，
+退出码为 0。证据角色排序使用同样的兜底（资格为 `below_floor_fallback`）；富文本／多模态路径保持原有门槛，
+不使用这一兜底。
 无答案案例、字面量查询和自然语言问题分别进行评估。
 
-Jev 使用 `/api/alpha/decisions`，请求时限为 20 秒；不自动重试、不跟随重定向，也不回退到其他提供方。
-每次请求最多包含 64 个问题，载荷上限为 64 KiB。
+Decisions 使用 `/api/alpha/decisions`，请求时限为 20 秒；不跟随重定向，也不回退到其他提供方。
+默认文本检索客户端（搜索的文档路由与证据重排，包括 ask/summarize 的初始检索和阅读器检索）
+只在收到 HTTP 429、500、502、503 或 504 后，以完全相同的请求字节有界重试一次：等待 250-1000 ms
+的抖动退避或更长的 `Retry-After`（单个非负整数秒数，最多 10 位），且仅当原始请求时限仍能容纳该等待再加
+2 秒时才重试；时限从不续期。其他形式的 `Retry-After`（HTTP 日期、重复字段、负数、小数或超长数值）不会被
+忽略，而是拒绝重试，并在失败诊断的 `retry_after_refusal`（`repeated`、`out_of_range` 或
+`not_delta_seconds`）中记录原因。
+重试在同一执行上下文中单独预留一次提交，没有剩余提交额度时不重试；额度耗尽后的调用在发送前以
+`Decisions submission budget exhausted` 失败。超时、连接或响应体中途错误、
+解析与校验失败及其他状态码从不重试。两次尝试都会报告：失败的一次保留其 HTTP 状态
+（`jev_retried_attempts`），计入 `jev_calls_attempted` 但没有用量条目，因此其未知费用使核算保持不完整。
+重试一经准入即计为一次尝试：在退避、预留和发送之前，先发出一条已记录失败尝试的 `before_retry`
+进度回执，因此在重试期间取消搜索也不会让宿主账本丢失任何一次提交；若该回执无法记录，则不发送重试。
+规划查询视图的每个操作对其逻辑调用最多接受一次这样的重试，失败的操作回执保留被重试的尝试。
+重试发送之后出现的错误（例如本地账本记录失败）类型为 `retry_post_send`。若重试回复此前已通过校验，
+提供方已以已知用量完成该提交：失败诊断保留其经检查的数值用量与返回模型，检索错误、操作回执与宿主账本
+将其计入 `jev_requests`、`jev_models` 和 `jev_usage`；否则其用量保持未知。
+即使 validated-response 与 terminal-failure 两个 observer 回调都失败，错误仍保留封闭的失败阶段、
+请求模型、发送／校验状态及先前尝试。已校验的首个回复以 `observer_callback` 保留并计入已知用量；
+提供方失败后回调再失败仍保留原来的 typed provider cause，不复制任意回调错误原文。
+只有在发送前被阻止的重试才是 `retry_admission`。
+judge、增强支持调用（其自有显式重试计划）、导航扫描、证据角色判断、富文本/多模态检索、显式重排候选池
+与批处理提交仍只提交一次；富文本路径会移除调用方客户端上附带的重试策略。
+每次请求最多包含 64 个问题。文本请求以及转义后的文本／问题封装保持 64 KiB 上限。
+Typed Luna 图片请求的完整请求体上限为 8 MiB，最多包含 4 张 PNG/JPEG；
+每张压缩文件不超过 1 MiB、像素不超过 800 万，合计不超过 2400 万像素。
+Base64 与 JSON 封装均计入完整请求体上限。
 格式错误、缺失、重复或不匹配的响应都会明确失败。
 实际返回的模型及可获得的用量／费用会被保留；不可获得的指标保持为 null。
 
@@ -139,7 +293,41 @@ Jev 使用 `/api/alpha/decisions`，请求时限为 20 秒；不自动重试、�
 后续搜索默认使用 hybrid。宿主在 Codex 用量之外，保留每次 Jev 搜索的覆盖范围与用量，
 总时限也包括初始检索。空范围或仅包含过期源的范围不能证明重排成功。
 摘要与检索使用真实的源文档证据；模型生成的引用必须能够解析到本次运行实际返回过的证据，
-且在完成时仍保持新鲜。
+且在完成时仍保持新鲜。检索阅读器的指令（受限与原生两种）增加两条通用的回答规则：
+按问题要求的形式先给出直接答案；当问题依赖某一具体段落时，先阅读被引用的注释或章节，
+解析该段落所依赖的文内引用（脚注或尾注标记、引文编号、“见表／见节”之类的指引）后再回答。
+所有证据、引用与弃答规则保持不变；证据缺失或无法支持答案时仍须设置 `insufficient_evidence: true`。
+富文本与多模态阅读器不接收这些附加规则。这些规则属于 GPTgrep 的 reader 合同。
+
+XL 比较的两组均保留相同的原生 Codex 基础，接收相同的问题、完整原始文档上下文与输出要求。
+GPTgrep 组额外获得固定版本的通用 Skills／角色、二进制和完整预处理产物，作为声明的实验处理。
+问题、标准答案与证据标注不得进入索引准备；标准答案、证据标注和判分状态只属于独立 evaluator，不能进入 reader。
+因此，这一比较衡量整个产品配置的效果，不能单独归因为检索。具体模型、权限、工具、预算、隔离与
+确认集合要求以[评估协议](evaluation.md)为准。
+
+`HostConfig.native_ptc`（默认 false）和 `--native-ptc` 为最终检索 reader 选择原生执行。必须在
+turn 开始前确认一个已存在的命名权限 profile。原生配置继承所选运行时的 Code Mode、MCP、web 及
+其他能力，然后应用 `HostConfig.native_capabilities`；shell 和图像查看默认启用。命名策略由运行时
+负责。其报告的沙箱投影作为私有观察保留，并不证明细粒度的强制执行。查询规划器会清除该标志，
+纯补全会拒绝原生执行。
+
+`native_ptc::Tracker` 在 thread/turn 绑定后统计原生命令、图像、文件修改、MCP、协作者、web、
+生成和 sleep 条目。同一 ID 的生命周期事件与一次最终快照只计一次；类型变化或状态不一致会导致
+失败。这些观察与 GPTgrep 直接请求的 ID 共享作业配置的 `max_tool_calls`。动态调用超额会在分发前
+被拒绝；观察到的原生超额会使宿主停止，此时执行可能已经开始。报告保留哈希后的 ID 和生命周期／
+状态元数据，不含命令、输出、图像路径、cwd 或进程 ID。GPTgrep 工具回执和引用验证保持原有含义。
+
+`run_native_task` 提供结构化的原生工作，输入为调用方指令、状态、JSON schema、工作目录和原始
+截止时间。它校验实际的最终 JSON，记录原生用量和权限观察，并且只在所拥有的进程组停止并被回收
+之后才返回报告。`OcrRuntimeProfile::with_native_agent` 为 `OcrHostExecutor` 选择这一路径。智能体
+可以检查原始来源和提供的 rendition，运行代码和 CV 库，并选择有用的派生图像。执行前后都会检查
+源文件哈希；在现有解析器接收结果之前，强类型 OCR 校验器会检查任务身份、必需区域和完成情况。
+私有的原生报告按摘要保留，可移植回执会区分原生执行与旧的受守卫图像传输。取消时会保留未知的
+提供方计量，同时等待所拥有进程的清理。
+
+Document 控制文件在现有 Document 驱动中使用显式的 `native_execution` 选择。它保留真实的
+`gptgrep_parse.toolbox` 操作和完整的后端验证，同时继承原生运行时能力。旧版固定 Page/Document
+图像 profile 及其资格验证回执仍可用于原有的执行模式。
 
 认证、源文档检索、推理、引用验证和任务验收是独立的结果状态。
 子进程成功退出不足以证明任务已完成。宿主会报告实际的线程／轮次身份、
@@ -156,7 +344,8 @@ Rust 的树与合并阶段具有明确的源代码映射和测试；仅仅生成
 
 ## 可选的推理索引增强
 
-`index` 不调用模型，先发布确定性的 LiteParse／文档树／tgrep 索引。显式 `enrich` 随后
+默认 legacy `index` 不调用模型，先发布确定性的 LiteParse／文档树／tgrep 索引。
+显式 OCR／Document-agent 索引是另一个已实现、需声明原生调用的流程。显式 `enrich` 随后
 沿来源绑定的 UTF-8 字节游标遍历每份已收录文档。零模型计划固定所有窗口和最坏调用预算；
 live Codex（builder 默认 `gpt-6-luna`）提出小型封闭 schema 提示，Jev 对准确的原文
 锚点进行支持判别。构建器和 Jev 使用独立持久账本；安全的预算暂停后可复用已验证的完整窗口。
@@ -208,7 +397,8 @@ builder 是**新的**模型样本，不能宣称重放了旧版未保留的 Jev 
 Jev 请求。24 个候选最多产生 48 个问题；硬上限仍为 64 个问题和 65,536 个编码请求字节。
 共享角色定义不超过 2,048 字节。准入检查完整请求（包括转义和元数据），超限明确失败。
 
-候选资格和原查询 literal anchor 的保留规则不变。符合条件的窗口依次按原始 anchor 分组、
+候选资格和原查询 literal anchor 的保留规则不变。没有任何窗口符合条件时，得分最高的三个窗口成为
+`below_floor_fallback` 候选，并与普通相关性路径一样标记 `below_threshold`。符合条件的窗口依次按原始 anchor 分组、
 角色（`direct_support`、`source_local_incomplete`、`background`、`no_support`）、相关性降序
 和稳定来源坐标排序。直接支持只表示至少一个所问事实可用，不证明所有约束或后续答案已被
 支持。交付集合的充分性始终为未评估。现有有界读取工具可以补齐局部片段，不引入隐藏读取

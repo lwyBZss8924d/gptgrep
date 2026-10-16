@@ -1,8 +1,13 @@
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use gptgrep_core::SearchOptions;
+
+mod decisions_budget;
+mod judge;
+mod parse_agent;
+mod parse_agent_index;
 use serde_json::{Value, json};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -23,6 +28,13 @@ struct Cli {
     schema: bool,
     #[arg(long, global = true, help = "Print a compact agent usage manifest")]
     llms: bool,
+    #[arg(
+        long,
+        global = true,
+        value_name = "FILE",
+        help = "Join an existing shared Decisions budget contract for paid operations"
+    )]
+    decisions_budget: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -35,6 +47,78 @@ enum Mode {
     Semantic,
 }
 
+#[derive(Debug, Clone, ValueEnum)]
+enum IndexOcr {
+    Off,
+    Auto,
+}
+
+#[derive(Debug, Args)]
+struct RichIndexArgs {
+    #[arg(
+        long,
+        help = "Explicitly publish source-bound v2 PDF/PNG/JPEG artifacts; default index retains v1"
+    )]
+    rich: bool,
+    #[arg(
+        long,
+        value_enum,
+        help = "Select v2 ingestion: off is local; auto requires the qualified native OCR runtime"
+    )]
+    ocr: Option<IndexOcr>,
+    #[arg(
+        long,
+        help = "Prepare all native pages and OCR routing without model calls or CURRENT publication"
+    )]
+    plan_only: bool,
+    #[arg(
+        long,
+        help = "Reuse only verified completed OCR results; unknown/failed tasks cannot be retried"
+    )]
+    resume: bool,
+    #[arg(
+        long,
+        help = "Explicit immutable OCR run identity, required for live OCR"
+    )]
+    ocr_run_id: Option<String>,
+    #[arg(
+        long,
+        help = "Operator-owned native or legacy qualified OcrRuntimeProfile JSON"
+    )]
+    ocr_runtime_profile: Option<PathBuf>,
+    #[arg(
+        long,
+        default_value = "codex",
+        help = "Pinned official Codex binary from the OCR runtime profile"
+    )]
+    ocr_codex_bin: String,
+    #[arg(
+        long,
+        help = "Existing independent authenticated OCR home; no login or credential reads"
+    )]
+    ocr_codex_home: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Existing canonical native state directory with logs child; authentication stays in OCR home"
+    )]
+    ocr_codex_state_dir: Option<PathBuf>,
+    #[arg(long, default_value_t = 24)]
+    ocr_max_pages: usize,
+    #[arg(
+        long,
+        default_value_t = 1800,
+        help = "One original OCR run deadline; resume adopts it unchanged"
+    )]
+    ocr_timeout_seconds: u64,
+    #[arg(long, default_value_t = 25)]
+    page_window: usize,
+    #[arg(
+        long,
+        help = "Require the frozen rich-ingest plan digest before live execution"
+    )]
+    expected_plan_sha256: Option<String>,
+}
+
 #[derive(Debug, Args)]
 struct HostArgs {
     #[arg(long, default_value = "codex")]
@@ -44,7 +128,17 @@ struct HostArgs {
         help = "Existing Codex account home; defaults to CODEX_HOME or ~/.codex"
     )]
     codex_home: Option<PathBuf>,
-    #[arg(long, default_value = "gpt-5.6-luna")]
+    #[arg(
+        long,
+        help = "Canonical existing native state directory with an existing logs child; account home stays unchanged"
+    )]
+    codex_state_dir: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Existing named Codex permission profile; selected on thread and turn without legacy sandbox overrides"
+    )]
+    codex_permissions: Option<String>,
+    #[arg(long, default_value = "gpt-6-luna")]
     model: String,
     #[arg(long, default_value = "max")]
     reasoning_effort: String,
@@ -78,8 +172,17 @@ impl HostArgs {
             codex_home: self
                 .codex_home
                 .unwrap_or_else(|| gptgrep_host::HostConfig::default().codex_home),
+            codex_state_dir: self.codex_state_dir,
+            permission_profile: self.codex_permissions,
+            native_ptc: false,
+            native_capabilities: Default::default(),
+            native_skills: Vec::new(),
+            native_runtime_package: None,
+            working_dir: None,
+            excluded_env_vars: Vec::new(),
             model: self.model,
             jev_model: None,
+            decisions_execution: None,
             document: None,
             reasoning_effort: self.reasoning_effort,
             service_tier: self.service_tier,
@@ -94,6 +197,90 @@ impl HostArgs {
     }
 }
 
+/// Bounds for the explicit v2 text/visual workflow. Legacy options keep their
+/// original defaults and are never silently repurposed for this workflow.
+#[derive(Debug, Args)]
+struct MultimodalArgs {
+    #[arg(
+        long,
+        help = "Route and rerank source-bound v2 text and images; requires a rich generation"
+    )]
+    multimodal: bool,
+    #[arg(long, requires = "multimodal", value_parser = clap::value_parser!(u64).range(1..=900))]
+    multimodal_timeout: Option<u64>,
+    #[arg(long, requires = "multimodal")]
+    window_bytes: Option<usize>,
+    #[arg(long, requires = "multimodal")]
+    max_visual_candidates: Option<usize>,
+    #[arg(long, requires = "multimodal")]
+    max_concurrent_batches: Option<usize>,
+    #[arg(long, requires = "multimodal")]
+    max_output_bytes: Option<usize>,
+    #[arg(long, requires = "multimodal")]
+    max_metadata_bytes: Option<usize>,
+    #[arg(long, requires = "multimodal")]
+    max_image_bytes: Option<u64>,
+    #[arg(long, requires = "multimodal")]
+    max_image_pixels: Option<u64>,
+}
+
+impl MultimodalArgs {
+    fn options(
+        &self,
+        query: &str,
+        document: Option<String>,
+        min_score: f64,
+        shared: bool,
+    ) -> Result<gptgrep_core::RichMultimodalSearchOptions> {
+        let mut options = gptgrep_core::RichMultimodalSearchOptions {
+            document,
+            min_score,
+            require_shared_ledger: shared,
+            ..Default::default()
+        };
+        if let Some(value) = self.window_bytes {
+            options.window_bytes = value;
+        }
+        if let Some(value) = self.max_visual_candidates {
+            options.max_visual_candidates = value;
+        }
+        if let Some(value) = self.max_concurrent_batches {
+            options.max_concurrent_batches = value;
+        }
+        if let Some(value) = self.max_output_bytes {
+            options.max_output_bytes = value;
+        }
+        if let Some(value) = self.max_metadata_bytes {
+            options.max_metadata_bytes = value;
+        }
+        if let Some(value) = self.max_image_bytes {
+            options.resources.image_file_bytes = value;
+        }
+        if let Some(value) = self.max_image_pixels {
+            options.resources.image_pixels = value;
+        }
+        if query.trim().is_empty()
+            || query.len() > 8192
+            || !(4..=2048).contains(&options.window_bytes)
+            || !(1..=16).contains(&options.max_visual_candidates)
+            || !(1..=4).contains(&options.max_concurrent_batches)
+            || !(1..=1048576).contains(&options.max_output_bytes)
+            || !(1..=524288).contains(&options.max_metadata_bytes)
+            || options.resources.image_file_bytes > gptgrep_jev::MAX_IMAGE_BYTES as u64
+            || !min_score.is_finite()
+            || !(0.0..=1.0).contains(&min_score)
+            || options
+                .document
+                .as_ref()
+                .is_some_and(|d| d.is_empty() || d.len() > 8192)
+        {
+            bail!("multimodal query or candidate/output options exceed their bounds");
+        }
+        options.resources.validate()?;
+        Ok(options)
+    }
+}
+
 #[derive(Debug, Args)]
 struct EnrichHostArgs {
     #[arg(long, default_value = "codex")]
@@ -103,6 +290,11 @@ struct EnrichHostArgs {
         help = "Existing Codex account home; defaults to CODEX_HOME or ~/.codex"
     )]
     codex_home: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Canonical existing native state directory with an existing logs child; account home stays unchanged"
+    )]
+    codex_state_dir: Option<PathBuf>,
     #[arg(long, default_value = "gpt-6-luna")]
     builder_model: String,
     #[arg(long, default_value = "max")]
@@ -120,6 +312,7 @@ impl EnrichHostArgs {
         let mut config = gptgrep_host::HostConfig::default();
         config.codex_bin = self.codex_bin;
         config.codex_home = self.codex_home.unwrap_or(config.codex_home);
+        config.codex_state_dir = self.codex_state_dir;
         config.model = self.builder_model;
         config.reasoning_effort = self.reasoning_effort;
         config.service_tier = self.service_tier;
@@ -130,7 +323,185 @@ impl EnrichHostArgs {
 }
 
 #[derive(Debug, Subcommand)]
+enum OcrCommand {
+    /// Explicit authenticated foreground loopback service; native CLI only.
+    Serve {
+        #[arg(
+            long,
+            value_name = "FILE",
+            help = "Bounded operator-owned gptgrep.ocr.serve.v1 control snapshot"
+        )]
+        config: PathBuf,
+        #[arg(
+            long,
+            default_value = "GPTGREP_OCR_SERVE_TOKEN",
+            help = "Selected bearer token environment variable name; value is never printed or inherited by OCR children"
+        )]
+        token_env: String,
+        #[arg(
+            long,
+            help = "Create only the supplied original-anchor ledger pair; existing state must match and is never reset"
+        )]
+        initialize_ledger: bool,
+        #[arg(
+            long,
+            help = "Require this exact SHA256 of the explicitly selected control snapshot"
+        )]
+        expected_control_sha256: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ParseAgentCommand {
+    /// Bounded foreground NDJSON toolbox for an external Codex/PTC agent.
+    Serve {
+        #[arg(long, value_name = "FILE")]
+        config: PathBuf,
+        #[arg(long, value_name = "SHA256")]
+        expected_control_sha256: String,
+    },
+    /// Complete deterministic parsing with optional qualified per-page OCR.
+    Run {
+        #[arg(long, value_name = "FILE")]
+        config: PathBuf,
+        #[arg(long, value_name = "SHA256")]
+        expected_control_sha256: String,
+        #[arg(long, value_name = "ALIAS")]
+        source: String,
+        #[arg(long, value_enum, default_value = "off")]
+        mode: IndexOcr,
+        #[arg(long, value_name = "FILE")]
+        output: PathBuf,
+    },
+    /// Launch one explicitly admitted Codex document turn over a prepared source.
+    Agent {
+        #[arg(long, value_name = "FILE")]
+        config: PathBuf,
+        #[arg(long, value_name = "SHA256")]
+        expected_control_sha256: String,
+        #[arg(long, value_name = "FILE")]
+        document_agent_control: PathBuf,
+        #[arg(long, value_name = "SHA256")]
+        expected_document_agent_control_sha256: String,
+        #[arg(long, value_name = "ALIAS")]
+        source: String,
+        #[arg(long, value_name = "FILE")]
+        output: PathBuf,
+    },
+    /// Produce private native-document qualification evidence, never publication.
+    Qualify {
+        #[arg(long, value_name = "FILE")]
+        config: PathBuf,
+        #[arg(long, value_name = "SHA256")]
+        expected_control_sha256: String,
+        #[arg(long, value_name = "FILE")]
+        document_agent_control: PathBuf,
+        #[arg(long, value_name = "SHA256")]
+        expected_document_agent_control_sha256: String,
+        #[arg(long, value_name = "ALIAS")]
+        source: String,
+        #[arg(long, value_name = "FILE")]
+        qualification_request: PathBuf,
+        #[arg(long, value_name = "SHA256")]
+        expected_qualification_request_sha256: String,
+        #[arg(long, value_name = "PRIVATE_FILE")]
+        evidence_output: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DecisionsBudgetCommand {
+    /// Create a NEW same-host Decisions ledger and its 0600 control file; never joins, resets or renews.
+    Init {
+        #[arg(long, value_name = "ID")]
+        run_id: String,
+        #[arg(
+            long,
+            value_name = "FILE",
+            help = "Regular file (<= 1 MiB); plan_digest is the SHA-256 of its bytes"
+        )]
+        plan_file: PathBuf,
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..=86400))]
+        deadline_seconds: u64,
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=200))]
+        max_submissions: u32,
+        #[arg(
+            long,
+            value_name = "ABS_PATH",
+            help = "New absolute journal path; it and its .lock sidecar must not exist"
+        )]
+        ledger: PathBuf,
+        #[arg(
+            long,
+            value_name = "ABS_CONTROL_JSON",
+            help = "New absolute control path, written once with mode 0600"
+        )]
+        output: PathBuf,
+    },
+    /// Read-only reservations by outcome, remaining allowance and deadline.
+    Status {
+        #[arg(long, value_name = "FILE")]
+        control: PathBuf,
+    },
+}
+
+#[derive(Debug)]
+struct OcrServeError(&'static str);
+impl std::fmt::Display for OcrServeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+impl std::error::Error for OcrServeError {}
+
+#[derive(Debug, Subcommand)]
 enum Command {
+    /// In-package document toolbox and explicit parse/OCR orchestration.
+    ParseAgent {
+        #[command(subcommand)]
+        command: ParseAgentCommand,
+    },
+    /// Explicit foreground OCR; ordinary search never starts it.
+    Ocr {
+        #[command(subcommand)]
+        command: OcrCommand,
+    },
+    /// Initialize or inspect a same-host Decisions submission ledger; JSON output, no network.
+    DecisionsBudget {
+        #[command(subcommand)]
+        command: DecisionsBudgetCommand,
+    },
+    /// Rerank exact source-bound v2 references; JSON output, no document routing.
+    Rerank {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long, default_value = "-")]
+        input: PathBuf,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, default_value_t = 180, value_parser = clap::value_parser!(u64).range(1..=900))]
+        multimodal_timeout: u64,
+    },
+    /// Run bounded local operations against one retained generation; JSON output.
+    Batch {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long, default_value = "-")]
+        input: PathBuf,
+        #[arg(
+            long,
+            help = "Use v2 artifact operations and explicit paid search_multimodal"
+        )]
+        rich: bool,
+        #[arg(
+            long,
+            requires = "rich",
+            help = "Decisions model for explicit paid rich batch operations"
+        )]
+        model: Option<String>,
+        #[arg(long, requires = "rich", default_value_t = 180, value_parser = clap::value_parser!(u64).range(1..=900))]
+        multimodal_timeout: u64,
+    },
     /// Parse documents and publish a complete immutable search generation.
     #[command(alias = "init")]
     Index {
@@ -143,6 +514,23 @@ enum Command {
             help = "Apply PageIndex scan-cost merging to native paginated documents"
         )]
         optimize_merge: bool,
+        #[arg(long, value_name = "FILE", requires_all = ["expected_parse_agent_config_sha256", "document_agent_controls", "expected_document_agent_controls_sha256"],
+            conflicts_with_all = ["optimize_merge", "rich", "ocr", "plan_only", "resume", "ocr_run_id", "ocr_runtime_profile", "ocr_codex_bin", "ocr_codex_home", "ocr_codex_state_dir", "ocr_max_pages", "ocr_timeout_seconds", "page_window", "expected_plan_sha256"],
+            help = "Use one exact prepared-document invocation for complete typed v2 indexing")]
+        parse_agent_config: Option<PathBuf>,
+        #[arg(long, value_name = "SHA256", requires = "parse_agent_config")]
+        expected_parse_agent_config_sha256: Option<String>,
+        #[arg(
+            long,
+            value_name = "FILE",
+            requires = "parse_agent_config",
+            help = "Closed pinned registry selecting one independently admitted document control per source alias"
+        )]
+        document_agent_controls: Option<PathBuf>,
+        #[arg(long, value_name = "SHA256", requires = "parse_agent_config")]
+        expected_document_agent_controls_sha256: Option<String>,
+        #[command(flatten)]
+        rich: RichIndexArgs,
     },
     /// Build source-bound, non-citable navigation hints over a published index.
     Enrich {
@@ -196,7 +584,10 @@ enum Command {
         max_windows_per_run: usize,
         #[arg(long, default_value_t = 900)]
         deadline_seconds: u64,
-        #[arg(long, help = "Jev Decisions model; default typesafe/jev-1.13")]
+        #[arg(
+            long,
+            help = "Jev Decisions model; default openai/gpt-6-luna-decisions"
+        )]
         jev_model: Option<String>,
         #[command(flatten)]
         host: EnrichHostArgs,
@@ -213,19 +604,22 @@ enum Command {
             help = "Restrict retrieval to one exact indexed source-relative path"
         )]
         document: Option<String>,
-        #[arg(short = 'n', long, default_value_t = 20)]
+        #[arg(short = 'n', long, default_value_t = 20, conflicts_with = "multimodal")]
         limit: usize,
-        #[arg(short = 'C', long, default_value_t = 0)]
+        #[arg(short = 'C', long, default_value_t = 0, conflicts_with = "multimodal")]
         context: usize,
-        #[arg(short = 'i', long)]
+        #[arg(short = 'i', long, conflicts_with = "multimodal")]
         ignore_case: bool,
-        #[arg(short = 'F', long)]
+        #[arg(short = 'F', long, conflicts_with = "multimodal")]
         fixed_strings: bool,
-        #[arg(long, default_value_t = 24)]
+        #[arg(long, default_value_t = 24, conflicts_with = "multimodal")]
         max_candidates: usize,
-        #[arg(long, default_value_t = 32)]
+        #[arg(long, default_value_t = 32, conflicts_with = "multimodal")]
         routing_docs: usize,
-        #[arg(long, help = "OpenRouter Decisions model; default typesafe/jev-1.13")]
+        #[arg(
+            long,
+            help = "OpenRouter Decisions model; default openai/gpt-6-luna-decisions"
+        )]
         model: Option<String>,
         #[arg(
             long,
@@ -233,6 +627,8 @@ enum Command {
             help = "Model relevance rubric floor (0..1); not calibrated confidence"
         )]
         min_score: f64,
+        #[command(flatten)]
+        visual: MultimodalArgs,
     },
     /// Inspect document tree nodes and their source coordinates.
     Tree {
@@ -276,9 +672,18 @@ enum Command {
     /// Run a bounded local Codex retrieval workflow and validate returned citations.
     Ask {
         question: String,
+        #[arg(
+            long,
+            requires = "codex_permissions",
+            help = "Opt in to native shell/Python/Pillow/view_image for the final reader; shares the observed tool budget and requires an existing named permission profile"
+        )]
+        native_ptc: bool,
         #[arg(default_value = ".")]
         root: PathBuf,
-        #[arg(long, help = "Jev Decisions model; default typesafe/jev-1.13")]
+        #[arg(
+            long,
+            help = "Jev Decisions model; default openai/gpt-6-luna-decisions"
+        )]
         jev_model: Option<String>,
         #[arg(
             long,
@@ -315,14 +720,23 @@ enum Command {
         )]
         experimental_evidence_roles: bool,
         #[command(flatten)]
-        host: HostArgs,
+        visual: MultimodalArgs,
+        #[arg(long, requires = "multimodal")]
+        max_citations: Option<usize>,
+        #[arg(long, requires = "multimodal")]
+        min_score: Option<f64>,
+        #[command(flatten)]
+        host: Box<HostArgs>,
     },
     /// Summarize one verified node through the local Codex host.
     Summarize {
         node_id: String,
         #[arg(long, default_value = ".")]
         root: PathBuf,
-        #[arg(long, help = "Jev Decisions model; default typesafe/jev-1.13")]
+        #[arg(
+            long,
+            help = "Jev Decisions model; default openai/gpt-6-luna-decisions"
+        )]
         jev_model: Option<String>,
         #[arg(
             long,
@@ -357,25 +771,85 @@ fn contract() -> Value {
     let mut contract = json!({
         "schema_version":"gptgrep.cli.v1", "name":"gptgrep", "version":env!("CARGO_PKG_VERSION"),
         "transport":"argv/stdout", "mcp":false, "default_output":"text", "machine_output":"--json",
-        "exit_codes":{"0":"success or matches","1":"no matches","2":"error, stale evidence, or incomplete enrichment"},
+        "exit_codes":{"0":"success or matches; a hybrid/semantic search may return only below_threshold low-confidence candidates (coverage.below_threshold_fallback > 0), which are not passing matches","1":"no matches","2":"error, stale evidence, or incomplete enrichment"},
         "commands":{
-            "index":{"usage":"gptgrep index ROOT [--max-files 100000] [--optimize-merge] --json","effect":"write owned .gptgrep immutable generation","network":false},
-            "enrich":{"usage":"gptgrep enrich ROOT --ledger-path ABSOLUTE_PATH --max-builder-calls N --max-jev-calls N [--plan-only] [--expected-plan-sha256 SHA] --json","effect":"explicit raw-only Codex/Jev navigation-overlay build after deterministic index","model_assisted":true,"plan_only_model_calls":0,"defaults":{"builder_model":"gpt-6-luna","reasoning_effort":"max","service_tier":"fast","jev_model":"typesafe/jev-1.13","window_bytes":8192,"max_hints_per_window":4},"output":"complete publishes a separate source-bound navigation overlay; incomplete/failed leaves the current index unchanged and exits 2","hint_authority":"non-citable navigation only; not full PageIndex Flash parity","resume":"same absolute ledger and bound plan; pending or failed calls are not automatically retried"},
-            "search":{"usage":"gptgrep search QUERY ROOT --mode regex|lexical|hybrid|semantic --json","options":{"mode":{"type":"string","default":"hybrid","enum":["hybrid","semantic","regex","lexical"]},"document":{"type":"string","description":"Exact indexed source-relative path; scope applies before candidate limits"},"limit":{"type":"integer","default":20,"minimum":1,"maximum":1000},"context":{"type":"integer","default":0,"maximum":100},"max-candidates":{"type":"integer","default":24,"maximum":24},"routing-docs":{"type":"integer","default":32,"maximum":32},"ignore-case":{"type":"boolean"},"fixed-strings":{"type":"boolean"},"model":{"type":"string","default":"typesafe/jev-1.13"},"min-score":{"type":"number","minimum":0,"maximum":1,"default":0.5}},"network":"required Jev for default hybrid and semantic; explicit regex/lexical primitives are local","credentials":"OPENROUTER_API_KEY environment only","output_schema":"gptgrep.v1"},
+            "batch":{"usage":"gptgrep batch --root ROOT --input FILE_OR_DASH --json","effect":"local generation-pinned search/catalog/tree/read operations","network":false,"request_schema":"gptgrep.batch.request.v1","output_schema":"gptgrep.batch.response.v1","limits":{"input_bytes":1048576,"operations":64,"output_bytes":1048576},"output_order":"input operation order","model_operations":"hybrid/semantic return output_budget_insufficient before any provider work in this foundation","continuation":"deterministic cursors bind generation, scope and projection; no model continuation","output":"always JSON; exit2 for any item or global failure"},
+            "index":{"usage":"gptgrep index ROOT [--ocr auto|off] [--rich] [--plan-only] --json","effect":"default legacy v1; explicit rich/ocr prepares source-bound v2 candidates and atomically publishes only complete documents","network":"none for plan-only/off; explicit auto uses qualified native OCR only for required source pages","options":{"ocr":{"enum":["off","auto"],"default":"legacy index when absent"},"plan-only":{"type":"boolean","effect":"local native parse/render; zero model calls and no CURRENT change"},"resume":{"type":"boolean","effect":"same immutable run; verified result reuse, no failed/unknown task retries or deadline renewal"},"ocr-run-id":{"type":"string","required":"live auto"},"ocr-runtime-profile":{"type":"path","required":"live auto; accepted image qualification required"},"ocr-codex-home":{"type":"path","required":"explicit independent existing home for live auto"},"ocr-codex-state-dir":{"type":"path","required":false,"effect":"existing canonical state/logs roots; sqlite and logs separated from authentication home"},"ocr-max-pages":{"type":"integer","default":24,"minimum":1,"maximum":24},"ocr-timeout-seconds":{"type":"integer","default":1800,"minimum":1,"maximum":86400},"page-window":{"type":"integer","default":25,"minimum":1,"maximum":25}},"output_schema":"gptgrep.rich-ingest.v1 for explicit rich/ocr/plan-only; legacy gptgrep.v1 otherwise","limitations":"rich UTF-8 text/Markdown, PDF/PNG/baseline JPEG; Office requires a working LibreOffice converter; other image variants remain unsupported; v2 consumption requires rich reader"},
+            "enrich":{"usage":"gptgrep enrich ROOT --ledger-path ABSOLUTE_PATH --max-builder-calls N --max-jev-calls N [--plan-only] [--expected-plan-sha256 SHA] --json","effect":"explicit raw-only Codex/Jev navigation-overlay build after deterministic index","model_assisted":true,"plan_only_model_calls":0,"defaults":{"builder_model":"gpt-6-luna","reasoning_effort":"max","service_tier":"fast","jev_model":gptgrep_jev::DEFAULT_MODEL,"window_bytes":8192,"max_hints_per_window":4},"output":"complete publishes a separate source-bound navigation overlay; incomplete/failed leaves the current index unchanged and exits 2","hint_authority":"non-citable navigation only; not full PageIndex Flash parity","resume":"same absolute ledger and bound plan; pending or failed calls are not automatically retried"},
+            "search":{"usage":"gptgrep search QUERY ROOT --mode regex|lexical|hybrid|semantic --json","options":{"mode":{"type":"string","default":"hybrid","enum":["hybrid","semantic","regex","lexical"]},"document":{"type":"string","description":"Exact indexed source-relative path; scope applies before candidate limits"},"limit":{"type":"integer","default":20,"minimum":1,"maximum":1000},"context":{"type":"integer","default":0,"maximum":100},"max-candidates":{"type":"integer","default":24,"maximum":24},"routing-docs":{"type":"integer","default":32,"maximum":32},"ignore-case":{"type":"boolean"},"fixed-strings":{"type":"boolean"},"model":{"type":"string","default":gptgrep_jev::DEFAULT_MODEL},"min-score":{"type":"number","minimum":0,"maximum":1,"default":0.5}},"network":"required Jev for default hybrid and semantic; explicit regex/lexical primitives are local","lexical_terms":"lexical/hybrid use at most 16 lowercase alphanumeric terms after deduplication, a fixed English function-word list and ASCII-letter tokens under 3 characters are dropped (digits and non-ASCII kept; an all-dropped query keeps its tokens); beyond 16, the first 64 are ranked by scoped index document frequency, rarer first, absent terms last, ties in question order; deterministic","routing":"hybrid/semantic route up to routing-docs fresh scoped documents with one Decisions call; exactly one routable document (for example a --document scope) is selected without that call and coverage.routing_status reports skipped_single_document (otherwise routed or no_candidates); the rerank request is unchanged","credentials":"OPENROUTER_API_KEY environment only","output_schema":"gptgrep.v1"},
             "tree":{"usage":"gptgrep tree FILE --root ROOT --json","effect":"read"},
             "read":{"usage":"gptgrep read DOCUMENT_ID:NODE_ID --root ROOT --max-bytes 8192 --offset BYTES --json","effect":"read"},
             "files":{"usage":"gptgrep files ROOT --json","effect":"read"},
             "status":{"usage":"gptgrep status ROOT --json","scope":"existing indexed files; index discovers new files"},
             "parse":{"usage":"gptgrep parse FILE --json","effect":"local parser"},
             "judge":{"usage":"gptgrep judge --input FILE [--model MODEL] --json","input":{"state":"JSON","questions":"Choice/Noul/Score map"},"effect":"explicit remote Decisions call"},
-            "ask":{"usage":"gptgrep ask QUESTION ROOT [--codex-home HOME] [--codex-bin codex] [--experimental-query-plan] [--planner-model MODEL] [--navigation-overlay-sha256 SHA --navigation-max-jev-calls N --navigation-max-request-bytes BYTES] [--experimental-evidence-roles] --json","effect":"required Jev routing/reranking followed by bounded local Codex reasoning","options":{"jev-model":{"type":"string","default":"typesafe/jev-1.13"},"document":{"type":"string"},"navigation-overlay-sha256":{"type":"string","requires":["experimental-query-plan","document"],"effect":"require exact completed source-bound overlay and full Jev hint scan before planned retrieval","report_schema":"gptgrep.navigation-query.v1","citation_authority":false},"navigation-max-jev-calls":{"type":"integer","requires":"navigation-overlay-sha256","minimum":1,"maximum":128,"default":32},"navigation-max-request-bytes":{"type":"integer","requires":"navigation-overlay-sha256","minimum":1,"maximum":8388608,"default":2097152},"experimental-query-plan":{"type":"boolean","default":false,"effect":"one extra no-tools Luna planner turn; up to two alternate retrieval queries; bounded parallel routes and final Jev reranking against the original question","limits":{"alternate_queries":2,"routing_concurrency":2,"union_candidates":24,"planner_timeout_seconds":45},"accounting":"model_attempts reports planner and reader separately; legacy usage is reader-only; overall timeout is shared"},"planner-model":{"type":"string","default":"gpt-6-luna","requires":"experimental-query-plan","effect":"select the query-planner Codex model independently from the final reader"},"experimental-evidence-roles":{"type":"boolean","default":false,"requires":"experimental-query-plan","effect":"one additional Choice per union candidate in the same mandatory Jev decision; source-bound role ordering and continuation hints","limits":{"union_candidates":24,"final_questions":48,"complete_request_bytes":65536},"sufficiency":"unassessed","accounting":"extra judgments and tokens are measured within the existing request; discarded-candidate metadata stays private and is not citable"}},"defaults":{"model":"gpt-5.6-luna","reasoning_effort":"max","service_tier":"fast","timeout_seconds":180,"max_tool_calls":12}},
+            "ask":{"usage":"gptgrep ask QUESTION ROOT [--codex-home HOME] [--codex-bin codex] [--native-ptc --codex-permissions NAME] [--experimental-query-plan] [--planner-model MODEL] [--navigation-overlay-sha256 SHA --navigation-max-jev-calls N --navigation-max-request-bytes BYTES] [--experimental-evidence-roles] --json","effect":"required Jev routing/reranking followed by bounded local Codex reasoning","options":{"native-ptc":{"type":"boolean","default":false,"requires":"codex-permissions","effect":"caller-selected native capabilities, Skills, shell and image tools for the final retrieval reader; planner and completion keep their selected workflows","budget":"observed native items and admitted GPTgrep dynamic calls share max_tool_calls. Past it, the text retrieval reader answers each further valid GPTgrep request with the restricted reader's recoverable tool_budget_exhausted denial: no retrieval, Jev work or charge, so the reader can finalize with an answer or insufficient_evidence in the same turn and original deadline; a malformed request stays fatal. After max_tool_calls denials the next request fails with host_native_ptc_tool_budget_exhausted. ask --multimodal --native-ptc keeps failing with host_native_ptc_tool_budget_exhausted on the first GPTgrep request past the budget. Native item events are post-start observations, not a pre-execution guard: a native item cannot be denied, and one observed past the budget fails with host_native_ptc_tool_budget_exhausted","accounting":"bounded payload-free model_attempts[].native_ptc metadata; after the first denial its tool_budget reports the restricted reader's max_tool_calls, admitted_tool_calls (observed native items plus charged GPTgrep calls, so max_tool_calls at every denial), denied_tool_calls and max_denied_tool_calls, while dynamic_requests_charged and native_tool_calls keep the split; denial receipts stay in the GPTgrep-only tool_calls; model-turn counts stay in model_attempts and model_usage","citation_authority":false},"jev-model":{"type":"string","default":gptgrep_jev::DEFAULT_MODEL},"document":{"type":"string"},"navigation-overlay-sha256":{"type":"string","requires":["experimental-query-plan","document"],"effect":"require exact completed source-bound overlay and full Jev hint scan before planned retrieval","report_schema":"gptgrep.navigation-query.v1","citation_authority":false},"navigation-max-jev-calls":{"type":"integer","requires":"navigation-overlay-sha256","minimum":1,"maximum":128,"default":32},"navigation-max-request-bytes":{"type":"integer","requires":"navigation-overlay-sha256","minimum":1,"maximum":8388608,"default":2097152},"experimental-query-plan":{"type":"boolean","default":false,"effect":"one extra no-tools Luna planner turn; up to two alternate retrieval queries; bounded parallel routes and final Jev reranking against the original question","limits":{"alternate_queries":2,"routing_concurrency":2,"union_candidates":24,"planner_timeout_seconds":45},"accounting":"model_attempts reports planner and reader separately; legacy usage is reader-only; overall timeout is shared"},"planner-model":{"type":"string","default":"gpt-6-luna","requires":"experimental-query-plan","effect":"select the query-planner Codex model independently from the final reader"},"experimental-evidence-roles":{"type":"boolean","default":false,"requires":"experimental-query-plan","effect":"one additional Choice per union candidate in the same mandatory Jev decision; source-bound role ordering and continuation hints","limits":{"union_candidates":24,"final_questions":48,"complete_request_bytes":65536},"sufficiency":"unassessed","accounting":"extra judgments and tokens are measured within the existing request; discarded-candidate metadata stays private and is not citable"}},"defaults":{"model":"gpt-6-luna","reasoning_effort":"max","service_tier":"fast","timeout_seconds":180,"max_tool_calls":12},"reader_answer_rules":"lead with the direct answer in the form the question asks for; resolve in-text references such as note markers, citation numbers and table or section pointers by reading the referenced passage. The rules never relax abstention: every evidence, citation and insufficient_evidence rule is unchanged. Rich text/multimodal readers do not receive them"},
             "summarize":{"usage":"gptgrep summarize DOCUMENT_ID:NODE_ID --root ROOT [host options] --json","effect":"required Jev retrieval in the selected document, then model-written summary with issued evidence citations"},
             "host-complete":{"usage":"gptgrep host-complete --input FILE_OR_DASH [host options] --json","input":{"instructions":"string","state":"JSON","schema":"JSON Schema object"},"effect":"explicit schema-validated local Codex completion; no citation assertion","defaults":{"max_input_bytes":262144,"service_tier":"fast"},"hard_max_input_bytes":1048576},
             "doctor":{"usage":"gptgrep doctor --json","effect":"local capability probe"}
         },
-        "search_output":{"fields":["schema_version","query","mode","document_scope","root","generation","index_used","source_fresh","minimum_relevance_score","hits","coverage","metrics","warnings"],"hit_fields":["path","node_id","title","line_start","line_end","page_start","page_end","match_line","match_column","byte_start","byte_end","column_start","node_offset","next_offset","node_coverage","coordinate_system","text","text_truncated","score","confidence","literal_anchor","source_sha256","source_fresh","citation"]},
+        "search_output":{"fields":["schema_version","query","mode","document_scope","root","generation","index_used","source_fresh","minimum_relevance_score","hits","coverage","metrics","warnings"],"hit_fields":["path","node_id","title","line_start","line_end","page_start","page_end","match_line","match_column","byte_start","byte_end","column_start","node_offset","next_offset","node_coverage","coordinate_system","text","text_truncated","score","confidence","literal_anchor","below_threshold","source_sha256","source_fresh","citation"],
+            "relevance_floor":"hybrid/semantic hits must score at least minimum_relevance_score (--min-score) unless retained as literal anchors; below_threshold=true marks any delivered hit scoring below it. When no reranked candidate passes, the top 3 by score are delivered flagged below_threshold=true as low-confidence candidates, coverage.below_threshold_fallback counts those actually returned after --limit and the final freshness check, filtered_candidates still counts them as below the floor, and a warning says so; they never pass the floor. Plain-text output prints them as PATH-LINE-TEXT context lines, never as PATH:LINE:TEXT matches. Regex/lexical apply no floor"},
         "bounds":{"source_file_bytes":67108864,"jev_candidates":24,"semantic_routing_documents":32},
-        "limitations":["No full PageIndex Flash parity claim", "No OCR in the initial native build", "Office conversion requires LibreOffice", "Semantic routing and evidence snippets have explicit budgets", "Generative synthesis requires explicit local Codex host mode", "Relevance floor is operational policy, not calibrated confidence; hybrid exact-token anchors are retained"]
+        "limitations":["No full PageIndex Flash parity claim", "OCR requires explicit rich ingestion and an accepted native runtime profile", "Office conversion requires LibreOffice", "Semantic routing and evidence snippets have explicit budgets", "Generative synthesis requires explicit local Codex host mode", "Relevance floor is operational policy, not calibrated confidence; hybrid exact-token anchors are retained"]
+    });
+    contract["commands"]["parse-agent"] = json!({
+        "serve_usage":"gptgrep parse-agent serve --config CONTROL_JSON --expected-control-sha256 SHA",
+        "run_usage":"gptgrep parse-agent run --config CONTROL_JSON --expected-control-sha256 SHA --source ALIAS --mode off|auto --output FILE",
+        "agent_usage":"gptgrep parse-agent agent --config CONTROL_JSON --expected-control-sha256 SHA --document-agent-control DOCUMENT_CONTROL_JSON --expected-document-agent-control-sha256 SHA --source ALIAS --output FILE",
+        "qualify_usage":"gptgrep parse-agent qualify --config CONTROL_JSON --expected-control-sha256 SHA --document-agent-control DOCUMENT_CONTROL_JSON --expected-document-agent-control-sha256 SHA --source ALIAS --qualification-request PURPOSE_JSON --expected-qualification-request-sha256 SHA --evidence-output PRIVATE_FILE",
+        "serve_transport":"foreground NDJSON on stdin/stdout; complete LF frame includes delimiter",
+        "toolbox_request_schema":"gptgrep.parse-toolbox.request.v1",
+        "toolbox_reply_schema":"gptgrep.parse-toolbox.reply.v1",
+        "control_schema":"gptgrep.parse-agent.control.v1",
+        "product_schema":"gptgrep.parse-agent.product.v1",
+        "control_authority":"exact operator snapshot registers source aliases, admitted paths/resources and original optional OCR context; model JSON cannot authorize them",
+        "input_limits":{"control_bytes":65536,"request_bytes":65536,"reply_bytes":4194304,"artifact_window_bytes":32768},
+        "operations":["prepare","extract_native","inspect_pages","inspect_artifacts","read_metadata_window","read_artifact","inspect_images","crop","inspect_ocr_plan","finalize","close"],
+        "ptc_ocr_operation":"execute_ocr through the selected original qualified executor; no JSON OCR-result submission",
+        "completeness":"native extraction traverses every original page through processing windows; metadata/text inventories use source-bound continuations",
+        "run_behavior":"complete parser stages and optional source-bound per-page OCR through the selected native-agent or legacy qualified runtime; auto incomplete returns2 without complete product",
+        "document_agent":"agent explicitly launches one selected standalone Codex app-server document turn with gptgrep_parse.toolbox; serve/run remain external PTC and deterministic surfaces",
+        "document_limits":{"legacy_profile_only":true,"native_tools":64,"native_turns":1,"native_seconds":900,"native_image_bytes":33554432,"rpc_bytes":33554432,"page_ocr_tools":8,"page_ocr_turns":1,"page_ocr_seconds":180},
+        "native_execution":{"document_control_field":"native_execution","ocr_runtime_schema":"gptgrep.ocr.native-agent-runtime.v1","capabilities":"caller-selected native tools, Skills, CLI and API configuration","budgets":"caller job tool, deadline, output, OCR admission and staging limits","qualification":"legacy native image qualifications do not apply; typed task identities, fresh source bytes and complete parser products remain validated"},
+        "requested_profile":{"model":"gpt-6-luna","effort":"max","service_tier":"fast","normalized_service_tier":"priority","actual_served_profile_verified":false},
+        "images":"native execution may inspect originals and derived images through selected native tools; legacy guarded view_image retains its accepted binary/profile/guard qualification and pre-turn catalogue",
+        "qualification":"qualify is a pinned private evidence purpose with no product/index transfer; its output is not an accepted qualification record",
+        "publication":"serve/run/agent create no generation; explicit index control registry consumes verified owned products once through the generation writer"
+    });
+    contract["commands"]["index"]["parse_agent"] = json!({
+        "usage":"gptgrep index ROOT --parse-agent-config CONTROL_JSON --expected-parse-agent-config-sha256 SHA --document-agent-controls REGISTRY_JSON --expected-document-agent-controls-sha256 SHA",
+        "controls_schema":"gptgrep.parse-agent.index-controls.v1",
+        "registry_fields":["schema","parse_agent_config","controls"],
+        "control_row_fields":["source_alias","document_control"],
+        "file_pin_fields":["path","bytes","sha256"],
+        "limits":{"registry_bytes":65536,"source_aliases":64,"document_control_bytes":65536,"total_document_control_bytes":1048576},
+        "preflight":"all source aliases must equal the complete supported corpus inventory; every pinned source control and actual binary/profile/permissions is checked before the first turn; legacy guarded image profiles also require their product-purpose qualification",
+        "shared_context":"one loaded invocation, original clock/OCR ledger/request quota and shared ResourceBudget continue across all sources; declared document tool/RPC caps are summed explicitly",
+        "publication":"manager moves each complete verified RichParsedDocument to the generation writer without reparse; complete source inventory and pins are checked again before publish",
+        "coverage":"all original parser pages/metadata and required OCR; model inspection windows/pages are reported separately and need not cover every metadata byte",
+        "unsupported":"excluded unsupported file count is reported separately; max-files refuses excess supported sources without truncation",
+        "conflicts":["legacy rich/OCR controls","optimize-merge","decisions-budget"],
+        "omitted":"original deterministic index behavior is unchanged",
+        "outcome_schema":"gptgrep.parse-agent.index.v1"
+    });
+    contract["commands"]["ocr"] = json!({
+        "usage":"gptgrep ocr serve --config CONTROL_JSON [--token-env ENV_NAME] [--expected-control-sha256 SHA] [--initialize-ledger]",
+        "effect":"explicit foreground authenticated loopback HTTP service; qualified native OCR on admitted requests",
+        "native_cli_only":true,"control_schema":"gptgrep.ocr.serve.v1","phase_schema":"gptgrep.ocr.service-phase.v1",
+        "catalog_schema":"gptgrep.ocr.task-catalog.v1","default_bind":"127.0.0.1:8828",
+        "routes":{"/v1/ocr/tasks":"exact catalog-bound OcrTask; paths restored only from server custody",
+                  "/ocr":"separate PNG multipart image-only compatibility; no generation authority"},
+        "limits":{"control_bytes":16384,"phase_bytes":16384,"task_bytes":131072,"catalog_bytes":8388608,
+                  "compatibility_png_bytes":1048576,"multipart_overhead_bytes":16384,"response_bytes":262144,
+                  "connections":8,"native_concurrency":2,"phase_admissions_max":1024,"page_seconds_max":180},
+        "defaults":{"token_env":"GPTGREP_OCR_SERVE_TOKEN","native_model":"gpt-6-luna","reasoning_effort":"max","service_tier":"fast"},
+        "qualification":"separate exact full-task and compatibility-mode/runtime policy qualification is required; requested identity is not observed served identity",
+        "initialize_ledger":"create/join exact original-anchor namespace; never replace, reset, renew or retry unknown requests",
+        "compatibility_confidence":"actual model-reported uncalibrated numeric confidence; whole-image region only; fresh mode qualification required",
+        "output":"bounded JSON preparation/stopped lifecycle; errors always structured, token and private paths omitted",
+        "shutdown":"stop admissions and await owned native stop/reap/drain; unknown remote outcome stays charged/quarantined",
+        "limitations":"listener/native/image/compatibility qualification and OS/RSS/cancellation guarantees remain pending"
     });
     contract["commands"]["enrich"]["options"] = json!({"rebuild-failed-window":{
         "type":"integer","requires":"resume","conflicts_with":"plan-only",
@@ -393,6 +867,80 @@ fn contract() -> Value {
         "binding":"part of new plans; resume must retain the same value; legacy plans remain zero",
         "billing":"failed attempts and observed/unknown provider usage remain recorded; no inference of zero billing"
     });
+    contract["commands"]["batch"]["limits"]["minimum_output_bytes"] =
+        json!("4096 + 1024 * operation_count; includes complete response, no trailing newline");
+    contract["commands"]["batch"]["invalid_request_diagnostics"] = json!({
+        "max_bytes":4096,
+        "scope":"invalid declarations and input I/O errors use the batch response schema; their cap is separate from an unadmitted requested output allowance"
+    });
+    contract["commands"]["batch"]["rich"] = json!({
+        "usage":"gptgrep batch --rich --root ROOT --input FILE_OR_DASH",
+        "request_schema":"gptgrep.batch.rich.request.v1",
+        "output_schema":"gptgrep.batch.rich.response.v1",
+        "request_envelope":{
+            "type":"object","required":["schema_version","operations"],"unknown_fields":"rejected",
+            "schema_version":"gptgrep.batch.rich.request.v1",
+            "generation":{"optional":true,"default":"CURRENT","exact_fields":["generation","manifest_sha256"],"exact_manifest_sha256":"64 lowercase hexadecimal characters","follow_up":"Copy the response generation object to keep subsequent requests on the same generation; never invent a pin"},
+            "budget":{"optional":true,"defaults":gptgrep_core::rich_batch::RichBatchBudget::default(),"local_only":"Set max_decisions_submissions to 0 for local operations"},
+            "operations":{"type":"array","minimum_items":1,"maximum_items":64,"discriminator":"op","required_per_item":["op","id"],"id":"Unique within the request; 1..128 UTF-8 bytes; no control characters","unknown_fields":"rejected","dependencies":"No intra-batch references; use returned document paths and resource IDs in later requests"}
+        },
+        "required_operation_fields":{
+            "inspect_documents":["op","id"],
+            "inspect_pages":["op","id","document"],
+            "inspect_native_metadata":["op","id","artifact_id","collection"],
+            "read_artifact":["op","id","artifact_id"],
+            "search_artifacts":["op","id","query"],
+            "inspect_visual":["op","id"],
+            "read_visual":["op","id","rendition_id"],
+            "search_multimodal":["op","id","query"],
+            "rerank":["op","id","query","candidates"]
+        },
+        "request_examples":[
+            {"schema_version":"gptgrep.batch.rich.request.v1","generation":"CURRENT","budget":{"max_operations":1,"max_output_bytes":16384,"max_decisions_submissions":0},"operations":[{"op":"inspect_documents","id":"documents-1","fields":["path","title","pages"],"page_size":5}]},
+            {"schema_version":"gptgrep.batch.rich.request.v1","generation":{"generation":"replace-with-returned-generation","manifest_sha256":"0000000000000000000000000000000000000000000000000000000000000000"},"budget":{"max_operations":1,"max_output_bytes":16384,"max_decisions_submissions":0},"operations":[{"op":"inspect_pages","id":"pages-1","document":"manual.pdf","fields":["page","native_text","metadata_artifact"],"page_size":1}]}
+        ],
+        "request_example_values":"The second example is a template: replace both generation fields with the exact response pin and manual.pdf with an inspect_documents path before execution",
+        "operations":["inspect_documents","inspect_pages","inspect_native_metadata","read_artifact","search_artifacts","inspect_visual","read_visual","search_multimodal","rerank"],
+        "generation":"CURRENT is resolved once; an exact generation and manifest SHA may be supplied",
+        "limits":{"input_bytes":1048576,"operations":64,"output_bytes":1048576,"minimum_output_bytes":"4096 + 1536 * operation_count"},
+        "inspection":"inspect_documents/inspect_pages remain indexed_metadata_only; no citation authority",
+        "inspect_native_metadata":{
+            "artifact_id":"page NativeMetadata ID returned by inspect_pages; document-wide metadata and text IDs are rejected",
+            "fields":gptgrep_core::NATIVE_METADATA_SCALAR_FIELDS,
+            "collections":{"object_summaries":gptgrep_core::NATIVE_OBJECT_FIELDS,"path_segments":gptgrep_core::NATIVE_SEGMENT_FIELDS,"image_geometry":gptgrep_core::NATIVE_IMAGE_FIELDS,"native_characters":gptgrep_core::NATIVE_CHARACTER_FIELDS,"native_words":gptgrep_core::NATIVE_WORD_FIELDS},
+            "item_fields":"closed selected fields for chosen collection; empty selects all row fields",
+            "object_id":"required only for path_segments; stable object ID returned by object_summaries",
+            "page_size":{"minimum":1,"maximum":1000,"default":100},
+            "max_output_bytes":{"minimum":1,"maximum":1048576,"default":1048576},
+            "cursor":"coverage.cursor binds exact generation, artifact SHA, source/prepared/profile/recipe, document/page, collection/object, normalized fields, page_size/max_output_bytes and row ordinal",
+            "output":"gptgrep.native_metadata.inspection.v1; mandatory identity, selected whole scalar objects and rows; metadata_only=true, citation_authority=false; freshly verifies source/prepared/artifact",
+            "admission":"4MiB maximum artifact; aggregate snapshot and owned response leases within256MiB; complete next row, scalars and cursor must fit reserved item share before JSON allocation; first-unfit is output_budget_insufficient",
+            "compatibility":"v7 complete graphics; v6 characters/words; unavailable geometry is explicit rebuild_required; no legacy silent upgrade",
+            "model_required":false
+        },
+        "search_continuation":"generation/scope/query/options-bound cursor over a bounded max_hits window; inspect search_ceiling_reached and exhausted",
+        "read_metrics":"partial reader API bytes; excludes final-wire delivery and complete physical I/O",
+        "inspect_visual":{"scope":"document_ids/first_page/last_page; default all fixed-pin documents","query":"opaque query bound into continuation; no model scoring","max_candidates":"1..256, default16","cursor":"native visual continuation returned in result.next_cursor"},
+        "read_visual":{"rendition_id":"ID returned by inspect_visual","output":"complete candidate and image_base64; no offset, byte window or cursor; never truncates image bytes"},
+        "visual_continuation":"binds exact generation, scope, query, max_candidates, stored resource budget and derived item output reservation; retain batch output budget, operation count and reserved share across continuation",
+        "visual_admission":"complete image/base64 and enclosing item must fit its fixed reservation before rendition byte reads; no borrowing from other operations; strict_cache_only refuses visual operations because no rendition cache exists",
+        "visual_authority":"local observations only; actual_image_delivery=false and citation_authority=false; no native/model delivery or citation proof",
+        "network":"only explicit search_multimodal and rerank invoke OpenRouter Decisions; local operations remain offline",
+        "model_submissions":"local:0; paid:null when exact batch attribution is unavailable; scheduled_logical_attempts and shared context snapshots are separate",
+        "search_multimodal":{"query":"nonempty UTF8 up to8192bytes","document":"optional exact source-relative path","window_bytes":"4..2048, default1024","max_visual_candidates":"1..16, default8","max_concurrent_batches":"1..4, default4","min_score":"0..1, default0.5","effect":"mandatory document routing then union text/independent visual rerank; no paid cursor or local fallback","admission":"all item output and worst-case call shares prepared before first submit; fixed shares never borrowed; one retained reader/context/original deadline","telemetry":"complete hit identities; bounded numeric usage projection retains full usage SHA, cost is lossy finite_f64 and is not an invoice","failure":"required paid failure retains partial observations and stops later paid operations; independent local items may continue"},
+        "rerank":{"query":"nonempty UTF8 up to8192bytes","candidates":"1..64 unique {id,evidence}; exact pinned native/OCR text <=2048bytes or up to16 visual source refs","max_concurrent_batches":"1..4, default4","effect":"rerank this supplied pool only; no document routing, caller content, dependency, cursor or reader citation rights","admission":"whole output and call share prepared before any batch submit"},
+        "paid_budget":{"max_decisions_submissions":"0..200, default8; whole batch worst-case call allowance also bounded by parent context","retained_preparation_bytes":268435456,"output":"same1MiB total, fixed per-item complete reservations; insufficient paid share fails before submit"},
+        "output":"always JSON without a trailing newline; exit2 for global or item failure/not_executed"
+    });
+    contract["commands"]["rerank"] = json!({
+        "usage":"gptgrep rerank --root ROOT --input FILE_OR_DASH --json",
+        "request_schema":"gptgrep.rich_rerank.request.v1","output_schema":"gptgrep.rich_rerank.response.v1",
+        "input":"query and1..64unique {id,evidence} resolved from one CURRENT/exact rich generation; no caller text, image bytes or URLs",
+        "limits":{"input_bytes":1048576,"output_bytes":1048576,"text_window_bytes":2048,"visual_candidates":16,"max_concurrent_batches":4},
+        "network":"explicit Luna Decisions; same original finite context; no routing/retry/fallback",
+        "output":"always bounded JSON; all supplied refs scored or typed failure; no inference cursor/initial routing pass/citation rights",
+        "options":{"model":"supported Luna Decisions profile","multimodal-timeout":"1..900seconds, default180; narrows existing deadline"}
+    });
     contract["commands"]["ask"]["options"]["experimental-source-continuation"] = json!({
         "type":"boolean","default":false,"requires":["experimental-query-plan","document"],
         "effect":"Reader guidance: node EOF is not evidence completeness; verify unresolved claims/referents using scoped verified tree/read nodes",
@@ -400,11 +948,138 @@ fn contract() -> Value {
         "citation_authority":"only issued source spans; no inferred unseen text or scope expansion",
         "report_schema":"gptgrep.source-continuation.v1","additional_model_calls":0
     });
+    contract["global_options"] = json!({"decisions-budget": {
+        "type":"file", "optional":true, "schema":gptgrep_jev::DECISIONS_BUDGET_CONTRACT_SCHEMA,
+        "control_bytes":16384, "effect":"join existing shared original-clock ledger for search hybrid/semantic, judge, ask, summarize and non-plan enrich",
+        "initialization":false, "initializer":"gptgrep decisions-budget init (separate command; this option only joins)",
+        "missing_files":"error", "without_file":"single-invocation bounded context",
+        "local_commands":"regex/lexical, schema, doctor, decisions-budget and enrich --plan-only do not open it"
+    }});
+    contract["commands"]["decisions-budget"] = json!({
+        "init_usage":"gptgrep decisions-budget init --run-id ID --plan-file FILE --deadline-seconds N --max-submissions N --ledger ABS_PATH --output ABS_CONTROL_JSON",
+        "status_usage":"gptgrep decisions-budget status --control FILE --json",
+        "effect":"init creates a NEW same-host Decisions ledger (journal plus .lock holding the immutable header and original clock anchor) and writes its portable control file once; status reads them without locking, creating or writing",
+        "init_options":{"run-id":"1..256 bytes without control characters","plan-file":"regular file up to 1048576 bytes; plan_digest is the lowercase SHA-256 of its bytes",
+            "deadline-seconds":{"type":"integer","minimum":1,"maximum":86400,"effect":"deadline_unix_ms = now + N seconds; fixed for the run"},
+            "max-submissions":{"type":"integer","minimum":1,"maximum":200},
+            "ledger":"absolute; existing parent; the journal and its .lock sidecar must not exist",
+            "output":"absolute control path; must not exist; written completely with mode 0600 and published without replacement"},
+        "refusals":"relative paths, missing parents, or any existing ledger, lock or control path; init never joins, resets, renews or replaces",
+        "control_schema":gptgrep_jev::DECISIONS_BUDGET_CONTRACT_SCHEMA,
+        "control_fields":["schema_version","run_id","plan_digest","deadline_unix_ms","max_submissions","ledger_path"],
+        "init_output_schema":decisions_budget::INIT_SCHEMA,
+        "status_output_schema":gptgrep_jev::DECISIONS_BUDGET_STATUS_SCHEMA,
+        "status_fields":["reservations{total,reserved,in_flight,unknown,terminal}","send_started","submission_observations","remaining_submissions","occupied_slots","requested_models","deadline_unix_ms","deadline_state","wall_remaining_ms","anchor_remaining_ms","admission_open","read_only"],
+        "join":"pass the control file to --decisions-budget for paid commands; reservations are permanent, so a joined run stops at max_submissions with 'Decisions submission budget exhausted' before any POST",
+        "network":false,"output":"always JSON; errors use gptgrep.error.v1 with code decisions_budget_failed"
+    });
+    contract["decisions"] = json!({"default_model":gptgrep_jev::DEFAULT_MODEL,
+        "legacy_model":gptgrep_jev::LEGACY_MODEL, "legacy_images":false,
+        "model_admission":"exact requested identifier; the observed canonical builds for Luna Decisions and legacy Jev; or, for a ~author/family-latest alias, a concrete author/family-VERSION build of the same author and family (VERSION starts with a digit). No other aliases, families, authors or fallback",
+        "aliases":{"syntax":"~author/family-latest","example":"~typesafe/jev-latest","admits":"author/family-VERSION, e.g. typesafe/jev-1.13 or typesafe/jev-1.13-20260917",
+            "rejects":"another author or family, variants such as :free, other aliases, and malformed aliases (before any request)","images":false,
+            "accounting":"requested_model and the served model are reported separately"},
+        "canonical_builds":{gptgrep_jev::DEFAULT_MODEL:gptgrep_jev::DEFAULT_MODEL_CANONICAL,gptgrep_jev::LEGACY_MODEL:gptgrep_jev::LEGACY_MODEL_CANONICAL},
+        "images":"exact Luna Decisions selector or its canonical build only; aliases and other models reject typed input.images and raw image parts before reservation or submission",
+        "raw_image_parts":"any object at any depth of a raw state or questions with an image_url or input_image member or type; strings are literal text and never image parts",
+        "typed_wire":"flat literal text plus PNG/JPEG image_url data URLs; local source bindings excluded",
+        "limits":{"text_envelope_bytes":gptgrep_jev::MAX_REQUEST_BYTES,"body_bytes":gptgrep_jev::MAX_MULTIMODAL_REQUEST_BYTES,
+            "images":gptgrep_jev::MAX_IMAGES,"image_file_bytes":gptgrep_jev::MAX_IMAGE_BYTES,"response_bytes":gptgrep_jev::MAX_RESPONSE_BYTES},
+        "transient_retry":{"applies_to":"search hybrid/semantic document routing and evidence reranking, including ask/summarize initial and reader searches and planned query-view routes and union rerank",
+            "max_retries":1,"statuses":gptgrep_jev::TRANSIENT_RETRY_STATUSES,"request":"identical prepared bytes",
+            "backoff_ms":[gptgrep_jev::RETRY_BACKOFF_MIN.as_millis() as u64,gptgrep_jev::RETRY_BACKOFF_MAX.as_millis() as u64],
+            "retry_after":"one non-negative integer number of seconds (at most ten digits) is honoured when longer than the backoff; any other returned form (HTTP-date, repeated, negative, fractional or longer) refuses the retry and is recorded as retry_after_refusal: repeated, out_of_range or not_delta_seconds",
+            "deadline":"original request deadline, never renewed; retry only if it leaves the wait plus 2 s",
+            "budget":"each attempt is a separate reservation in the same execution context; no retry without a remaining submission; a call refused by the exhausted budget fails with 'Decisions submission budget exhausted' before any send",
+            "never":"timeouts, deadlines, connection or mid-body errors, size/JSON/validation failures, other statuses",
+            "accounting":"metrics.jev_retried_attempts keeps each failed attempt's HTTP status with null usage; it counts in jev_calls_attempted, has no jev_usage entry and leaves accounting incomplete",
+            "receipts":"an admitted retry is counted, with its failed attempt, in a before_retry progress receipt before its backoff and send; if that receipt cannot be recorded the retry is not sent",
+            "failure_kinds":{"retry_admission":"the retry stopped before its HTTP send","retry_post_send":"a local step failed after the retry was sent; a reply that had validated keeps its checked usage and served model and counts in jev_requests, jev_models and jev_usage, otherwise its usage is unknown"},
+            "single_submission":["judge","enrich support calls (own --support-retries plan)","navigation scans","evidence-role decisions","rich/multimodal search and ask","explicit rerank pools","batch"]}});
+    contract["commands"]["judge"]["output"] = json!({
+        "success":"validated Decisions response JSON; model is the served build, requested_model is the selector sent",
+        "failure":{"code":judge::JUDGE_FAILURE_CODE,"field":"judge","schema":judge::JUDGE_FAILURE_SCHEMA,
+            "fields":["stage","requested_model","submission","served_model","provider_response_id","provider","usage","usage_presence","usage_unavailable_reason","cost_usd","cost_unavailable_reason","failure","latency_ms","elapsed_ms","execution"],
+            "submission":["not_submitted","sent_response_received","sent_outcome_unknown"],
+            "unknowns":"missing usage or cost stays null with a reason; never zero-filled; no bodies, headers, URLs or keys"}});
+    contract["commands"]["judge"]["input"] = json!({"one_of":[
+        {"state":"JSON","questions":"Choice/Noul/Score map"},
+        {"input":{"text":[{"source":{"source_id":"string","unit_id":"string","source_sha256":"sha256"},"text":"literal string"}],
+            "images":[{"source":{"source_id":"string","unit_id":"string","source_sha256":"sha256"},"path":"local PNG/JPEG path"}]},
+        "questions":"Choice/Noul/Score map"}],"control_bytes":65536});
+    let multimodal = json!({"type":"boolean","default":false,
+        "generation":"v2 only; CURRENT resolved once and retained",
+        "routing":"mandatory document routing plus text/independent visual union reranking",
+        "decisions_model":gptgrep_jev::DEFAULT_MODEL,
+        "limits":{"query_utf8_bytes":8192,"text_candidates":24,"routing_documents":8,
+            "visual_candidates":16,"concurrent_batches":4,"images_per_request":4,
+            "request_image_pixels":24000000,"request_bytes":8388608},
+        "coverage":"bounded candidate pool; inspect omitted pages/artifacts and truncation; not exhaustive semantic recall",
+        "search_schema":"gptgrep.rich_multimodal_search.v1","ask_schema":"gptgrep.rich_multimodal.host.v1",
+        "output":"one complete typed JSON report, including without --json",
+        "qualification":"implementation with offline mock checks; actual model image influence/native runtime qualification pending"});
+    for command in ["search", "ask"] {
+        contract["commands"][command]["options"]["multimodal"] = multimodal.clone();
+        for (name, minimum, maximum, default) in [
+            ("multimodal-timeout", 1, 900, 180),
+            ("window-bytes", 4, 2048, 1024),
+            ("max-visual-candidates", 1, 16, 8),
+            ("max-concurrent-batches", 1, 4, 4),
+            ("max-output-bytes", 1, 1048576, 1048576),
+            ("max-metadata-bytes", 1, 524288, 524288),
+            ("max-image-bytes", 1, 1048576, 1048576),
+            ("max-image-pixels", 1, 8000000, 8000000),
+        ] {
+            contract["commands"][command]["options"][name] = json!({"type":"integer","minimum":minimum,"maximum":maximum,"default":default,"requires":"multimodal"});
+        }
+    }
+    contract["commands"]["search"]["options"]["multimodal"]["conflicts"] = json!([
+        "mode other than hybrid",
+        "limit",
+        "context",
+        "ignore-case",
+        "fixed-strings",
+        "max-candidates",
+        "routing-docs"
+    ]);
+    contract["commands"]["search"]["options"]["multimodal"]["citation_authority"] = json!(false);
+    contract["commands"]["ask"]["options"]["multimodal"]["conflicts"] = json!([
+        "experimental-query-plan",
+        "experimental-source-continuation",
+        "experimental-evidence-roles",
+        "navigation options",
+        "planner-model",
+        "native profile other than gpt-6-luna/max/fast"
+    ]);
+    contract["commands"]["ask"]["options"]["multimodal"]["citation_authority"] = json!(
+        "only a complete actual reader RPC write+flush and fresh source/coordinate binding; Decisions image exposure grants none"
+    );
+    contract["commands"]["ask"]["options"]["max-citations"] =
+        json!({"type":"integer","minimum":1,"maximum":8,"default":8,"requires":"multimodal"});
+    contract["commands"]["ask"]["options"]["min-score"] =
+        json!({"type":"number","minimum":0,"maximum":1,"default":0.5,"requires":"multimodal"});
+    contract["commands"]["ask"]["options"]["multimodal"]["host_bounds"] = json!({"rerank_report_bytes":524288,"candidate_metadata_bytes":32768,"bootstrap_candidate_metadata_bytes":524288,"image_result_frame_bytes":1048576,"complete_output_reserved_before_calls":true});
+    for command in ["ask", "summarize", "host-complete"] {
+        contract["commands"][command]["options"]["codex-permissions"] = json!({
+            "type":"string","default":null,
+            "validation":"1 to 128 ASCII letters, digits, underscores, hyphens or colons",
+            "effect":"selects a named native permission profile and requires the matching activePermissionProfile acknowledgment before a turn; omits legacy sandbox overrides",
+            "qualification":"the acknowledgment records profile provenance; actual filesystem enforcement requires runtime validation"
+        });
+    }
+    for command in ["ask", "summarize", "host-complete", "enrich"] {
+        contract["commands"][command]["options"]["codex-state-dir"] = json!({
+            "type":"path","default":null,
+            "validation":"canonical absolute existing directory; its logs child must also be an existing canonical directory; symlinks and missing/non-directory paths are rejected before spawn",
+            "effect":"explicit sqlite_home=DIR and log_dir=DIR/logs; codex-home authentication/profile routing is unchanged",
+            "omitted":"original sqlite_home binding to codex-home and original log configuration; no implicit directory creation or fallback"
+        });
+    }
     contract
 }
 
 fn llms() -> &'static str {
-    "# GPTgrep\n\nLocal vectorless retrieval helper for agents. No MCP server.\n\n1. gptgrep index ./docs --json\n1a. gptgrep enrich ./docs --ledger-path /path/to/private/enrich.jsonl --max-builder-calls 100 --max-jev-calls 100 --plan-only --json\n2. gptgrep search 'concept in natural language' ./docs --json\n3. gptgrep search 'pattern' ./docs --mode regex --json\n4. gptgrep tree manual.pdf --root ./docs --json\n5. gptgrep read DOCUMENT_ID:NODE_ID --root ./docs --json\n\nJev routing/reranking is required by default search, ask and summarize. OPENROUTER_API_KEY must be supplied for model-assisted runs; failures never silently downgrade to local retrieval. Explicit regex/lexical and enrich --plan-only remain offline. Enrich is an explicit Codex/Jev step that creates non-citable navigation hints after local indexing. Use --document RELATIVE_PATH to scope before candidate budgets. Hybrid/semantic and judge send bounded data to OpenRouter Jev. Inspect coverage, source_fresh, coordinate_system and text_truncated before citing evidence. The main agent performs reasoning and controls follow-up reads. New files require reindexing. --schema provides the command contract.\n"
+    "# GPTgrep\n\nLocal vectorless retrieval helper for agents. No MCP server.\n\n1. gptgrep index ./docs --json\n1r. gptgrep index ./documents --ocr auto --plan-only --json\n1n. gptgrep index ./native-documents --ocr off --json\n1a. gptgrep enrich ./docs --ledger-path /path/to/private/enrich.jsonl --max-builder-calls 100 --max-jev-calls 100 --plan-only --json\n2. gptgrep search 'concept in natural language' ./docs --json\n3. gptgrep search 'pattern' ./docs --mode regex --json\n4. gptgrep tree manual.pdf --root ./docs --json\n5. gptgrep read DOCUMENT_ID:NODE_ID --root ./docs --json\n6. gptgrep batch --root ./docs --input operations.json --json\n7. gptgrep batch --rich --root ./docs --input rich-operations.json\n\nBatch accepts gptgrep.batch.request.v1 JSON, pins one generation and preserves operation order. Local search/catalog/tree/read operations share bounded output reservations. Batch hybrid/semantic are currently rejected before provider work; inspect each item status and coverage.\n\nRich batch request shape: send one JSON object, not a bare operation array. schema_version and operations are required. generation defaults to the string CURRENT; budget may be omitted or partially specified, with defaults shown by --schema. Every operation requires the discriminator op and a unique id (1..128 UTF-8 bytes, no control characters). Unknown fields are rejected. Start with this local request in rich-operations.json:\n\n```json\n{\n  \"schema_version\": \"gptgrep.batch.rich.request.v1\",\n  \"generation\": \"CURRENT\",\n  \"budget\": {\n    \"max_operations\": 1,\n    \"max_output_bytes\": 16384,\n    \"max_decisions_submissions\": 0\n  },\n  \"operations\": [\n    {\n      \"op\": \"inspect_documents\",\n      \"id\": \"documents-1\",\n      \"fields\": [\n        \"path\",\n        \"title\",\n        \"pages\"\n      ],\n      \"page_size\": 5\n    }\n  ]\n}\n```\n\nRun gptgrep batch --rich --root ./docs --input rich-operations.json. For a follow-up, copy the exact response generation object and use a returned document path; operations cannot refer to another item in the same batch. Replace both generation fields and manual.pdf in this template before running it:\n\n```json\n{\n  \"schema_version\": \"gptgrep.batch.rich.request.v1\",\n  \"generation\": {\n    \"generation\": \"replace-with-returned-generation\",\n    \"manifest_sha256\": \"0000000000000000000000000000000000000000000000000000000000000000\"\n  },\n  \"budget\": {\n    \"max_operations\": 1,\n    \"max_output_bytes\": 16384,\n    \"max_decisions_submissions\": 0\n  },\n  \"operations\": [\n    {\n      \"op\": \"inspect_pages\",\n      \"id\": \"pages-1\",\n      \"document\": \"manual.pdf\",\n      \"fields\": [\n        \"page\",\n        \"native_text\",\n        \"metadata_artifact\"\n      ],\n      \"page_size\": 1\n    }\n  ]\n}\n```\n\nThe zero max_decisions_submissions allowance keeps these examples local. Read item status and coverage; retain the exact generation and operation options when using a returned cursor. Inspect commands.batch.rich.required_operation_fields in --schema output for other operations.\n\nFor a separately published v2 generation, batch --rich accepts gptgrep.batch.rich.request.v1 with inspect_documents, inspect_pages, inspect_native_metadata, read_artifact, search_artifacts, inspect_visual, read_visual and explicit search_multimodal. Document/page enumeration returns indexed metadata only. inspect_native_metadata takes a page metadata artifact_id, closed fields and item_fields, collection, optional path object_id, page_size, max_output_bytes and coverage.cursor. It returns verified structural geometry/characters/words with mandatory source and artifact identities; it is metadata_only and never citation authority. Object summaries and selected path segments paginate independently; old geometry is rebuild_required and an indivisible first row that cannot fit is output_budget_insufficient. Text read/search preserve typed native/OCR evidence; their cursors bind generation and operation options. Search pages cover a bounded max_hits window; inspect truncation and exhaustion. Opt-in inspect_visual takes scope (document_ids, first_page, last_page), query, max_candidates and its own cursor; use result.next_cursor and retain the batch output budget and per-item reservation when continuing. read_visual takes rendition_id and returns complete image_base64 plus pinned candidate metadata; no image byte windows, truncation or cursor. Both visual operations reuse the generation resource budget and report actual_image_delivery=false and citation_authority=false. They establish local observations, not model delivery or citation rights. The seven deterministic operations remain local and perform zero model submissions. search_multimodal requires mandatory document routing then source-bound text/visual reranking on the same finite Decisions context. All complete item output shares and worst-case call shares are prepared before the first submit. budget.max_decisions_submissions defaults to8 (hard cap200); no operation borrows a later share. Paid results have no inference cursor, preserve partial attempt receipts, and grant no reader citation rights. Required paid failure stops later paid items while independent local items may continue. model_submissions is null when exact batch attribution is unavailable; scheduled attempts and shared context snapshots are separate. Numeric cost telemetry is a labelled lossy finite_f64 projection with full usage SHA; missing cost remains null. Explicit rerank --root ROOT --input FILE_OR_DASH accepts gptgrep.rich_rerank.request.v1 with query and unique {id,evidence} candidates. It resolves exact pinned native/OCR text windows and visual refs, scores only that supplied pool using the same rubric, and creates neither routing-pass nor citation rights. The equivalent rich batch rerank operation shares the same prepaid output/call reservations. Caller text/image bytes/URLs, implicit dependencies and inference cursors are rejected.\n\nJev routing/reranking is required by default search, ask and summarize. OPENROUTER_API_KEY must be supplied for model-assisted runs; failures never silently downgrade to local retrieval. Their routing/reranking retries one received Decisions HTTP 429/500/502/503/504 at most once with identical bytes, only within the original request deadline and a remaining submission; metrics.jev_retried_attempts reports the failed attempt with unknown cost, and timeouts or other failures are never retried. Explicit regex/lexical and enrich --plan-only remain offline. Lexical and hybrid search keep at most 16 query terms: common English function words and ASCII-letter tokens under three characters are dropped, and longer questions keep their rarest terms in the scoped index. Enrich is an explicit Codex/Jev step that creates non-citable navigation hints after local indexing. Use --document RELATIVE_PATH to scope before candidate budgets; a single routable document is selected without a routing call (coverage.routing_status=skipped_single_document). The default Decisions model is openai/gpt-6-luna-decisions; native Codex defaults separately to gpt-6-luna/max/fast. Hybrid/semantic and judge send bounded data to OpenRouter Decisions. Judge input accepts state/questions or typed input.text/input.images with explicit source bindings and local PNG/JPEG paths. --decisions-budget FILE joins an existing original-clock shared budget; it never initializes or resets a ledger. Create a new ledger once with gptgrep decisions-budget init --run-id ID --plan-file FILE --deadline-seconds N --max-submissions N --ledger ABS_PATH --output ABS_CONTROL_JSON; it refuses existing ledger, lock and control paths and writes a 0600 control file. Inspect it read-only with gptgrep decisions-budget status --control FILE --json. Without the file, paid calls share their single-invocation bounded client context. Explicit --model typesafe/jev-1.13 remains text-only. An alias such as --model '~typesafe/jev-latest' is text-only and admits only a concrete same-author, same-family build such as typesafe/jev-1.13-20260917; requested_model and the served model are reported separately. Judge failures use code decisions_judge_failed with a judge object: submission state, served model, usage and cost or null with a reason, and latency. Inspect coverage, source_fresh, coordinate_system and text_truncated before citing evidence. A hit with below_threshold=true scored below the relevance floor: when no candidate passes, at most three such low-confidence candidates are still delivered (coverage.below_threshold_fallback) with a warning; verify them before relying on them. Exit status 0 can carry only such flagged candidates; plain-text output prints them with grep's context separator (PATH-LINE-TEXT), never as PATH:LINE:TEXT matches. The main agent performs reasoning and controls follow-up reads. Use search QUERY ROOT --multimodal or ask QUESTION ROOT --multimodal on a published v2 rich generation. Both retain one generation and one finite Decisions context, perform mandatory document routing, and rerank a union of text and independent visual candidates. Scope with --document PATH; bound --window-bytes, --max-visual-candidates, --max-concurrent-batches, --max-image-bytes, --max-image-pixels, --max-metadata-bytes and --max-output-bytes. --multimodal-timeout limits the same invocation and never extends an existing shared deadline. Search returns gptgrep.rich_multimodal_search.v1 JSON with model-exposure-only evidence and no citation rights. Ask uses native gpt-6-luna/max/fast, accepts --max-citations 1..8, and issues typed text/image citations only after actual complete reader delivery and freshness checks. Inspect coverage/truncation and actual observations; implementation and offline mocks do not qualify actual image influence/native runtime. No legacy generation, regex/lexical, grep-window or planning fallback is allowed. Foreground OCR is available through the native and incur CLIs: gptgrep ocr serve --config CONTROL_JSON --token-env GPTGREP_OCR_SERVE_TOKEN. It uses explicit server-held task custody, the selected native runtime, a finite original-anchor phase and authenticated loopback only. Legacy image profiles retain their qualification requirements. The optional --initialize-ledger creates or joins the exact namespace without reset or renewal. /ocr is separately qualified PNG multipart compatibility with model-reported uncalibrated confidence and no generation authority. Ordinary queries never start OCR; listener/native qualification remains pending. Rich ingestion supports lossless UTF-8 text/Markdown, PDF, PNG and restricted baseline JPEG. Office uses one bounded LibreOffice conversion; a working converter is required and real Office runtime qualification remains pending. The full JPEG family remains unsupported. New files require reindexing. --schema provides the command contract.\n\nUse gptgrep parse-agent serve --config CONTROL_JSON --expected-control-sha256 SHA for a bounded foreground LiteParse toolbox. An external Codex/PTC agent can prepare a registered source, extract all native pages, inspect complete page/artifact/metadata inventories through continuations, read full images or crops, request selected per-page OCR, and finalize. The exact control snapshot owns source aliases, budgets, paths and original OCR context; model JSON cannot admit a source path or submit paid OCR results. For deterministic complete parsing use gptgrep parse-agent run --config CONTROL_JSON --expected-control-sha256 SHA --source ALIAS --mode off|auto --output FILE. Auto refuses incomplete required OCR; off reports required_ocr_complete honestly. The product file contains complete RichParsedDocument fields and is not generation publication. Serve and run remain independently usable deterministic/external PTC surfaces. Explicit gptgrep parse-agent agent --config CONTROL_JSON --expected-control-sha256 SHA --document-agent-control DOCUMENT_CONTROL_JSON --expected-document-agent-control-sha256 SHA --source ALIAS --output FILE launches the selected standalone Codex app-server document turn with the bounded gptgrep_parse.toolbox. It requests gpt-6-luna/max/fast (normalized priority); actual served identity remains unknown. Legacy guarded document view_image requires its accepted binary/profile/guard qualification, complete source-bound pre-turn image catalogue and private image-only permission scope. Native Document/OCR execution uses the caller-selected tools, permissions, job budgets and original deadline. Retained fixed Page/Document transports keep their original profile contracts. Complete verified parser extraction, artifact metadata and required OCR cover every original page; actual model inspection is partial coverage, not a full metadata-read requirement. Dynamic images/crops remain mediated transport; native crop child augmentation is separate. For complete typed indexing use gptgrep index ROOT --parse-agent-config CONTROL_JSON --expected-parse-agent-config-sha256 SHA --document-agent-controls REGISTRY_JSON --expected-document-agent-controls-sha256 SHA. The closed gptgrep.parse-agent.index-controls.v1 registry pins the config and one distinct admitted document control per registered source alias. All controls and the complete supported corpus inventory are checked before any turn, then pins/inventory are rechecked before publish. One invocation retains the original clock, OCR context, request quota and shared ResourceBudget across source transfers; the generation writer consumes owned verified products without reparse. Unsupported file counts are reported separately and excess supported files are refused, never truncated. Omit all four flags to retain ordinary index behavior; do not mix legacy rich/OCR or optimize-merge controls. Explicit parse-agent qualify accepts a pinned private qualification purpose and writes evidence only to a fresh private file with --evidence-output; that evidence is not accepted qualification or publication. Native page OCR profiles and old DynamicImages qualifications remain separate.\n"
 }
 
 fn emit(value: &Value) -> Result<()> {
@@ -414,9 +1089,278 @@ fn emit(value: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Grep-style search lines. A matching or passing hit prints PATH:LINE:TEXT. A
+/// below-floor fallback candidate never passed the relevance floor, so it uses
+/// grep's context-line separator (PATH-LINE-TEXT) and is never shown as a match.
+fn write_text_hits(out: &mut impl Write, hits: &[gptgrep_core::Hit]) -> io::Result<()> {
+    for hit in hits {
+        let separator = if hit.is_below_threshold_fallback() {
+            '-'
+        } else {
+            ':'
+        };
+        for (offset, line) in hit.text.lines().enumerate() {
+            writeln!(
+                out,
+                "{}{separator}{}{separator}{}",
+                hit.path,
+                hit.line_start + offset,
+                line
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn program_available(name: &str) -> bool {
     std::env::var_os("PATH")
         .is_some_and(|paths| std::env::split_paths(&paths).any(|p| p.join(name).is_file()))
+}
+
+fn decisions_context(
+    path: Option<&std::path::Path>,
+) -> Result<Option<gptgrep_jev::ExecutionContext>> {
+    path.map(gptgrep_jev::ExecutionContext::from_budget_file)
+        .transpose()
+}
+
+fn multimodal_client(
+    reader: &gptgrep_core::RichGenerationReader,
+    model: Option<&str>,
+    budget: Option<&std::path::Path>,
+    timeout: u64,
+) -> Result<gptgrep_jev::JevClient> {
+    let selected = model.unwrap_or(gptgrep_jev::DEFAULT_MODEL);
+    if !matches!(
+        selected,
+        gptgrep_jev::DEFAULT_MODEL | "openai/gpt-6-luna-decisions-20261006"
+    ) {
+        bail!("multimodal retrieval requires the supported Luna Decisions image profile");
+    }
+    if !(1..=900).contains(&timeout) {
+        bail!("multimodal timeout must be 1 to 900 seconds");
+    }
+    let execution = match decisions_context(budget)? {
+        Some(context) => context,
+        None => gptgrep_jev::ExecutionContext::new(
+            "gptgrep.cli.multimodal.invocation",
+            &reader.pin().manifest_sha256,
+            std::time::SystemTime::now() + std::time::Duration::from_secs(timeout),
+            gptgrep_jev::MAX_SUBMISSIONS,
+        )?,
+    };
+    // The existing shared deadline is never extended. Search's explicit
+    // invocation cap also narrows shared contexts, without changing their ledger.
+    let execution = execution
+        .with_deadline(std::time::Instant::now() + std::time::Duration::from_secs(timeout))?;
+    Ok(gptgrep_jev::JevClient::from_env(Some(selected))?.with_execution_context(execution))
+}
+
+fn require_keys(value: &Value, allowed: &[&str]) -> Result<()> {
+    let object = value
+        .as_object()
+        .context("judge input requires an object")?;
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        bail!("judge input contains an unknown field");
+    }
+    Ok(())
+}
+
+/// Admit either the original state/questions contract or typed local image evidence.
+fn prepare_judge(
+    client: &gptgrep_jev::JevClient,
+    data: &Value,
+) -> Result<gptgrep_jev::PreparedDecision> {
+    let questions = data
+        .get("questions")
+        .context("judge input requires questions")?
+        .clone();
+    if let Some(input) = data.get("input") {
+        require_keys(data, &["input", "questions"])?;
+        require_keys(input, &["text", "images"])?;
+        let mut evidence = gptgrep_jev::DecisionInput::default();
+        if let Some(text) = input.get("text") {
+            let items = text
+                .as_array()
+                .context("judge text evidence requires an array")?;
+            for item in items {
+                require_keys(item, &["source", "text"])?;
+                evidence.text.push(gptgrep_jev::TextEvidence {
+                    source: serde_json::from_value(
+                        item.get("source")
+                            .context("judge evidence requires source")?
+                            .clone(),
+                    )?,
+                    text: item
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .context("judge evidence requires literal text")?
+                        .into(),
+                });
+            }
+        }
+        if let Some(images) = input.get("images") {
+            let items = images
+                .as_array()
+                .context("judge image evidence requires an array")?;
+            if items.len() > gptgrep_jev::MAX_IMAGES {
+                bail!("judge image count exceeds the limit");
+            }
+            for item in items {
+                require_keys(item, &["source", "path"])?;
+                let source = serde_json::from_value(
+                    item.get("source")
+                        .context("judge evidence requires source")?
+                        .clone(),
+                )?;
+                let path = item
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .context("judge image evidence requires path")?;
+                evidence.images.push(gptgrep_jev::ImageEvidence::from_file(
+                    source,
+                    std::path::Path::new(path),
+                )?);
+            }
+        }
+        client.prepare_input(evidence, questions, gptgrep_jev::MAX_RESPONSE_BYTES)
+    } else {
+        let state = data
+            .get("state")
+            .context("judge input requires state or input")?
+            .clone();
+        client.prepare_decision(state, questions)
+    }
+}
+
+/// One fixed host root per task; all executors share the existing two-page
+/// context, original clock and persistent ledger. No alternate model route.
+struct RichOcrExecutor {
+    pages: std::collections::BTreeMap<String, gptgrep_host::OcrHostExecutor>,
+}
+impl gptgrep_parse::OcrExecutor for RichOcrExecutor {
+    fn execute<'a>(
+        &'a self,
+        task: gptgrep_parse::OcrTask,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<gptgrep_parse::OcrPageResult>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let page = self
+                .pages
+                .get(&task.task_sha256)
+                .context("unplanned rich OCR task")?;
+            gptgrep_parse::OcrExecutor::execute(page, task).await
+        })
+    }
+}
+
+async fn run_rich_index(
+    root: &std::path::Path,
+    max_files: usize,
+    args: RichIndexArgs,
+) -> Result<i32> {
+    let mode = if matches!(args.ocr, Some(IndexOcr::Auto)) {
+        gptgrep_parse::OcrMode::Auto
+    } else {
+        gptgrep_parse::OcrMode::Off
+    };
+    if args.resume && args.ocr_run_id.is_none() {
+        bail!("--resume requires --ocr-run-id");
+    }
+    let profile = if let Some(path) = &args.ocr_runtime_profile {
+        let bytes = gptgrep_core::read_rich_runtime_descriptor(path)?;
+        let profile: gptgrep_host::OcrRuntimeProfile = serde_json::from_slice(&bytes)
+            .map_err(|_| anyhow::anyhow!("invalid OCR runtime profile"))?;
+        profile.validate()?;
+        Some(profile)
+    } else {
+        None
+    };
+    let mut options = gptgrep_core::RichIngestOptions {
+        max_files,
+        mode,
+        max_ocr_pages: args.ocr_max_pages,
+        run_id: args.ocr_run_id.clone(),
+        resume: args.resume,
+        runtime_profile_sha256: profile.as_ref().map(|p| p.sha256()).transpose()?,
+        ..Default::default()
+    };
+    options.native.page_window = args.page_window;
+    let ingest = gptgrep_core::prepare_rich_ingest(root, options).await?;
+    if args
+        .expected_plan_sha256
+        .as_ref()
+        .is_some_and(|sha| sha != &ingest.report().plan_sha256)
+    {
+        bail!("rich ingest plan digest differs from --expected-plan-sha256");
+    }
+    if args.plan_only || !ingest.report().blockers.is_empty() {
+        emit(&serde_json::to_value(ingest.report())?)?;
+        return Ok(if ingest.report().blockers.is_empty() {
+            0
+        } else {
+            2
+        });
+    }
+    if mode == gptgrep_parse::OcrMode::Auto && ingest.needs_ocr_executor() {
+        let profile = profile.context("live OCR requires --ocr-runtime-profile")?;
+        if !profile.execution_ready() {
+            bail!("ocr_runtime_image_qualification_required");
+        }
+        let home = args
+            .ocr_codex_home
+            .context("live OCR requires an explicit independent --ocr-codex-home")?;
+        let state = ingest.state_dir()?;
+        let clock = ingest.ocr_clock(args.ocr_timeout_seconds)?;
+        let context = gptgrep_host::OcrExecutionContext::with_clock_anchor(
+            args.ocr_run_id
+                .as_deref()
+                .context("live OCR run ID required")?,
+            &ingest.report().plan_sha256,
+            clock,
+            args.ocr_max_pages,
+        )?
+        .with_ledger(state.join("budget.json"))?;
+        let raw = state.join("raw");
+        if raw.is_symlink() {
+            bail!("OCR raw result directory cannot be a symlink");
+        }
+        std::fs::create_dir_all(&raw)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&raw, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let mut pages = std::collections::BTreeMap::new();
+        for (hash, prepared_root) in ingest.ocr_staging_roots() {
+            pages.insert(
+                hash,
+                gptgrep_host::OcrHostExecutor::new(
+                    gptgrep_host::OcrHostConfig {
+                        codex_bin: args.ocr_codex_bin.clone(),
+                        codex_home: home.clone(),
+                        codex_state_dir: args.ocr_codex_state_dir.clone(),
+                        prepared_root,
+                        raw_results_dir: raw.clone(),
+                        runtime_profile: profile.clone(),
+                        transport: profile.transport(),
+                    },
+                    context.clone(),
+                )?,
+            );
+        }
+        let executor = RichOcrExecutor { pages };
+        let report = ingest.publish(Some(&executor)).await;
+        let ok = report.status == "published" && report.failure_code.is_none();
+        emit(&serde_json::to_value(report)?)?;
+        Ok(if ok { 0 } else { 2 })
+    } else {
+        let report = ingest.publish(None).await;
+        let ok = report.status == "published" && report.failure_code.is_none();
+        emit(&serde_json::to_value(report)?)?;
+        Ok(if ok { 0 } else { 2 })
+    }
 }
 
 async fn run(cli: Cli) -> Result<i32> {
@@ -433,11 +1377,391 @@ async fn run(cli: Cli) -> Result<i32> {
         return Ok(0);
     };
     match command {
+        Command::ParseAgent { command } => {
+            if cli.decisions_budget.is_some() {
+                bail!("parse_agent_incompatible_decisions_budget");
+            }
+            return match command {
+                ParseAgentCommand::Serve {
+                    config,
+                    expected_control_sha256,
+                } => parse_agent::serve(&config, &expected_control_sha256).await,
+                ParseAgentCommand::Run {
+                    config,
+                    expected_control_sha256,
+                    source,
+                    mode,
+                    output,
+                } => {
+                    let mode = match mode {
+                        IndexOcr::Off => gptgrep_parse::OcrMode::Off,
+                        IndexOcr::Auto => gptgrep_parse::OcrMode::Auto,
+                    };
+                    parse_agent::run(&config, &expected_control_sha256, &source, mode, &output)
+                        .await
+                }
+                ParseAgentCommand::Agent {
+                    config,
+                    expected_control_sha256,
+                    document_agent_control,
+                    expected_document_agent_control_sha256,
+                    source,
+                    output,
+                } => {
+                    let control = gptgrep_host::parse_agent_driver::load_document_control(
+                        &document_agent_control,
+                        &expected_document_agent_control_sha256,
+                    )?;
+                    gptgrep_host::parse_agent_driver::preflight_document_agent_control(&control)?;
+                    let product = parse_agent::agent(
+                        &config,
+                        &expected_control_sha256,
+                        &document_agent_control,
+                        &expected_document_agent_control_sha256,
+                        &source,
+                        &output,
+                    )
+                    .await?;
+                    control
+                        .original_clock
+                        .remaining()
+                        .map_err(|_| anyhow::anyhow!("document_original_deadline_after_output"))?;
+                    let document = product.document()?;
+                    let outcome = product.outcome();
+                    emit(
+                        &json!({"schema":"gptgrep.parse-agent.agent.v1","status":"complete",
+                        "source_sha256":document.summary.source_sha256,"original_pages":document.pages.len(),
+                        "model_inspected_pages":outcome.verified_product.delivered_pages,
+                        "native_viewer_enabled":outcome.native_viewer_enabled,
+                        "native_image_influence_qualified":outcome.native_image_influence_qualified,
+                        "actual_served_profile_verified":false,"publication_authorized":false}),
+                    )?;
+                    Ok(0)
+                }
+                ParseAgentCommand::Qualify {
+                    config,
+                    expected_control_sha256,
+                    document_agent_control,
+                    expected_document_agent_control_sha256,
+                    source,
+                    qualification_request,
+                    expected_qualification_request_sha256,
+                    evidence_output,
+                } => {
+                    parse_agent_index::preflight_private_qualification_output(&evidence_output)?;
+                    let control = gptgrep_host::parse_agent_driver::load_document_control(
+                        &document_agent_control,
+                        &expected_document_agent_control_sha256,
+                    )?;
+                    let evidence = parse_agent::qualify_image_source(
+                        &config,
+                        &expected_control_sha256,
+                        &document_agent_control,
+                        &expected_document_agent_control_sha256,
+                        &source,
+                        &qualification_request,
+                        &expected_qualification_request_sha256,
+                    )
+                    .await?;
+                    let purpose_sha256 = evidence.purpose_sha256().to_owned();
+                    parse_agent_index::write_private_qualification(
+                        evidence,
+                        &evidence_output,
+                        &control,
+                    )?;
+                    emit(
+                        &json!({"schema":"gptgrep.native-document.private-qualification-output.v1",
+                        "status":"private_evidence_written","purpose_sha256":purpose_sha256,
+                        "qualification_accepted":false,"publication_authorized":false}),
+                    )?;
+                    Ok(0)
+                }
+            };
+        }
+        Command::Ocr { command } => {
+            if cli.decisions_budget.is_some() {
+                return Err(OcrServeError("ocr_serve_incompatible_decisions_budget").into());
+            }
+            return run_ocr_serve(command).await;
+        }
+        Command::DecisionsBudget { command } => {
+            if cli.decisions_budget.is_some() {
+                return Err(decisions_budget::DecisionsBudgetCommandError(
+                    "decisions-budget commands take their own control or ledger; omit the global --decisions-budget".into(),
+                )
+                .into());
+            }
+            emit(&match command {
+                DecisionsBudgetCommand::Init {
+                    run_id,
+                    plan_file,
+                    deadline_seconds,
+                    max_submissions,
+                    ledger,
+                    output,
+                } => decisions_budget::init(
+                    &run_id,
+                    &plan_file,
+                    deadline_seconds,
+                    max_submissions,
+                    &ledger,
+                    &output,
+                )?,
+                DecisionsBudgetCommand::Status { control } => decisions_budget::status(&control)?,
+            })?;
+        }
+        Command::Rerank {
+            root,
+            input,
+            model,
+            multimodal_timeout,
+        } => {
+            let mut bytes = Vec::with_capacity(8192);
+            let read_result = (|| -> io::Result<()> {
+                if input.as_os_str() == "-" {
+                    io::stdin().lock().take(1_048_577).read_to_end(&mut bytes)?;
+                } else {
+                    std::fs::File::open(&input)?
+                        .take(1_048_577)
+                        .read_to_end(&mut bytes)?;
+                }
+                Ok(())
+            })();
+            if read_result.is_err() {
+                serde_json::to_writer(
+                    io::stdout().lock(),
+                    &gptgrep_core::rich_rerank_input_io_failure(),
+                )?;
+                return Ok(2);
+            }
+            let request = match gptgrep_core::parse_rich_rerank_request(&bytes) {
+                Ok(request) => request,
+                Err(e) => {
+                    serde_json::to_writer(io::stdout().lock(), &e)?;
+                    return Ok(2);
+                }
+            };
+            let reader = match gptgrep_core::open_rich_rerank_reader(&root, &request) {
+                Ok(reader) => reader,
+                Err(e) => {
+                    serde_json::to_writer(io::stdout().lock(), &e)?;
+                    return Ok(2);
+                }
+            };
+            let client = match multimodal_client(
+                &reader,
+                model.as_deref(),
+                cli.decisions_budget.as_deref(),
+                multimodal_timeout,
+            ) {
+                Ok(client) => client,
+                Err(_) => {
+                    serde_json::to_writer(
+                        io::stdout().lock(),
+                        &gptgrep_core::rich_rerank_context_failure(reader.pin()),
+                    )?;
+                    return Ok(2);
+                }
+            };
+            let prepared = match gptgrep_core::prepare_rich_rerank(reader, client, request) {
+                Ok(prepared) => prepared,
+                Err(e) => {
+                    serde_json::to_writer(io::stdout().lock(), &e)?;
+                    return Ok(2);
+                }
+            };
+            return match prepared.execute().await {
+                Ok(report) => {
+                    serde_json::to_writer(io::stdout().lock(), &report)?;
+                    Ok(0)
+                }
+                Err(e) => {
+                    serde_json::to_writer(io::stdout().lock(), &e)?;
+                    Ok(2)
+                }
+            };
+        }
+        Command::Batch {
+            root,
+            input,
+            rich,
+            model,
+            multimodal_timeout,
+        } => {
+            let mut bytes = Vec::with_capacity(8192);
+            let cap = if rich {
+                gptgrep_core::rich_batch::MAX_RICH_BATCH_INPUT_BYTES
+            } else {
+                gptgrep_core::batch::MAX_BATCH_INPUT_BYTES
+            };
+            let read_result = (|| -> io::Result<()> {
+                if input.as_os_str() == "-" {
+                    io::stdin()
+                        .lock()
+                        .take(cap as u64 + 1)
+                        .read_to_end(&mut bytes)?;
+                } else {
+                    std::fs::File::open(&input)?
+                        .take(cap as u64 + 1)
+                        .read_to_end(&mut bytes)?;
+                }
+                Ok(())
+            })();
+            if read_result.is_err() {
+                if rich {
+                    serde_json::to_writer(
+                        io::stdout().lock(),
+                        &gptgrep_core::rich_batch::rich_batch_input_io_failure(),
+                    )?;
+                } else {
+                    serde_json::to_writer(
+                        io::stdout().lock(),
+                        &gptgrep_core::batch::input_io_failure(),
+                    )?;
+                }
+                return Ok(2);
+            }
+            if rich {
+                let request = match gptgrep_core::rich_batch::parse_rich_batch_request(&bytes) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        serde_json::to_writer(io::stdout().lock(), &error)?;
+                        return Ok(2);
+                    }
+                };
+                let result = if request.requires_model() {
+                    match gptgrep_core::rich_batch::open_rich_batch_reader(&root, &request) {
+                        Err(e) => Err(e),
+                        Ok(reader) => {
+                            // Only the explicit paid operation reaches credential lookup.
+                            // Errors remain bounded batch diagnostics, never raw provider/config text.
+                            let client = multimodal_client(
+                                &reader,
+                                model.as_deref(),
+                                cli.decisions_budget.as_deref(),
+                                multimodal_timeout,
+                            )
+                            .ok();
+                            gptgrep_core::rich_batch::dispatch_rich_batch_with_reader_and_client(
+                                &reader, request, client,
+                            )
+                            .await
+                        }
+                    }
+                } else {
+                    gptgrep_core::rich_batch::dispatch_rich_batch(&root, request)
+                };
+                return match result {
+                    Ok(response) => {
+                        let failed =
+                            response.coverage.failed > 0 || response.coverage.not_executed > 0;
+                        serde_json::to_writer(io::stdout().lock(), &response)?;
+                        Ok(if failed { 2 } else { 0 })
+                    }
+                    Err(error) => {
+                        serde_json::to_writer(io::stdout().lock(), &error)?;
+                        Ok(2)
+                    }
+                };
+            }
+            let request = match gptgrep_core::batch::parse_batch_request(&bytes) {
+                Ok(request) => request,
+                Err(error) => {
+                    serde_json::to_writer(io::stdout().lock(), &error)?;
+                    return Ok(2);
+                }
+            };
+            match gptgrep_core::batch::dispatch_batch(&root, request, None).await {
+                Ok(response) => {
+                    let failed = response.coverage.failed > 0 || response.coverage.not_executed > 0;
+                    serde_json::to_writer(io::stdout().lock(), &response)?;
+                    if failed {
+                        return Ok(2);
+                    }
+                }
+                Err(error) => {
+                    serde_json::to_writer(io::stdout().lock(), &error)?;
+                    return Ok(2);
+                }
+            }
+        }
         Command::Index {
             root,
             max_files,
             optimize_merge,
+            parse_agent_config,
+            expected_parse_agent_config_sha256,
+            document_agent_controls,
+            expected_document_agent_controls_sha256,
+            rich,
         } => {
+            if parse_agent_config.is_some()
+                || expected_parse_agent_config_sha256.is_some()
+                || document_agent_controls.is_some()
+                || expected_document_agent_controls_sha256.is_some()
+            {
+                if optimize_merge
+                    || rich.rich
+                    || rich.ocr.is_some()
+                    || rich.plan_only
+                    || rich.resume
+                    || rich.ocr_run_id.is_some()
+                    || rich.ocr_runtime_profile.is_some()
+                    || rich.ocr_codex_home.is_some()
+                    || rich.ocr_codex_state_dir.is_some()
+                    || rich.ocr_codex_bin != "codex"
+                    || rich.ocr_max_pages != 24
+                    || rich.ocr_timeout_seconds != 1800
+                    || rich.page_window != 25
+                    || rich.expected_plan_sha256.is_some()
+                    || cli.decisions_budget.is_some()
+                {
+                    bail!("parse_agent_index_incompatible_legacy_options");
+                }
+                let (Some(config), Some(config_sha), Some(controls), Some(controls_sha)) = (
+                    parse_agent_config,
+                    expected_parse_agent_config_sha256,
+                    document_agent_controls,
+                    expected_document_agent_controls_sha256,
+                ) else {
+                    bail!("parse_agent_index_complete_control_selection_required");
+                };
+                let report = parse_agent_index::index(
+                    &root,
+                    max_files,
+                    &config,
+                    &config_sha,
+                    &controls,
+                    &controls_sha,
+                )
+                .await?;
+                if cli.json {
+                    emit(&serde_json::to_value(&report)?)?;
+                } else {
+                    println!(
+                        "Indexed {} verified parser products ({} bytes); excluded {} unsupported files",
+                        report.indexed_files,
+                        report.source_bytes,
+                        report.excluded_unsupported_files
+                    );
+                }
+                return Ok(0);
+            }
+            if rich.rich || rich.ocr.is_some() || rich.plan_only {
+                if optimize_merge {
+                    bail!(
+                        "rich ingestion rebuilds complete projection; --optimize-merge is legacy-only"
+                    );
+                }
+                return run_rich_index(&root, max_files, rich).await;
+            }
+            if rich.resume
+                || rich.ocr_run_id.is_some()
+                || rich.ocr_runtime_profile.is_some()
+                || rich.ocr_codex_home.is_some()
+            {
+                bail!("OCR options require explicit --ocr auto or --rich");
+            }
             let report = gptgrep_core::index_with_options(&root, max_files, optimize_merge).await?;
             if cli.json {
                 emit(&serde_json::to_value(&report)?)?;
@@ -469,6 +1793,9 @@ async fn run(cli: Cli) -> Result<i32> {
         } => {
             let mut host = host.config();
             host.jev_model = jev_model;
+            if !plan_only {
+                host.decisions_execution = decisions_context(cli.decisions_budget.as_deref())?;
+            }
             let config = gptgrep_host::EnrichConfig {
                 host,
                 ledger_path,
@@ -563,7 +1890,32 @@ async fn run(cli: Cli) -> Result<i32> {
             routing_docs,
             model,
             min_score,
+            visual,
         } => {
+            if visual.multimodal {
+                if !matches!(mode, Mode::Hybrid) {
+                    bail!(
+                        "--multimodal uses mandatory rich routing/reranking; --mode must be hybrid"
+                    );
+                }
+                let options =
+                    visual.options(&query, document, min_score, cli.decisions_budget.is_some())?;
+                let reader = gptgrep_core::RichGenerationReader::open(&root)?;
+                let client = multimodal_client(
+                    &reader,
+                    model.as_deref(),
+                    cli.decisions_budget.as_deref(),
+                    visual.multimodal_timeout.unwrap_or(180),
+                )?;
+                let prepared =
+                    gptgrep_core::prepare_rich_multimodal_search(reader, client, &query, &options)?;
+                let report = prepared.execute().await?.into_report();
+                let code = if report.hits.is_empty() { 1 } else { 0 };
+                // A typed JSON report is required to preserve image identities,
+                // coverage, accounting and exposure-only citation status.
+                emit(&serde_json::to_value(report)?)?;
+                return Ok(code);
+            }
             if (fixed_strings || context > 0 || ignore_case) && !matches!(mode, Mode::Regex) {
                 bail!("--fixed-strings, --ignore-case and --context require --mode regex");
             }
@@ -579,16 +1931,24 @@ async fn run(cli: Cli) -> Result<i32> {
                 model,
                 min_score,
             };
-            let report = gptgrep_core::search(&root, &query, &options).await?;
+            let report = if matches!(mode, Mode::Hybrid | Mode::Semantic) {
+                if let Some(context) = decisions_context(cli.decisions_budget.as_deref())? {
+                    // Same bounded transient retry as the default search client;
+                    // each attempt is a separate reservation in the joined ledger.
+                    let client = gptgrep_jev::JevClient::from_env(options.model.as_deref())?
+                        .with_execution_context(context)
+                        .with_transient_retry(gptgrep_jev::TransientRetry::standard());
+                    gptgrep_core::search_with_client(&root, &query, &options, &client).await?
+                } else {
+                    gptgrep_core::search(&root, &query, &options).await?
+                }
+            } else {
+                gptgrep_core::search(&root, &query, &options).await?
+            };
             if cli.json {
                 emit(&serde_json::to_value(&report)?)?;
             } else {
-                let mut stdout = io::stdout().lock();
-                for h in &report.hits {
-                    for (offset, line) in h.text.lines().enumerate() {
-                        writeln!(stdout, "{}:{}:{}", h.path, h.line_start + offset, line)?;
-                    }
-                }
+                write_text_hits(&mut io::stdout().lock(), &report.hits)?;
                 for warning in &report.warnings {
                     eprintln!("warning: {warning}");
                 }
@@ -635,35 +1995,48 @@ async fn run(cli: Cli) -> Result<i32> {
             emit(&result)?;
         }
         Command::Judge { input, model } => {
-            let metadata = std::fs::metadata(&input)?;
-            if metadata.len() > 65536 {
-                bail!("judge input exceeds 64 KiB limit");
-            }
-            let data: Value = serde_json::from_slice(&std::fs::read(input)?)?;
-            let state = data
-                .get("state")
-                .context("judge input requires state")?
-                .clone();
-            let questions = data
-                .get("questions")
-                .context("judge input requires questions")?
-                .clone();
-            let client = gptgrep_jev::JevClient::from_env(model.as_deref())?;
-            emit(&serde_json::to_value(
-                client.decide(state, questions).await?,
-            )?)?;
+            let started = std::time::Instant::now();
+            let requested = model
+                .clone()
+                .unwrap_or_else(|| gptgrep_jev::DEFAULT_MODEL.into());
+            let data = (|| -> Result<Value> {
+                let mut bytes = Vec::new();
+                std::fs::File::open(&input)?
+                    .take(gptgrep_jev::MAX_REQUEST_BYTES as u64 + 1)
+                    .read_to_end(&mut bytes)?;
+                if bytes.len() > gptgrep_jev::MAX_REQUEST_BYTES {
+                    bail!("judge input exceeds 64 KiB limit");
+                }
+                Ok(gptgrep_jev::parse_unique_json(&bytes)?)
+            })()
+            .map_err(|error| {
+                judge::JudgeFailure::before_submission("input", &requested, &error, started, None)
+            })?;
+            let client = (|| -> Result<gptgrep_jev::JevClient> {
+                let client = gptgrep_jev::JevClient::from_env(model.as_deref())?;
+                Ok(match decisions_context(cli.decisions_budget.as_deref())? {
+                    Some(context) => client.with_execution_context(context),
+                    None => client,
+                })
+            })()
+            .map_err(|error| {
+                judge::JudgeFailure::before_submission("client", &requested, &error, started, None)
+            })?;
+            emit(&judge::run(client, &data, started).await?)?;
         }
+
         Command::Doctor => {
             emit(
                 &json!({"schema_version":"gptgrep.doctor.v1","version":env!("CARGO_PKG_VERSION"),
                 "native_index":"embedded tgrep-core","vector_database":false,"mcp":false,
-                "jev":{"required_for":["default search","ask","summarize"],"configured":std::env::var_os("OPENROUTER_API_KEY").is_some(),"default_model":"typesafe/jev-1.13","endpoint":"https://openrouter.ai/api/alpha/decisions","network_checked":false},
+                "jev":{"required_for":["default search","ask","summarize"],"configured":std::env::var_os("OPENROUTER_API_KEY").is_some(),"default_model":gptgrep_jev::DEFAULT_MODEL,"endpoint":"https://openrouter.ai/api/alpha/decisions","network_checked":false},
                 "parsing":{"plaintext":true,"liteparse":"embedded Rust library; PDFium required at runtime","ocr":false,"libreoffice_available":program_available("libreoffice") || program_available("soffice")},
                 "full_pageindex_flash_parity":false}),
             )?;
         }
         Command::Ask {
             question,
+            native_ptc,
             root,
             host,
             jev_model,
@@ -675,9 +2048,72 @@ async fn run(cli: Cli) -> Result<i32> {
             navigation_max_request_bytes,
             planner_model,
             experimental_evidence_roles,
+            visual,
+            max_citations,
+            min_score,
         } => {
+            if visual.multimodal {
+                if experimental_query_plan
+                    || experimental_source_continuation
+                    || experimental_evidence_roles
+                    || navigation_overlay_sha256.is_some()
+                    || navigation_max_jev_calls.is_some()
+                    || navigation_max_request_bytes.is_some()
+                    || planner_model.is_some()
+                {
+                    bail!(
+                        "--multimodal cannot combine with legacy query planning, navigation or source continuation"
+                    );
+                }
+                if host.model != "gpt-6-luna"
+                    || host.reasoning_effort != "max"
+                    || host.service_tier != "fast"
+                {
+                    bail!("--multimodal ask requires the native gpt-6-luna/max/fast profile");
+                }
+                let citations = max_citations.unwrap_or(8);
+                if !(1..=8).contains(&citations) {
+                    bail!("multimodal citations must be 1 to 8");
+                }
+                let retrieval = visual.options(
+                    &question,
+                    document.clone(),
+                    min_score.unwrap_or(0.5),
+                    cli.decisions_budget.is_some(),
+                )?;
+                let timeout = visual
+                    .multimodal_timeout
+                    .unwrap_or(host.timeout)
+                    .min(host.timeout);
+                let reader = gptgrep_core::RichGenerationReader::open(&root)?;
+                let client = multimodal_client(
+                    &reader,
+                    jev_model.as_deref(),
+                    cli.decisions_budget.as_deref(),
+                    timeout,
+                )?;
+                let mut config = host.config();
+                config.native_ptc = native_ptc;
+                config.document = document;
+                config.timeout_secs = timeout;
+                // The explicit client already owns the selected model/context.
+                // The host retains and consumes its genuine initial pass once.
+                let options = gptgrep_host::RichMultimodalHostOptions {
+                    max_output_bytes: retrieval.max_output_bytes,
+                    max_citations: citations,
+                    retrieval,
+                };
+                let prepared = gptgrep_host::prepare_rich_multimodal_host(
+                    reader, client, &question, &config, &options,
+                )?;
+                let report = prepared.execute(&|_| Ok(())).await?;
+                emit(&serde_json::to_value(report)?)?;
+                return Ok(0);
+            }
             let mut config = host.config();
+            config.native_ptc = native_ptc;
             config.jev_model = jev_model;
+            config.decisions_execution = decisions_context(cli.decisions_budget.as_deref())?;
             config.document = document;
             config.source_continuation = experimental_source_continuation;
             config.navigation = navigation_overlay_sha256.map(|expected_overlay_sha256| {
@@ -705,6 +2141,7 @@ async fn run(cli: Cli) -> Result<i32> {
         } => {
             let mut config = host.config();
             config.jev_model = jev_model;
+            config.decisions_execution = decisions_context(cli.decisions_budget.as_deref())?;
             config.document = document;
             emit(&serde_json::to_value(
                 gptgrep_host::summarize(&root, &node_id, &config).await?,
@@ -749,7 +2186,29 @@ async fn run(cli: Cli) -> Result<i32> {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    let as_json = cli.json;
+    let as_json = cli.json
+        || matches!(
+            &cli.command,
+            Some(Command::Ocr { .. } | Command::DecisionsBudget { .. })
+        )
+        || matches!(
+            &cli.command,
+            Some(
+                Command::Search {
+                    visual: MultimodalArgs {
+                        multimodal: true,
+                        ..
+                    },
+                    ..
+                } | Command::Ask {
+                    visual: MultimodalArgs {
+                        multimodal: true,
+                        ..
+                    },
+                    ..
+                }
+            )
+        );
     let host_operation = matches!(
         cli.command,
         Some(Command::Ask { .. } | Command::Summarize { .. } | Command::HostComplete { .. })
@@ -786,28 +2245,56 @@ async fn main() {
             }
             if as_json {
                 let code = error
-                    .downcast_ref::<gptgrep_host::CompletionError>()
-                    .map(|e| e.code())
+                    .downcast_ref::<OcrServeError>()
+                    .map(|e| e.0)
                     .unwrap_or_else(|| {
-                        if let Some(partial) =
-                            error.downcast_ref::<gptgrep_host::HostRetrievalError>()
-                        {
-                            partial.code.as_str()
-                        } else if let Some(protocol) =
-                            error.downcast_ref::<gptgrep_host::HostProtocolError>()
-                        {
-                            protocol.code()
-                        } else if error.is::<gptgrep_core::JevSearchError>() {
-                            "jev_search_failed"
-                        } else if error.is::<gptgrep_host::HostCapabilityError>() {
-                            "host_no_evidence_tools"
-                        } else {
-                            "gptgrep_error"
-                        }
+                        error
+                            .downcast_ref::<gptgrep_host::CompletionError>()
+                            .map(|e| e.code())
+                            .unwrap_or_else(|| {
+                                if let Some(partial) =
+                                    error.downcast_ref::<gptgrep_host::HostRetrievalError>()
+                                {
+                                    partial.code.as_str()
+                                } else if let Some(protocol) =
+                                    error.downcast_ref::<gptgrep_host::HostProtocolError>()
+                                {
+                                    protocol.code()
+                                } else if let Some(partial) =
+                                    error.downcast_ref::<gptgrep_host::RichMultimodalHostError>()
+                                {
+                                    partial.code
+                                } else if let Some(partial) =
+                                    error.downcast_ref::<gptgrep_core::RichMultimodalSearchError>()
+                                {
+                                    partial.code
+                                } else if error.is::<gptgrep_core::JevSearchError>() {
+                                    "jev_search_failed"
+                                } else if error.is::<judge::JudgeFailure>() {
+                                    judge::JUDGE_FAILURE_CODE
+                                } else if error
+                                    .is::<decisions_budget::DecisionsBudgetCommandError>()
+                                {
+                                    "decisions_budget_failed"
+                                } else if error.is::<gptgrep_host::HostCapabilityError>() {
+                                    "host_no_evidence_tools"
+                                } else {
+                                    "gptgrep_error"
+                                }
+                            })
                     });
-                let mut report = json!({"schema_version":"gptgrep.error.v1","ok":false,"code":code,"error":format!("{error:#}")});
+                let diagnostic = if error.is::<OcrServeError>() {
+                    "Foreground OCR failed; token values, private paths and native diagnostics are omitted.".into()
+                } else {
+                    format!("{error:#}")
+                };
+                let mut report = json!({"schema_version":"gptgrep.error.v1","ok":false,"code":code,"error":diagnostic});
+                append_document_runtime_diagnostic(&error, &mut report);
                 if let Some(partial) = error.downcast_ref::<gptgrep_core::JevSearchError>() {
                     report["retrieval"] = serde_json::to_value(partial).unwrap_or(Value::Null);
+                }
+                if let Some(failure) = error.downcast_ref::<judge::JudgeFailure>() {
+                    report["judge"] = serde_json::to_value(failure.report()).unwrap_or(Value::Null);
                 }
                 if let Some(partial) = error.downcast_ref::<gptgrep_host::HostRetrievalError>() {
                     report["host_retrieval"] = serde_json::to_value(partial).unwrap_or(Value::Null);
@@ -815,12 +2302,96 @@ async fn main() {
                 if let Some(protocol) = error.downcast_ref::<gptgrep_host::HostProtocolError>() {
                     report["host_protocol"] = serde_json::to_value(protocol).unwrap_or(Value::Null);
                 }
+                if let Some(partial) =
+                    error.downcast_ref::<gptgrep_core::RichMultimodalSearchError>()
+                {
+                    report["multimodal_retrieval"] =
+                        serde_json::to_value(partial).unwrap_or(Value::Null);
+                }
+                if let Some(partial) = error.downcast_ref::<gptgrep_host::RichMultimodalHostError>()
+                {
+                    report["multimodal_host"] =
+                        serde_json::to_value(partial).unwrap_or(Value::Null);
+                }
                 let _ = emit(&report);
             } else {
                 eprintln!("gptgrep: {error:#}");
             }
             std::process::exit(2);
         }
+    }
+}
+
+async fn run_ocr_serve(command: OcrCommand) -> Result<i32> {
+    let OcrCommand::Serve {
+        config,
+        token_env,
+        initialize_ledger,
+        expected_control_sha256,
+    } = command;
+    gptgrep_host::validate_token_env_name(&token_env)
+        .map_err(|_| OcrServeError("ocr_serve_token_env_invalid"))?;
+    if expected_control_sha256.as_ref().is_some_and(|sha| {
+        sha.len() != 64
+            || !sha
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }) {
+        return Err(OcrServeError("ocr_serve_control_digest_invalid").into());
+    }
+    let control =
+        tokio::task::spawn_blocking(move || gptgrep_host::ForegroundOcrControl::load(&config))
+            .await
+            .map_err(|_| OcrServeError("ocr_serve_control_unavailable"))?
+            .map_err(|_| OcrServeError("ocr_serve_control_invalid"))?;
+    let digest = control.sha256().to_owned();
+    if expected_control_sha256
+        .as_ref()
+        .is_some_and(|expected| expected != &digest)
+    {
+        return Err(OcrServeError("ocr_serve_control_digest_mismatch").into());
+    }
+    let bind = control.bind();
+    let token =
+        std::env::var(&token_env).map_err(|_| OcrServeError("ocr_serve_token_unavailable"))?;
+    if !(32..=256).contains(&token.len()) || !token.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(OcrServeError("ocr_serve_token_invalid").into());
+    }
+    let service = tokio::task::spawn_blocking(move || {
+        control.prepare(token.as_bytes(), &token_env, initialize_ledger)
+    })
+    .await
+    .map_err(|_| OcrServeError("ocr_serve_prepare_unavailable"))?
+    .map_err(|_| OcrServeError("ocr_serve_prepare_failed"))?;
+    emit(
+        &json!({"schema_version":"gptgrep.ocr.serve.lifecycle.v1","status":"prepared","control_sha256":digest,
+        "bind":bind.to_string(),"listener_ready":false,"native_model_calls":0}),
+    )?;
+    let shutdown = gptgrep_host::OcrCancellation::default();
+    let signal = shutdown.clone();
+    let signal_task = tokio::spawn(async move {
+        shutdown_signal().await;
+        signal.cancel();
+    });
+    let result = service.serve(shutdown).await;
+    signal_task.abort();
+    let _ = signal_task.await;
+    result.map_err(|_| OcrServeError("ocr_serve_execution_failed"))?;
+    emit(
+        &json!({"schema_version":"gptgrep.ocr.serve.lifecycle.v1","status":"stopped","owned_cleanup_awaited":true,
+        "provider_usage":null,"remote_completion":"unavailable_unless_observed"}),
+    )?;
+    Ok(0)
+}
+
+fn append_document_runtime_diagnostic(error: &anyhow::Error, report: &mut Value) {
+    // Cleanup can wrap the primary error through std::error::Error::source.
+    if let Some(diagnostic) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<gptgrep_host::DocumentRuntimeError>())
+    {
+        report["code"] = json!(diagnostic.code());
+        report["document_runtime"] = serde_json::to_value(diagnostic).unwrap_or(Value::Null);
     }
 }
 
@@ -838,8 +2409,517 @@ async fn shutdown_signal() {
 }
 
 #[cfg(test)]
+mod document_runtime_cli_tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct CleanupWrapper(anyhow::Error);
+    impl std::fmt::Display for CleanupWrapper {
+        fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(output, "{}; document_ocr_cleanup_unknown", self.0)
+        }
+    }
+    impl std::error::Error for CleanupWrapper {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(self.0.as_ref())
+        }
+    }
+
+    #[test]
+    fn document_runtime_json_keeps_typed_failure_through_cleanup_sources() {
+        for cleanup_failed in [false, true] {
+            let diagnostic = gptgrep_host::DocumentRuntimeError {
+                stage: gptgrep_host::DocumentRuntimeStage::ActiveTurn,
+                startup_method: None,
+                event: gptgrep_host::DocumentRuntimeEvent::Error,
+                identity: gptgrep_host::DocumentRuntimeIdentity::Matched,
+                transport: gptgrep_host::DocumentRuntimeTransport {
+                    thread_start_sent: true,
+                    thread_start_acknowledged: true,
+                    turn_start_sent: true,
+                    turn_start_acknowledged: true,
+                },
+                codex_error_info: Some(gptgrep_host::CodexErrorInfo::Unauthorized),
+                http_status_code: None,
+                will_retry: Some(false),
+                usage: None,
+                usage_updates_without_numeric: Some(1),
+                provider_request_count: None,
+                accounting_complete: false,
+                diagnostics: Some(json!({"classification":"authentication"})),
+            };
+            let primary = anyhow::Error::new(diagnostic);
+            let error = if cleanup_failed {
+                anyhow::Error::new(CleanupWrapper(primary))
+            } else {
+                primary
+            };
+            let mut report = json!({"schema_version":"gptgrep.error.v1","ok":false,
+                "code":"gptgrep_error","error":format!("{error:#}")});
+            append_document_runtime_diagnostic(&error, &mut report);
+            assert_eq!(report["code"], "document_runtime_refused_no_retry");
+            assert_eq!(report["document_runtime"]["stage"], "active_turn");
+            assert_eq!(
+                report["document_runtime"]["codex_error_info"],
+                "unauthorized"
+            );
+            assert_eq!(
+                report["document_runtime"]["transport"]["turn_start_acknowledged"],
+                true
+            );
+            assert!(report["document_runtime"]["usage"].is_null());
+            assert_eq!(
+                report["document_runtime"]["usage_updates_without_numeric"],
+                1
+            );
+            assert!(report["document_runtime"]["provider_request_count"].is_null());
+            assert_eq!(report["document_runtime"]["accounting_complete"], false);
+            assert_eq!(
+                report["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("document_ocr_cleanup_unknown"),
+                cleanup_failed
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod query_plan_cli_tests {
     use super::*;
+
+    #[test]
+    fn parse_agent_index_controls_are_closed_and_preserve_ordinary_index_defaults() {
+        let ordinary = Cli::try_parse_from(["gptgrep", "index", "."]).unwrap();
+        let Some(Command::Index {
+            max_files,
+            optimize_merge,
+            parse_agent_config,
+            rich,
+            ..
+        }) = ordinary.command
+        else {
+            panic!("ordinary index remains reachable");
+        };
+        assert_eq!(max_files, 100000);
+        assert!(!optimize_merge);
+        assert!(parse_agent_config.is_none());
+        assert!(!rich.rich);
+        assert!(rich.ocr.is_none());
+        assert!(
+            Cli::try_parse_from([
+                "gptgrep",
+                "index",
+                ".",
+                "--parse-agent-config",
+                "control.json"
+            ])
+            .is_err()
+        );
+        let selected = vec![
+            "gptgrep",
+            "index",
+            ".",
+            "--parse-agent-config",
+            "control.json",
+            "--expected-parse-agent-config-sha256",
+            "sha",
+            "--document-agent-controls",
+            "registry.json",
+            "--expected-document-agent-controls-sha256",
+            "sha",
+        ];
+        assert!(
+            Cli::try_parse_from(selected.clone()).is_ok(),
+            "legacy default-valued flags are not explicit conflicts"
+        );
+        for extra in [
+            vec!["--optimize-merge"],
+            vec!["--rich"],
+            vec!["--ocr", "off"],
+            vec!["--ocr-codex-bin", "codex"],
+            vec!["--page-window", "25"],
+        ] {
+            let mut arguments = selected.clone();
+            arguments.extend(extra);
+            assert!(
+                Cli::try_parse_from(arguments).is_err(),
+                "explicit legacy options cannot silently coexist"
+            );
+        }
+    }
+    #[test]
+    fn document_agent_and_private_qualification_have_explicit_pinned_front_doors() {
+        let selected = vec![
+            "gptgrep",
+            "parse-agent",
+            "agent",
+            "--config",
+            "control.json",
+            "--expected-control-sha256",
+            "sha",
+            "--document-agent-control",
+            "document.json",
+            "--expected-document-agent-control-sha256",
+            "sha",
+            "--source",
+            "registered",
+            "--output",
+            "product.json",
+        ];
+        let parsed = Cli::try_parse_from(selected).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::ParseAgent {
+                command: ParseAgentCommand::Agent { .. }
+            })
+        ));
+        let qualifier = [
+            "gptgrep",
+            "parse-agent",
+            "qualify",
+            "--config",
+            "control.json",
+            "--expected-control-sha256",
+            "sha",
+            "--document-agent-control",
+            "document.json",
+            "--expected-document-agent-control-sha256",
+            "sha",
+            "--source",
+            "registered",
+            "--qualification-request",
+            "purpose.json",
+            "--expected-qualification-request-sha256",
+            "sha",
+            "--evidence-output",
+            "private-fixture.json",
+        ];
+        assert!(Cli::try_parse_from(qualifier).is_ok());
+        let contract = contract();
+        assert_eq!(
+            contract["commands"]["index"]["parse_agent"]["controls_schema"],
+            "gptgrep.parse-agent.index-controls.v1"
+        );
+        assert_eq!(
+            contract["commands"]["parse-agent"]["document_limits"]["native_tools"],
+            64
+        );
+        assert_eq!(
+            contract["commands"]["parse-agent"]["document_limits"]["page_ocr_tools"],
+            8
+        );
+        assert!(llms().contains("--document-agent-controls"));
+        assert!(llms().contains("partial coverage"));
+    }
+
+    #[test]
+    fn rich_batch_discovery_examples_match_request_parser() {
+        let schema = contract();
+        let examples = schema["commands"]["batch"]["rich"]["request_examples"]
+            .as_array()
+            .unwrap();
+        for example in examples {
+            let request = gptgrep_core::rich_batch::parse_rich_batch_request(
+                &serde_json::to_vec(example).unwrap(),
+            )
+            .expect("schema example matches the real rich batch parser");
+            assert!(!request.requires_model());
+            assert_eq!(request.budget.max_decisions_submissions, 0);
+        }
+        let mut documented_examples = 0;
+        for block in llms().split("```json\n").skip(1) {
+            let raw = block.split("\n```").next().unwrap();
+            let request = gptgrep_core::rich_batch::parse_rich_batch_request(raw.as_bytes())
+                .expect("llms example matches the real rich batch parser");
+            assert!(!request.requires_model());
+            assert_eq!(request.budget.max_decisions_submissions, 0);
+            documented_examples += 1;
+        }
+        assert_eq!(documented_examples, examples.len());
+    }
+
+    #[test]
+    fn production_defaults_budget_option_and_typed_judge_frontdoor_are_reachable() {
+        let cli = Cli::try_parse_from([
+            "gptgrep",
+            "search",
+            "ordinary query",
+            ".",
+            "--decisions-budget",
+            "budget.json",
+        ])
+        .unwrap();
+        assert_eq!(cli.decisions_budget, Some(PathBuf::from("budget.json")));
+        let contract = contract();
+        assert_eq!(
+            contract["decisions"]["default_model"],
+            gptgrep_jev::DEFAULT_MODEL
+        );
+        assert_eq!(
+            contract["commands"]["ask"]["defaults"]["model"],
+            "gpt-6-luna"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let image = directory.path().join("evidence.png");
+        // Fixed 1x1 PNG fixture; generic source text contains no evaluator input.
+        std::fs::write(
+            &image,
+            [
+                137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0,
+                1, 8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 248,
+                207, 192, 240, 31, 0, 5, 0, 1, 255, 137, 153, 61, 29, 0, 0, 0, 0, 73, 69, 78, 68,
+                174, 66, 96, 130,
+            ],
+        )
+        .unwrap();
+        let source = json!({"source_id":"source","unit_id":"page","source_sha256":"a".repeat(64)});
+        let data = json!({"input":{"text":[{"source":{"source_id":"source","unit_id":"caption","source_sha256":"a".repeat(64)},"text":"Observe this image."}],
+            "images":[{"source":source,"path":image}]},"questions":{"visible":{"type":"noul","instructions":"Is the image visible?"}}});
+        let client = gptgrep_jev::JevClient::new("ordinary-mock-only", None).unwrap();
+        let prepared = prepare_judge(&client, &data).unwrap();
+        let wire: Value = serde_json::from_slice(prepared.canonical_body()).unwrap();
+        assert!(wire["state"][0].is_string());
+        assert_eq!(wire["state"][1]["type"], "image_url");
+        assert!(wire["state"][1].get("source").is_none());
+        assert_eq!(
+            client
+                .execution_context()
+                .snapshot()
+                .unwrap()
+                .logical_reservations,
+            0
+        );
+        let legacy =
+            gptgrep_jev::JevClient::new("ordinary-mock-only", Some(gptgrep_jev::LEGACY_MODEL))
+                .unwrap();
+        assert!(prepare_judge(&legacy, &data).is_err());
+        let mut unknown = data.clone();
+        unknown["state"] = json!("ambiguous");
+        assert!(prepare_judge(&client, &unknown).is_err());
+        assert!(
+            prepare_judge(
+                &client,
+                &json!({"state":"original structured state","questions":data["questions"]})
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn decisions_budget_commands_and_alias_admission_are_discoverable() {
+        let init = Cli::try_parse_from([
+            "gptgrep",
+            "decisions-budget",
+            "init",
+            "--run-id",
+            "synthetic-run",
+            "--plan-file",
+            "plan.json",
+            "--deadline-seconds",
+            "600",
+            "--max-submissions",
+            "2",
+            "--ledger",
+            "/abs/ledger.json",
+            "--output",
+            "/abs/control.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            init.command,
+            Some(Command::DecisionsBudget {
+                command: DecisionsBudgetCommand::Init {
+                    deadline_seconds: 600,
+                    max_submissions: 2,
+                    ..
+                }
+            })
+        ));
+        for (option, invalid) in [("--deadline-seconds", "0"), ("--max-submissions", "201")] {
+            let mut args = vec![
+                "gptgrep",
+                "decisions-budget",
+                "init",
+                "--run-id",
+                "r",
+                "--plan-file",
+                "p",
+                "--deadline-seconds",
+                "60",
+                "--max-submissions",
+                "1",
+                "--ledger",
+                "/l",
+                "--output",
+                "/o",
+            ];
+            let index = args.iter().position(|arg| *arg == option).unwrap();
+            args[index + 1] = invalid;
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        assert!(
+            Cli::try_parse_from([
+                "gptgrep",
+                "decisions-budget",
+                "status",
+                "--control",
+                "control.json",
+                "--json"
+            ])
+            .is_ok()
+        );
+        let contract = contract();
+        let budget = &contract["commands"]["decisions-budget"];
+        assert!(
+            budget["init_usage"]
+                .as_str()
+                .unwrap()
+                .contains("--plan-file FILE --deadline-seconds N")
+        );
+        assert_eq!(
+            budget["status_output_schema"],
+            gptgrep_jev::DECISIONS_BUDGET_STATUS_SCHEMA
+        );
+        assert_eq!(
+            contract["global_options"]["decisions-budget"]["initialization"],
+            false
+        );
+        assert_eq!(
+            contract["decisions"]["aliases"]["example"],
+            "~typesafe/jev-latest"
+        );
+        assert_eq!(contract["decisions"]["aliases"]["images"], false);
+        assert!(
+            contract["decisions"]["raw_image_parts"]
+                .as_str()
+                .unwrap()
+                .contains("image_url or input_image member or type")
+        );
+        assert_eq!(
+            contract["decisions"]["canonical_builds"][gptgrep_jev::LEGACY_MODEL],
+            gptgrep_jev::LEGACY_MODEL_CANONICAL
+        );
+        assert_eq!(
+            contract["commands"]["judge"]["output"]["failure"]["code"],
+            judge::JUDGE_FAILURE_CODE
+        );
+        assert!(llms().contains("gptgrep decisions-budget init --run-id ID"));
+        assert!(llms().contains("gptgrep decisions-budget status --control FILE --json"));
+        assert!(llms().contains("~typesafe/jev-latest"));
+        assert!(llms().contains("decisions_judge_failed"));
+        assert!(
+            contract["commands"]["search"]["routing"]
+                .as_str()
+                .unwrap()
+                .contains("skipped_single_document")
+        );
+        assert!(llms().contains("routing_status=skipped_single_document"));
+        assert!(
+            contract["search_output"]["hit_fields"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("below_threshold"))
+        );
+        assert!(
+            contract["search_output"]["relevance_floor"]
+                .as_str()
+                .unwrap()
+                .contains("below_threshold_fallback")
+        );
+        assert!(llms().contains("below_threshold=true"));
+        assert!(
+            contract["commands"]["search"]["lexical_terms"]
+                .as_str()
+                .unwrap()
+                .contains("document frequency")
+        );
+        assert!(llms().contains("keep their rarest terms in the scoped index"));
+        let rules = contract["commands"]["ask"]["reader_answer_rules"]
+            .as_str()
+            .unwrap();
+        assert!(rules.contains("in-text references"));
+        assert!(rules.contains("never relax abstention"));
+        // Opt-1b: the answer-commitment rule is gone from the reader contract.
+        assert!(!rules.contains("commit to it"));
+        let retry = &contract["decisions"]["transient_retry"];
+        assert_eq!(retry["max_retries"], 1);
+        assert_eq!(retry["statuses"], json!([429, 500, 502, 503, 504]));
+        assert_eq!(retry["backoff_ms"], json!([250, 1000]));
+        assert!(retry["receipts"].as_str().unwrap().contains("before_retry"));
+        assert!(
+            retry["failure_kinds"]["retry_post_send"]
+                .as_str()
+                .unwrap()
+                .contains("counts in jev_requests, jev_models and jev_usage")
+        );
+        let retry_after = retry["retry_after"].as_str().unwrap();
+        assert!(retry_after.contains("refuses the retry"));
+        assert!(!retry_after.contains("ignored"));
+        for refusal in [
+            gptgrep_jev::RetryAfterRefusal::Repeated,
+            gptgrep_jev::RetryAfterRefusal::OutOfRange,
+            gptgrep_jev::RetryAfterRefusal::NotDeltaSeconds,
+        ] {
+            let code = serde_json::to_value(refusal).unwrap();
+            assert!(retry_after.contains(code.as_str().unwrap()), "{code}");
+        }
+        assert!(
+            retry["budget"]
+                .as_str()
+                .unwrap()
+                .contains("Decisions submission budget exhausted")
+        );
+        assert!(llms().contains("metrics.jev_retried_attempts"));
+    }
+
+    #[test]
+    fn plain_text_search_never_prints_fallback_candidates_as_matches() {
+        let hit = |line: usize, below_threshold: bool, literal_anchor: bool| -> gptgrep_core::Hit {
+            serde_json::from_value(json!({
+                "path": "notes.md", "node_id": "node", "title": "Notes",
+                "line_start": line, "line_end": line, "page_start": 1, "page_end": 1,
+                "match_line": null, "match_column": null, "byte_start": 0, "byte_end": 4,
+                "node_offset": null, "next_offset": null, "column_start": 1,
+                "coordinate_system": "source_lines", "text": "text", "text_truncated": false,
+                "score": 0.2, "confidence": null, "literal_anchor": literal_anchor,
+                "below_threshold": below_threshold, "source_sha256": "a",
+                "source_fresh": true, "citation": "notes.md:L1-L1"
+            }))
+            .unwrap()
+        };
+        let mut out = Vec::new();
+        // A passing hit and a retained literal anchor are matches; a fallback
+        // candidate is printed with grep's context separator.
+        write_text_hits(
+            &mut out,
+            &[
+                hit(3, false, false),
+                hit(7, true, true),
+                hit(9, true, false),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "notes.md:3:text\nnotes.md:7:text\nnotes.md-9-text\n"
+        );
+        let contract = contract();
+        assert!(
+            contract["exit_codes"]["0"]
+                .as_str()
+                .unwrap()
+                .contains("below_threshold")
+        );
+        assert!(
+            contract["search_output"]["relevance_floor"]
+                .as_str()
+                .unwrap()
+                .contains("PATH-LINE-TEXT")
+        );
+        assert!(llms().contains("PATH-LINE-TEXT"));
+    }
 
     #[test]
     fn planning_is_explicit_and_limited_to_ask() {
@@ -1258,3 +3338,105 @@ mod query_plan_cli_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod multimodal_cli_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_workflow_maps_tighter_bounds_and_preserves_legacy_defaults() {
+        let cli = Cli::try_parse_from([
+            "gptgrep",
+            "search",
+            "图表",
+            "--multimodal",
+            "--document",
+            "report.pdf",
+            "--window-bytes",
+            "512",
+            "--max-visual-candidates",
+            "3",
+            "--max-concurrent-batches",
+            "2",
+            "--max-output-bytes",
+            "900000",
+            "--max-metadata-bytes",
+            "32000",
+            "--max-image-bytes",
+            "500000",
+            "--max-image-pixels",
+            "4000000",
+            "--min-score",
+            "0.7",
+        ])
+        .unwrap();
+        let Some(Command::Search {
+            query,
+            document,
+            min_score,
+            visual,
+            ..
+        }) = cli.command
+        else {
+            panic!("search");
+        };
+        let options = visual.options(&query, document, min_score, true).unwrap();
+        assert!(options.require_shared_ledger);
+        assert_eq!(options.document.as_deref(), Some("report.pdf"));
+        assert_eq!(
+            (
+                options.window_bytes,
+                options.max_visual_candidates,
+                options.max_concurrent_batches
+            ),
+            (512, 3, 2)
+        );
+        assert_eq!(
+            (options.max_output_bytes, options.max_metadata_bytes),
+            (900000, 32000)
+        );
+        assert_eq!(
+            (
+                options.resources.image_file_bytes,
+                options.resources.image_pixels
+            ),
+            (500000, 4000000)
+        );
+        assert_eq!(options.min_score, 0.7);
+        let legacy = Cli::try_parse_from(["gptgrep", "search", "text"]).unwrap();
+        assert!(matches!(
+            legacy.command,
+            Some(Command::Search {
+                visual: MultimodalArgs {
+                    multimodal: false,
+                    ..
+                },
+                limit: 20,
+                context: 0,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn legacy_candidate_options_and_unselected_visual_controls_do_not_silently_change_workflow() {
+        for flag in ["--limit", "--context", "--max-candidates", "--routing-docs"] {
+            assert!(
+                Cli::try_parse_from(["gptgrep", "search", "chart", "--multimodal", flag, "1"])
+                    .is_err()
+            );
+        }
+        for flag in ["--ignore-case", "--fixed-strings"] {
+            assert!(
+                Cli::try_parse_from(["gptgrep", "search", "chart", "--multimodal", flag]).is_err()
+            );
+        }
+        assert!(Cli::try_parse_from(["gptgrep", "ask", "chart", "--max-citations", "2"]).is_err());
+        assert!(
+            Cli::try_parse_from(["gptgrep", "search", "chart", "--window-bytes", "100"]).is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod native_ptc_cli_tests;

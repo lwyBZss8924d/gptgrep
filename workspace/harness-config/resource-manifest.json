@@ -1,8 +1,101 @@
 {
   "schema_version": "aicatlog.resources.v1",
   "resources": [
-    {"id": "workflow", "kind": "workflow", "path": "workflow.txt", "when": "Plan, implement, validate or hand off project work"},
-    {"id": "checkpoint-template", "path": "templates/checkpoint.json", "when": "Record a continuation cursor"},
-    {"id": "goal-contract", "path": "goal-contract.json", "when": "Select live comparative PageIndex benchmark gates and research-preview acceptance"}
+    {
+      "id": "navigation",
+      "kind": "navigation",
+      "path": "llms.txt",
+      "when": "Select current project contracts and implementation topics"
+    },
+    {
+      "id": "authority",
+      "kind": "governance",
+      "path": "AGENTS.md",
+      "when": "Check project ownership, validation and delivery constraints"
+    },
+    {
+      "id": "spec",
+      "kind": "specification",
+      "path": "SPEC.md",
+      "when": "Check product behavior and XL release acceptance"
+    },
+    {
+      "id": "evaluation",
+      "kind": "workflow",
+      "path": "docs/evaluation.md",
+      "when": "Freeze matched XL tasks, source groups, reader/judge boundaries and development or confirmation outcomes"
+    },
+    {
+      "id": "benchmark",
+      "kind": "document",
+      "path": "benchmark/UPSTREAM.md",
+      "when": "Verify pinned XL release, raw context, scorer and rights"
+    },
+    {
+      "id": "native-runner",
+      "kind": "workflow",
+      "path": "benchmark/NATIVE-RUNNER.md",
+      "when": "Launch separately supervised native readers and independent judge"
+    },
+    {
+      "id": "self-opt",
+      "kind": "tool",
+      "path": "self-opt/src/cli.ts",
+      "when": "Compare retained complete measurements and plan an isolated product iteration"
+    },
+    {
+      "id": "architecture",
+      "kind": "document",
+      "path": "docs/architecture.md",
+      "when": "Select the Rust product and runtime module boundary"
+    },
+    {
+      "id": "development",
+      "kind": "workflow",
+      "path": "docs/development.md",
+      "when": "Prepare build, test, native runtime and authentication environment"
+    },
+    {
+      "id": "auth-supervisor",
+      "kind": "workflow",
+      "path": "workspace/harness-tooling/codex-auth/README.md",
+      "when": "Route an authorized live shared-login consumer through exact auth supervision"
+    },
+    {
+      "id": "status",
+      "kind": "document",
+      "path": "docs/experimental-status.md",
+      "when": "Check retained baseline and current source versus acceptance limits"
+    },
+    {
+      "id": "release",
+      "kind": "workflow",
+      "path": "docs/release.md",
+      "when": "Check release packaging, independent review and platform evidence"
+    },
+    {
+      "id": "development-storage",
+      "kind": "workflow",
+      "path": "workspace/harness-config/development-storage.md",
+      "when": "Plan governed downloads, builds, tests or worker storage and checkpoint usage"
+    },
+    {
+      "id": "workflow",
+      "kind": "workflow",
+      "path": "workspace/harness-config/workflow.txt",
+      "when": "Plan, implement, validate or hand off project work"
+    },
+    {
+      "id": "checkpoint-template",
+      "kind": "document",
+      "path": "workspace/harness-config/templates/checkpoint.json",
+      "when": "Record a continuation cursor"
+    },
+    {
+      "id": "goal-contract",
+      "kind": "document",
+      "path": "workspace/harness-config/goal-contract.json",
+      "when": "Select the 0.2 XL development endpoint and separate frozen release acceptance"
+    }
   ]
 }

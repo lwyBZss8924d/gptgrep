@@ -1,0 +1,4050 @@
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -276,7 +276,7 @@
+ 
+ [[package]]
+ name = "app_test_support"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
+@@ -1895,7 +1895,7 @@
+ 
+ [[package]]
+ name = "codex-agent-extension"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "codex-core",
+@@ -1907,7 +1907,7 @@
+ 
+ [[package]]
+ name = "codex-agent-graph-store"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-protocol",
+  "codex-state",
+@@ -1922,7 +1922,7 @@
+ 
+ [[package]]
+ name = "codex-agent-identity"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
+@@ -1942,7 +1942,7 @@
+ 
+ [[package]]
+ name = "codex-agent-message-board-client"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -1965,7 +1965,7 @@
+ 
+ [[package]]
+ name = "codex-agent-message-board-extension"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "base64 0.22.1",
+  "caseless",
+@@ -1988,7 +1988,7 @@
+ 
+ [[package]]
+ name = "codex-agent-roles"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-config",
+  "codex-file-system",
+@@ -2001,7 +2001,7 @@
+ 
+ [[package]]
+ name = "codex-analytics"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-app-server-protocol",
+  "codex-git-utils",
+@@ -2024,7 +2024,7 @@
+ 
+ [[package]]
+ name = "codex-ansi-escape"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "ansi-to-tui",
+  "pretty_assertions",
+@@ -2035,7 +2035,7 @@
+ 
+ [[package]]
+ name = "codex-api"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "assert_matches",
+@@ -2073,7 +2073,7 @@
+ 
+ [[package]]
+ name = "codex-app-server"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "app_test_support",
+@@ -2187,7 +2187,7 @@
+ 
+ [[package]]
+ name = "codex-app-server-client"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-app-server",
+  "codex-app-server-protocol",
+@@ -2214,7 +2214,7 @@
+ 
+ [[package]]
+ name = "codex-app-server-daemon"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "blake3",
+@@ -2240,7 +2240,7 @@
+ 
+ [[package]]
+ name = "codex-app-server-protocol"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "codex-app-server-protocol-noop-macros",
+@@ -2274,11 +2274,11 @@
+ 
+ [[package]]
+ name = "codex-app-server-protocol-noop-macros"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ 
+ [[package]]
+ name = "codex-app-server-test-client"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "clap",
+@@ -2300,7 +2300,7 @@
+ 
+ [[package]]
+ name = "codex-app-server-transport"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "axum",
+  "base64 0.22.1",
+@@ -2342,7 +2342,7 @@
+ 
+ [[package]]
+ name = "codex-apply-patch"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "assert_cmd",
+@@ -2362,7 +2362,7 @@
+ 
+ [[package]]
+ name = "codex-arg0"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "codex-apply-patch",
+@@ -2386,7 +2386,7 @@
+ 
+ [[package]]
+ name = "codex-async-utils"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "pretty_assertions",
+  "rand 0.9.3",
+@@ -2396,7 +2396,7 @@
+ 
+ [[package]]
+ name = "codex-attachment-store"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "pretty_assertions",
+  "serde",
+@@ -2406,7 +2406,7 @@
+ 
+ [[package]]
+ name = "codex-aws-auth"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "aws-config",
+  "aws-credential-types",
+@@ -2432,7 +2432,7 @@
+ 
+ [[package]]
+ name = "codex-backend-client"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "codex-api",
+@@ -2452,7 +2452,7 @@
+ 
+ [[package]]
+ name = "codex-backend-openapi-models"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "serde",
+  "serde_json",
+@@ -2461,7 +2461,7 @@
+ 
+ [[package]]
+ name = "codex-build-info"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-install-context",
+  "pretty_assertions",
+@@ -2474,7 +2474,7 @@
+ 
+ [[package]]
+ name = "codex-bwrap"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "cc",
+  "libc",
+@@ -2483,7 +2483,7 @@
+ 
+ [[package]]
+ name = "codex-chatgpt"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "clap",
+@@ -2505,7 +2505,7 @@
+ 
+ [[package]]
+ name = "codex-cli"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "app_test_support",
+@@ -2607,7 +2607,7 @@
+ 
+ [[package]]
+ name = "codex-client"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-http-client",
+  "eventsource-stream",
+@@ -2621,7 +2621,7 @@
+ 
+ [[package]]
+ name = "codex-cloud-client"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "async-stream",
+@@ -2645,7 +2645,7 @@
+ 
+ [[package]]
+ name = "codex-cloud-config"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "base64 0.22.1",
+  "chrono",
+@@ -2671,7 +2671,7 @@
+ 
+ [[package]]
+ name = "codex-cloud-tasks"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -2704,7 +2704,7 @@
+ 
+ [[package]]
+ name = "codex-cloud-tasks-client"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -2719,7 +2719,7 @@
+ 
+ [[package]]
+ name = "codex-cloud-tasks-mock-client"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "chrono",
+  "codex-cloud-tasks-client",
+@@ -2728,7 +2728,7 @@
+ 
+ [[package]]
+ name = "codex-code-mode"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-code-mode-protocol",
+  "codex-http-client",
+@@ -2751,7 +2751,7 @@
+ 
+ [[package]]
+ name = "codex-code-mode-host"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "axum",
+@@ -2780,7 +2780,7 @@
+ 
+ [[package]]
+ name = "codex-code-mode-protocol"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-protocol",
+  "glob",
+@@ -2798,7 +2798,7 @@
+ 
+ [[package]]
+ name = "codex-code-mode-runtime"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "base64 0.22.1",
+  "codex-code-mode-protocol",
+@@ -2816,11 +2816,11 @@
+ 
+ [[package]]
+ name = "codex-collaboration-mode-templates"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ 
+ [[package]]
+ name = "codex-config"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
+@@ -2870,7 +2870,7 @@
+ 
+ [[package]]
+ name = "codex-config-schema"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "clap",
+@@ -2879,7 +2879,7 @@
+ 
+ [[package]]
+ name = "codex-connectors"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "arc-swap",
+@@ -2901,7 +2901,7 @@
+ 
+ [[package]]
+ name = "codex-connectors-extension"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-connectors",
+  "codex-core-plugins",
+@@ -2915,7 +2915,7 @@
+ 
+ [[package]]
+ name = "codex-context-fragments"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-protocol",
+  "codex-utils-string",
+@@ -2925,7 +2925,7 @@
+ 
+ [[package]]
+ name = "codex-core"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "arc-swap",
+@@ -3040,6 +3040,7 @@
+  "serde_json",
+  "serial_test",
+  "sha1 0.10.6",
++ "sha2 0.10.9",
+  "shlex",
+  "similar",
+  "tempfile",
+@@ -3067,7 +3068,7 @@
+ 
+ [[package]]
+ name = "codex-core-api"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-analytics",
+  "codex-app-server-protocol",
+@@ -3090,7 +3091,7 @@
+ 
+ [[package]]
+ name = "codex-core-plugin-common"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-utils-absolute-path",
+  "semver",
+@@ -3101,7 +3102,7 @@
+ 
+ [[package]]
+ name = "codex-core-plugins"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -3158,7 +3159,7 @@
+ 
+ [[package]]
+ name = "codex-diagnostics"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "libc",
+  "pretty_assertions",
+@@ -3166,7 +3167,7 @@
+ 
+ [[package]]
+ name = "codex-exec"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "assert_cmd",
+@@ -3218,7 +3219,7 @@
+ 
+ [[package]]
+ name = "codex-exec-server"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "arc-swap",
+@@ -3287,7 +3288,7 @@
+ 
+ [[package]]
+ name = "codex-exec-server-protocol"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "base64 0.22.1",
+  "codex-file-system",
+@@ -3304,7 +3305,7 @@
+ 
+ [[package]]
+ name = "codex-exec-server-test-support"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "codex-exec-server",
+@@ -3319,7 +3320,7 @@
+ 
+ [[package]]
+ name = "codex-execpolicy"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "clap",
+@@ -3337,7 +3338,7 @@
+ 
+ [[package]]
+ name = "codex-experimental-api-macros"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "proc-macro2",
+  "quote",
+@@ -3346,7 +3347,7 @@
+ 
+ [[package]]
+ name = "codex-extension-api"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-api",
+  "codex-config",
+@@ -3368,7 +3369,7 @@
+ 
+ [[package]]
+ name = "codex-extension-items"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-utils-absolute-path",
+  "pretty_assertions",
+@@ -3380,7 +3381,7 @@
+ 
+ [[package]]
+ name = "codex-external-agent-migration"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "chrono",
+  "codex-analytics",
+@@ -3410,7 +3411,7 @@
+ 
+ [[package]]
+ name = "codex-features"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-network-proxy",
+  "codex-protocol",
+@@ -3424,7 +3425,7 @@
+ 
+ [[package]]
+ name = "codex-feedback"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "bytes",
+@@ -3451,7 +3452,7 @@
+ 
+ [[package]]
+ name = "codex-file-search"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "clap",
+@@ -3467,7 +3468,7 @@
+ 
+ [[package]]
+ name = "codex-file-system"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "bytes",
+  "codex-protocol",
+@@ -3479,7 +3480,7 @@
+ 
+ [[package]]
+ name = "codex-file-watcher"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "notify",
+  "pretty_assertions",
+@@ -3490,7 +3491,7 @@
+ 
+ [[package]]
+ name = "codex-git-attribution"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-backend-client",
+  "codex-extension-api",
+@@ -3503,7 +3504,7 @@
+ 
+ [[package]]
+ name = "codex-git-utils"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -3531,7 +3532,7 @@
+ 
+ [[package]]
+ name = "codex-goal-extension"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -3556,7 +3557,7 @@
+ 
+ [[package]]
+ name = "codex-guardian-context"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-context-fragments",
+  "codex-history",
+@@ -3568,7 +3569,7 @@
+ 
+ [[package]]
+ name = "codex-guardian-reviewer"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "codex-analytics",
+@@ -3593,7 +3594,7 @@
+ 
+ [[package]]
+ name = "codex-guardian-v2"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "codex-analytics",
+@@ -3630,7 +3631,7 @@
+ 
+ [[package]]
+ name = "codex-history"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "codex-protocol",
+@@ -3642,7 +3643,7 @@
+ 
+ [[package]]
+ name = "codex-history-notes-extension"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-analytics",
+  "codex-client",
+@@ -3667,7 +3668,7 @@
+ 
+ [[package]]
+ name = "codex-home"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-extension-api",
+  "codex-utils-absolute-path",
+@@ -3679,7 +3680,7 @@
+ 
+ [[package]]
+ name = "codex-hooks"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "async-channel",
+@@ -3707,7 +3708,7 @@
+ 
+ [[package]]
+ name = "codex-http-client"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "bytes",
+  "codex-utils-cargo-bin",
+@@ -3743,7 +3744,7 @@
+ 
+ [[package]]
+ name = "codex-image-generation-extension"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "base64 0.22.1",
+  "codex-api",
+@@ -3771,7 +3772,7 @@
+ 
+ [[package]]
+ name = "codex-install-context"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-utils-absolute-path",
+  "codex-utils-home-dir",
+@@ -3784,7 +3785,7 @@
+ 
+ [[package]]
+ name = "codex-keyring-store"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "keyring",
+  "pretty_assertions",
+@@ -3795,7 +3796,7 @@
+ 
+ [[package]]
+ name = "codex-linux-sandbox"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "clap",
+  "codex-core",
+@@ -3824,7 +3825,7 @@
+ 
+ [[package]]
+ name = "codex-lmstudio"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-core",
+  "codex-http-client",
+@@ -3838,7 +3839,7 @@
+ 
+ [[package]]
+ name = "codex-login"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
+@@ -3884,7 +3885,7 @@
+ 
+ [[package]]
+ name = "codex-mcp"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "arc-swap",
+@@ -3924,7 +3925,7 @@
+ 
+ [[package]]
+ name = "codex-mcp-extension"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "axum",
+@@ -3957,7 +3958,7 @@
+ 
+ [[package]]
+ name = "codex-memories-extension"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-core",
+  "codex-extension-api",
+@@ -3979,7 +3980,7 @@
+ 
+ [[package]]
+ name = "codex-memories-read"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-protocol",
+  "codex-shell-command",
+@@ -3989,7 +3990,7 @@
+ 
+ [[package]]
+ name = "codex-memories-write"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -4026,7 +4027,7 @@
+ 
+ [[package]]
+ name = "codex-mermaid"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "insta",
+  "pretty_assertions",
+@@ -4035,7 +4036,7 @@
+ 
+ [[package]]
+ name = "codex-message-history"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-config",
+  "memchr",
+@@ -4049,7 +4050,7 @@
+ 
+ [[package]]
+ name = "codex-model-provider"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "base64 0.22.1",
+  "chrono",
+@@ -4083,7 +4084,7 @@
+ 
+ [[package]]
+ name = "codex-model-provider-info"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-client",
+  "codex-protocol",
+@@ -4101,7 +4102,7 @@
+ 
+ [[package]]
+ name = "codex-models-manager"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "chrono",
+  "codex-http-client",
+@@ -4120,7 +4121,7 @@
+ 
+ [[package]]
+ name = "codex-mxc-sandbox"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "appcontainer_common",
+@@ -4142,7 +4143,7 @@
+ 
+ [[package]]
+ name = "codex-network-proxy"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
+@@ -4191,7 +4192,7 @@
+ 
+ [[package]]
+ name = "codex-ollama"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "assert_matches",
+  "async-stream",
+@@ -4211,7 +4212,7 @@
+ 
+ [[package]]
+ name = "codex-otel"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "bytes",
+  "chrono",
+@@ -4248,7 +4249,7 @@
+ 
+ [[package]]
+ name = "codex-otel-trace-websocket"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "axum",
+@@ -4259,7 +4260,7 @@
+ 
+ [[package]]
+ name = "codex-plugin"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-config",
+  "codex-core-plugin-common",
+@@ -4274,7 +4275,7 @@
+ 
+ [[package]]
+ name = "codex-process-hardening"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "libc",
+  "pretty_assertions",
+@@ -4282,7 +4283,7 @@
+ 
+ [[package]]
+ name = "codex-prompts"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "codex-collaboration-mode-templates",
+@@ -4299,7 +4300,7 @@
+ 
+ [[package]]
+ name = "codex-protocol"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "chardetng",
+@@ -4344,7 +4345,7 @@
+ 
+ [[package]]
+ name = "codex-queue-extension"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "codex-core",
+@@ -4365,7 +4366,7 @@
+ 
+ [[package]]
+ name = "codex-realtime-webrtc"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "codex-build-info",
+@@ -4384,7 +4385,7 @@
+ 
+ [[package]]
+ name = "codex-response-debug-context"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "base64 0.22.1",
+  "codex-api",
+@@ -4395,7 +4396,7 @@
+ 
+ [[package]]
+ name = "codex-responses-api-proxy"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "clap",
+@@ -4412,7 +4413,7 @@
+ 
+ [[package]]
+ name = "codex-rmcp-client"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "axum",
+@@ -4463,7 +4464,7 @@
+ 
+ [[package]]
+ name = "codex-rollout"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -4494,7 +4495,7 @@
+ 
+ [[package]]
+ name = "codex-rollout-trace"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "codex-code-mode",
+@@ -4510,7 +4511,7 @@
+ 
+ [[package]]
+ name = "codex-sandboxing"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "codex-mxc-sandbox",
+@@ -4538,7 +4539,7 @@
+ 
+ [[package]]
+ name = "codex-secrets"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "age",
+  "anyhow",
+@@ -4559,7 +4560,7 @@
+ 
+ [[package]]
+ name = "codex-shell-command"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
+@@ -4582,7 +4583,7 @@
+ 
+ [[package]]
+ name = "codex-shell-escalation"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "clap",
+@@ -4602,7 +4603,7 @@
+ 
+ [[package]]
+ name = "codex-skills"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-protocol",
+  "codex-shell-command",
+@@ -4619,7 +4620,7 @@
+ 
+ [[package]]
+ name = "codex-skills-extension"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "assert_matches",
+  "blake3",
+@@ -4657,7 +4658,7 @@
+ 
+ [[package]]
+ name = "codex-state"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -4684,7 +4685,7 @@
+ 
+ [[package]]
+ name = "codex-stdio-to-uds"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "codex-uds",
+@@ -4696,7 +4697,7 @@
+ 
+ [[package]]
+ name = "codex-tcp-tunnel"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "bytes",
+@@ -4717,7 +4718,7 @@
+ 
+ [[package]]
+ name = "codex-terminal-detection"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "pretty_assertions",
+  "tracing",
+@@ -4725,7 +4726,7 @@
+ 
+ [[package]]
+ name = "codex-test-binary-support"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-arg0",
+  "tempfile",
+@@ -4733,7 +4734,7 @@
+ 
+ [[package]]
+ name = "codex-thread-manager-sample"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "clap",
+@@ -4744,7 +4745,7 @@
+ 
+ [[package]]
+ name = "codex-thread-store"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "chrono",
+  "codex-app-server-protocol",
+@@ -4775,7 +4776,7 @@
+ 
+ [[package]]
+ name = "codex-tools"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "bitflags 2.13.1",
+  "codex-code-mode",
+@@ -4801,7 +4802,7 @@
+ 
+ [[package]]
+ name = "codex-tui"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "app_test_support",
+@@ -4927,7 +4928,7 @@
+ 
+ [[package]]
+ name = "codex-uds"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "async-io",
+  "libc",
+@@ -4941,7 +4942,7 @@
+ 
+ [[package]]
+ name = "codex-user-verification"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "base64 0.22.1",
+  "core-foundation 0.10.1",
+@@ -4961,7 +4962,7 @@
+ 
+ [[package]]
+ name = "codex-utils-absolute-path"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "dirs",
+  "dunce",
+@@ -4975,14 +4976,14 @@
+ 
+ [[package]]
+ name = "codex-utils-approval-presets"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-protocol",
+ ]
+ 
+ [[package]]
+ name = "codex-utils-audio"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "base64 0.22.1",
+  "codex-protocol",
+@@ -4996,7 +4997,7 @@
+ 
+ [[package]]
+ name = "codex-utils-cache"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "lru",
+  "sha1 0.10.6",
+@@ -5005,7 +5006,7 @@
+ 
+ [[package]]
+ name = "codex-utils-cargo-bin"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "assert_cmd",
+  "runfiles",
+@@ -5014,7 +5015,7 @@
+ 
+ [[package]]
+ name = "codex-utils-cli"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "clap",
+  "codex-protocol",
+@@ -5026,15 +5027,15 @@
+ 
+ [[package]]
+ name = "codex-utils-elapsed"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ 
+ [[package]]
+ name = "codex-utils-fuzzy-match"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ 
+ [[package]]
+ name = "codex-utils-git-discovery"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-git-utils",
+  "codex-utils-absolute-path",
+@@ -5047,7 +5048,7 @@
+ 
+ [[package]]
+ name = "codex-utils-home-dir"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-utils-absolute-path",
+  "dirs",
+@@ -5057,7 +5058,7 @@
+ 
+ [[package]]
+ name = "codex-utils-image"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "base64 0.22.1",
+  "codex-utils-cache",
+@@ -5071,7 +5072,7 @@
+ 
+ [[package]]
+ name = "codex-utils-json-to-toml"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "pretty_assertions",
+  "serde_json",
+@@ -5080,7 +5081,7 @@
+ 
+ [[package]]
+ name = "codex-utils-oss"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-core",
+  "codex-lmstudio",
+@@ -5090,7 +5091,7 @@
+ 
+ [[package]]
+ name = "codex-utils-output-truncation"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-protocol",
+  "codex-utils-string",
+@@ -5100,7 +5101,7 @@
+ 
+ [[package]]
+ name = "codex-utils-path"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-utils-absolute-path",
+  "dunce",
+@@ -5111,7 +5112,7 @@
+ 
+ [[package]]
+ name = "codex-utils-path-uri"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "base64 0.22.1",
+  "codex-utils-absolute-path",
+@@ -5127,7 +5128,7 @@
+ 
+ [[package]]
+ name = "codex-utils-plugins"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-exec-server",
+  "codex-exec-server-protocol",
+@@ -5141,7 +5142,7 @@
+ 
+ [[package]]
+ name = "codex-utils-process"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "pretty_assertions",
+  "tokio",
+@@ -5149,7 +5150,7 @@
+ 
+ [[package]]
+ name = "codex-utils-pty"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "codex-utils-cargo-bin",
+@@ -5168,7 +5169,7 @@
+ 
+ [[package]]
+ name = "codex-utils-readiness"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "assert_matches",
+  "thiserror 2.0.18",
+@@ -5178,7 +5179,7 @@
+ 
+ [[package]]
+ name = "codex-utils-redacted-string"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "schemars 0.8.22",
+  "serde",
+@@ -5186,14 +5187,14 @@
+ 
+ [[package]]
+ name = "codex-utils-rustls-provider"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "rustls",
+ ]
+ 
+ [[package]]
+ name = "codex-utils-sandbox-summary"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-protocol",
+  "codex-utils-absolute-path",
+@@ -5203,7 +5204,7 @@
+ 
+ [[package]]
+ name = "codex-utils-sleep-inhibitor"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "core-foundation 0.9.4",
+  "libc",
+@@ -5213,14 +5214,14 @@
+ 
+ [[package]]
+ name = "codex-utils-stream-parser"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "pretty_assertions",
+ ]
+ 
+ [[package]]
+ name = "codex-utils-string"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "pretty_assertions",
+  "regex-lite",
+@@ -5230,14 +5231,14 @@
+ 
+ [[package]]
+ name = "codex-utils-template"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "pretty_assertions",
+ ]
+ 
+ [[package]]
+ name = "codex-v8-poc"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "pretty_assertions",
+  "v8",
+@@ -5245,7 +5246,7 @@
+ 
+ [[package]]
+ name = "codex-voice-host"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "codex-install-context",
+@@ -5272,7 +5273,7 @@
+ 
+ [[package]]
+ name = "codex-web-search-extension"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-api",
+  "codex-core",
+@@ -5294,7 +5295,7 @@
+ 
+ [[package]]
+ name = "codex-websocket-auth"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
+@@ -5313,7 +5314,7 @@
+ 
+ [[package]]
+ name = "codex-websocket-client"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-http-client",
+  "codex-utils-rustls-provider",
+@@ -5329,7 +5330,7 @@
+ 
+ [[package]]
+ name = "codex-windows-sandbox"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
+@@ -5359,7 +5360,7 @@
+ 
+ [[package]]
+ name = "codex-windows-sandbox-service"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "codex-cloud-config",
+@@ -5376,14 +5377,14 @@
+ 
+ [[package]]
+ name = "codex-windows-sandbox-test-support"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "dirs",
+ ]
+ 
+ [[package]]
+ name = "codex-workload-identity"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "codex-http-client",
+  "pretty_assertions",
+@@ -5398,7 +5399,7 @@
+ 
+ [[package]]
+ name = "codex-worktree"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "codex-git-utils",
+@@ -5639,7 +5640,7 @@
+ 
+ [[package]]
+ name = "core_test_support"
+-version = "0.0.0"
++version = "0.162.1-gptgrep.1"
+ dependencies = [
+  "anyhow",
+  "assert_cmd",
+--- a/codex-rs/Cargo.toml
++++ b/codex-rs/Cargo.toml
+@@ -160,7 +160,7 @@
+ resolver = "2"
+ 
+ [workspace.package]
+-version = "0.162.1"
++version = "0.162.1-gptgrep.1"
+ # Track the edition for all workspace crates in one place. Individual
+ # crates can still override this value, but keeping it here means new
+ # crates created with `cargo new -w ...` automatically inherit the 2024
+--- a/codex-rs/app-server-protocol/src/protocol/v1.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v1.rs
+@@ -81,6 +81,14 @@
+     /// Operating system for the running app-server target, for example
+     /// `"macos"`, `"linux"`, or `"windows"`.
+     pub platform_os: String,
++    /// Required native Page readiness, present only for the explicitly selected guard.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    #[ts(optional = nullable)]
++    pub gptgrep_native_ocr: Option<serde_json::Value>,
++    /// Required native Document readiness, present only for the explicitly selected guard.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    #[ts(optional = nullable)]
++    pub gptgrep_native_document: Option<serde_json::Value>,
+ }
+ 
+ #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+@@ -245,3 +253,52 @@
+ pub struct InterruptConversationResponse {
+     pub abort_reason: TurnAbortReason,
+ }
++
++#[cfg(test)]
++mod initialize_native_ready_tests {
++    use super::InitializeResponse;
++    use codex_utils_absolute_path::AbsolutePathBuf;
++    use serde_json::json;
++
++    fn ordinary() -> InitializeResponse {
++        InitializeResponse {
++            user_agent: "test".into(),
++            codex_home: AbsolutePathBuf::from_absolute_path("/native-test").unwrap(),
++            platform_family: "unix".into(),
++            platform_os: "macos".into(),
++            gptgrep_native_ocr: None,
++            gptgrep_native_document: None,
++        }
++    }
++
++    #[test]
++    fn ordinary_initialize_wire_omits_both_native_fields_and_accepts_old_wire() {
++        let expected = br#"{"userAgent":"test","codexHome":"/native-test","platformFamily":"unix","platformOs":"macos"}"#;
++        assert_eq!(serde_json::to_vec(&ordinary()).unwrap(), expected);
++        let parsed: InitializeResponse = serde_json::from_slice(expected).unwrap();
++        assert_eq!(parsed, ordinary());
++    }
++
++    #[test]
++    fn typed_initialize_payload_preserves_the_selected_ready_namespace_only() {
++        for document in [false, true] {
++            let mut response = ordinary();
++            let ready = json!({"schema_version": if document {
++                "gptgrep.native-document.ready.v1"
++            } else {
++                "gptgrep.native-ocr.ready.v1"
++            }, "required": true});
++            let (present, absent) = if document {
++                response.gptgrep_native_document = Some(ready.clone());
++                ("gptgrepNativeDocument", "gptgrepNativeOcr")
++            } else {
++                response.gptgrep_native_ocr = Some(ready.clone());
++                ("gptgrepNativeOcr", "gptgrepNativeDocument")
++            };
++            let payload: crate::ClientResponsePayload = response.into();
++            let (_, result) = payload.to_jsonrpc_parts(crate::RequestId::Integer(1)).unwrap();
++            assert_eq!(result[present], ready);
++            assert!(result.get(absent).is_none());
++        }
++    }
++}
+--- a/codex-rs/app-server-transport/src/transport/mod.rs
++++ b/codex-rs/app-server-transport/src/transport/mod.rs
+@@ -383,6 +383,8 @@
+                     codex_home,
+                     platform_family: "unix".to_string(),
+                     platform_os: "linux".to_string(),
++                    gptgrep_native_ocr: None,
++                    gptgrep_native_document: None,
+                 },
+             )),
+         });
+--- a/codex-rs/app-server-transport/src/transport/remote_control/segment_tests.rs
++++ b/codex-rs/app-server-transport/src/transport/remote_control/segment_tests.rs
+@@ -140,6 +140,8 @@
+                     codex_home,
+                     platform_family: "unix".to_string(),
+                     platform_os: "linux".to_string(),
++                    gptgrep_native_ocr: None,
++                    gptgrep_native_document: None,
+                 })),
+             })),
+         },
+--- a/codex-rs/app-server-transport/src/transport/remote_control/tests.rs
++++ b/codex-rs/app-server-transport/src/transport/remote_control/tests.rs
+@@ -1892,6 +1892,8 @@
+                             codex_home: codex_home.path().abs(),
+                             platform_family: "test-family".to_string(),
+                             platform_os: "test-os".to_string(),
++                            gptgrep_native_ocr: None,
++                            gptgrep_native_document: None,
+                         },
+                     ),
+                 ),
+--- a/codex-rs/app-server/src/request_processors/initialize_processor.rs
++++ b/codex-rs/app-server/src/request_processors/initialize_processor.rs
+@@ -78,6 +78,8 @@
+         // shared thread when another connected client did not opt into
+         // experimental API). Proposed direction is instance-global first-write-wins
+         // with initialize-time mismatch rejection.
++        let native_ocr = codex_core::native_ocr::ready()
++            .map_err(|error| invalid_request(error.to_owned()))?;
+         let analytics_initialize_params = params.clone();
+         let capabilities = params.capabilities.unwrap_or_default();
+         let experimental_api_enabled = capabilities.experimental_api;
+@@ -210,16 +212,23 @@
+         }
+ 
+         let user_agent = get_codex_user_agent();
+-        let response = InitializeResponse {
++        let mut response = InitializeResponse {
+             user_agent,
+             codex_home,
+             platform_family: std::env::consts::FAMILY.to_string(),
+             platform_os: std::env::consts::OS.to_string(),
++            gptgrep_native_ocr: None,
++            gptgrep_native_document: None,
+         };
+ 
+-        self.outgoing
+-            .send_response(connection_request_id, response)
+-            .await;
++        if let Some(native_ocr) = native_ocr {
++            if native_ocr["schema_version"] == "gptgrep.native-document.ready.v1" {
++                response.gptgrep_native_document = Some(native_ocr);
++            } else {
++                response.gptgrep_native_ocr = Some(native_ocr);
++            }
++        }
++        self.outgoing.send_response(connection_request_id, response).await;
+ 
+         if let Some(outbound_initialized) = outbound_initialized {
+             outbound_initialized.store(true, Ordering::Release);
+--- a/codex-rs/app-server/tests/suite/v2/initialize.rs
++++ b/codex-rs/app-server/tests/suite/v2/initialize.rs
+@@ -59,6 +59,7 @@
+         codex_home: response_codex_home,
+         platform_family,
+         platform_os,
++        ..
+     } = to_response::<InitializeResponse>(response)?;
+ 
+     assert!(user_agent.starts_with("codex_vscode/"));
+@@ -171,6 +172,7 @@
+         codex_home: response_codex_home,
+         platform_family,
+         platform_os,
++        ..
+     } = to_response::<InitializeResponse>(response)?;
+ 
+     assert!(user_agent.starts_with("codex_originator_via_env_var/"));
+--- a/codex-rs/apply-patch/src/file_update.rs
++++ b/codex-rs/apply-patch/src/file_update.rs
+@@ -30,7 +30,7 @@
+     sandbox: Option<&FileSystemSandboxContext>,
+ ) -> std::result::Result<AppliedPatch, ApplyPatchError> {
+     let original_contents = fs
+-        .read_file_text(path, ReadFileOptions { follow_symlinks }, sandbox)
++        .read_file_text(path, ReadFileOptions { follow_symlinks, max_bytes: None }, sandbox)
+         .await
+         .map_err(|err| {
+             ApplyPatchError::IoError(IoError {
+--- a/codex-rs/apply-patch/src/lib.rs
++++ b/codex-rs/apply-patch/src/lib.rs
+@@ -508,7 +508,7 @@
+                 )
+                 .await;
+                 let deleted_content = fs
+-                    .read_file_text(&path_uri, ReadFileOptions { follow_symlinks }, sandbox)
++                    .read_file_text(&path_uri, ReadFileOptions { follow_symlinks, max_bytes: None }, sandbox)
+                     .await
+                     .ok();
+                 if deleted_content.is_none() {
+@@ -716,7 +716,7 @@
+ ) -> bool {
+     match expected_content {
+         Some(expected_content) => fs
+-            .read_file_text(path, ReadFileOptions { follow_symlinks }, sandbox)
++            .read_file_text(path, ReadFileOptions { follow_symlinks, max_bytes: None }, sandbox)
+             .await
+             .is_ok_and(|content| content == expected_content),
+         None => false,
+@@ -732,7 +732,7 @@
+ ) -> Option<String> {
+     note_existing_path_delta_support(path, fs, follow_symlinks, sandbox, exact).await;
+     match fs
+-        .read_file_text(path, ReadFileOptions { follow_symlinks }, sandbox)
++        .read_file_text(path, ReadFileOptions { follow_symlinks, max_bytes: None }, sandbox)
+         .await
+     {
+         Ok(content) => Some(content),
+--- a/codex-rs/codex-api/src/common.rs
++++ b/codex-rs/codex-api/src/common.rs
+@@ -249,7 +249,8 @@
+ pub struct ResponsesApiTools(Arc<RawValue>);
+ 
+ impl ResponsesApiTools {
+-    pub(crate) fn as_raw_value(&self) -> &RawValue {
++    /// Borrow the immutable serialized schema for pre-send admission.
++    pub fn as_raw_value(&self) -> &RawValue {
+         &self.0
+     }
+ }
+--- a/codex-rs/core/Cargo.toml
++++ b/codex-rs/core/Cargo.toml
+@@ -107,6 +107,7 @@
+ ] }
+ serde = { workspace = true, features = ["derive"] }
+ serde_json = { workspace = true }
++sha2 = { workspace = true }
+ sha1 = { workspace = true }
+ shlex = { workspace = true }
+ similar = { workspace = true }
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -1779,6 +1779,8 @@
+                 client_setup.api_auth,
+             )
+             .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
++            crate::native_ocr::before_wire_request(&request, false)
++                .map_err(|error| CodexErr::InvalidRequest(error.to_owned()))?;
+             let stream_result = client.stream_request(request, options).await;
+ 
+             match stream_result {
+@@ -2028,6 +2030,8 @@
+                     .prepare_response_items_for_request(&mut request.input);
+                 Some(original_item_ids)
+             };
++            crate::native_ocr::before_wire_request(&request, warmup)
++                .map_err(|error| CodexErr::InvalidRequest(error.to_owned()))?;
+             let mut ws_payload = ResponseCreateWsRequest {
+                 previous_response_id,
+                 input: incremental_items.as_deref().unwrap_or(&request.input),
+@@ -2183,6 +2187,11 @@
+         service_tier: Option<String>,
+         responses_metadata: &CodexResponsesMetadata,
+     ) -> Result<()> {
++        if crate::native_ocr::required()
++            .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?
++        {
++            return Ok(());
++        }
+         if !self.client.responses_websocket_enabled() {
+             return Ok(());
+         }
+@@ -2245,6 +2254,10 @@
+         responses_metadata: &CodexResponsesMetadata,
+         inference_trace: &InferenceTraceContext,
+     ) -> Result<ResponseStream> {
++        crate::native_ocr::before_model_request(
++            &model_info.slug, effort.as_ref(), service_tier.as_deref(),
++        )
++        .map_err(|error| CodexErr::InvalidRequest(error.to_owned()))?;
+         let wire_api = self.client.state.provider.info().wire_api;
+         match wire_api {
+             WireApi::Responses => {
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -4200,6 +4200,9 @@
+         if features.enabled(Feature::MemoryTool) && memories_config.use_memories {
+             helper_readable_roots.push(memories_root);
+         }
++        if crate::native_ocr::required()? {
++            helper_readable_roots.clear();
++        }
+         let effective_permission_profile = constrained_permission_profile.value.get().clone();
+         let (mut effective_file_system_sandbox_policy, effective_network_sandbox_policy) =
+             effective_permission_profile.to_runtime_permissions();
+--- a/codex-rs/core/src/image_preparation.rs
++++ b/codex-rs/core/src/image_preparation.rs
+@@ -104,6 +104,8 @@
+     UnsupportedLowDetail,
+     #[error(transparent)]
+     Processing(#[from] ImageProcessingError),
++    #[error("{0}")]
++    RequiredNativeAdmission(&'static str),
+ }
+ 
+ impl ImagePreparationError {
+@@ -115,6 +117,7 @@
+                 IMAGE_TOO_LARGE_PLACEHOLDER
+             }
+             ImagePreparationError::Processing(_) => IMAGE_PROCESSING_ERROR_PLACEHOLDER,
++            ImagePreparationError::RequiredNativeAdmission(_) => IMAGE_PROCESSING_ERROR_PLACEHOLDER,
+         }
+     }
+ }
+@@ -361,6 +364,15 @@
+     let Some(prepared) = resize_image(image_url, detail, mode)? else {
+         return Ok(None);
+     };
++    crate::native_ocr::prepared_image(
++        origin.item_id,
++        prepared.encoded.bytes.as_ref(),
++        &prepared.encoded.mime,
++        prepared.encoded.width,
++        prepared.encoded.height,
++        *detail,
++    )
++    .map_err(ImagePreparationError::RequiredNativeAdmission)?;
+     metadata.push(prepared.metadata(origin));
+     let resize = prepared.resize;
+     let request = UploadRequest {
+@@ -381,6 +393,8 @@
+             }
+         }
+     };
++    crate::native_ocr::assembled_image(origin.item_id, image)
++        .map_err(ImagePreparationError::RequiredNativeAdmission)?;
+     Ok(resize)
+ }
+ 
+--- a/codex-rs/core/src/lib.rs
++++ b/codex-rs/core/src/lib.rs
+@@ -10,6 +10,7 @@
+ mod client;
+ mod client_common;
+ mod model_request;
++pub mod native_ocr;
+ mod realtime_context;
+ mod realtime_conversation;
+ mod realtime_history;
+--- /dev/null
++++ b/codex-rs/core/src/native_ocr.rs
+@@ -0,0 +1,1912 @@
++//! Required, process-local admission for isolated GPTgrep OCR and document runtimes.
++//!
++//! This module is absent from the ordinary upstream runtime. A page child opts in
++//! through a sealed manifest before initialize; no model-visible tool can change
++//! the manifest, the original clock, the counter, or its image grants.
++use base64::Engine;
++use codex_protocol::models::PermissionProfile;
++use codex_protocol::openai_models::ReasoningEffort;
++use codex_protocol::protocol::AskForApproval;
++use codex_tools::ToolName;
++use serde::{Deserialize, Serialize};
++use serde_json::{Value, json};
++use sha2::{Digest, Sha256};
++use std::collections::{BTreeMap, BTreeSet};
++use std::fs::{self, File, OpenOptions};
++use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
++use std::path::{Component, Path, PathBuf};
++use std::sync::{Mutex, OnceLock};
++use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
++
++use crate::session::turn_context::TurnContext;
++
++const MANIFEST_SCHEMA: &str = "gptgrep.native-ocr.admission.v1";
++const READY_SCHEMA: &str = "gptgrep.native-ocr.ready.v1";
++const RECEIPT_SCHEMA: &str = "gptgrep.native-ocr.receipt.v1";
++const MANIFEST_LIMIT: usize = 64 * 1024;
++const RECEIPT_LIMIT: usize = 16 * 1024;
++const MAX_TOOLS: u32 = 8;
++const MAX_SECONDS: u64 = 180;
++const FRAME_LIMIT: u64 = 4 * 1024 * 1024;
++const IMAGE_WIRE_RESERVATION: u64 = 8 * 1024 * 1024;
++const PIXEL_WORKING_LIMIT: u64 = 64 * 1024 * 1024;
++const PROFILE_ID: &str = "gptgrep_native_ocr";
++const DOCUMENT_MANIFEST_SCHEMA: &str = "gptgrep.native-document.admission.v1";
++const DOCUMENT_READY_SCHEMA: &str = "gptgrep.native-document.ready.v1";
++const DOCUMENT_RECEIPT_SCHEMA: &str = "gptgrep.native-document.receipt.v1";
++const DOCUMENT_PROFILE_ID: &str = "gptgrep_native_document";
++const DOCUMENT_MAX_TOOLS: u32 = 64;
++const DOCUMENT_MAX_SECONDS: u64 = 900;
++const DOCUMENT_IMAGE_WIRE_RESERVATION: u64 = 32 * 1024 * 1024;
++const CATALOGUE_LIMIT: u64 = 4 * 1024 * 1024;
++const CATALOGUE_ROW_LIMIT: usize = 8192;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum GuardKind { Page, Document }
++
++impl GuardKind {
++    fn max_tools(self) -> u32 { match self { Self::Page => MAX_TOOLS, Self::Document => DOCUMENT_MAX_TOOLS } }
++    fn max_seconds(self) -> u64 { match self { Self::Page => MAX_SECONDS, Self::Document => DOCUMENT_MAX_SECONDS } }
++    fn image_wire_reservation(self) -> u64 { match self { Self::Page => IMAGE_WIRE_RESERVATION, Self::Document => DOCUMENT_IMAGE_WIRE_RESERVATION } }
++    fn profile_id(self) -> &'static str { match self { Self::Page => PROFILE_ID, Self::Document => DOCUMENT_PROFILE_ID } }
++    fn manifest_schema(self) -> &'static str { match self { Self::Page => MANIFEST_SCHEMA, Self::Document => DOCUMENT_MANIFEST_SCHEMA } }
++    fn ready_schema(self) -> &'static str { match self { Self::Page => READY_SCHEMA, Self::Document => DOCUMENT_READY_SCHEMA } }
++    fn receipt_schema(self) -> &'static str { match self { Self::Page => RECEIPT_SCHEMA, Self::Document => DOCUMENT_RECEIPT_SCHEMA } }
++    fn context_name(self) -> &'static str { match self { Self::Page => "ocr_resource", Self::Document => "toolbox" } }
++    fn context_namespace(self) -> &'static str { match self { Self::Page => "gptgrep_ocr", Self::Document => "gptgrep_parse" } }
++    fn context_key(self) -> &'static str { match self { Self::Page => "gptgrep_ocr.ocr_resource", Self::Document => "gptgrep_parse.toolbox" } }
++    fn environment_names(self) -> [&'static str; 3] {
++        match self {
++            Self::Page => ["GPTGREP_NATIVE_OCR_REQUIRED", "GPTGREP_NATIVE_OCR_ADMISSION", "GPTGREP_NATIVE_OCR_ADMISSION_SHA256"],
++            Self::Document => ["GPTGREP_NATIVE_DOCUMENT_REQUIRED", "GPTGREP_NATIVE_DOCUMENT_ADMISSION", "GPTGREP_NATIVE_DOCUMENT_ADMISSION_SHA256"],
++        }
++    }
++}
++
++fn select_kind(page: [bool; 3], document: [bool; 3]) -> AdmissionResult<Option<GuardKind>> {
++    match (page.iter().any(|v| *v), document.iter().any(|v| *v)) {
++        (false, false) => Ok(None),
++        (true, false) => Ok(Some(GuardKind::Page)),
++        (false, true) => Ok(Some(GuardKind::Document)),
++        (true, true) => Err("native_modes_ambiguous"),
++    }
++}
++
++#[derive(Clone, Debug, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct ImageCataloguePin {
++    path: PathBuf,
++    bytes: u64,
++    sha256: String,
++    count: u32,
++}
++
++type AdmissionResult<T> = Result<T, &'static str>;
++
++#[derive(Clone, Debug, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct NativeImageLimits {
++    image_file_bytes: u64,
++    image_base64_bytes: u64,
++    image_wire_bytes: u64,
++    image_transport_bytes: u64,
++}
++impl NativeImageLimits {
++    fn validate(&self) -> AdmissionResult<()> {
++        let encoded = base64_length(self.image_file_bytes)?;
++        if self.image_file_bytes == 0 || self.image_base64_bytes < encoded
++            || self.image_wire_bytes <= self.image_base64_bytes
++            || self.image_transport_bytes < self.image_wire_bytes
++        { return Err("native_ocr_image_limits"); }
++        usize::try_from(self.image_file_bytes.checked_add(1)
++            .ok_or("native_ocr_transport_overflow")?).map_err(|_| "native_ocr_transport_overflow")?;
++        usize::try_from(self.image_wire_bytes).map_err(|_| "native_ocr_transport_overflow")?;
++        self.image_transport_bytes.checked_add(8 * 1024 * 1024)
++            .ok_or("native_ocr_transport_overflow")?;
++        Ok(())
++    }
++}
++fn base64_length(bytes: u64) -> AdmissionResult<u64> {
++    bytes.checked_add(2).and_then(|n| n.checked_div(3))
++        .and_then(|n| n.checked_mul(4)).ok_or("native_ocr_transport_overflow")
++}
++
++#[derive(Clone, Debug, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct ImageGrant {
++    pub artifact_id: String,
++    pub relative_path: PathBuf,
++    pub bytes: u64,
++    pub sha256: String,
++    pub width: u32,
++    pub height: u32,
++    pub rendition_sha256: String,
++}
++
++#[derive(Debug, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct AdmissionManifest {
++    schema_version: String,
++    task_sha256: String,
++    source_sha256: String,
++    prepared_sha256: String,
++    runtime_profile_sha256: String,
++    deadline_unix_ms: u64,
++    max_tool_calls: u32,
++    #[serde(default, deserialize_with = "explicit_max_seconds")]
++    max_seconds: Option<u64>,
++    max_turns: u32,
++    frame_bytes: u64,
++    image_transport_reserved_bytes: u64,
++    #[serde(default, deserialize_with = "explicit_image_limits")]
++    image_limits: Option<NativeImageLimits>,
++    image_root: PathBuf,
++    receipt_root: PathBuf,
++    permissions_profile_sha256: String,
++    images: Vec<ImageGrant>,
++    #[serde(default)]
++    image_catalog: Option<ImageCataloguePin>,
++}
++
++fn explicit_image_limits<'de, D: serde::Deserializer<'de>>(
++    deserializer: D,
++) -> Result<Option<NativeImageLimits>, D::Error> {
++    NativeImageLimits::deserialize(deserializer).map(Some)
++}
++impl AdmissionManifest {
++    fn image_file_limit(&self) -> u64 {
++        self.image_limits.as_ref().map_or(FRAME_LIMIT, |limits| limits.image_file_bytes)
++    }
++    fn image_wire_limit(&self) -> u64 {
++        self.image_limits.as_ref().map_or(FRAME_LIMIT, |limits| limits.image_wire_bytes)
++    }
++}
++
++fn explicit_max_seconds<'de, D: serde::Deserializer<'de>>(
++    deserializer: D,
++) -> Result<Option<u64>, D::Error> {
++    u64::deserialize(deserializer).map(Some)
++}
++fn admitted_max_seconds(manifest: &AdmissionManifest, kind: GuardKind) -> AdmissionResult<u64> {
++    match (kind, manifest.max_seconds) {
++        (GuardKind::Page, None) => Ok(MAX_SECONDS),
++        (GuardKind::Page, Some(_)) => Err("native_page_duration_override"),
++        (GuardKind::Document, None) => Ok(DOCUMENT_MAX_SECONDS),
++        (GuardKind::Document, Some(seconds)) if (1..=3600).contains(&seconds) => Ok(seconds),
++        (GuardKind::Document, Some(_)) => Err("native_document_duration_out_of_range"),
++    }
++}
++fn check_admitted_remaining(
++    manifest: &AdmissionManifest,
++    kind: GuardKind,
++    remaining: u128,
++) -> AdmissionResult<()> {
++    let milliseconds = admitted_max_seconds(manifest, kind)?
++        .checked_mul(1000).ok_or("native_ocr_deadline_out_of_range")?;
++    if remaining == 0 || remaining > u128::from(milliseconds) {
++        return Err("native_ocr_deadline_out_of_range");
++    }
++    Ok(())
++}
++#[derive(Debug)]
++struct Guard {
++    kind: GuardKind,
++    catalogue: Option<Mutex<File>>,
++    manifest: AdmissionManifest,
++    manifest_sha256: String,
++    deadline: Instant,
++    expected_permissions: Value,
++    image_directory: File,
++    receipt_directory: File,
++    state: Mutex<State>,
++}
++
++#[derive(Debug, Default)]
++struct State {
++    turn_id: Option<String>,
++    turns: u32,
++    submissions: u32,
++    calls: BTreeMap<String, Call>,
++    image_wire_bytes: u64,
++    violation: Option<&'static str>,
++}
++
++#[derive(Debug)]
++struct Call {
++    ordinal: u32,
++    native_image: bool,
++    dispatched: bool,
++    grant: Option<ImageGrant>,
++    source_verified: bool,
++    prepared: Option<PreparedBinding>,
++    assembled: bool,
++}
++
++#[derive(Debug, Clone)]
++struct PreparedBinding {
++    bytes: u64,
++    sha256: String,
++    width: u32,
++    height: u32,
++    wire_bytes: u64,
++}
++
++static GUARD: OnceLock<AdmissionResult<Option<Guard>>> = OnceLock::new();
++
++fn digest(bytes: &[u8]) -> String {
++    format!("{:x}", Sha256::digest(bytes))
++}
++
++fn valid_digest(value: &str) -> bool {
++    value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
++}
++
++fn get() -> AdmissionResult<Option<&'static Guard>> {
++    match GUARD.get_or_init(load) {
++        Ok(guard) => Ok(guard.as_ref()),
++        Err(error) => Err(*error),
++    }
++}
++
++/// A required flag cannot degrade to ordinary unguarded behavior.
++fn load() -> AdmissionResult<Option<Guard>> {
++    let page = GuardKind::Page.environment_names().map(|name| std::env::var_os(name).is_some());
++    let document = GuardKind::Document.environment_names().map(|name| std::env::var_os(name).is_some());
++    let Some(kind) = select_kind(page, document)? else { return Ok(None); };
++    let [required_name, path_name, digest_name] = kind.environment_names();
++    let required = std::env::var_os(required_name);
++    let path = std::env::var_os(path_name);
++    let expected = std::env::var_os(digest_name);
++    if required.as_deref() != Some(std::ffi::OsStr::new("1")) {
++        return Err("native_ocr_required_flag");
++    }
++    let path = PathBuf::from(path.ok_or("native_ocr_admission_missing")?);
++    let expected = expected
++        .and_then(|value| value.into_string().ok())
++        .ok_or("native_ocr_admission_digest_missing")?;
++    if !valid_digest(&expected) {
++        return Err("native_ocr_admission_digest");
++    }
++    let bytes = read_sealed_file(&path, MANIFEST_LIMIT as u64)?;
++    if digest(&bytes) != expected {
++        return Err("native_ocr_admission_changed");
++    }
++    let manifest: AdmissionManifest = serde_json::from_slice(&bytes)
++        .map_err(|_| "native_ocr_admission_schema")?;
++    validate_manifest(&manifest, kind)?;
++    let now_ms = SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .map_err(|_| "native_ocr_clock")?
++        .as_millis();
++    let remaining = u128::from(manifest.deadline_unix_ms)
++        .checked_sub(now_ms)
++        .ok_or("native_ocr_deadline_expired")?;
++    check_admitted_remaining(&manifest, kind, remaining)?;
++    let deadline = Instant::now()
++        .checked_add(Duration::from_millis(remaining as u64))
++        .ok_or("native_ocr_clock")?;
++    let expected_permissions = permission_value(&manifest, kind);
++    if digest(&serde_json::to_vec(&expected_permissions)
++        .map_err(|_| "native_ocr_permission_serialization")?) != manifest.permissions_profile_sha256
++    {
++        return Err("native_ocr_permission_digest");
++    }
++    let image_directory = open_directory(&manifest.image_root)?;
++    let receipt_directory = open_directory(&manifest.receipt_root)?;
++    let catalogue = manifest.image_catalog.as_ref().map(|pin| open_catalogue(pin, manifest.image_file_limit())).transpose()?.map(Mutex::new);
++    let guard = Guard {
++        kind, catalogue,
++        manifest,
++        manifest_sha256: expected,
++        deadline,
++        expected_permissions,
++        image_directory,
++        receipt_directory,
++        state: Mutex::new(State::default()),
++    };
++    guard.write_receipt("ready.json", &guard.ready_value())?;
++    Ok(Some(guard))
++}
++
++fn validate_manifest(manifest: &AdmissionManifest, kind: GuardKind) -> AdmissionResult<()> {
++    admitted_max_seconds(manifest, kind)?;
++    let image_reservation = if let Some(limits) = &manifest.image_limits {
++        limits.validate()?;
++        limits.image_transport_bytes
++    } else { kind.image_wire_reservation() };
++    if manifest.schema_version != kind.manifest_schema()
++        || manifest.max_tool_calls != kind.max_tools()
++        || manifest.max_turns != 1
++        || manifest.frame_bytes != FRAME_LIMIT
++        || manifest.image_transport_reserved_bytes != image_reservation
++        || (kind == GuardKind::Page && (manifest.images.is_empty()
++            || manifest.images.len() > MAX_TOOLS as usize || manifest.image_catalog.is_some()))
++        || (kind == GuardKind::Document && (!manifest.images.is_empty() || manifest.image_catalog.is_none()))
++    {
++        return Err("native_ocr_admission_limits");
++    }
++    for value in [
++        &manifest.task_sha256,
++        &manifest.source_sha256,
++        &manifest.prepared_sha256,
++        &manifest.runtime_profile_sha256,
++        &manifest.permissions_profile_sha256,
++    ] {
++        if !valid_digest(value) {
++            return Err("native_ocr_admission_binding");
++        }
++    }
++    validate_absolute(&manifest.image_root)?;
++    validate_absolute(&manifest.receipt_root)?;
++    if manifest.image_root.starts_with(&manifest.receipt_root)
++        || manifest.receipt_root.starts_with(&manifest.image_root)
++    {
++        return Err("native_ocr_root_overlap");
++    }
++    if let Some(pin) = &manifest.image_catalog {
++        validate_absolute(&pin.path)?;
++        if !valid_digest(&pin.sha256) || pin.bytes > CATALOGUE_LIMIT
++            || u64::from(pin.count) > pin.bytes
++            || pin.path.starts_with(&manifest.image_root)
++            || pin.path.starts_with(&manifest.receipt_root)
++        { return Err("native_document_catalogue_binding"); }
++    }
++    let mut paths = BTreeSet::new();
++    let mut ids = BTreeSet::new();
++    for grant in &manifest.images {
++        validate_grant(grant, manifest.image_file_limit())?;
++        if !paths.insert(grant.relative_path.clone()) || !ids.insert(grant.artifact_id.clone()) {
++            return Err("native_ocr_image_grant");
++        }
++    }
++    Ok(())
++}
++
++fn validate_grant(grant: &ImageGrant, image_file_limit: u64) -> AdmissionResult<()> {
++    let mut parts = grant.relative_path.components();
++    if !matches!(parts.next(), Some(Component::Normal(_))) || parts.next().is_some()
++        || grant.artifact_id.is_empty() || grant.artifact_id.len() > 256
++        || !valid_digest(&grant.sha256) || !valid_digest(&grant.rendition_sha256)
++        || grant.bytes == 0 || grant.bytes > image_file_limit
++        || grant.width == 0 || grant.height == 0
++        || u64::from(grant.width) * u64::from(grant.height) > PIXEL_WORKING_LIMIT / 4
++    { return Err("native_ocr_image_grant"); }
++    Ok(())
++}
++
++fn permission_value(manifest: &AdmissionManifest, kind: GuardKind) -> Value {
++    let mut entries = vec![json!({
++        "path":{"type":"special","value":{"kind":"root"}},"access":"deny"
++    })];
++    if kind == GuardKind::Document {
++        // The guard still checks each single leaf against the complete sealed catalogue.
++        // The directory grants filesystem access only; it grants no shell/read tool.
++        entries.push(json!({"path":{"type":"path","path":manifest.image_root},"access":"read"}));
++    } else {
++        for grant in &manifest.images {
++            entries.push(json!({
++                "path":{"type":"path","path":manifest.image_root.join(&grant.relative_path)},
++                "access":"read"
++            }));
++        }
++    }
++    entries.sort_by_key(|entry| canonical_value(entry.clone()).to_string());
++    canonical_value(json!({"type":"managed","network":"restricted",
++        "file_system":{"type":"restricted","entries":entries}}))
++}
++
++// Explicit key order makes the digest independent of serde_json preserve_order.
++fn canonical_value(value: Value) -> Value {
++    match value {
++        Value::Object(object) => {
++            let mut pairs: Vec<_> = object.into_iter().collect();
++            pairs.sort_by(|left, right| left.0.cmp(&right.0));
++            let mut result = serde_json::Map::new();
++            for (key, value) in pairs {
++                result.insert(key, canonical_value(value));
++            }
++            Value::Object(result)
++        }
++        Value::Array(values) => Value::Array(values.into_iter().map(canonical_value).collect()),
++        other => other,
++    }
++}
++
++fn normalized_permissions(profile: &PermissionProfile) -> AdmissionResult<Value> {
++    let mut value = canonical_value(serde_json::to_value(profile)
++        .map_err(|_| "native_ocr_permission_serialization")?);
++    let entries = value.pointer_mut("/file_system/entries").and_then(Value::as_array_mut)
++        .ok_or("native_ocr_permission_shape")?;
++    entries.sort_by_key(|entry| entry.to_string());
++    Ok(value)
++}
++
++fn validate_environment_selection(
++    selection: &codex_protocol::protocol::TurnEnvironmentSelection,
++    image_root: &Path,
++) -> AdmissionResult<()> {
++    if selection.environment_id != codex_exec_server::LOCAL_ENVIRONMENT_ID
++        || selection.cwd.to_abs_path().ok().as_ref().map(|path| path.as_path())
++            != Some(image_root)
++        || !selection.workspace_roots.is_empty()
++        || selection.selected_capability_roots != Default::default()
++    {
++        return Err("native_ocr_environment_selection");
++    }
++    Ok(())
++}
++
++impl Guard {
++    fn ready_value(&self) -> Value {
++        let mut value = json!({
++            "schema_version":self.kind.ready_schema(),"required":true,
++            "admission_sha256":self.manifest_sha256,
++            "task_sha256":self.manifest.task_sha256,
++            "source_sha256":self.manifest.source_sha256,
++            "prepared_sha256":self.manifest.prepared_sha256,
++            "runtime_profile_sha256":self.manifest.runtime_profile_sha256,
++            "permissions_profile_id":self.kind.profile_id(),
++            "permissions_profile_sha256":self.manifest.permissions_profile_sha256,
++            "environment_ids":[codex_exec_server::LOCAL_ENVIRONMENT_ID],
++            "environment_id_argument_admitted":false,
++            "max_tool_calls":self.kind.max_tools(),"max_turns":1,
++            "max_seconds":self.manifest.max_seconds.unwrap_or_else(|| self.kind.max_seconds()),
++            "deadline_unix_ms":self.manifest.deadline_unix_ms,
++            "frame_bytes":FRAME_LIMIT,
++            "image_transport_reserved_bytes":self.manifest.image_transport_reserved_bytes,
++            "tool_counter_before_lookup_hooks_handler":true,
++            "tool_counter_before_argument_parse":true,
++            "normalized_request_profile_verified_before_send":true,
++            "native_image_read_bounded":true,
++            "assembled_image_receipts_required":true,
++            "requested_model":"gpt-6-luna","requested_effort":"max",
++            "normalized_request_service_tier":"priority",
++            "actual_served_profile_verified":false
++        });
++        if let Some(limits) = &self.manifest.image_limits {
++            value["image_limits"] = json!(limits);
++        }
++        if let Some(pin) = &self.manifest.image_catalog {
++            value["image_catalog_sha256"] = json!(pin.sha256);
++            value["image_catalog_count"] = json!(pin.count);
++        }
++        value
++    }
++
++    fn check(&self, state: &State) -> AdmissionResult<()> {
++        if let Some(error) = state.violation {
++            return Err(error);
++        }
++        if Instant::now() >= self.deadline {
++            return Err("native_ocr_deadline_expired");
++        }
++        same_directory(&self.manifest.image_root, &self.image_directory)?;
++        same_directory(&self.manifest.receipt_root, &self.receipt_directory)?;
++        if let (Some(pin), Some(file)) = (&self.manifest.image_catalog, &self.catalogue) {
++            let file = file.lock().map_err(|_| "native_document_catalogue_poisoned")?;
++            same_regular_file(&pin.path, &file)?;
++        }
++        Ok(())
++    }
++
++    fn fail<T>(&self, state: &mut State, error: &'static str) -> AdmissionResult<T> {
++        state.violation.get_or_insert(error);
++        // The original error remains fatal even if the bounded receipt cannot be written.
++        let _ = self.write_receipt("violation.json", &json!({
++            "schema_version":self.kind.receipt_schema(),"kind":"violation",
++            "admission_sha256":self.manifest_sha256,"task_sha256":self.manifest.task_sha256,
++            "error":state.violation,"submissions":state.submissions,"turns":state.turns,
++            "image_wire_bytes":state.image_wire_bytes,"accepted":false
++        }));
++        Err(error)
++    }
++
++    fn write_receipt(&self, leaf: &str, value: &Value) -> AdmissionResult<()> {
++        same_directory(&self.manifest.receipt_root, &self.receipt_directory)?;
++        let bytes = serde_json::to_vec(value).map_err(|_| "native_ocr_receipt_serialization")?;
++        if bytes.len() > RECEIPT_LIMIT {
++            return Err("native_ocr_receipt_limit");
++        }
++        let mut file = create_leaf(&self.receipt_directory, leaf)?;
++        file.write_all(&bytes).map_err(|_| "native_ocr_receipt_write")?;
++        file.sync_all().map_err(|_| "native_ocr_receipt_sync")?;
++        Ok(())
++    }
++}
++
++/// App-server initialize echoes this value. Missing/invalid required state fails initialize.
++pub fn ready() -> AdmissionResult<Option<Value>> {
++    let Some(guard) = get()? else { return Ok(None); };
++    let state = guard.state.lock().map_err(|_| "native_ocr_guard_poisoned")?;
++    guard.check(&state)?;
++    Ok(Some(guard.ready_value()))
++}
++
++/// Config must not add helper/home roots to a required image-only permission profile.
++pub(crate) fn required() -> std::io::Result<bool> {
++    get().map(|guard| guard.is_some()).map_err(std::io::Error::other)
++}
++
++/// Called before the constructed turn becomes runnable. The single turn is consumed on admission.
++pub(crate) fn admit_turn(turn: &TurnContext) -> AdmissionResult<()> {
++    let Some(guard) = get()? else { return Ok(()); };
++    let mut state = guard.state.lock().map_err(|_| "native_ocr_guard_poisoned")?;
++    if let Err(error) = guard.check(&state) { return guard.fail(&mut state, error); }
++    state.turns = state.turns.checked_add(1).ok_or("native_ocr_turn_count_overflow")?;
++    if state.turns != 1 || state.turn_id.is_some() {
++        return guard.fail(&mut state, "native_ocr_turn_budget_exhausted");
++    }
++    if turn.initial_environments.environments.len() != 1 {
++        return guard.fail(&mut state, "native_ocr_environment_selection");
++    }
++    let selections = turn.initial_environments.all_selections();
++    if let Err(error) = validate_environment_selection(
++        &selections[0], &guard.manifest.image_root,
++    ) {
++        return guard.fail(&mut state, error);
++    }
++    let permissions = normalized_permissions(&turn.permission_profile())?;
++    if permissions != guard.expected_permissions {
++        return guard.fail(&mut state, "native_ocr_turn_permission_value_mismatch");
++    }
++    if turn.config.permissions.active_permission_profile().as_ref()
++        .is_none_or(|profile| profile.id != guard.kind.profile_id())
++    {
++        return guard.fail(&mut state, "native_ocr_turn_active_profile_id_mismatch");
++    }
++    if turn.config.permissions.approval_policy.value() != AskForApproval::Never {
++        return guard.fail(&mut state, "native_ocr_turn_approval_policy_mismatch");
++    }
++    if turn.initial_settings.model_info.slug != "gpt-6-luna" {
++        return guard.fail(&mut state, "native_ocr_turn_model_mismatch");
++    }
++    if turn.initial_settings.effective_reasoning_effort() != Some(ReasoningEffort::Max) {
++        return guard.fail(&mut state, "native_ocr_turn_effort_mismatch");
++    }
++    if turn.initial_settings.service_tier.as_deref() != Some("priority") {
++        return guard.fail(&mut state, "native_ocr_turn_service_tier_mismatch");
++    }
++    state.turn_id = Some(turn.sub_id.clone());
++    if let Err(error) = guard.write_receipt("turn.json", &json!({
++        "schema_version":guard.kind.receipt_schema(),"kind":"turn_admitted",
++        "admission_sha256":guard.manifest_sha256,
++        "task_sha256":guard.manifest.task_sha256,
++        "turn_id":turn.sub_id,"max_turns":1,
++        "permissions_profile_sha256":guard.manifest.permissions_profile_sha256
++    })) { return guard.fail(&mut state, error); }
++    Ok(())
++}
++
++// Classification borrows the raw item and never parses arguments first.
++fn raw_tool_parts(item: &codex_protocol::models::ResponseItem)
++    -> Option<(&str, Option<&str>, Option<&str>)>
++{
++    use codex_protocol::models::ResponseItem;
++    match item {
++        ResponseItem::FunctionCall { name, namespace, call_id, .. }
++        | ResponseItem::CustomToolCall { name, namespace, call_id, .. } =>
++            Some((name, namespace.as_deref(), Some(call_id))),
++        ResponseItem::ToolSearchCall { call_id, .. } =>
++            Some(("tool_search", None, call_id.as_deref())),
++        ResponseItem::LocalShellCall { call_id, .. } =>
++            Some(("local_shell", None, call_id.as_deref())),
++        ResponseItem::WebSearchCall { .. } => Some(("web_search", None, None)),
++        ResponseItem::ImageGenerationCall { .. } => Some(("image_generation", None, None)),
++        _ => None,
++    }
++}
++
++pub(crate) fn is_model_tool(item: &codex_protocol::models::ResponseItem) -> bool {
++    raw_tool_parts(item).is_some()
++}
++
++/// Called under active-turn accounting before ToolRouter argument parsing.
++pub(crate) fn admit_model_tool(
++    turn_id: &str, item: &codex_protocol::models::ResponseItem, active_count: Option<u64>,
++) -> AdmissionResult<()> {
++    let Some(guard) = get()? else { return Ok(()); };
++    guard.admit_model_tool(turn_id, item, active_count)
++}
++
++/// A previously counted raw call reaches registry once, without double charging.
++pub(crate) fn verify_dispatched_tool(
++    turn_id: &str, tool: &ToolName, call_id: &str, active_count: Option<u64>,
++) -> AdmissionResult<()> {
++    let Some(guard) = get()? else { return Ok(()); };
++    guard.verify_dispatched_tool(turn_id, tool, call_id, active_count)
++}
++
++/// Validate the completed HTTP/WebSocket request after all profile normalization.
++pub(crate) fn before_wire_request(
++    request: &codex_api::ResponsesApiRequest, warmup: bool,
++) -> AdmissionResult<()> {
++    let Some(guard) = get()? else { return Ok(()); };
++    let tools = match request.tools.as_ref() {
++        Some(tools) => {
++            let raw = tools.as_raw_value().get();
++            if raw.len() > MANIFEST_LIMIT {
++                let mut state = guard.state.lock().map_err(|_| "native_ocr_guard_poisoned")?;
++                return guard.fail(&mut state, "native_ocr_tool_schema_limit");
++            }
++            match serde_json::from_str(raw) {
++                Ok(value) => Some(value),
++                Err(_) => {
++                    let mut state = guard.state.lock().map_err(|_| "native_ocr_guard_poisoned")?;
++                    return guard.fail(&mut state, "native_ocr_tool_schema");
++                }
++            }
++        }
++        None => None,
++    };
++    guard.before_wire_request(
++        &request.model,
++        request.reasoning.as_ref().and_then(|reasoning| reasoning.effort.as_ref()),
++        request.service_tier.as_deref(), tools.as_ref(), warmup,
++    )
++}
++
++fn validate_model_tools(tools: Option<&Value>, kind: GuardKind) -> AdmissionResult<()> {
++    let Some(Value::Array(tools)) = tools else { return Err("native_ocr_tool_schema"); };
++    if tools.len() > MAX_TOOLS as usize { return Err("native_ocr_tool_schema"); }
++    let mut admitted = BTreeSet::new();
++    fn function(tool: &Value, namespace: Option<&str>, admitted: &mut BTreeSet<String>, kind: GuardKind)
++        -> AdmissionResult<()>
++    {
++        if tool.get("type").and_then(Value::as_str) != Some("function") {
++            return Err("native_ocr_model_tool_not_admitted");
++        }
++        let name = tool.get("name").and_then(Value::as_str)
++            .ok_or("native_ocr_tool_schema")?;
++        let key = match (namespace, name) {
++            (None | Some("functions"), "view_image") => "view_image",
++            (Some(namespace), name) if namespace == kind.context_namespace()
++                && name == kind.context_name() => kind.context_key(),
++            _ => return Err("native_ocr_model_tool_not_admitted"),
++        };
++        if !admitted.insert(key.into()) { return Err("native_ocr_duplicate_model_tool"); }
++        Ok(())
++    }
++    for tool in tools {
++        if tool.get("type").and_then(Value::as_str) == Some("namespace") {
++            let namespace = tool.get("name").and_then(Value::as_str)
++                .ok_or("native_ocr_tool_schema")?;
++            let nested = tool.get("tools").and_then(Value::as_array)
++                .ok_or("native_ocr_tool_schema")?;
++            if nested.len() > MAX_TOOLS as usize { return Err("native_ocr_tool_schema"); }
++            for tool in nested { function(tool, Some(namespace), &mut admitted, kind)?; }
++        } else {
++            function(tool, None, &mut admitted, kind)?;
++        }
++    }
++    if admitted.len() != 2 || !admitted.contains("view_image")
++        || !admitted.contains(kind.context_key())
++    {
++        return Err("native_ocr_required_model_tool_missing");
++    }
++    Ok(())
++}
++
++/// Validate final rewritten path before the native handler performs any file operation.
++/// The handler passes this exact byte ceiling to the sandboxed filesystem service.
++pub(crate) fn image_grant(
++    call_id: &str, path: &Path, environment_id: Option<&str>, permissions: &PermissionProfile,
++) -> AdmissionResult<Option<ImageGrant>> {
++    let Some(guard) = get()? else { return Ok(None); };
++    guard.image_grant(call_id, path, environment_id, permissions)
++}
++
++/// Hash the actual bounded buffer that the native handler will decode and return.
++pub(crate) fn source_buffer(call_id: &str, bytes: &[u8]) -> AdmissionResult<()> {
++    let Some(guard) = get()? else { return Ok(()); };
++    guard.source_buffer(call_id, bytes)
++}
++
++/// Called after native resize/encoding, before attachment upload/outgoing image assembly.
++/// The selected image reservation is disjoint from the host's RPC allowance.
++pub(crate) fn prepared_image(
++    call_id: Option<&str>, bytes: &[u8], mime: &str, width: u32, height: u32,
++    detail: Option<codex_protocol::models::ImageDetail>,
++) -> AdmissionResult<()> {
++    let Some(guard) = get()? else { return Ok(()); };
++    guard.prepared_image(call_id, bytes, mime, width, height, detail)
++}
++
++/// Record the actual image reference after attachment preparation. File IDs prove
++/// reference assembly plus the separately pinned upload payload, not provider ingestion.
++pub(crate) fn assembled_image(call_id: Option<&str>, image: &codex_protocol::models::ImageReference)
++    -> AdmissionResult<()>
++{
++    let Some(guard) = get()? else { return Ok(()); };
++    guard.assembled_image(call_id, image)
++}
++
++fn planned_image_wire_bytes(
++    call_id: &str, payload_bytes: usize, mime: &str,
++    detail: Option<codex_protocol::models::ImageDetail>,
++) -> AdmissionResult<u64> {
++    if !matches!(mime, "image/png" | "image/jpeg" | "image/webp" | "image/gif") {
++        return Err("native_ocr_prepared_mime");
++    }
++    let length = u64::try_from(payload_bytes).map_err(|_| "native_ocr_transport_overflow")?;
++    let encoded = base64_length(length)?;
++    let framing = image_wire_bytes(call_id,
++        codex_protocol::models::ImageReference::Inline {
++            image_url: format!("data:{mime};base64,"),
++        }, detail)?;
++    framing.checked_add(encoded).ok_or("native_ocr_transport_overflow")
++}
++
++fn image_wire_bytes(call_id: &str, image: codex_protocol::models::ImageReference,
++    detail: Option<codex_protocol::models::ImageDetail>) -> AdmissionResult<u64>
++{
++    use codex_protocol::models::{FunctionCallOutputBody, FunctionCallOutputContentItem,
++        FunctionCallOutputPayload, ResponseInputItem};
++    let item = ResponseInputItem::FunctionCallOutput {
++        call_id:call_id.to_owned(),
++        output:FunctionCallOutputPayload {
++            body:FunctionCallOutputBody::ContentItems(vec![FunctionCallOutputContentItem::InputImage {
++                image,detail,
++            }]),success:Some(true),
++        },
++    };
++    serde_json::to_vec(&item).map(|bytes| bytes.len() as u64)
++        .map_err(|_| "native_ocr_image_wire_serialization")
++}
++
++/// No subsequent model request can continue after a guard/read/preparation failure.
++pub(crate) fn before_model_request(model: &str, effort: Option<&ReasoningEffort>, tier: Option<&str>)
++    -> AdmissionResult<()>
++{
++    let Some(guard) = get()? else { return Ok(()); };
++    guard.before_model_request(model, effort, tier)
++}
++
++fn validate_absolute(path: &Path) -> AdmissionResult<()> {
++    if !path.is_absolute() || path.components().any(|part| matches!(part, Component::CurDir | Component::ParentDir))
++        || path.to_str().is_none() || path.as_os_str().len() > 4096
++        || fs::canonicalize(path).map_err(|_| "native_ocr_path_unavailable")? != path
++    { return Err("native_ocr_path_not_canonical"); }
++    Ok(())
++}
++
++#[cfg(unix)]
++fn open_directory(path: &Path) -> AdmissionResult<File> {
++    use std::os::unix::fs::OpenOptionsExt;
++    validate_absolute(path)?;
++    OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
++        .open(path).map_err(|_| "native_ocr_directory_open")
++}
++
++#[cfg(unix)]
++fn same_directory(path: &Path, held: &File) -> AdmissionResult<()> {
++    use std::os::unix::fs::MetadataExt;
++    let metadata = fs::symlink_metadata(path).map_err(|_| "native_ocr_directory_changed")?;
++    let original = held.metadata().map_err(|_| "native_ocr_directory_changed")?;
++    if !metadata.is_dir() || metadata.dev() != original.dev() || metadata.ino() != original.ino() {
++        return Err("native_ocr_directory_changed");
++    }
++    Ok(())
++}
++
++#[cfg(unix)]
++fn open_leaf(directory: &File, path: &Path) -> AdmissionResult<File> {
++    use std::os::fd::{AsRawFd, FromRawFd};
++    use std::os::unix::ffi::OsStrExt;
++    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| "native_ocr_leaf_name")?;
++    // SAFETY: held directory is live, name is NUL-terminated, returned descriptor is owned here.
++    let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC) };
++    if fd < 0 { return Err("native_ocr_leaf_open"); }
++    let file = unsafe { File::from_raw_fd(fd) };
++    use std::os::unix::fs::MetadataExt;
++    let metadata = file.metadata().map_err(|_| "native_ocr_leaf_metadata")?;
++    if !metadata.is_file() || metadata.nlink() != 1 { return Err("native_ocr_leaf_not_regular"); }
++    Ok(file)
++}
++
++#[cfg(unix)]
++fn create_leaf(directory: &File, leaf: &str) -> AdmissionResult<File> {
++    use std::os::fd::{AsRawFd, FromRawFd};
++    let name = std::ffi::CString::new(leaf).map_err(|_| "native_ocr_leaf_name")?;
++    // SAFETY: generated single-component leaf and held directory descriptor.
++    let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0o600) };
++    if fd < 0 { return Err("native_ocr_receipt_open"); }
++    Ok(unsafe { File::from_raw_fd(fd) })
++}
++
++#[cfg(unix)]
++fn read_sealed_file(path: &Path, limit: u64) -> AdmissionResult<Vec<u8>> {
++    use std::os::unix::fs::MetadataExt;
++    use std::os::unix::fs::OpenOptionsExt;
++    validate_absolute(path)?;
++    let mut file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
++        .open(path).map_err(|_| "native_ocr_manifest_open")?;
++    let before = file.metadata().map_err(|_| "native_ocr_manifest_metadata")?;
++    if !before.is_file() || before.nlink() != 1 || before.len() > limit {
++        return Err("native_ocr_manifest_limit");
++    }
++    let mut bytes = Vec::with_capacity(before.len() as usize);
++    (&mut file).take(limit + 1).read_to_end(&mut bytes).map_err(|_| "native_ocr_manifest_read")?;
++    let after = file.metadata().map_err(|_| "native_ocr_manifest_metadata")?;
++    if bytes.len() as u64 != before.len() || after.len() != before.len()
++        || (after.mtime(), after.mtime_nsec(), after.ctime(), after.ctime_nsec())
++            != (before.mtime(), before.mtime_nsec(), before.ctime(), before.ctime_nsec())
++    { return Err("native_ocr_manifest_changed"); }
++    Ok(bytes)
++}
++
++
++#[cfg(unix)]
++fn same_regular_file(path: &Path, held: &File) -> AdmissionResult<()> {
++    use std::os::unix::fs::MetadataExt;
++    let current = fs::symlink_metadata(path).map_err(|_| "native_document_catalogue_changed")?;
++    let original = held.metadata().map_err(|_| "native_document_catalogue_changed")?;
++    if !current.is_file() || current.nlink() != 1 || original.nlink() != 1
++        || current.dev() != original.dev() || current.ino() != original.ino()
++    { return Err("native_document_catalogue_changed"); }
++    Ok(())
++}
++
++#[cfg(unix)]
++fn open_catalogue(pin: &ImageCataloguePin, image_file_limit: u64) -> AdmissionResult<File> {
++    use std::os::unix::fs::OpenOptionsExt;
++    validate_absolute(&pin.path)?;
++    let mut file = OpenOptions::new().read(true)
++        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
++        .open(&pin.path).map_err(|_| "native_document_catalogue_open")?;
++    same_regular_file(&pin.path, &file)?;
++    scan_catalogue(&mut file, pin, None, image_file_limit)?;
++    Ok(file)
++}
++
++#[cfg(unix)]
++fn scan_catalogue(file: &mut File, pin: &ImageCataloguePin, selected: Option<&Path>, image_file_limit: u64)
++    -> AdmissionResult<Option<ImageGrant>>
++{
++    use std::os::unix::fs::MetadataExt;
++    same_regular_file(&pin.path, file)?;
++    let before = file.metadata().map_err(|_| "native_document_catalogue_metadata")?;
++    if pin.bytes > CATALOGUE_LIMIT || before.len() != pin.bytes || !valid_digest(&pin.sha256) {
++        return Err("native_document_catalogue_limit");
++    }
++    file.seek(SeekFrom::Start(0)).map_err(|_| "native_document_catalogue_seek")?;
++    let mut reader = BufReader::with_capacity(CATALOGUE_ROW_LIMIT, (&mut *file).take(pin.bytes + 1));
++    let mut hasher = Sha256::new();
++    let mut total = 0u64;
++    let mut count = 0u32;
++    let mut previous: Option<PathBuf> = None;
++    let mut ids = BTreeSet::new();
++    let mut id_bytes = 0usize;
++    let mut found = None;
++    loop {
++        let mut row = Vec::with_capacity(CATALOGUE_ROW_LIMIT);
++        loop {
++            let available = reader.fill_buf().map_err(|_| "native_document_catalogue_read")?;
++            if available.is_empty() {
++                if !row.is_empty() { return Err("native_document_catalogue_missing_lf"); }
++                break;
++            }
++            let newline = available.iter().position(|byte| *byte == b'\n');
++            let consumed = newline.map_or(available.len(), |index| index + 1);
++            if row.len().checked_add(consumed).is_none_or(|n| n > CATALOGUE_ROW_LIMIT) {
++                return Err("native_document_catalogue_row_limit");
++            }
++            row.extend_from_slice(&available[..consumed]);
++            reader.consume(consumed);
++            if newline.is_some() { break; }
++        }
++        if row.is_empty() { break; }
++        total = total.checked_add(row.len() as u64).ok_or("native_document_catalogue_overflow")?;
++        if total > pin.bytes { return Err("native_document_catalogue_changed"); }
++        hasher.update(&row);
++        let grant: ImageGrant = serde_json::from_slice(&row)
++            .map_err(|_| "native_document_catalogue_row_schema")?;
++        validate_grant(&grant, image_file_limit)?;
++        if previous.as_ref().is_some_and(|prior| prior >= &grant.relative_path)
++            || !ids.insert(grant.artifact_id.clone())
++        { return Err("native_document_catalogue_order_or_identity"); }
++        id_bytes = id_bytes.checked_add(grant.artifact_id.len())
++            .ok_or("native_document_catalogue_overflow")?;
++        // Raw catalogue <=4MiB also bounds the retained identity set and node count.
++        if id_bytes as u64 > pin.bytes { return Err("native_document_catalogue_identity_limit"); }
++        previous = Some(grant.relative_path.clone());
++        count = count.checked_add(1).ok_or("native_document_catalogue_overflow")?;
++        if selected == Some(grant.relative_path.as_path()) { found = Some(grant); }
++    }
++    drop(reader);
++    let after = file.metadata().map_err(|_| "native_document_catalogue_metadata")?;
++    same_regular_file(&pin.path, file)?;
++    if total != pin.bytes || count != pin.count || format!("{:x}", hasher.finalize()) != pin.sha256
++        || (before.len(), before.mtime(), before.mtime_nsec(), before.ctime(), before.ctime_nsec())
++            != (after.len(), after.mtime(), after.mtime_nsec(), after.ctime(), after.ctime_nsec())
++    { return Err("native_document_catalogue_changed"); }
++    Ok(found)
++}
++
++#[cfg(not(unix))]
++fn same_regular_file(_: &Path, _: &File) -> AdmissionResult<()> { Err("native_document_platform_not_admitted") }
++#[cfg(not(unix))]
++fn open_catalogue(_: &ImageCataloguePin, _: u64) -> AdmissionResult<File> { Err("native_document_platform_not_admitted") }
++#[cfg(not(unix))]
++fn scan_catalogue(_: &mut File, _: &ImageCataloguePin, _: Option<&Path>, _: u64)
++    -> AdmissionResult<Option<ImageGrant>> { Err("native_document_platform_not_admitted") }
++
++#[cfg(not(unix))]
++fn open_directory(_: &Path) -> AdmissionResult<File> { Err("native_ocr_platform_not_admitted") }
++#[cfg(not(unix))]
++fn same_directory(_: &Path, _: &File) -> AdmissionResult<()> { Err("native_ocr_platform_not_admitted") }
++#[cfg(not(unix))]
++fn open_leaf(_: &File, _: &Path) -> AdmissionResult<File> { Err("native_ocr_platform_not_admitted") }
++#[cfg(not(unix))]
++fn create_leaf(_: &File, _: &str) -> AdmissionResult<File> { Err("native_ocr_platform_not_admitted") }
++#[cfg(not(unix))]
++fn read_sealed_file(_: &Path, _: u64) -> AdmissionResult<Vec<u8>> { Err("native_ocr_platform_not_admitted") }
++
++impl Guard {
++fn admit_model_tool(
++    &self, turn_id: &str, item: &codex_protocol::models::ResponseItem,
++    active_count: Option<u64>,
++) -> AdmissionResult<()> {
++    let Some((name, namespace, call_id)) = raw_tool_parts(item) else {
++        return Err("native_ocr_raw_tool_missing");
++    };
++    // Bound identity cloning, while still consuming an invalid proposal.
++    let tool = if name.len() <= 128 && namespace.is_none_or(|value| value.len() <= 128) {
++        ToolName::new(namespace.map(str::to_owned), name)
++    } else {
++        ToolName::plain("invalid_native_identity")
++    };
++    self.admit_tool(turn_id, &tool, call_id.unwrap_or(""), active_count)
++}
++
++fn verify_dispatched_tool(
++    &self, turn_id: &str, tool: &ToolName, call_id: &str, active_count: Option<u64>,
++) -> AdmissionResult<()> {
++    let mut state = self.state.lock().map_err(|_| "native_ocr_guard_poisoned")?;
++    if let Err(error) = self.check(&state) { return self.fail(&mut state, error); }
++    if state.turn_id.as_deref() != Some(turn_id)
++        || active_count != Some(u64::from(state.submissions))
++    { return self.fail(&mut state, "native_ocr_active_state_missing_or_changed"); }
++    let Some(call) = state.calls.get(call_id) else {
++        return self.fail(&mut state, "native_ocr_dispatch_not_pre_admitted");
++    };
++    let image = tool.name == "view_image" && tool.is_default_namespace();
++    let context = tool.name == self.kind.context_name() && tool.namespace.as_deref() == Some(self.kind.context_namespace());
++    if call.dispatched || call.native_image != image || (!image && !context) {
++        return self.fail(&mut state, "native_ocr_dispatch_changed_or_repeated");
++    }
++    state.calls.get_mut(call_id).ok_or("native_ocr_dispatch_not_pre_admitted")?.dispatched = true;
++    Ok(())
++}
++
++fn before_wire_request(
++    &self, model: &str, effort: Option<&ReasoningEffort>, tier: Option<&str>,
++    tools: Option<&Value>, warmup: bool,
++) -> AdmissionResult<()> {
++    let mut state = self.state.lock().map_err(|_| "native_ocr_guard_poisoned")?;
++    if let Err(error) = self.check(&state) { return self.fail(&mut state, error); }
++    if model != "gpt-6-luna" || effort.map(ReasoningEffort::as_str) != Some("max")
++        || tier != Some("priority")
++        || (!warmup && (state.turns != 1 || state.turn_id.is_none()
++            || state.calls.values().any(|call| call.native_image && !call.assembled)))
++    {
++        return self.fail(&mut state, "native_ocr_normalized_request_profile");
++    }
++    if let Err(error) = validate_model_tools(tools, self.kind) { return self.fail(&mut state, error); }
++    Ok(())
++}
++
++fn admit_tool(&self, 
++    turn_id: &str, tool: &ToolName, call_id: &str, active_count: Option<u64>,
++) -> AdmissionResult<()> {
++    let guard = self;
++    let mut state = guard.state.lock().map_err(|_| "native_ocr_guard_poisoned")?;
++    state.submissions = state.submissions.checked_add(1).ok_or("native_ocr_counter_overflow")?;
++    if let Err(error) = guard.check(&state) { return guard.fail(&mut state, error); }
++    if state.turn_id.as_deref() != Some(turn_id)
++        || active_count != Some(u64::from(state.submissions))
++    { return guard.fail(&mut state, "native_ocr_active_state_missing_or_changed"); }
++    if state.submissions > guard.kind.max_tools() {
++        return guard.fail(&mut state, "native_ocr_tool_budget_exhausted");
++    }
++    if call_id.is_empty() || call_id.len() > 256 || state.calls.contains_key(call_id) {
++        return guard.fail(&mut state, "native_ocr_duplicate_or_invalid_call");
++    }
++    let native_image = tool.name == "view_image" && tool.is_default_namespace();
++    let context = tool.name == guard.kind.context_name()
++        && tool.namespace.as_deref() == Some(guard.kind.context_namespace());
++    if !native_image && !context {
++        return guard.fail(&mut state, "native_ocr_tool_not_admitted");
++    }
++    let ordinal = state.submissions;
++    if let Err(error) = guard.write_receipt(&format!("call-{ordinal}.json"), &json!({
++        "schema_version":guard.kind.receipt_schema(),"kind":"tool_admitted",
++        "admission_sha256":guard.manifest_sha256,"task_sha256":guard.manifest.task_sha256,
++        "turn_id":turn_id,"call_id":call_id,"ordinal":ordinal,
++        "native_image":native_image,"handler_not_yet_executed":true,
++        "argument_parser_not_yet_executed":true
++    })) { return guard.fail(&mut state, error); }
++    state.calls.insert(call_id.into(), Call { ordinal, native_image, dispatched:false, grant:None,
++        source_verified:false, prepared:None, assembled:false });
++    Ok(())
++}
++
++fn image_grant(&self, 
++    call_id: &str, path: &Path, environment_id: Option<&str>, permissions: &PermissionProfile,
++) -> AdmissionResult<Option<ImageGrant>> {
++    let guard = self;
++    let mut state = guard.state.lock().map_err(|_| "native_ocr_guard_poisoned")?;
++    if let Err(error) = guard.check(&state) { return guard.fail(&mut state, error); }
++    let actual = normalized_permissions(permissions)?;
++    if environment_id.is_some() || actual != guard.expected_permissions {
++        return guard.fail(&mut state, "native_ocr_image_environment_or_permissions");
++    }
++    let grant = if guard.kind == GuardKind::Document {
++        let relative = path.strip_prefix(&guard.manifest.image_root)
++            .map_err(|_| "native_document_image_not_granted")?;
++        let pin = guard.manifest.image_catalog.as_ref()
++            .ok_or("native_document_catalogue_missing")?;
++        let mut file = guard.catalogue.as_ref().ok_or("native_document_catalogue_missing")?
++            .lock().map_err(|_| "native_document_catalogue_poisoned")?;
++        match scan_catalogue(&mut file, pin, Some(relative), guard.manifest.image_file_limit()) {
++            Ok(value) => value,
++            Err(error) => return guard.fail(&mut state, error),
++        }
++    } else {
++        guard.manifest.images.iter().find(|grant| {
++            path == guard.manifest.image_root.join(&grant.relative_path)
++        }).cloned()
++    };
++    let Some(grant) = grant else { return guard.fail(&mut state, "native_ocr_image_not_granted"); };
++    let Some(call) = state.calls.get(call_id) else {
++        return guard.fail(&mut state, "native_ocr_image_call_not_admitted");
++    };
++    if !call.native_image || !call.dispatched || call.grant.is_some() {
++        return guard.fail(&mut state, "native_ocr_image_call_changed");
++    }
++    // Check the leaf through the held directory; never hash or read an ungranted path.
++    let file = open_leaf(&guard.image_directory, &grant.relative_path)?;
++    let metadata = file.metadata().map_err(|_| "native_ocr_image_metadata")?;
++    if !metadata.is_file() || metadata.len() != grant.bytes {
++        return guard.fail(&mut state, "native_ocr_image_size_changed");
++    }
++    state.calls.get_mut(call_id).ok_or("native_ocr_image_call_not_admitted")?.grant = Some(grant.clone());
++    Ok(Some(grant))
++}
++
++fn source_buffer(&self, call_id: &str, bytes: &[u8]) -> AdmissionResult<()> {
++    let guard = self;
++    let mut state = guard.state.lock().map_err(|_| "native_ocr_guard_poisoned")?;
++    if let Err(error) = guard.check(&state) { return guard.fail(&mut state, error); }
++    let Some(call) = state.calls.get(call_id) else {
++        return guard.fail(&mut state, "native_ocr_image_call_not_admitted");
++    };
++    let Some(grant) = call.grant.clone() else {
++        return guard.fail(&mut state, "native_ocr_image_grant_missing");
++    };
++    let ordinal = call.ordinal;
++    if bytes.len() as u64 != grant.bytes || digest(bytes) != grant.sha256 {
++        return guard.fail(&mut state, "native_ocr_image_buffer_changed");
++    }
++    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
++        .with_guessed_format().map_err(|_| "native_ocr_image_format")?;
++    let (width, height) = reader.into_dimensions().map_err(|_| "native_ocr_image_dimensions")?;
++    if (width,height) != (grant.width,grant.height)
++        || u64::from(width) * u64::from(height) > PIXEL_WORKING_LIMIT / 4
++    { return guard.fail(&mut state, "native_ocr_image_dimensions_changed"); }
++    if let Err(error) = guard.write_receipt(&format!("source-{ordinal}.json"), &json!({
++        "schema_version":guard.kind.receipt_schema(),"kind":"native_source_buffer",
++        "admission_sha256":guard.manifest_sha256,"task_sha256":guard.manifest.task_sha256,
++        "call_id":call_id,"ordinal":ordinal,"artifact_id":grant.artifact_id,
++        "source_buffer_bytes":bytes.len(),"source_buffer_sha256":grant.sha256,
++        "source_width":width,"source_height":height,"rendition_sha256":grant.rendition_sha256
++    })) { return guard.fail(&mut state, error); }
++    state.calls.get_mut(call_id).ok_or("native_ocr_image_call_not_admitted")?.source_verified = true;
++    Ok(())
++}
++
++fn prepared_image(&self, 
++    call_id: Option<&str>, bytes: &[u8], mime: &str, width: u32, height: u32,
++    detail: Option<codex_protocol::models::ImageDetail>,
++) -> AdmissionResult<()> {
++    let guard = self;
++    let mut state = guard.state.lock().map_err(|_| "native_ocr_guard_poisoned")?;
++    if let Err(error) = guard.check(&state) { return guard.fail(&mut state, error); }
++    let Some(call_id) = call_id else { return guard.fail(&mut state, "native_ocr_assembly_call_missing"); };
++    let Some(call) = state.calls.get(call_id) else {
++        return guard.fail(&mut state, "native_ocr_assembly_call_unknown");
++    };
++    let Some(grant) = call.grant.clone() else {
++        return guard.fail(&mut state, "native_ocr_assembly_grant_missing");
++    };
++    let ordinal = call.ordinal;
++    if !call.native_image || !call.source_verified || call.prepared.is_some() || call.assembled
++        || width == 0 || height == 0
++        || u64::from(width) * u64::from(height) > PIXEL_WORKING_LIMIT / 4
++    { return guard.fail(&mut state, "native_ocr_assembly_changed"); }
++    // Forecast exact base64 plus serialized framing before allocating either.
++    // Base64 characters need no JSON escaping; mime and call identity framing do.
++    let wire_bytes = planned_image_wire_bytes(call_id, bytes.len(), mime, detail)?;
++    let next = state.image_wire_bytes.checked_add(wire_bytes).ok_or("native_ocr_transport_overflow")?;
++    let payload = u64::try_from(bytes.len()).map_err(|_| "native_ocr_transport_overflow")?;
++    let encoded = base64_length(payload)?;
++    if payload == 0 || payload > guard.manifest.image_file_limit()
++        || guard.manifest.image_limits.as_ref().is_some_and(|limits| encoded > limits.image_base64_bytes)
++        || wire_bytes > guard.manifest.image_wire_limit()
++        || next > guard.manifest.image_transport_reserved_bytes {
++        return guard.fail(&mut state, "native_ocr_image_wire_budget_exhausted");
++    }
++    let image_url = format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes));
++    let actual_wire = image_wire_bytes(call_id,
++        codex_protocol::models::ImageReference::Inline { image_url }, detail)?;
++    if actual_wire != wire_bytes {
++        return guard.fail(&mut state, "native_ocr_image_wire_forecast_changed");
++    }
++    state.image_wire_bytes = next;
++    if let Err(error) = guard.write_receipt(&format!("prepared-{ordinal}.json"), &json!({
++        "schema_version":guard.kind.receipt_schema(),"kind":"native_prepared_image",
++        "admission_sha256":guard.manifest_sha256,"task_sha256":guard.manifest.task_sha256,
++        "call_id":call_id,"ordinal":ordinal,"artifact_id":grant.artifact_id,
++        "source_buffer_sha256":grant.sha256,"prepared_image_bytes":bytes.len(),
++        "prepared_image_sha256":digest(bytes),"source_width":grant.width,"source_height":grant.height,
++        "prepared_width":width,"prepared_height":height,"image_wire_bytes":wire_bytes,
++        "cumulative_image_wire_bytes":next,"provider_ingestion_verified":false
++    })) { return guard.fail(&mut state, error); }
++    state.calls.get_mut(call_id).ok_or("native_ocr_assembly_call_unknown")?.prepared = Some(PreparedBinding {
++        bytes:bytes.len() as u64, sha256:digest(bytes), width,height,wire_bytes,
++    });
++    Ok(())
++}
++
++fn assembled_image(&self, call_id: Option<&str>, image: &codex_protocol::models::ImageReference)
++    -> AdmissionResult<()>
++{
++    let guard = self;
++    let mut state = guard.state.lock().map_err(|_| "native_ocr_guard_poisoned")?;
++    if let Err(error) = guard.check(&state) { return guard.fail(&mut state, error); }
++    let Some(call_id) = call_id else { return guard.fail(&mut state, "native_ocr_assembly_call_missing"); };
++    let Some(call) = state.calls.get(call_id) else {
++        return guard.fail(&mut state, "native_ocr_assembly_call_unknown");
++    };
++    let Some(grant) = call.grant.clone() else {
++        return guard.fail(&mut state, "native_ocr_assembly_grant_missing");
++    };
++    let ordinal = call.ordinal;
++    let Some(prepared) = call.prepared.clone() else {
++        return guard.fail(&mut state, "native_ocr_prepared_image_missing");
++    };
++    if call.assembled { return guard.fail(&mut state, "native_ocr_duplicate_assembly"); }
++    let reference = match image {
++        codex_protocol::models::ImageReference::Inline { image_url } => {
++            let (prefix, payload) = image_url.split_once(',').ok_or("native_ocr_assembled_image_format")?;
++            if !prefix.starts_with("data:") || !prefix.ends_with(";base64")
++                || image_url.len() as u64 > guard.manifest.image_wire_limit()
++            { return guard.fail(&mut state, "native_ocr_assembled_image_format"); }
++            let bytes = base64::engine::general_purpose::STANDARD.decode(payload)
++                .map_err(|_| "native_ocr_assembled_image_format")?;
++            if bytes.len() as u64 != prepared.bytes || digest(&bytes) != prepared.sha256 {
++                return guard.fail(&mut state, "native_ocr_upload_payload_changed");
++            }
++            json!({"type":"inline","bytes":bytes.len(),"sha256":digest(&bytes)})
++        }
++        codex_protocol::models::ImageReference::File { file_id } => {
++            if file_id.is_empty() || file_id.len() > 256 {
++                return guard.fail(&mut state, "native_ocr_assembled_reference");
++            }
++            json!({"type":"file","reference_sha256":digest(file_id.as_bytes())})
++        }
++    };
++    if let Err(error) = guard.write_receipt(&format!("assembled-{ordinal}.json"), &json!({
++        "schema_version":guard.kind.receipt_schema(),"kind":"native_image_assembled",
++        "admission_sha256":guard.manifest_sha256,"task_sha256":guard.manifest.task_sha256,
++        "call_id":call_id,"ordinal":ordinal,"artifact_id":grant.artifact_id,
++        "source_buffer_sha256":grant.sha256,"reference":reference,
++        "prepared_image_sha256":prepared.sha256,"prepared_image_bytes":prepared.bytes,
++        "prepared_width":prepared.width,"prepared_height":prepared.height,
++        "image_content_wire_charge":prepared.wire_bytes,
++        "local_assembly_verified":true,"provider_ingestion_verified":false
++    })) { return guard.fail(&mut state, error); }
++    state.calls.get_mut(call_id).ok_or("native_ocr_assembly_call_unknown")?.assembled = true;
++    Ok(())
++}
++
++fn before_model_request(&self, model: &str, effort: Option<&ReasoningEffort>, tier: Option<&str>)
++    -> AdmissionResult<()>
++{
++    let guard = self;
++    let mut state = guard.state.lock().map_err(|_| "native_ocr_guard_poisoned")?;
++    if let Err(error) = guard.check(&state) { return guard.fail(&mut state, error); }
++    if state.turns != 1 || state.turn_id.is_none() || model != "gpt-6-luna"
++        || effort != Some(&ReasoningEffort::Max) || tier != Some("priority")
++        || state.calls.values().any(|call| call.native_image && !call.assembled)
++    { return guard.fail(&mut state, "native_ocr_model_request_not_admitted"); }
++    Ok(())
++}
++}
++
++#[cfg(all(test, unix))]
++mod tests {
++    use super::*;
++    use codex_protocol::models::{ImageDetail, ImageReference};
++    use std::os::unix::fs::{PermissionsExt, symlink};
++
++    struct Fixture {
++        _temporary: tempfile::TempDir,
++        guard: Guard,
++        png: Vec<u8>,
++    }
++
++    fn fixture() -> Fixture {
++        let temporary = tempfile::tempdir().expect("external test temporary root");
++        let root = temporary.path().canonicalize().expect("physical fixture root");
++        let images = root.join("images");
++        let receipts = root.join("receipts");
++        fs::create_dir(&images).expect("images");
++        fs::create_dir(&receipts).expect("receipts");
++        fs::set_permissions(&images, fs::Permissions::from_mode(0o700)).expect("private images");
++        fs::set_permissions(&receipts, fs::Permissions::from_mode(0o700)).expect("private receipts");
++        let mut png = std::io::Cursor::new(Vec::new());
++        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
++            2, 2, image::Rgba([40, 90, 160, 255]),
++        )).write_to(&mut png, image::ImageFormat::Png).expect("synthetic PNG");
++        let png = png.into_inner();
++        fs::write(images.join("page.png"), &png).expect("fixture image");
++        let mut manifest = AdmissionManifest {
++            schema_version: MANIFEST_SCHEMA.into(),
++            task_sha256: "a".repeat(64),
++            source_sha256: "b".repeat(64),
++            prepared_sha256: "c".repeat(64),
++            runtime_profile_sha256: "d".repeat(64),
++            deadline_unix_ms: 1,
++            max_tool_calls: MAX_TOOLS,
++            max_seconds: None,
++            max_turns: 1,
++            frame_bytes: FRAME_LIMIT,
++            image_transport_reserved_bytes: IMAGE_WIRE_RESERVATION,
++            image_limits: None,
++            image_root: images,
++            receipt_root: receipts,
++            permissions_profile_sha256: "e".repeat(64),
++            image_catalog: None,
++            images: vec![ImageGrant {
++                artifact_id: "page-image".into(),
++                relative_path: PathBuf::from("page.png"),
++                bytes: png.len() as u64,
++                sha256: digest(&png),
++                width: 2,
++                height: 2,
++                rendition_sha256: "f".repeat(64),
++            }],
++        };
++        let expected_permissions = permission_value(&manifest, GuardKind::Page);
++        manifest.permissions_profile_sha256 = digest(
++            &serde_json::to_vec(&expected_permissions).expect("permission JSON"),
++        );
++        let guard = Guard {
++            kind: GuardKind::Page, catalogue: None,
++            image_directory: open_directory(&manifest.image_root).expect("held images"),
++            receipt_directory: open_directory(&manifest.receipt_root).expect("held receipts"),
++            manifest,
++            manifest_sha256: "9".repeat(64),
++            expected_permissions,
++            deadline: Instant::now() + Duration::from_secs(60),
++            state: Mutex::new(State {
++                turn_id: Some("fixture-turn".into()),
++                turns: 1,
++                ..State::default()
++            }),
++        };
++        Fixture { _temporary: temporary, guard, png }
++    }
++
++    fn admit_image(fixture: &Fixture) {
++        fixture.guard.admit_tool(
++            "fixture-turn", &ToolName::plain("view_image"), "image-call", Some(1),
++        ).expect("first native image call");
++        fixture.guard.verify_dispatched_tool(
++            "fixture-turn", &ToolName::plain("view_image"), "image-call", Some(1),
++        ).expect("pre-admitted registry dispatch");
++        let permissions: PermissionProfile =
++            serde_json::from_value(fixture.guard.expected_permissions.clone())
++                .expect("named image-only permissions");
++        assert!(fixture.guard.image_grant(
++            "image-call",
++            &fixture.guard.manifest.image_root.join("page.png"),
++            None, &permissions,
++        ).expect("exact granted leaf").is_some());
++        fixture.guard.source_buffer("image-call", &fixture.png).expect("actual source buffer");
++    }
++
++    fn configured_image_limits() -> NativeImageLimits {
++        NativeImageLimits { image_file_bytes: 4_194_304, image_base64_bytes: 5_592_408,
++            image_wire_bytes: 5_657_944, image_transport_bytes: 5_854_568 }
++    }
++
++    #[test]
++    fn configured_image_wire_exceeds_rpc_frame_and_remains_bound() {
++        let mut fixture = fixture();
++        let limits = configured_image_limits();
++        fixture.guard.manifest.image_transport_reserved_bytes = limits.image_transport_bytes;
++        fixture.guard.manifest.image_limits = Some(limits);
++        validate_manifest(&fixture.guard.manifest, GuardKind::Page).expect("configured page admission");
++        assert_eq!(fixture.guard.ready_value()["image_limits"]["image_file_bytes"], 4_194_304);
++        admit_image(&fixture);
++        // The source remains a valid pinned PNG; this synthetic native output
++        // isolates the actual preparation/assembly wire boundary without a model.
++        let payload = vec![7u8; 3_200_000];
++        let forecast = planned_image_wire_bytes("image-call", payload.len(), "image/png", None).unwrap();
++        assert!(forecast > FRAME_LIMIT);
++        fixture.guard.prepared_image(Some("image-call"), &payload, "image/png", 1000, 800, None)
++            .expect("configured output larger than the RPC frame");
++        fixture.guard.assembled_image(Some("image-call"), &ImageReference::Inline {
++            image_url: format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(&payload)),
++        }).expect("exact larger inline payload");
++        fixture.guard.before_model_request("gpt-6-luna", Some(&ReasoningEffort::Max), Some("priority"))
++            .expect("configured assembly complete");
++    }
++
++    #[test]
++    fn configured_image_limits_reject_overflow_incoherence_and_excess_payload() {
++        let mut limits = configured_image_limits();
++        limits.image_file_bytes = u64::MAX;
++        assert!(limits.validate().is_err());
++        limits = configured_image_limits();
++        limits.image_base64_bytes -= 1;
++        assert!(limits.validate().is_err());
++        let mut fixture = fixture();
++        let limits = configured_image_limits();
++        fixture.guard.manifest.image_transport_reserved_bytes = limits.image_transport_bytes;
++        fixture.guard.manifest.image_limits = Some(limits);
++        admit_image(&fixture);
++        assert_eq!(fixture.guard.prepared_image(Some("image-call"), &vec![0; 4_194_305],
++            "image/png", 2, 2, None), Err("native_ocr_image_wire_budget_exhausted"));
++        assert!(!fixture.guard.manifest.receipt_root.join("prepared-1.json").exists());
++        assert!(fixture.guard.before_model_request("gpt-6-luna", Some(&ReasoningEffort::Max), Some("priority")).is_err());
++        let worst_call_id = "\\u{1}".repeat(256);
++        let framed = planned_image_wire_bytes(&worst_call_id, 4_194_304, "image/jpeg", Some(ImageDetail::Original)).unwrap();
++        assert!(framed <= configured_image_limits().image_wire_bytes);
++    }
++
++    #[test]
++    fn ninth_submission_is_consumed_and_denied_before_any_image_handler() {
++        let fixture = fixture();
++        for ordinal in 1..=MAX_TOOLS {
++            fixture.guard.admit_tool(
++                "fixture-turn",
++                &ToolName::namespaced("gptgrep_ocr", "ocr_resource"),
++                &format!("context-{ordinal}"), Some(u64::from(ordinal)),
++            ).expect("eight context calls");
++        }
++        assert_eq!(fixture.guard.admit_tool(
++            "fixture-turn", &ToolName::plain("view_image"), "ninth-image", Some(9),
++        ), Err("native_ocr_tool_budget_exhausted"));
++        let state = fixture.guard.state.lock().expect("state");
++        assert_eq!((state.submissions, state.calls.len()), (9, 8));
++        assert!(!state.calls.contains_key("ninth-image"));
++        assert!(!fixture.guard.manifest.receipt_root.join("call-9.json").exists());
++        assert!(!fixture.guard.manifest.receipt_root.join("source-9.json").exists());
++        drop(state);
++        assert_eq!(fixture.guard.before_model_request(
++            "gpt-6-luna", Some(&ReasoningEffort::Max), Some("priority"),
++        ), Err("native_ocr_tool_budget_exhausted"));
++    }
++
++    #[test]
++    fn unknown_and_duplicate_calls_latch_without_refunding_the_counter() {
++        let unknown = fixture();
++        assert_eq!(unknown.guard.admit_tool(
++            "fixture-turn", &ToolName::plain("shell"), "unknown", Some(1),
++        ), Err("native_ocr_tool_not_admitted"));
++        assert_eq!(unknown.guard.state.lock().expect("state").submissions, 1);
++        let duplicate = fixture();
++        duplicate.guard.admit_tool(
++            "fixture-turn", &ToolName::plain("view_image"), "same", Some(1),
++        ).expect("first");
++        assert_eq!(duplicate.guard.admit_tool(
++            "fixture-turn", &ToolName::plain("view_image"), "same", Some(2),
++        ), Err("native_ocr_duplicate_or_invalid_call"));
++        let state = duplicate.guard.state.lock().expect("state");
++        assert_eq!((state.submissions, state.calls.len()), (2, 1));
++    }
++
++    #[test]
++    fn absent_active_state_and_elapsed_deadline_refuse_the_first_handler() {
++        let absent = fixture();
++        assert_eq!(absent.guard.admit_tool(
++            "fixture-turn", &ToolName::plain("view_image"), "image", None,
++        ), Err("native_ocr_active_state_missing_or_changed"));
++        let mut elapsed = fixture();
++        elapsed.guard.deadline = Instant::now() - Duration::from_millis(1);
++        assert_eq!(elapsed.guard.admit_tool(
++            "fixture-turn", &ToolName::plain("view_image"), "image", Some(1),
++        ), Err("native_ocr_deadline_expired"));
++        assert!(elapsed.guard.state.lock().expect("state").calls.is_empty());
++    }
++
++    #[test]
++    fn image_leaf_symlink_and_same_size_changed_buffer_are_rejected() {
++        let link = fixture();
++        let path = link.guard.manifest.image_root.join("page.png");
++        let replacement = link.guard.manifest.image_root.join("replacement.png");
++        fs::rename(&path, &replacement).expect("fixture rename");
++        symlink("replacement.png", &path).expect("fixture symlink");
++        assert!(open_leaf(&link.guard.image_directory, Path::new("page.png")).is_err());
++        let changed = fixture();
++        changed.guard.admit_tool(
++            "fixture-turn", &ToolName::plain("view_image"), "image-call", Some(1),
++        ).expect("first");
++        changed.guard.verify_dispatched_tool(
++            "fixture-turn", &ToolName::plain("view_image"), "image-call", Some(1),
++        ).expect("pre-admitted registry dispatch");
++        let permissions = serde_json::from_value(changed.guard.expected_permissions.clone())
++            .expect("permissions");
++        changed.guard.image_grant(
++            "image-call", &changed.guard.manifest.image_root.join("page.png"),
++            None, &permissions,
++        ).expect("exact leaf");
++        let mut altered = changed.png.clone();
++        altered[0] ^= 1;
++        assert_eq!(changed.guard.source_buffer("image-call", &altered),
++            Err("native_ocr_image_buffer_changed"));
++        assert!(!changed.guard.manifest.receipt_root.join("source-1.json").exists());
++    }
++
++    #[test]
++    fn native_source_prepared_and_assembled_receipts_join_exact_payload() {
++        let fixture = fixture();
++        admit_image(&fixture);
++        fixture.guard.prepared_image(
++            Some("image-call"), &fixture.png, "image/png", 2, 2, Some(ImageDetail::Original),
++        ).expect("prepared source");
++        let reference = ImageReference::Inline {
++            image_url: format!("data:image/png;base64,{}",
++                base64::engine::general_purpose::STANDARD.encode(&fixture.png)),
++        };
++        fixture.guard.assembled_image(Some("image-call"), &reference)
++            .expect("same outgoing payload");
++        fixture.guard.before_model_request(
++            "gpt-6-luna", Some(&ReasoningEffort::Max), Some("priority"),
++        ).expect("image assembly complete");
++        let root = &fixture.guard.manifest.receipt_root;
++        let source: Value = serde_json::from_slice(
++            &fs::read(root.join("source-1.json")).expect("source receipt"),
++        ).expect("source JSON");
++        let prepared: Value = serde_json::from_slice(
++            &fs::read(root.join("prepared-1.json")).expect("prepared receipt"),
++        ).expect("prepared JSON");
++        let assembled: Value = serde_json::from_slice(
++            &fs::read(root.join("assembled-1.json")).expect("assembled receipt"),
++        ).expect("assembled JSON");
++        for receipt in [&source, &prepared, &assembled] {
++            assert_eq!(receipt["call_id"], "image-call");
++            assert_eq!(receipt["ordinal"], 1);
++            assert_eq!(receipt["artifact_id"], "page-image");
++        }
++        assert_eq!(source["source_buffer_sha256"], digest(&fixture.png));
++        assert_eq!(prepared["prepared_image_sha256"], assembled["prepared_image_sha256"]);
++        assert_eq!(assembled["reference"]["sha256"], digest(&fixture.png));
++        assert_eq!(assembled["provider_ingestion_verified"], false);
++    }
++
++    #[test]
++    fn unassembled_or_changed_upload_cannot_reach_a_later_model_request() {
++        let missing = fixture();
++        admit_image(&missing);
++        assert_eq!(missing.guard.before_model_request(
++            "gpt-6-luna", Some(&ReasoningEffort::Max), Some("priority"),
++        ), Err("native_ocr_model_request_not_admitted"));
++        let changed = fixture();
++        admit_image(&changed);
++        changed.guard.prepared_image(
++            Some("image-call"), &changed.png, "image/png", 2, 2, None,
++        ).expect("prepared");
++        let mut altered = changed.png.clone();
++        let last = altered.len() - 1;
++        altered[last] ^= 1;
++        let reference = ImageReference::Inline {
++            image_url: format!("data:image/png;base64,{}",
++                base64::engine::general_purpose::STANDARD.encode(&altered)),
++        };
++        assert_eq!(changed.guard.assembled_image(Some("image-call"), &reference),
++            Err("native_ocr_upload_payload_changed"));
++        assert!(!changed.guard.manifest.receipt_root.join("assembled-1.json").exists());
++        assert_eq!(changed.guard.before_model_request(
++            "gpt-6-luna", Some(&ReasoningEffort::Max), Some("priority"),
++        ), Err("native_ocr_upload_payload_changed"));
++    }
++
++    #[test]
++    fn base64_forecast_includes_escaped_call_identity_and_refuses_before_encoding() {
++        for size in 0..=11 {
++            let bytes = vec![37u8; size];
++            let call = "a\\b\"c";
++            let planned = planned_image_wire_bytes(call, size, "image/png", None)
++                .expect("bounded forecast");
++            let actual = image_wire_bytes(call, ImageReference::Inline {
++                image_url: format!("data:image/png;base64,{}",
++                    base64::engine::general_purpose::STANDARD.encode(bytes)),
++            }, None).expect("exact serialized output");
++            assert_eq!(planned, actual);
++        }
++        let fixture = fixture();
++        admit_image(&fixture);
++        let too_large = vec![0; 3 * 1024 * 1024];
++        assert_eq!(fixture.guard.prepared_image(
++            Some("image-call"), &too_large, "image/png", 2, 2, None,
++        ), Err("native_ocr_image_wire_budget_exhausted"));
++        let state = fixture.guard.state.lock().expect("state");
++        assert_eq!(state.image_wire_bytes, 0);
++        assert!(state.calls["image-call"].prepared.is_none());
++        assert!(!fixture.guard.manifest.receipt_root.join("prepared-1.json").exists());
++    }
++
++    #[test]
++    fn canonical_permission_hash_is_key_and_entry_order_independent() {
++        let fixture = fixture();
++        let mut actual = fixture.guard.expected_permissions.clone();
++        actual.pointer_mut("/file_system/entries").and_then(Value::as_array_mut)
++            .expect("entries").reverse();
++        let permissions: PermissionProfile = serde_json::from_value(actual).expect("permissions");
++        let normalized = normalized_permissions(&permissions).expect("normalized permission JSON");
++        assert_eq!(normalized, fixture.guard.expected_permissions);
++        assert_eq!(digest(&serde_json::to_vec(&normalized).expect("JSON")),
++            fixture.guard.manifest.permissions_profile_sha256);
++        let mut wider = normalized;
++        wider["network"] = json!("enabled");
++        assert_ne!(wider, fixture.guard.expected_permissions);
++    }
++
++    #[test]
++    fn native_environment_is_the_single_local_image_root_with_no_workspace_grants() {
++        use codex_protocol::protocol::{EnvironmentConfigState, TurnEnvironmentSelection};
++        use codex_utils_path_uri::PathUri;
++        let fixture = fixture();
++        let mut selection = TurnEnvironmentSelection {
++            environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
++            cwd: PathUri::from_host_native_path(&fixture.guard.manifest.image_root)
++                .expect("local image root"),
++            workspace_roots: Vec::new(),
++            config: EnvironmentConfigState::FromThread,
++            selected_capability_roots: Default::default(),
++        };
++        validate_environment_selection(&selection, &fixture.guard.manifest.image_root)
++            .expect("exact local environment");
++        selection.environment_id = "remote".into();
++        assert_eq!(validate_environment_selection(&selection, &fixture.guard.manifest.image_root),
++            Err("native_ocr_environment_selection"));
++        selection.environment_id = codex_exec_server::LOCAL_ENVIRONMENT_ID.into();
++        selection.workspace_roots.push(selection.cwd.clone());
++        assert_eq!(validate_environment_selection(&selection, &fixture.guard.manifest.image_root),
++            Err("native_ocr_environment_selection"));
++    }
++
++    fn allowed_wire_tools() -> Value {
++        json!([
++            {"type":"function","name":"view_image"},
++            {"type":"namespace","name":"gptgrep_ocr",
++                "tools":[{"type":"function","name":"ocr_resource"}]},
++        ])
++    }
++
++    #[test]
++    fn malformed_client_tool_search_is_counted_and_fatal_before_router_parse() {
++        let fixture = fixture();
++        let item: codex_protocol::models::ResponseItem = serde_json::from_value(json!({
++            "type":"tool_search_call","call_id":"bad-search","execution":"client",
++            "arguments":"not-a-search-parameter-object"
++        })).expect("typed raw tool-search item");
++        assert_eq!(fixture.guard.admit_model_tool("fixture-turn", &item, Some(1)),
++            Err("native_ocr_tool_not_admitted"));
++        let state = fixture.guard.state.lock().expect("state");
++        assert_eq!(state.submissions, 1);
++        assert!(state.calls.is_empty());
++        drop(state);
++        assert_eq!(fixture.guard.before_wire_request(
++            "gpt-6-luna", Some(&ReasoningEffort::Max), Some("priority"),
++            Some(&allowed_wire_tools()), false,
++        ), Err("native_ocr_tool_not_admitted"));
++    }
++
++    #[test]
++    fn normalized_tier_omission_and_missing_viewer_are_fatal_before_send() {
++        let priority = fixture();
++        priority.guard.before_wire_request(
++            "gpt-6-luna", Some(&ReasoningEffort::Max), Some("priority"),
++            Some(&allowed_wire_tools()), false,
++        ).expect("selected normalized request");
++        let omitted = fixture();
++        assert_eq!(omitted.guard.before_wire_request(
++            "gpt-6-luna", Some(&ReasoningEffort::Max), None,
++            Some(&allowed_wire_tools()), false,
++        ), Err("native_ocr_normalized_request_profile"));
++        let missing = fixture();
++        assert_eq!(missing.guard.before_wire_request(
++            "gpt-6-luna", Some(&ReasoningEffort::Max), Some("priority"),
++            Some(&json!([{"type":"namespace","name":"gptgrep_ocr",
++                "tools":[{"type":"function","name":"ocr_resource"}]}])), false,
++        ), Err("native_ocr_required_model_tool_missing"));
++        let extra = fixture();
++        let mut tools = allowed_wire_tools();
++        tools.as_array_mut().expect("tools").push(json!({"type":"web_search"}));
++        assert_eq!(extra.guard.before_wire_request(
++            "gpt-6-luna", Some(&ReasoningEffort::Max), Some("priority"),
++            Some(&tools), false,
++        ), Err("native_ocr_model_tool_not_admitted"));
++    }
++
++    #[test]
++    fn raw_call_is_counted_once_then_registry_verification_cannot_repeat() {
++        let fixture = fixture();
++        let item: codex_protocol::models::ResponseItem = serde_json::from_value(json!({
++            "type":"function_call","name":"view_image","call_id":"image-call",
++            "arguments":"not-json"
++        })).expect("raw function proposal");
++        fixture.guard.admit_model_tool("fixture-turn", &item, Some(1)).expect("raw count");
++        fixture.guard.verify_dispatched_tool(
++            "fixture-turn", &ToolName::plain("view_image"), "image-call", Some(1),
++        ).expect("single dispatch");
++        assert_eq!(fixture.guard.state.lock().expect("state").submissions, 1);
++        assert_eq!(fixture.guard.verify_dispatched_tool(
++            "fixture-turn", &ToolName::plain("view_image"), "image-call", Some(1),
++        ), Err("native_ocr_dispatch_changed_or_repeated"));
++    }
++
++    fn document_fixture(count: u32) -> Fixture {
++        let mut fixture = fixture();
++        let original = fixture.guard.manifest.images[0].clone();
++        let path = fixture.guard.manifest.image_root.parent().expect("owned fixture root")
++            .join("image-catalog.ndjson");
++        let mut catalogue = Vec::new();
++        for ordinal in 0..count {
++            let leaf = format!("page-{ordinal:04}.png");
++            fs::write(fixture.guard.manifest.image_root.join(&leaf), &fixture.png)
++                .expect("all synthetic document images");
++            let row = json!({
++                "artifact_id":format!("document-image-{ordinal:04}"),
++                "relative_path":leaf,"bytes":original.bytes,"sha256":original.sha256,
++                "width":original.width,"height":original.height,
++                "rendition_sha256":original.rendition_sha256,
++            });
++            serde_json::to_writer(&mut catalogue, &row).expect("catalogue row");
++            catalogue.push(b'\n');
++        }
++        fs::write(&path, &catalogue).expect("sealed catalogue");
++        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).expect("private catalogue");
++        let pin = ImageCataloguePin { path, bytes:catalogue.len() as u64,
++            sha256:digest(&catalogue), count };
++        fixture.guard.kind = GuardKind::Document;
++        let manifest = &mut fixture.guard.manifest;
++        manifest.schema_version = DOCUMENT_MANIFEST_SCHEMA.into();
++        manifest.max_tool_calls = DOCUMENT_MAX_TOOLS;
++        manifest.image_transport_reserved_bytes = DOCUMENT_IMAGE_WIRE_RESERVATION;
++        manifest.images.clear();
++        manifest.image_catalog = Some(pin.clone());
++        fixture.guard.catalogue = Some(Mutex::new(open_catalogue(&pin, FRAME_LIMIT).expect("catalogue fully checked")));
++        fixture.guard.expected_permissions = permission_value(manifest, GuardKind::Document);
++        manifest.permissions_profile_sha256 = digest(&serde_json::to_vec(
++            &fixture.guard.expected_permissions,
++        ).expect("canonical document permissions"));
++        validate_manifest(manifest, GuardKind::Document).expect("document manifest");
++        fixture
++    }
++
++    fn allowed_document_wire_tools() -> Value {
++        json!([
++            {"type":"function","name":"view_image"},
++            {"type":"namespace","name":"gptgrep_parse",
++                "tools":[{"type":"function","name":"toolbox"}]},
++        ])
++    }
++
++    #[test]
++    fn document_catalogue_grants_the_last_image_beyond_page_child_limits() {
++        let fixture = document_fixture(19);
++        let ready = fixture.guard.ready_value();
++        assert_eq!(ready["schema_version"], DOCUMENT_READY_SCHEMA);
++        assert_eq!(ready["max_tool_calls"], 64);
++        assert_eq!(ready["max_seconds"], 900);
++        assert_eq!(ready["image_transport_reserved_bytes"], 33554432);
++        assert_eq!(ready["image_catalog_count"], 19);
++        assert_eq!(ready["actual_served_profile_verified"], false);
++        fixture.guard.admit_tool("fixture-turn", &ToolName::plain("view_image"), "last", Some(1))
++            .expect("native document image submission");
++        fixture.guard.verify_dispatched_tool("fixture-turn",
++            &ToolName::plain("view_image"), "last", Some(1)).expect("registry dispatch");
++        let permissions = serde_json::from_value(fixture.guard.expected_permissions.clone())
++            .expect("document permissions");
++        let grant = fixture.guard.image_grant("last",
++            &fixture.guard.manifest.image_root.join("page-0018.png"), None, &permissions)
++            .expect("complete catalogue lookup").expect("last image grant");
++        assert_eq!(grant.artifact_id, "document-image-0018");
++        fixture.guard.source_buffer("last", &fixture.png).expect("actual image buffer");
++        fixture.guard.prepared_image(Some("last"), &fixture.png, "image/png", 2, 2, None)
++            .expect("native prepared image");
++        fixture.guard.assembled_image(Some("last"), &ImageReference::Inline {
++            image_url:format!("data:image/png;base64,{}",
++                base64::engine::general_purpose::STANDARD.encode(&fixture.png)),
++        }).expect("actual reference assembly");
++        fixture.guard.before_wire_request("gpt-6-luna", Some(&ReasoningEffort::Max),
++            Some("priority"), Some(&allowed_document_wire_tools()), false)
++            .expect("final normalized document request");
++        let receipt: Value = serde_json::from_slice(&fs::read(
++            fixture.guard.manifest.receipt_root.join("assembled-1.json"),
++        ).expect("image assembly receipt")).expect("receipt JSON");
++        assert_eq!(receipt["schema_version"], DOCUMENT_RECEIPT_SCHEMA);
++        assert_eq!(receipt["artifact_id"], "document-image-0018");
++        assert_eq!(receipt["provider_ingestion_verified"], false);
++    }
++
++    #[test]
++    fn document_configured_limits_accept_larger_source_and_wire() {
++        let mut fixture = document_fixture(1);
++        let mut limits = configured_image_limits();
++        limits.image_file_bytes = 8_388_608;
++        limits.image_base64_bytes = 11_184_812;
++        limits.image_wire_bytes = 11_250_348;
++        limits.image_transport_bytes = DOCUMENT_IMAGE_WIRE_RESERVATION;
++        fixture.guard.manifest.image_limits = Some(limits);
++        validate_manifest(&fixture.guard.manifest, GuardKind::Document).expect("configured document admission");
++        let mut grant: ImageGrant = serde_json::from_slice(&fs::read(&fixture.guard.manifest.image_catalog.as_ref().unwrap().path).unwrap()).unwrap();
++        grant.bytes = FRAME_LIMIT + 1;
++        validate_grant(&grant, fixture.guard.manifest.image_file_limit()).expect("configured source cap");
++        assert!(validate_grant(&grant, FRAME_LIMIT).is_err());
++        fixture.guard.admit_tool("fixture-turn", &ToolName::plain("view_image"), "configured", Some(1)).unwrap();
++        fixture.guard.verify_dispatched_tool("fixture-turn", &ToolName::plain("view_image"), "configured", Some(1)).unwrap();
++        let permissions = serde_json::from_value(fixture.guard.expected_permissions.clone()).unwrap();
++        fixture.guard.image_grant("configured", &fixture.guard.manifest.image_root.join("page-0000.png"), None, &permissions).unwrap();
++        fixture.guard.source_buffer("configured", &fixture.png).unwrap();
++        let payload = vec![9u8; 4_194_305];
++        fixture.guard.prepared_image(Some("configured"), &payload, "image/png", 2000, 1000, None).unwrap();
++        fixture.guard.assembled_image(Some("configured"), &ImageReference::Inline {
++            image_url: format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(&payload)),
++        }).unwrap();
++        assert_eq!(fixture.guard.ready_value()["image_limits"]["image_file_bytes"], 8_388_608);
++    }
++
++    #[test]
++    fn document_sixty_fifth_tool_is_fatal_without_changing_page_child_counter() {
++        let fixture = document_fixture(0);
++        for ordinal in 1..=DOCUMENT_MAX_TOOLS {
++            fixture.guard.admit_tool("fixture-turn",
++                &ToolName::namespaced("gptgrep_parse", "toolbox"),
++                &format!("parse-{ordinal}"), Some(u64::from(ordinal))).expect("document toolbox call");
++        }
++        assert_eq!(fixture.guard.admit_tool("fixture-turn", &ToolName::plain("view_image"),
++            "sixty-five", Some(65)), Err("native_ocr_tool_budget_exhausted"));
++        assert_eq!(fixture.guard.state.lock().expect("state").submissions, 65);
++        assert!(!fixture.guard.manifest.receipt_root.join("call-65.json").exists());
++        let page = super::tests::fixture();
++        assert_eq!(page.guard.ready_value()["max_tool_calls"], 8);
++        assert_eq!(page.guard.ready_value()["image_transport_reserved_bytes"], 8388608);
++        assert!(page.guard.ready_value().get("image_catalog_count").is_none());
++    }
++
++    #[test]
++    fn catalogue_hash_change_or_unregistered_leaf_cannot_reach_native_read() {
++        let changed = document_fixture(2);
++        let pin = changed.guard.manifest.image_catalog.as_ref().expect("pin");
++        fs::set_permissions(&pin.path, fs::Permissions::from_mode(0o600)).expect("fixture mutation");
++        let mut bytes = fs::read(&pin.path).expect("fixture catalogue");
++        let identity = b"document-image-0000";
++        let at = bytes.windows(identity.len()).position(|window| window == identity)
++            .expect("artifact identity value byte");
++        bytes[at] = b'e';
++        fs::write(&pin.path, bytes).expect("same-size changed catalogue");
++        let mut file = changed.guard.catalogue.as_ref().expect("catalogue").lock().expect("lock");
++        assert_eq!(scan_catalogue(&mut file, pin, Some(Path::new("page-0001.png")), FRAME_LIMIT)
++            .expect_err("same-size source change"), "native_document_catalogue_changed");
++        drop(file);
++        let unregistered = document_fixture(1);
++        unregistered.guard.admit_tool("fixture-turn", &ToolName::plain("view_image"), "unknown", Some(1))
++            .expect("count proposal");
++        unregistered.guard.verify_dispatched_tool("fixture-turn", &ToolName::plain("view_image"),
++            "unknown", Some(1)).expect("single dispatch");
++        let permissions = serde_json::from_value(unregistered.guard.expected_permissions.clone())
++            .expect("permissions");
++        assert_eq!(unregistered.guard.image_grant("unknown",
++            &unregistered.guard.manifest.image_root.join("page.png"), None, &permissions)
++            .expect_err("unregistered source image"), "native_ocr_image_not_granted");
++        assert!(!unregistered.guard.manifest.receipt_root.join("source-1.json").exists());
++    }
++
++    #[test]
++    fn catalogue_duplicate_identity_and_oversized_row_are_refused_without_truncation() {
++        let duplicate = document_fixture(2);
++        let pin = duplicate.guard.manifest.image_catalog.as_ref().expect("pin");
++        let bytes = fs::read(&pin.path).expect("catalogue");
++        let text = String::from_utf8(bytes).expect("fixture UTF8");
++        let replacement = text.replace("document-image-0001", "document-image-0000").into_bytes();
++        fs::set_permissions(&pin.path, fs::Permissions::from_mode(0o600)).expect("fixture permissions");
++        fs::write(&pin.path, &replacement).expect("duplicate fixture");
++        let changed_pin = ImageCataloguePin { sha256:digest(&replacement), ..pin.clone() };
++        assert_eq!(open_catalogue(&changed_pin, FRAME_LIMIT).expect_err("duplicate catalogue ID"),
++            "native_document_catalogue_order_or_identity");
++        let large = document_fixture(0);
++        let pin = large.guard.manifest.image_catalog.as_ref().expect("pin");
++        let mut row = vec![b' '; CATALOGUE_ROW_LIMIT];
++        row.push(b'\n');
++        fs::set_permissions(&pin.path, fs::Permissions::from_mode(0o600)).expect("fixture permissions");
++        fs::write(&pin.path, &row).expect("oversized row");
++        let changed_pin = ImageCataloguePin { bytes:row.len() as u64, sha256:digest(&row),
++            count:1, ..pin.clone() };
++        assert_eq!(open_catalogue(&changed_pin, FRAME_LIMIT).expect_err("bounded row"),
++            "native_document_catalogue_row_limit");
++    }
++
++    #[test]
++    fn document_and_page_tool_schemas_and_environment_modes_do_not_cross_accept() {
++        assert_eq!(select_kind([false;3], [false;3]).expect("ordinary runtime"), None);
++        assert_eq!(select_kind([true;3], [false;3]).expect("page mode"), Some(GuardKind::Page));
++        assert_eq!(select_kind([false;3], [true;3]).expect("document mode"), Some(GuardKind::Document));
++        assert_eq!(select_kind([true,false,false], [false,true,false]), Err("native_modes_ambiguous"));
++        let document = document_fixture(0);
++        assert_eq!(document.guard.before_wire_request("gpt-6-luna", Some(&ReasoningEffort::Max),
++            Some("priority"), Some(&allowed_wire_tools()), false),
++            Err("native_ocr_model_tool_not_admitted"));
++        let page = fixture();
++        assert_eq!(page.guard.before_wire_request("gpt-6-luna", Some(&ReasoningEffort::Max),
++            Some("priority"), Some(&allowed_document_wire_tools()), false),
++            Err("native_ocr_model_tool_not_admitted"));
++    }
++    #[test]
++    fn document_duration_selects_only_explicit_bounded_admission_seconds() {
++        let mut document = document_fixture(1);
++        assert_eq!(admitted_max_seconds(&document.guard.manifest, GuardKind::Document), Ok(900));
++        assert_eq!(check_admitted_remaining(&document.guard.manifest, GuardKind::Document, 900_000), Ok(()));
++        assert_eq!(check_admitted_remaining(&document.guard.manifest, GuardKind::Document, 900_001),
++            Err("native_ocr_deadline_out_of_range"));
++        document.guard.manifest.max_seconds = Some(3600);
++        validate_manifest(&document.guard.manifest, GuardKind::Document).expect("explicit duration");
++        assert_eq!(document.guard.ready_value()["max_seconds"], 3600);
++        assert_eq!(document.guard.ready_value()["max_tool_calls"], 64);
++        assert_eq!(document.guard.ready_value()["max_turns"], 1);
++        assert_eq!(check_admitted_remaining(&document.guard.manifest, GuardKind::Document, 3_600_000), Ok(()));
++        assert_eq!(check_admitted_remaining(&document.guard.manifest, GuardKind::Document, 3_600_001),
++            Err("native_ocr_deadline_out_of_range"));
++        assert_eq!(check_admitted_remaining(&document.guard.manifest, GuardKind::Document, 0),
++            Err("native_ocr_deadline_out_of_range"));
++        for seconds in [0, 3601, u64::MAX] {
++            document.guard.manifest.max_seconds = Some(seconds);
++            assert_eq!(validate_manifest(&document.guard.manifest, GuardKind::Document),
++                Err("native_document_duration_out_of_range"));
++        }
++    }
++
++    #[test]
++    fn page_duration_override_is_refused_and_original_tuple_is_unchanged() {
++        let mut page = fixture();
++        let ready = page.guard.ready_value();
++        assert_eq!(ready["max_tool_calls"], 8);
++        assert_eq!(ready["max_turns"], 1);
++        assert_eq!(ready["max_seconds"], 180);
++        assert_eq!(admitted_max_seconds(&page.guard.manifest, GuardKind::Page), Ok(180));
++        assert_eq!(check_admitted_remaining(&page.guard.manifest, GuardKind::Page, 180_000), Ok(()));
++        assert_eq!(check_admitted_remaining(&page.guard.manifest, GuardKind::Page, 180_001),
++            Err("native_ocr_deadline_out_of_range"));
++        for seconds in [0, 180, 900, 3600, u64::MAX] {
++            page.guard.manifest.max_seconds = Some(seconds);
++            assert_eq!(validate_manifest(&page.guard.manifest, GuardKind::Page),
++                Err("native_page_duration_override"));
++        }
++    }
++
++    #[test]
++    fn duration_field_rejects_null_fractional_negative_and_string_values() {
++        let fixture = fixture();
++        let manifest = &fixture.guard.manifest;
++        let mut value = json!({
++            "schema_version":manifest.schema_version,"task_sha256":manifest.task_sha256,
++            "source_sha256":manifest.source_sha256,"prepared_sha256":manifest.prepared_sha256,
++            "runtime_profile_sha256":manifest.runtime_profile_sha256,"deadline_unix_ms":1,
++            "max_tool_calls":8,"max_turns":1,"frame_bytes":FRAME_LIMIT,
++            "image_transport_reserved_bytes":IMAGE_WIRE_RESERVATION,
++            "image_root":manifest.image_root,"receipt_root":manifest.receipt_root,
++            "permissions_profile_sha256":manifest.permissions_profile_sha256,"images":[]
++        });
++        assert!(serde_json::from_value::<AdmissionManifest>(value.clone()).is_ok());
++        for duration in [Value::Null, json!(-1), json!(1.5), json!("3600")] {
++            value["max_seconds"] = duration;
++            assert!(serde_json::from_value::<AdmissionManifest>(value.clone()).is_err());
++        }
++    }
++
++}
+--- a/codex-rs/core/src/session/turn_context.rs
++++ b/codex-rs/core/src/session/turn_context.rs
+@@ -1211,6 +1211,8 @@
+         let turn_context = self
+             .new_turn_from_configuration(sub_id, configuration, turn_environments, options)
+             .await;
++        crate::native_ocr::admit_turn(&turn_context)
++            .map_err(|error| CodexErr::InvalidRequest(error.to_owned()))?;
+         Ok(Some((turn_context, commit.snapshot)))
+     }
+ 
+--- a/codex-rs/core/src/stream_events_utils.rs
++++ b/codex-rs/core/src/stream_events_utils.rs
+@@ -311,6 +311,8 @@
+     })
+ }
+ 
++#[expect(clippy::await_holding_invalid_type,
++    reason = "raw native tool admission keeps active-turn accounting atomic")]
+ #[instrument(level = "trace", skip_all)]
+ pub(crate) async fn handle_output_item_done(
+     ctx: &mut HandleOutputCtx,
+@@ -319,6 +321,24 @@
+ ) -> Result<OutputItemResult> {
+     let mut output = OutputItemResult::default();
+     let plan_mode = ctx.step_context.turn.mode() == ModeKind::Plan;
++
++    if crate::native_ocr::required()
++        .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?
++        && crate::native_ocr::is_model_tool(&item)
++    {
++        let mut active = ctx.sess.active_turn.lock().await;
++        let active_count = if let Some(active_turn) = active.as_mut() {
++            let mut turn_state = active_turn.turn_state.lock().await;
++            turn_state.tool_calls = turn_state.tool_calls.saturating_add(1);
++            Some(turn_state.tool_calls as u64)
++        } else {
++            None
++        };
++        crate::native_ocr::admit_model_tool(
++            &ctx.step_context.turn.sub_id, &item, active_count,
++        )
++        .map_err(|error| CodexErr::InvalidRequest(error.to_owned()))?;
++    }
+ 
+     match ToolRouter::build_tool_call(item.clone()) {
+         // The model emitted a tool call; log it, persist the item immediately, and queue the tool execution.
+--- a/codex-rs/core/src/tools/handlers/view_image.rs
++++ b/codex-rs/core/src/tools/handlers/view_image.rs
+@@ -156,9 +156,24 @@
+         let model_visible_path = path_uri.inferred_native_path_string();
+         let sandbox = turn_environment.sandbox_context(/*additional_permissions*/ None);
+         let fs = turn_environment.environment.get_filesystem();
++        let grant = if crate::native_ocr::required()
++            .map_err(|error| FunctionCallError::Fatal(error.to_string()))?
++        {
++            let local_path = path_uri.to_abs_path()
++                .map_err(|_| FunctionCallError::Fatal("native_ocr_local_image_required".into()))?;
++            crate::native_ocr::image_grant(
++                &call_id,
++                local_path.as_path(),
++                environment_id.as_deref(),
++                turn_environment.permission_profile(),
++            )
++            .map_err(|error| FunctionCallError::Fatal(error.to_owned()))?
++        } else {
++            None
++        };
+ 
+         let metadata = fs
+-            .get_metadata(&path_uri, GetMetadataOptions::default(), Some(&sandbox))
++            .get_metadata(&path_uri, GetMetadataOptions { follow_symlinks: grant.is_none() }, Some(&sandbox))
+             .await
+             .map_err(|error| {
+                 FunctionCallError::RespondToModel(format!(
+@@ -172,13 +187,15 @@
+             )));
+         }
+         let file_bytes = fs
+-            .read_file(&path_uri, ReadFileOptions::default(), Some(&sandbox))
++            .read_file(&path_uri, ReadFileOptions { follow_symlinks: grant.is_none(), max_bytes: grant.as_ref().map(|grant| grant.bytes) }, Some(&sandbox))
+             .await
+             .map_err(|error| {
+                 FunctionCallError::RespondToModel(format!(
+                     "unable to read image at `{model_visible_path}`: {error}"
+                 ))
+             })?;
++        crate::native_ocr::source_buffer(&call_id, &file_bytes)
++            .map_err(|error| FunctionCallError::Fatal(error.to_owned()))?;
+         // Reject non-images before their bytes can reach code mode without changing
+         // valid image bytes, metadata, or centralized image preparation.
+         image::load_from_memory(&file_bytes).map_err(|_| {
+--- a/codex-rs/core/src/tools/registry.rs
++++ b/codex-rs/core/src/tools/registry.rs
+@@ -550,7 +550,21 @@
+             let mut active = invocation.session.active_turn.lock().await;
+             if let Some(active_turn) = active.as_mut() {
+                 let mut turn_state = active_turn.turn_state.lock().await;
+-                turn_state.tool_calls = turn_state.tool_calls.saturating_add(1);
++                if !crate::native_ocr::required()
++                    .map_err(|error| FunctionCallError::Fatal(error.to_string()))?
++                {
++                    turn_state.tool_calls = turn_state.tool_calls.saturating_add(1);
++                }
++                crate::native_ocr::verify_dispatched_tool(
++                    &invocation.turn.sub_id, &tool_name, &call_id_owned,
++                    Some(turn_state.tool_calls as u64),
++                )
++                .map_err(|error| FunctionCallError::Fatal(error.to_owned()))?;
++            } else {
++                crate::native_ocr::verify_dispatched_tool(
++                    &invocation.turn.sub_id, &tool_name, &call_id_owned, None,
++                )
++                .map_err(|error| FunctionCallError::Fatal(error.to_owned()))?;
+             }
+         }
+ 
+--- a/codex-rs/exec-server-protocol/src/protocol.rs
++++ b/codex-rs/exec-server-protocol/src/protocol.rs
+@@ -559,6 +559,8 @@
+     pub path: PathUri,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub follow_symlinks: Option<bool>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub max_bytes: Option<u64>,
+     pub sandbox: Option<FileSystemSandboxContext>,
+ }
+ 
+@@ -569,6 +571,8 @@
+     path: PathUri,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     follow_symlinks: Option<bool>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    max_bytes: Option<u64>,
+     sandbox: Option<WireFileSystemSandboxContext>,
+ }
+ 
+@@ -914,7 +918,7 @@
+ }
+ 
+ impl_wire_filesystem_request! {
+-    WireFsReadFileParams => FsReadFileParams { path, follow_symlinks },
++    WireFsReadFileParams => FsReadFileParams { path, follow_symlinks, max_bytes },
+     WireFsOpenParams => FsOpenParams { handle_id, path, mode },
+     WireFsWriteFileParams => FsWriteFileParams { path, data_base64, follow_symlinks },
+     WireFsCreateDirectoryParams => FsCreateDirectoryParams { path, recursive, follow_symlinks },
+@@ -1739,6 +1743,7 @@
+         let params = FsReadFileParams {
+             path: unc,
+             follow_symlinks: None,
++            max_bytes: None,
+             sandbox: Some(FileSystemSandboxContext::from_permission_profile(
+                 permissions,
+                 cwd,
+@@ -1785,6 +1790,7 @@
+         let params = FsReadFileParams {
+             path,
+             follow_symlinks: None,
++            max_bytes: None,
+             sandbox: Some(sandbox),
+         };
+         let mut json = serde_json::to_value(WireFsReadFileParams::from(params.clone()))
+--- a/codex-rs/exec-server/src/fs_helper.rs
++++ b/codex-rs/exec-server/src/fs_helper.rs
+@@ -302,6 +302,7 @@
+                     &params.path,
+                     ReadFileOptions {
+                         follow_symlinks: params.follow_symlinks.unwrap_or(true),
++                        max_bytes: params.max_bytes,
+                     },
+                     /*sandbox*/ None,
+                 )
+--- a/codex-rs/exec-server/src/local_file_system_read.rs
++++ b/codex-rs/exec-server/src/local_file_system_read.rs
+@@ -27,18 +27,19 @@
+         } else {
+             no_follow::open_file(path.as_path())?
+         };
++        let limit = options.max_bytes.unwrap_or(MAX_READ_FILE_BYTES).min(MAX_READ_FILE_BYTES);
+         let metadata = file.metadata()?;
+-        if metadata.len() > MAX_READ_FILE_BYTES {
+-            return Err(file_too_large_error());
++        if metadata.len() > limit {
++            return Err(file_too_large_error(limit));
+         }
+         let mut bytes = Vec::with_capacity(metadata.len() as usize);
+         CancellableReader {
+-            reader: file.take(MAX_READ_FILE_BYTES + 1),
++            reader: file.take(limit + 1),
+             cancelled,
+         }
+         .read_to_end(&mut bytes)?;
+-        if bytes.len() as u64 > MAX_READ_FILE_BYTES {
+-            return Err(file_too_large_error());
++        if bytes.len() as u64 > limit {
++            return Err(file_too_large_error(limit));
+         }
+         Ok(bytes)
+     })
+@@ -62,10 +63,10 @@
+     }
+ }
+ 
+-fn file_too_large_error() -> io::Error {
++fn file_too_large_error(limit: u64) -> io::Error {
+     io::Error::new(
+         io::ErrorKind::InvalidInput,
+-        format!("file is too large to read: limit is {MAX_READ_FILE_BYTES} bytes"),
++        format!("file is too large to read: limit is {limit} bytes"),
+     )
+ }
+ 
+--- a/codex-rs/exec-server/src/local_file_system_read_tests.rs
++++ b/codex-rs/exec-server/src/local_file_system_read_tests.rs
+@@ -22,7 +22,7 @@
+         LOCAL_FS
+             .read_file(
+                 &PathUri::from_host_native_path(&path)?,
+-                ReadFileOptions { follow_symlinks },
++                ReadFileOptions { follow_symlinks, max_bytes: None },
+                 /*sandbox*/ None,
+             )
+             .await?,
+@@ -41,7 +41,7 @@
+     let error = LOCAL_FS
+         .read_file(
+             &PathUri::from_host_native_path(&path)?,
+-            ReadFileOptions { follow_symlinks },
++            ReadFileOptions { follow_symlinks, max_bytes: None },
+             /*sandbox*/ None,
+         )
+         .await
+@@ -89,3 +89,28 @@
+     assert_eq!((first, error.kind()), (*b"x", std::io::ErrorKind::Other));
+     Ok(())
+ }
++
++#[test_case(true ; "follow")]
++#[test_case(false ; "no_follow")]
++#[tokio::test]
++async fn caller_ceiling_refuses_before_allocation_and_preserves_exact_limit(
++    follow_symlinks: bool,
++) -> anyhow::Result<()> {
++    let directory = TempDir::new()?;
++    let path = directory.path().canonicalize()?.join("bounded.bin");
++    std::fs::write(&path, b"abcde")?;
++    let uri = PathUri::from_host_native_path(&path)?;
++    let limited = ReadFileOptions { follow_symlinks, max_bytes: Some(4) };
++    let error = LOCAL_FS.read_file(&uri, limited, None).await
++        .expect_err("caller limit below size must be rejected");
++    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
++    assert!(error.to_string().contains("4 bytes"));
++    let exact = ReadFileOptions { follow_symlinks, max_bytes: Some(5) };
++    assert_eq!(LOCAL_FS.read_file(&uri, exact, None).await?, b"abcde");
++    let oversized = ReadFileOptions { follow_symlinks, max_bytes: Some(u64::MAX) };
++    std::fs::File::create(&path)?.set_len(MAX_READ_FILE_BYTES + 1)?;
++    let error = LOCAL_FS.read_file(&uri, oversized, None).await
++        .expect_err("caller cannot enlarge hard cap");
++    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
++    Ok(())
++}
+--- a/codex-rs/exec-server/src/remote_file_system.rs
++++ b/codex-rs/exec-server/src/remote_file_system.rs
+@@ -87,6 +87,7 @@
+             .fs_read_file(FsReadFileParams {
+                 path: path.clone(),
+                 follow_symlinks: (!options.follow_symlinks).then_some(false),
++                    max_bytes: options.max_bytes,
+                 sandbox: sandbox.cloned(),
+             })
+             .await
+--- a/codex-rs/exec-server/src/remote_file_system_path_uri_tests.rs
++++ b/codex-rs/exec-server/src/remote_file_system_path_uri_tests.rs
+@@ -93,6 +93,7 @@
+         .map(|path| FsReadFileParams {
+             path,
+             follow_symlinks: None,
++            max_bytes: None,
+             sandbox: Some(sandbox.clone()),
+         })
+         .collect::<Vec<_>>();
+@@ -222,6 +223,7 @@
+         expected_params.push(FsReadFileParams {
+             path,
+             follow_symlinks: None,
++            max_bytes: None,
+             sandbox: Some(sandbox),
+         });
+     }
+--- a/codex-rs/exec-server/src/sandboxed_file_system.rs
++++ b/codex-rs/exec-server/src/sandboxed_file_system.rs
+@@ -152,6 +152,7 @@
+                 FsHelperRequest::ReadFile(FsReadFileParams {
+                     path: path.clone(),
+                     follow_symlinks: (!options.follow_symlinks).then_some(false),
++                    max_bytes: options.max_bytes,
+                     sandbox: None,
+                 }),
+             )
+--- a/codex-rs/exec-server/src/server/file_system_handler.rs
++++ b/codex-rs/exec-server/src/server/file_system_handler.rs
+@@ -183,6 +183,7 @@
+                 &params.path,
+                 ReadFileOptions {
+                     follow_symlinks: params.follow_symlinks.unwrap_or(true),
++                        max_bytes: params.max_bytes,
+                 },
+                 params.sandbox.as_ref(),
+             )
+@@ -438,6 +439,7 @@
+                 .read_file(FsReadFileParams {
+                     path,
+                     follow_symlinks: None,
++                    max_bytes: None,
+                     sandbox: Some(sandbox_context(sandbox_policy)),
+                 })
+                 .await
+--- a/codex-rs/exec-server/tests/forward.rs
++++ b/codex-rs/exec-server/tests/forward.rs
+@@ -128,6 +128,7 @@
+         .fs_read_file(FsReadFileParams {
+             path: PathUri::from_host_native_path(path)?,
+             follow_symlinks: None,
++            max_bytes: None,
+             sandbox: None,
+         })
+         .await?;
+--- a/codex-rs/exec-server/tests/relay.rs
++++ b/codex-rs/exec-server/tests/relay.rs
+@@ -408,6 +408,7 @@
+         .fs_read_file(FsReadFileParams {
+             path: PathUri::from_host_native_path(large_file_path)?,
+             follow_symlinks: None,
++            max_bytes: None,
+             sandbox: None,
+         })
+         .await?;
+--- a/codex-rs/file-system/src/lib.rs
++++ b/codex-rs/file-system/src/lib.rs
+@@ -55,12 +55,15 @@
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ pub struct ReadFileOptions {
+     pub follow_symlinks: bool,
++    /// Optional caller ceiling; it cannot increase the implementation's hard cap.
++    pub max_bytes: Option<u64>,
+ }
+ 
+ impl Default for ReadFileOptions {
+     fn default() -> Self {
+         Self {
+             follow_symlinks: true,
++            max_bytes: None,
+         }
+     }
+ }

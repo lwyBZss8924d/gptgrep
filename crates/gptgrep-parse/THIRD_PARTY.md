@@ -2,13 +2,18 @@
 
 Direct dependency:
 
-- Source: [run-llama/liteparse](https://github.com/run-llama/liteparse/tree/a7105d3e3cfaf001970578c6615f6e71015aa483).
-- Git revision: `a7105d3e3cfaf001970578c6615f6e71015aa483`.
-- Core version: `2.14.6`; `liteparse-pdfium` / `liteparse-pdfium-sys`: `1.11.0`.
+- Source: [run-llama/liteparse](https://github.com/run-llama/liteparse/tree/ab8879623ee45a0b7a775d12b42a9a7ae9dab16b).
+- Git revision: `ab8879623ee45a0b7a775d12b42a9a7ae9dab16b`.
+- Core version: `2.15.1`; `liteparse-pdfium` / `liteparse-pdfium-sys`: `1.11.0`.
 - License: Apache-2.0; full upstream text retained in
   [licenses/LiteParse-APACHE-2.0.txt](licenses/LiteParse-APACHE-2.0.txt).
 - Build profile: `default-features = false`; no Tesseract or ONNX OCR feature.
-- No changes to the upstream source were made for this adapter.
+- Upstream reference checkouts remain unchanged. The workspace uses a narrow
+  owned copy of the pinned PDFium wrapper exposing an allocation-free annotation
+  count, admitted document Info/page-label/outline getters, admitted font info
+  and checked page-object/segment accessors (see `modifications` in
+  `UPSTREAM.json`); its source hashes, patch scope and Apache-2.0 notice are
+  retained in [vendor/liteparse-pdfium](../../vendor/liteparse-pdfium/UPSTREAM.json).
 
 The adapter relies on the public APIs in `crates/liteparse/src/lib.rs`,
 `parser.rs`, `config.rs`, `types.rs` and `layout.rs`. These exact source contracts
@@ -38,3 +43,17 @@ into a different platform package.
 
 The synthetic PDF fixture generator in the Rust tests is original GPTgrep code;
 no upstream benchmark PDF or dataset has been copied into this crate.
+
+The rich image adapter uses the existing exact registry dependency `image`
+`0.25.10` with only PNG/JPEG features. Its selected decoder packages are `png`
+`0.18.1` and `zune-jpeg` `0.5.15`; Cargo.lock binds their registry checksums and
+transitive dependencies. Restricted baseline JPEG preparation decodes with the
+direct `zune-jpeg` 0.5.15 dependency in strict mode after GPTgrep's own entropy
+validator; JPEG crop remains unavailable.
+The small streaming PDF writer, container admission
+scan and synthetic image fixtures are original GPTgrep code. No decoder source
+is copied or changed. The inspected package manifests declare the image and PNG
+licenses as MIT OR Apache-2.0, and zune-jpeg/zune-core as MIT OR Apache-2.0 OR
+Zlib. Selected JPEG decoder notices must accompany
+binary redistribution together with the dependency license closure. This
+source delivery does not replace the release packaging notice gate.

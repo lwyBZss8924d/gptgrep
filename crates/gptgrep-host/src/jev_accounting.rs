@@ -65,7 +65,11 @@ pub struct JevReport {
     /// Logical client-call attempts, not proof that an HTTP request was sent.
     pub attempted_calls: usize,
     pub unobserved_attempts: usize,
+    /// Served (provider-returned) Decisions builds of validated responses.
     pub models: Vec<String>,
+    /// Requested Decisions selectors of all attempts, reported separately.
+    #[serde(default)]
+    pub requested_models: Vec<String>,
     pub usage: Vec<Value>,
     pub accounting_complete: bool,
     pub searches: Vec<SearchTelemetry>,
@@ -473,11 +477,22 @@ impl Accounting {
             ),
             "host_jev_plan_operation_invalid"
         );
+        // One logical call per operation; an admitted bounded transient retry
+        // adds exactly one attempt, recorded with its failed predecessor.
+        let retried = event.metrics.jev_retried_attempts.len();
         ensure!(
             matches!(
                 event.event.as_str(),
-                "admitted" | "before_call" | "after_reply" | "finished" | "failed" | "interrupted"
-            ) && event.metrics.jev_calls_attempted <= 1
+                "admitted"
+                    | "before_call"
+                    | "before_retry"
+                    | "after_reply"
+                    | "finished"
+                    | "failed"
+                    | "interrupted"
+            ) && retried <= 1
+                && event.metrics.jev_calls_attempted <= 1 + retried
+                && event.metrics.jev_requests <= 1
                 && event.metrics.jev_requests <= event.metrics.jev_calls_attempted,
             "host_jev_plan_event_invalid"
         );
@@ -494,7 +509,8 @@ impl Accounting {
             ensure!(
                 prior.query_sha256 == event.query_sha256
                     && prior.metrics.jev_calls_attempted <= event.metrics.jev_calls_attempted
-                    && prior.metrics.jev_requests <= event.metrics.jev_requests,
+                    && prior.metrics.jev_requests <= event.metrics.jev_requests
+                    && prior.metrics.jev_retried_attempts.len() <= retried,
                 "host_jev_plan_event_regressed"
             );
         }
@@ -680,7 +696,11 @@ impl Accounting {
             && matches!(report.mode.as_str(), "hybrid" | "semantic")
         {
             "no_candidates"
-        } else if report.hits.is_empty() && report.coverage.reranked_candidates > 0 {
+        } else if report.coverage.reranked_candidates > 0
+            && (report.hits.is_empty() || report.coverage.below_threshold_fallback > 0)
+        {
+            // No candidate met the relevance floor; any delivered hits are the
+            // flagged low-confidence fallback.
             "filtered_all"
         } else if matches!(report.mode.as_str(), "hybrid" | "semantic") {
             "reranked"
@@ -701,6 +721,7 @@ impl Accounting {
             .0
             .lock()
             .map_err(|_| anyhow!("host_jev_ledger_unavailable"))?;
+        let elapsed_ms = state.search_started[index].elapsed().as_millis();
         let search = &mut state.searches[index];
         search.status = "failed".into();
         search.accounting_complete = false;
@@ -718,10 +739,31 @@ impl Accounting {
             search.stage = error.stage.clone();
             search.document_scope = error.document_scope.clone();
             search.generation = error.generation.clone();
-            search
+            let plan = search
                 .plan
-                .get_or_insert_with(PlannedSearchTelemetry::default)
-                .coverage = Some(error.coverage.clone());
+                .get_or_insert_with(PlannedSearchTelemetry::default);
+            plan.coverage = Some(error.coverage.clone());
+            // The core retains each operation's latest observation, including one
+            // whose durable receipt was refused or never written. Keep the larger
+            // view of every operation so no attempt or validated usage is lost.
+            for operation in &error.operations {
+                let newer = plan
+                    .operations
+                    .get(&operation.operation_id)
+                    .is_none_or(|prior| {
+                        prior.metrics.jev_calls_attempted <= operation.metrics.jev_calls_attempted
+                            && prior.metrics.jev_requests <= operation.metrics.jev_requests
+                            && prior.metrics.jev_retried_attempts.len()
+                                <= operation.metrics.jev_retried_attempts.len()
+                    });
+                if newer {
+                    let mut operation = operation.clone();
+                    operation.evidence_roles = None;
+                    plan.operations
+                        .insert(operation.operation_id.clone(), operation);
+                }
+            }
+            search.metrics = plan_metrics(&plan.operations, elapsed_ms);
         }
         if let Some(diagnostics) = search
             .plan
@@ -750,7 +792,12 @@ impl Accounting {
         state.searches[index] = search.clone();
         let current = &mut state.searches[index];
         if current.plan.is_some() && current.status == "awaiting_delivery" {
-            current.status = if current.delivered_hits == 0 {
+            let fallback = current
+                .plan
+                .as_ref()
+                .and_then(|plan| plan.coverage.as_ref())
+                .is_some_and(|coverage| coverage.below_threshold_fallback > 0);
+            current.status = if current.delivered_hits == 0 || fallback {
                 "filtered_all"
             } else {
                 "reranked"
@@ -836,8 +883,14 @@ fn plan_metrics(operations: &BTreeMap<String, PlannedSearchEvent>, elapsed_ms: u
             .jev_models
             .extend(operation.metrics.jev_models.iter().cloned());
         metrics
+            .jev_requested_models
+            .extend(operation.metrics.jev_requested_models.iter().cloned());
+        metrics
             .jev_usage
             .extend(operation.metrics.jev_usage.iter().cloned());
+        metrics
+            .jev_retried_attempts
+            .extend(operation.metrics.jev_retried_attempts.iter().cloned());
     }
     metrics
 }
@@ -857,6 +910,10 @@ fn summarize(searches: &[SearchTelemetry]) -> JevReport {
         .iter()
         .flat_map(|s| s.metrics.jev_models.iter().cloned())
         .collect();
+    let requested_models: BTreeSet<_> = searches
+        .iter()
+        .flat_map(|s| s.metrics.jev_requested_models.iter().cloned())
+        .collect();
     JevReport {
         required: true,
         initial_status: searches
@@ -868,6 +925,7 @@ fn summarize(searches: &[SearchTelemetry]) -> JevReport {
         attempted_calls,
         unobserved_attempts: attempted_calls.saturating_sub(requests),
         models: models.into_iter().collect(),
+        requested_models: requested_models.into_iter().collect(),
         usage: searches
             .iter()
             .flat_map(|s| s.metrics.jev_usage.iter().cloned())
@@ -885,7 +943,9 @@ fn summarize_state(state: &State) -> JevReport {
             .attempted_calls
             .saturating_sub(navigation.requests);
         let mut models: BTreeSet<_> = summary.models.into_iter().collect();
+        let mut requested: BTreeSet<_> = summary.requested_models.into_iter().collect();
         for batch in &navigation.batches {
+            requested.insert(batch.requested_model.clone());
             if let Some(model) = &batch.model {
                 models.insert(model.clone());
                 summary
@@ -894,6 +954,7 @@ fn summarize_state(state: &State) -> JevReport {
             }
         }
         summary.models = models.into_iter().collect();
+        summary.requested_models = requested.into_iter().collect();
         summary.accounting_complete &= navigation.accounting_complete();
     }
     summary
@@ -1038,7 +1099,9 @@ mod evidence_role_storage_tests {
         let index = accounting
             .start_search("initial", QUESTION, "hybrid", None, true)
             .unwrap();
-        let (client, server) = mock_roles(1).await;
+        // One document: the view selects it without a routing call, so the
+        // mixed request is the first and only admission.
+        let (client, server) = mock_roles(0).await;
         let observer = |event: &PlannedSearchEvent| {
             if event.evidence_roles.is_some() && event.event == "before_call" {
                 accounting.0.lock().unwrap().bytes = 4 * 1024 * 1024 - 4096;
@@ -1057,13 +1120,13 @@ mod evidence_role_storage_tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(server.await.unwrap().len(), 1);
+        assert_eq!(server.await.unwrap().len(), 0);
         let failure = error
             .downcast_ref::<gptgrep_core::PlannedSearchError>()
             .unwrap();
         assert!(failure.cause.contains("observer"));
-        assert_eq!(failure.metrics.jev_requests, 1);
-        assert_eq!(accounting.summary().requests, 1);
+        assert_eq!(failure.metrics.jev_requests, 0);
+        assert_eq!(accounting.summary().requests, 0);
         assert!(!accounting.summary().accounting_complete);
     }
 
@@ -1075,7 +1138,8 @@ mod evidence_role_storage_tests {
             .start_search("initial", QUESTION, "hybrid", None, true)
             .unwrap();
         let ledger = accounting.path();
-        let (client, server) = mock_roles(2).await;
+        // One document: no routing call; the mixed union request is the only one.
+        let (client, server) = mock_roles(1).await;
         let observer = |event: &PlannedSearchEvent| {
             if event.evidence_roles.is_some() && event.event == "after_reply" {
                 accounting.0.lock().unwrap().file = File::open(&ledger).unwrap();
@@ -1094,7 +1158,7 @@ mod evidence_role_storage_tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(server.await.unwrap().len(), 2);
+        assert_eq!(server.await.unwrap().len(), 1);
         assert!(
             error
                 .downcast_ref::<gptgrep_core::PlannedSearchError>()
@@ -1103,8 +1167,16 @@ mod evidence_role_storage_tests {
                 .contains("observer")
         );
         let summary = accounting.summary();
-        assert_eq!(summary.requests, 2);
-        assert_eq!(summary.usage.len(), 2);
+        assert_eq!(summary.requests, 1);
+        assert_eq!(summary.usage.len(), 1);
+        // Served builds and requested selectors are reported separately.
+        assert_eq!(summary.requested_models, [gptgrep_jev::DEFAULT_MODEL]);
+        assert!(
+            summary
+                .models
+                .iter()
+                .all(|model| model != gptgrep_jev::DEFAULT_MODEL)
+        );
         assert!(!summary.accounting_complete);
         let plan = summary.searches[0].plan.as_ref().unwrap();
         assert!(

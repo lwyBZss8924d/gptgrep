@@ -1,0 +1,391 @@
+{
+  "binary": {
+    "bytes": 307804160,
+    "sha256": "23c599a6a6ddbdbd165c16c6ac73994ffc4bea9dcfdaa0840ec3444c48dc1d6c"
+  },
+  "effective_derived_build_version": "0.162.1-gptgrep.1",
+  "files": [
+    {
+      "postimage": {
+        "bytes": 409981,
+        "sha256": "6b14a5a05e437bc4c9d18f8134a827d5a044db86ac40f330c65b141d5c558caa"
+      },
+      "preimage": {
+        "bytes": 408033,
+        "sha256": "49fe417bcafe3f69f1f6636e23274f90d37e75e388127a76888c39001a4f8117"
+      },
+      "relative_path": "codex-rs/Cargo.lock"
+    },
+    {
+      "postimage": {
+        "bytes": 21065,
+        "sha256": "08b8ecf7dc72ce2b6e8a39c8fb1fb0183d1aaeef9c785efca36fae9824eb7873"
+      },
+      "preimage": {
+        "bytes": 21055,
+        "sha256": "c31fb138f0167e885a0dd349534b615a265f4190e7264a112070e7ea57188b05"
+      },
+      "relative_path": "codex-rs/Cargo.toml"
+    },
+    {
+      "postimage": {
+        "bytes": 11387,
+        "sha256": "28f409b5decb550ddc0dfd9e8f6b0e4344ad09a2ab804f3f478727c72eb57f6a"
+      },
+      "preimage": {
+        "bytes": 8916,
+        "sha256": "e0642bd1bc7dbe5e24d508420471d705d5688efe8df3a8b40e3af22be55d7754"
+      },
+      "relative_path": "codex-rs/app-server-protocol/src/protocol/v1.rs"
+    },
+    {
+      "postimage": {
+        "bytes": 21463,
+        "sha256": "11ec00a21b6bc5311429704af8f2d4a10f1c5b0c432de9d5c25e45e9ae809837"
+      },
+      "preimage": {
+        "bytes": 21366,
+        "sha256": "3d9696a60255f90404ffd00864b426242963f1ea54fe0d54eb635574ec6e08e8"
+      },
+      "relative_path": "codex-rs/app-server-transport/src/transport/mod.rs"
+    },
+    {
+      "postimage": {
+        "bytes": 14380,
+        "sha256": "51fa4051ee354cb306c06391df0c90edd66233512ec71948b065c32980592d05"
+      },
+      "preimage": {
+        "bytes": 14283,
+        "sha256": "8b70f1c75559633c6c834688e716d4d514ed2c76da07c3badf238e77029a6499"
+      },
+      "relative_path": "codex-rs/app-server-transport/src/transport/remote_control/segment_tests.rs"
+    },
+    {
+      "postimage": {
+        "bytes": 112602,
+        "sha256": "025f8c42872618adddf08ddb4ad8edf5ee43d0eab67998f3180fac94ae0a3a0b"
+      },
+      "preimage": {
+        "bytes": 112489,
+        "sha256": "fb6ecfa8276550bd6390992e2dd35b2c06f5736aae21a5bb0cc1ce53da65d16a"
+      },
+      "relative_path": "codex-rs/app-server-transport/src/transport/remote_control/tests.rs"
+    },
+    {
+      "postimage": {
+        "bytes": 11417,
+        "sha256": "3549fc87dec4112171bdbee771c4cbe107a4c2e5574ac5c7fcf19910ebe515ba"
+      },
+      "preimage": {
+        "bytes": 10926,
+        "sha256": "4535560b07ab10d1538acd461560a55c1bdf0c9b4049e72775d6b770421f117f"
+      },
+      "relative_path": "codex-rs/app-server/src/request_processors/initialize_processor.rs"
+    },
+    {
+      "postimage": {
+        "bytes": 12846,
+        "sha256": "8c6f7aeeb81105f7603e50186c90b39ca0013841b12a12f49ed6e93896caacf1"
+      },
+      "preimage": {
+        "bytes": 12824,
+        "sha256": "1d98c17b6f664b354befb033ba5fdccc77b378f3746a1b1e6c8d1c34dfa724dc"
+      },
+      "relative_path": "codex-rs/app-server/tests/suite/v2/initialize.rs"
+    },
+    {
+      "postimage": {
+        "bytes": 7823,
+        "sha256": "9876832a7aae461e015ba5260ca56ee6c0778b141d0794f545c67cf82e9e8c9a"
+      },
+      "preimage": {
+        "bytes": 7806,
+        "sha256": "9a2e4f4ccef98e34709bec522554729bfdfd188bb92b7db87ddc7bab87f866e6"
+      },
+      "relative_path": "codex-rs/apply-patch/src/file_update.rs"
+    },
+    {
+      "postimage": {
+        "bytes": 46208,
+        "sha256": "6aac3131d2ae7ceef37ff4ab47e3d54c8e72eafbe9b7fd691621b81b04d7e945"
+      },
+      "preimage": {
+        "bytes": 46157,
+        "sha256": "81eeac02181ffb6b1c8e1bdb18457372f11ef800f18675f77f0e10f3ee5dd9f2"
+      },
+      "relative_path": "codex-rs/apply-patch/src/lib.rs"
+    },
+    {
+      "postimage": {
+        "bytes": 14242,
+        "sha256": "463cd1adcebfcbf81b967b5db6d4cbf881ad4e46fa6d8f638f8e38938cfcd195"
+      },
+      "preimage": {
+        "bytes": 14178,
+        "sha256": "6d2bdb9fdbd443120b73734d13ba19912ef6883553df92a926a2fa887d61a6b6"
+      },
+      "relative_path": "codex-rs/codex-api/src/common.rs"
+    },
+    {
+      "postimage": {
+        "bytes": 6571,
+        "sha256": "a5490994bbeffc2ffbfc5a57d4feddee8545d84ae440ddf05c99271168e53d27"
+      },
+      "preimage": {
+        "bytes": 6543,
+        "sha256": "9eb742e8253e80b764c30b71e52345adcf766e09de0104a39b0b908528ec82da"
+      },
+      "relative_path": "codex-rs/core/Cargo.toml"
+    },
+    {
+      "postimage": {
+        "bytes": 120333,
+        "sha256": "d2af2427dbfdc1dc25da38df078e8751a4de6e7fbd3c6b1e6db293ada2c0a937"
+      },
+      "preimage": {
+        "bytes": 119673,
+        "sha256": "6ca16eb5fb185192738d321c22eacf74664e0ae2c107176c1c8a7f23fde33089"
+      },
+      "relative_path": "codex-rs/core/src/client.rs"
+    },
+    {
+      "postimage": {
+        "bytes": 202666,
+        "sha256": "6251018a562bc6692f3b975f260e0ad9f376700e6bc608f67ea022b4c879f4ab"
+      },
+      "preimage": {
+        "bytes": 202569,
+        "sha256": "32babb117ff4bf0dc08050c4a755f5996f57f51fcebb82595c81648420394259"
+      },
+      "relative_path": "codex-rs/core/src/config/mod.rs"
+    },
+    {
+      "postimage": {
+        "bytes": 16299,
+        "sha256": "d3e266096834acd0f1334cd1501135a5f411bbf7b12696daa0d3a048e365f247"
+      },
+      "preimage": {
+        "bytes": 15719,
+        "sha256": "374a37531788b488920a232a925cd79d2f52693b3b229847f4f4b0857382db11"
+      },
+      "relative_path": "codex-rs/core/src/image_preparation.rs"
+    },
+    {
+      "postimage": {
+        "bytes": 9043,
+        "sha256": "a9555a78eb4a20b149734673fc3d486c5900e6a01f9fd0101fe65285987979d2"
+      },
+      "preimage": {
+        "bytes": 9023,
+        "sha256": "fc60777de96a035b5e5e91df3b39a45cc41460fb4f97a772a580fc64b7a8f608"
+      },
+      "relative_path": "codex-rs/core/src/lib.rs"
+    },
+    {
+      "postimage": {
+        "bytes": 87076,
+        "sha256": "fcb58626a1c3e355bddc459498a9f990aa3021e495c56a9f0bb8ccf86a8ee959"
+      },
+      "preimage": null,
+      "relative_path": "codex-rs/core/src/native_ocr.rs"
+    },
+    {
+      "postimage": {
+        "bytes": 63873,
+        "sha256": "ac41fca558cd62933f2cb2db4eeaa766f5089658d65cd369c8fc398d89e766a2"
+      },
+      "preimage": {
+        "bytes": 63745,
+        "sha256": "764ef09cd2a625e34d7d6f91637db631e22685996d8f504e8ddb4ad93367955b"
+      },
+      "relative_path": "codex-rs/core/src/session/turn_context.rs"
+    },
+    {
+      "postimage": {
+        "bytes": 21934,
+        "sha256": "bf8005fa43e8502a39de0d6063d4f1b19427961f8a2ba21c87dbf2005c4989aa"
+      },
+      "preimage": {
+        "bytes": 21077,
+        "sha256": "177f9e3e23ccdce9c3fceb43dbe69f7c21ee6f90b33f0b940a588437c3e8ac18"
+      },
+      "relative_path": "codex-rs/core/src/stream_events_utils.rs"
+    },
+    {
+      "postimage": {
+        "bytes": 20108,
+        "sha256": "68f665b5c51f4cf32a45063cbb58ad7ba81d19f12d106a6434352a1f49483c7b"
+      },
+      "preimage": {
+        "bytes": 19237,
+        "sha256": "788b24418a885ef75109a3b71de366119fa733f9e91c6f0de142d437835258db"
+      },
+      "relative_path": "codex-rs/core/src/tools/handlers/view_image.rs"
+    },
+    {
+      "postimage": {
+        "bytes": 32474,
+        "sha256": "87f6db257597fb6d9a0f9394ab49ed807b10c8abe1276f0d638e8415265f1899"
+      },
+      "preimage": {
+        "bytes": 31760,
+        "sha256": "6005ef16dd58e18e4dbe8bfc8429cdc5083ef320694ae0babbde2d70a2f86346"
+      },
+      "relative_path": "codex-rs/core/src/tools/registry.rs"
+    },
+    {
+      "postimage": {
+        "bytes": 75494,
+        "sha256": "218be3b5e5db117da255f6f850b0bd2584fe3c135b82d9aa40bc749e5dc8bc8a"
+      },
+      "preimage": {
+        "bytes": 75239,
+        "sha256": "23982d8b73c25c6a3744514fc3106bd8c40efa00c6edb608d8aac526fd74ec5c"
+      },
+      "relative_path": "codex-rs/exec-server-protocol/src/protocol.rs"
+    },
+    {
+      "postimage": {
+        "bytes": 18531,
+        "sha256": "0aad58c2f08ab57206d783f3bfef8ed5602549c826ffe672b19a5703b6c27b06"
+      },
+      "preimage": {
+        "bytes": 18478,
+        "sha256": "80804a6be4677d99d95697fa70f61b028f1c3e7f5f2d16d09960789369d9d454"
+      },
+      "relative_path": "codex-rs/exec-server/src/fs_helper.rs"
+    },
+    {
+      "postimage": {
+        "bytes": 2422,
+        "sha256": "ba1a411b5a40fecd17642ba8199f1e1b41cf89b7b1eff2752d195a8943ed8a2c"
+      },
+      "preimage": {
+        "bytes": 2363,
+        "sha256": "d7ec29392fade077756cfd1312ae9d8fbeb61dcbd9d7e3ecbd386f30c4d10072"
+      },
+      "relative_path": "codex-rs/exec-server/src/local_file_system_read.rs"
+    },
+    {
+      "postimage": {
+        "bytes": 4287,
+        "sha256": "e90c1d86d2502683c445f7d2cccfa05a9a6cb8848b307bd92aff1d78876c39e0"
+      },
+      "preimage": {
+        "bytes": 3033,
+        "sha256": "e5168e792707de3cfc3c07174dca8953d558c27be8a062f7a728bf10f2488b3e"
+      },
+      "relative_path": "codex-rs/exec-server/src/local_file_system_read_tests.rs"
+    },
+    {
+      "postimage": {
+        "bytes": 16018,
+        "sha256": "6e48c7b8ac7f6720829a04d95b1e773b805c3f0838dafd2899064201542f2cda"
+      },
+      "preimage": {
+        "bytes": 15968,
+        "sha256": "4be3c98e04bdb8a225c3e53dd90506e197a37f2717d57619d21db9501d65c93a"
+      },
+      "relative_path": "codex-rs/exec-server/src/remote_file_system.rs"
+    },
+    {
+      "postimage": {
+        "bytes": 35513,
+        "sha256": "e333904d39404af667fc65d92505b8cc7a43095f2961eded9e0afa93cc531e38"
+      },
+      "preimage": {
+        "bytes": 35455,
+        "sha256": "544ea6ad69e7d1161d6a6c92bd37fe11fcc6bb150c4f961fb331c2dd6287eb59"
+      },
+      "relative_path": "codex-rs/exec-server/src/remote_file_system_path_uri_tests.rs"
+    },
+    {
+      "postimage": {
+        "bytes": 15446,
+        "sha256": "b35a7046e3c39a5e2e636593cc125425a4a90f0c6f90d1f2bbe531d09be4202c"
+      },
+      "preimage": {
+        "bytes": 15396,
+        "sha256": "c1b49d14f87a7e4daea947bca4312d42db51796e773cf685b168051733168c29"
+      },
+      "relative_path": "codex-rs/exec-server/src/sandboxed_file_system.rs"
+    },
+    {
+      "postimage": {
+        "bytes": 15161,
+        "sha256": "b021e9046d6c8c02ec25d06382a5a8a18389f71d00ec0b14062bc8c362d2b7e4"
+      },
+      "preimage": {
+        "bytes": 15071,
+        "sha256": "ff85733dc19a40b01f5f8bc70a5c4ec26a7b0b353090c9481c4ac3a407f8c342"
+      },
+      "relative_path": "codex-rs/exec-server/src/server/file_system_handler.rs"
+    },
+    {
+      "postimage": {
+        "bytes": 4973,
+        "sha256": "77f6cf6f020d23a142cd1b70633ff0b6d3c88582ffe3c921ba90fcfd9a97e49e"
+      },
+      "preimage": {
+        "bytes": 4944,
+        "sha256": "df7e95f1e23ee283ff5175a7c563216159169ffd820833e64aec30b3303c3f9e"
+      },
+      "relative_path": "codex-rs/exec-server/tests/forward.rs"
+    },
+    {
+      "postimage": {
+        "bytes": 16103,
+        "sha256": "f295539c2beef3f5b967151e4f25214cef82c1a85a0509f49940405153779ee5"
+      },
+      "preimage": {
+        "bytes": 16074,
+        "sha256": "1f7a8f12819f2c6464c8c3981b8bc0a12cb26e06e1ea9d472cbfe167a6bacd90"
+      },
+      "relative_path": "codex-rs/exec-server/tests/relay.rs"
+    },
+    {
+      "postimage": {
+        "bytes": 25892,
+        "sha256": "ef97e7c8723b76087e079dc732a3ffc16f4722f17ff3e77ce4f57080948a1b89"
+      },
+      "preimage": {
+        "bytes": 25748,
+        "sha256": "9b7fe888858c41554318ba039f468266aa067ceccc781131cd022ef87ca6b16c"
+      },
+      "relative_path": "codex-rs/file-system/src/lib.rs"
+    }
+  ],
+  "guard_source": {
+    "bytes": 87076,
+    "sha256": "fcb58626a1c3e355bddc459498a9f990aa3021e495c56a9f0bb8ccf86a8ee959"
+  },
+  "license_notice": [
+    {
+      "bytes": 10926,
+      "git_blob": "4606e72e042564097e8780d66c1d4dcb611869bd",
+      "relative_path": "LICENSE",
+      "sha256": "d17f227e4df5da1600391338865ce0f3055211760a36688f816941d58232d8dc"
+    },
+    {
+      "bytes": 242,
+      "git_blob": "2805899d56d0332d175cfc613c67d45d6f006db7",
+      "relative_path": "NOTICE",
+      "sha256": "9d71575ecfd9a843fc1677b0efb08053c6ba9fd686a0de1a6f5382fd3c220915"
+    }
+  ],
+  "models_manager_whole_client_version": "0.162.1",
+  "observed_build_profile": "dev-small",
+  "observed_build_target": "aarch64-apple-darwin",
+  "patch": {
+    "bytes": 144098,
+    "relative_path": "codex-native-guard-v0.162.1.patch",
+    "sha256": "d6d82e783da12ead5edc4bf97974b23ebf0f9023799d1086ee0b4ee95ca97e31"
+  },
+  "postimages_match_observed_build": true,
+  "protocol_schema_sha256": "5b2d2cfaf332595f8c53f6c62c3909749e36b0a955f1dd4f6b0627976668cf49",
+  "scope": "Strict native Page/Document guard and unchanged ready ABI; explicit Document duration 1..3600 seconds with Page fixed at 180; native accounting hook; typed initialize compiler repair; truthful derived Cargo version plus exact workspace lock refresh. No clientInfo spoof, guard relaxation, machine paths, runtime identities or corpus literals.",
+  "upstream_release": "rust-v0.162.1",
+  "upstream_repository": "https://github.com/openai/codex.git",
+  "upstream_revision": "092d3acd6bec3e3a14bdc7e7a2810ab628ab759d",
+  "upstream_tree": "572cdecd45cd985f0ad80b63d8b86ffcb345f47a"
+}

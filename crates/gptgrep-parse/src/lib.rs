@@ -10,10 +10,77 @@ use gptgrep_pageindex::{
 use liteparse::{LiteParse, LiteParseConfig, OutputFormat, types::PdfInput};
 use std::path::{Path, PathBuf};
 
-pub const NATIVE_PARSER: &str = "liteparse-2.14.6/layout-v1";
-pub const LITEPARSE_REVISION: &str = "a7105d3e3cfaf001970578c6615f6e71015aa483";
-/// An explicit resource limit, checked before parsing. Never silently truncate.
-pub const MAX_NATIVE_PAGES: u32 = 100_000;
+mod artifact;
+mod crop;
+mod document_metadata;
+#[cfg(test)]
+mod document_metadata_tests;
+mod geometry;
+mod image_prepare;
+#[cfg(test)]
+mod image_prepare_tests;
+mod native_crop;
+pub mod native_graphics;
+mod ocr;
+mod ocr_compat;
+mod office;
+mod resource;
+mod rich;
+#[cfg(test)]
+mod rich_tests;
+mod rich_text;
+
+pub use artifact::{ArtifactKind, ArtifactRef, FeatureState, artifact_id};
+pub use crop::{CropAdmission, CropOutput, CropRecipe, PixelCrop, crop_rendition};
+pub use document_metadata::{
+    DOCUMENT_METADATA_NATIVE_RECIPE, DOCUMENT_METADATA_SCHEMA, MAX_NATIVE_BOOKMARK_DEPTH,
+    MAX_NATIVE_BOOKMARKS, NativeBookmark, NativeBookmarkDestination, NativeDocumentMetadata,
+    NativePageLabel, document_metadata_native_profile_digest, validate_native_document_metadata,
+};
+pub use geometry::{AffineTransform, BoundingBox, PageGeometry};
+pub use image_prepare::image_preparation_profile_digest;
+pub use liteparse::stages::PageComplexityStats as NativePageComplexity;
+pub use liteparse::types::{Page as NativeLayoutPage, WordBox as NativeWordBox};
+pub use native_crop::{
+    NativeOcrCrop, NativeOcrCropProof, create_native_ocr_crop, validate_native_crop_proof,
+    validate_native_crop_proof_metadata, validate_native_crop_set,
+};
+pub use native_graphics::{
+    NATIVE_GRAPHICS_RECIPE, NativePageMetadata, native_graphics_profile_digest,
+    native_metadata_working_upper, validate_native_graphics_metadata,
+};
+pub use ocr::{
+    OcrExecutor, OcrImage, OcrImageDelivery, OcrNativeAgentReceipt, OcrNativeImageDelivery,
+    OcrNativeImageReference, OcrPageResult, OcrProfile, OcrReceipt, OcrRegion, OcrRegionResult,
+    OcrRegionStatus, OcrResultStatus, OcrTask, OcrTaskBudget, ocr_profile_digest, ocr_task_digest,
+    validate_ocr_result, validate_ocr_result_metadata, validate_ocr_task,
+    validate_ocr_task_metadata, validate_rendition, validate_rendition_metadata,
+};
+pub use ocr_compat::{
+    COMPATIBILITY_MODE, CompatibilityOcrRegion, CompatibilityOcrResult, CompatibilityOcrTask,
+    compatibility_task_digest, validate_compatibility_result,
+};
+pub use office::{is_office_extension, office_preparation_profile_digest};
+pub use resource::{NativeImageLimits, ResourceBudget};
+pub use rich::native_text_metadata::{
+    NATIVE_FONT_WORD_RECIPE, NativeBounds, NativeCharacter, NativeFontInfo, NativeGeometry,
+    NativeTextMetadata, native_font_word_profile_digest, validate_native_text_metadata,
+};
+pub use rich::{
+    ConversionIdentity, CoverageState, NativeCandidate, NativeOptions, NativePage, OcrMode,
+    OcrPlan, PreparationOptions, PreparedDocument, PreparedImageGeometry, PreparedSummary,
+    RICH_PARSER, RichParsedDocument, SegmentMap, extract_native, finalize_document,
+    native_page_complexity, prepare_document,
+};
+pub use rich_text::{
+    PlaintextMetadata, plaintext_native_profile_digest, plaintext_preparation_profile_digest,
+};
+
+pub const NATIVE_PARSER: &str = "liteparse-2.15.1/layout-v1";
+pub const LITEPARSE_REVISION: &str = "ab8879623ee45a0b7a775d12b42a9a7ae9dab16b";
+/// PDFium represents page counts and indices with signed 32-bit integers.
+/// This is a format/runtime representation bound, not a document resource policy.
+pub const MAX_NATIVE_PAGES: u32 = i32::MAX as u32;
 
 const TEXT_EXTENSIONS: &[&str] = &[
     "md", "mdx", "markdown", "txt", "rst", "adoc", "log", "json", "jsonl", "yaml", "yml", "toml",
@@ -39,7 +106,7 @@ fn extension(path: &Path) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
-fn is_plaintext(path: &Path) -> bool {
+pub(crate) fn is_plaintext(path: &Path) -> bool {
     if let Some(ext) = extension(path) {
         return TEXT_EXTENSIONS.contains(&ext.as_str());
     }
@@ -122,7 +189,7 @@ async fn parse_native(path: PathBuf, title: String) -> Result<ParsedDocument> {
     ensure!(total > 0, "document contains no pages: {}", path.display());
     ensure!(
         total <= MAX_NATIVE_PAGES,
-        "document has {total} pages, exceeding the explicit {MAX_NATIVE_PAGES}-page limit; no partial index was accepted"
+        "document page count cannot be represented by PDFium; no partial index was accepted"
     );
     let mut pages = Vec::new();
     let mut headings = Vec::new();
@@ -294,7 +361,7 @@ mod tests {
     // A tiny original fixture, generated here rather than copying a benchmark
     // document. Real PDFium parsing exercises the native dependency and page
     // citation contract; this is not a mocked parser acceptance test.
-    fn pdf_fixture(with_text: bool) -> Vec<u8> {
+    pub(super) fn pdf_fixture(with_text: bool) -> Vec<u8> {
         let content = |heading: &str, body: &str| {
             if with_text {
                 format!("BT /F1 22 Tf 72 720 Td ({heading}) Tj 0 -35 Td /F1 11 Tf ({body}) Tj ET")
@@ -319,7 +386,7 @@ mod tests {
         pdf_objects(&objects)
     }
 
-    fn pdf_objects(objects: &[String]) -> Vec<u8> {
+    pub(super) fn pdf_objects(objects: &[String]) -> Vec<u8> {
         let mut pdf = String::from("%PDF-1.4\n");
         let mut offsets = vec![0];
         for (index, object) in objects.iter().enumerate() {

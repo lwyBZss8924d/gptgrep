@@ -1,0 +1,3343 @@
+//! Synthetic protocol tests, authored only. These are not native/model proof.
+use super::*;
+use std::sync::{Arc, Mutex};
+const PRIVATE_BACKEND_ERROR: &str = "MOCK-private-backend-error /synthetic/private/source";
+struct Captured(Arc<Mutex<Vec<u8>>>);
+impl AsyncWrite for Captured {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.0
+            .lock()
+            .expect("synthetic writer")
+            .extend_from_slice(bytes);
+        std::task::Poll::Ready(Ok(bytes.len()))
+    }
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+struct Backend {
+    prepared: DocumentPreparedState,
+    calls: usize,
+    finalized: bool,
+    refuse: bool,
+    application_refusal: bool,
+    images: Vec<DocumentImageGrant>,
+}
+impl Backend {
+    fn new() -> Self {
+        Self {
+            prepared: DocumentPreparedState {
+                schema: "gptgrep.parse-agent.prepared-document.v1",
+                handle: "a".repeat(64),
+                task_sha256: "d".repeat(64),
+                source_sha256: "b".repeat(64),
+                prepared_sha256: "c".repeat(64),
+                original_pages: 137,
+                artifact_count: 300,
+                native_metadata_artifacts: 138,
+                required_ocr_tasks: 0,
+                original_rendition_artifacts: 0,
+            },
+            calls: 0,
+            finalized: false,
+            refuse: false,
+            application_refusal: false,
+            images: Vec::new(),
+        }
+    }
+}
+impl DocumentBackend for Backend {
+    fn prepared(&self) -> &DocumentPreparedState {
+        &self.prepared
+    }
+    fn images(&self) -> &[DocumentImageGrant] {
+        &self.images
+    }
+    fn reserve_retained(&self, _: u64) -> Result<()> {
+        Ok(())
+    }
+    fn call<'a>(
+        &'a mut self,
+        operation: DocumentToolOperation,
+    ) -> Pin<Box<dyn Future<Output = Result<DocumentToolReply>> + Send + 'a>> {
+        self.calls += 1;
+        Box::pin(async move {
+            if self.refuse {
+                return Err(anyhow!(PRIVATE_BACKEND_ERROR)
+                    .context("MOCK-private-backend-context")
+                    .context("parse_agent_operation_failed"));
+            }
+            if self.application_refusal
+                && matches!(
+                    operation,
+                    DocumentToolOperation::ReadArtifact { .. }
+                        | DocumentToolOperation::ReadMetadataWindow { .. }
+                )
+            {
+                let bytes = b"{\"ok\":false,\"error\":\"parse_toolbox_unknown_artifact\",\"guidance\":\"inspect_artifacts; use issued IDs\"}\n";
+                return Ok(DocumentToolReply {
+                    text: String::from_utf8(bytes.to_vec())?,
+                    image_url: None,
+                    source_frame_sha256: sha(bytes),
+                });
+            }
+            if matches!(operation, DocumentToolOperation::Finalize {}) {
+                self.finalized = true;
+            }
+            DocumentToolReply::from_core_frame(
+                b"{\"ok\":true,\"data\":{\"kind\":\"synthetic\"}}\n".to_vec(),
+                4096,
+            )
+        })
+    }
+    fn verify_complete(&self) -> Result<DocumentVerifiedProduct> {
+        ensure!(self.finalized, "synthetic not finalized");
+        Ok(DocumentVerifiedProduct {
+            handle: self.prepared.handle.clone(),
+            source_sha256: self.prepared.source_sha256.clone(),
+            prepared_sha256: self.prepared.prepared_sha256.clone(),
+            original_pages: 137,
+            delivered_pages: 0,
+            native_metadata_artifacts: 138,
+            native_metadata_complete: 0,
+            registered_ocr_tasks: 0,
+            inspected_ocr_tasks: 0,
+            required_ocr_complete: true,
+            parser_complete_original_pages: true,
+            all_source_artifacts_verified: true,
+            model_inspection_complete: false,
+        })
+    }
+}
+fn limits() -> DocumentAgentLimits {
+    DocumentAgentLimits {
+        timeout_ms: 900_000,
+        max_tool_calls: 64,
+        max_messages: 100,
+        incoming_frame_bytes: 65_536,
+        outgoing_frame_bytes: 4_194_304,
+        tool_argument_bytes: 4096,
+        tool_reply_bytes: 262_144,
+        total_rpc_bytes: 33_554_432,
+        working_bytes: 67_108_864,
+        tracking_bytes: 8_388_608,
+    }
+}
+fn control() -> Result<DocumentAgentControl> {
+    let clock = serde_json::from_value(
+        json!({"schema":"gptgrep.run-clock-anchor.v1","deadline_unix_ms":999999,
+        "clock_kind":"synthetic","boot_identity":"synthetic","clock_namespace":null,"monotonic_started_ns":1,"monotonic_deadline_ns":2}),
+    )?;
+    let file = DocumentFilePin {
+        path: "/synthetic/never-read".into(),
+        bytes: 1,
+        sha256: "f".repeat(64),
+    };
+    Ok(DocumentAgentControl {
+        schema: "gptgrep.parse-agent.document-control.v1".into(),
+        invocation_id: "synthetic".into(),
+        codex_bin: file.clone(),
+        runtime_profile: file.clone(),
+        model_descriptor: file.clone(),
+        permissions_config: file,
+        auth_home: "/synthetic/auth".into(),
+        state_dir: "/synthetic/state".into(),
+        cwd: "/synthetic/cwd".into(),
+        environment_id: "local".into(),
+        auth_mode: "chatgpt".into(),
+        requested_model: DOCUMENT_MODEL.into(),
+        reasoning_effort: "max".into(),
+        requested_service_tier: "fast".into(),
+        original_clock: clock,
+        deadline_unix_ms: 999999,
+        limits: limits(),
+        native_viewer: None,
+        native_execution: None,
+        document_image_qualification: None,
+    })
+}
+fn line(value: Value) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec(&value).expect("synthetic frame");
+    bytes.push(b'\n');
+    bytes
+}
+fn startup(auth: &str) -> Vec<u8> {
+    startup_with_thread(auth, thread_response())
+}
+fn thread_response() -> Value {
+    json!({"thread":{"id":"synthetic-thread"},"model":DOCUMENT_MODEL,"modelProvider":"openai",
+        "approvalPolicy":"never","activePermissionProfile":{"id":PERMISSIONS,"extends":null},
+        "sandbox":{"type":"readOnly","networkAccess":false},"reasoningEffort":"max","serviceTier":"priority"})
+}
+fn startup_with_thread(auth: &str, response: Value) -> Vec<u8> {
+    startup_with_config(auth, response, json!({"mcp_servers":{},"tools":{}}))
+}
+fn startup_with_config(auth: &str, response: Value, config: Value) -> Vec<u8> {
+    let mut script = Vec::new();
+    for value in [
+        json!({"id":1,"result":{}}),
+        json!({"id":2,"result":{"account":{"type":auth}}}),
+        json!({"id":3,"result":{"config":config}}),
+        json!({"id":4,"result":response}),
+        json!({"id":5,"result":{"turn":{"id":"synthetic-turn"}}}),
+    ] {
+        script.extend(line(value));
+    }
+    script
+}
+fn tool(call: &str, op: &str) -> Value {
+    json!({"id":101,"method":"item/tool/call","params":{"threadId":"synthetic-thread",
+    "turnId":"synthetic-turn","callId":call,"namespace":NAMESPACE,"tool":TOOL,"arguments":{"op":op}}})
+}
+fn finish() -> Vec<u8> {
+    finish_with_items(Vec::new())
+}
+fn finish_with_items(items: Vec<Value>) -> Vec<u8> {
+    let mut script = Vec::new();
+    script.extend(line(json!({"method":"item/completed","params":{"threadId":"synthetic-thread",
+    "turnId":"synthetic-turn","item":{"type":"agentMessage","id":"synthetic-answer","phase":"final_answer",
+    "text":json!({"status":"complete","handle":"a".repeat(64)}).to_string()}}})));
+    script.extend(line(
+        json!({"method":"turn/completed","params":{"threadId":"synthetic-thread",
+        "turn":{"id":"synthetic-turn","status":"completed","error":null,"items":items}}}),
+    ));
+    script
+}
+async fn replay(script: &[u8], backend: &mut Backend) -> Result<DocumentAgentOutcome> {
+    replay_captured(script, backend, Arc::new(Mutex::new(Vec::new()))).await
+}
+async fn replay_captured(
+    script: &[u8],
+    backend: &mut Backend,
+    captured: Arc<Mutex<Vec<u8>>>,
+) -> Result<DocumentAgentOutcome> {
+    let config = control()?;
+    replay_control(script, backend, captured, &config).await
+}
+async fn replay_control(
+    script: &[u8],
+    backend: &mut Backend,
+    captured: Arc<Mutex<Vec<u8>>>,
+    config: &DocumentAgentControl,
+) -> Result<DocumentAgentOutcome> {
+    let budget = TransportBudget::new(config.limits.total_rpc_bytes);
+    let writer = Captured(captured);
+    run_protocol(
+        script,
+        writer,
+        config,
+        backend,
+        DocumentRunBudget {
+            working: DocumentWorking::new(config.limits.working_bytes),
+            transport: budget,
+            deadline: Instant::now() + Duration::from_secs(30),
+        },
+        None,
+        None,
+    )
+    .await
+}
+
+fn named_workspace_projection() -> Value {
+    json!({"type":"workspaceWrite","writableRoots":[],"networkAccess":false,
+        "excludeTmpdirEnvVar":true,"excludeSlashTmp":true})
+}
+fn sent_frames(captured: &Arc<Mutex<Vec<u8>>>) -> Vec<Value> {
+    std::str::from_utf8(&captured.lock().unwrap())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn native_execution_control() -> Result<DocumentAgentControl> {
+    let mut config = control()?;
+    config.native_execution = Some(DocumentNativeExecution {
+        native_skills: Vec::new(),
+        native_runtime_package: None,
+        permission_profile: "synthetic-native".into(),
+        capabilities: BTreeMap::from([
+            ("features.code_mode.enabled".into(), json!(true)),
+            ("features.code_mode_host.enabled".into(), json!(true)),
+            ("features.plugins".into(), json!(true)),
+            ("features.apps".into(), json!(true)),
+            ("features.hooks".into(), json!(true)),
+            ("web_search".into(), json!("live")),
+        ]),
+    });
+    config.limits.timeout_ms = 3_600_000;
+    Ok(config)
+}
+fn native_execution_startup() -> Vec<u8> {
+    let mut response = thread_response();
+    response["activePermissionProfile"]["id"] = json!("synthetic-native");
+    response["sandbox"] = json!({"type":"dangerFullAccess","networkAccess":true});
+    startup_with_config(
+        "chatgpt",
+        response,
+        json!({
+            "mcp_servers":{"synthetic":{"enabled":true}},
+            "tools":{"synthetic_native_tool":{"enabled":true}},
+            "web_search":"live"
+        }),
+    )
+}
+fn item_event(method: &str, item: Value) -> Value {
+    json!({"method":method,"params":{"threadId":"synthetic-thread",
+        "turnId":"synthetic-turn","item":item}})
+}
+
+#[tokio::test]
+async fn native_document_inherits_capabilities_and_observes_tools_without_legacy_guard()
+-> Result<()> {
+    let config = native_execution_control()?;
+    let mut script = line(json!({"method":"mcpServer/startupStatus/updated",
+        "params":{"name":"synthetic","status":"ready"}}));
+    script.extend(line(json!({"method":"configWarning",
+        "params":{"summary":"Codex could not find bubblewrap on PATH.","details":null}})));
+    script.extend(native_execution_startup());
+    script.extend(line(json!({"method":"warning",
+        "params":{"threadId":"synthetic-thread","message":"Under-development features enabled: code_mode."}})));
+    script.extend(line(json!({"method":"error",
+        "params":{"threadId":"synthetic-thread","turnId":"synthetic-turn","willRetry":true,
+        "error":{"message":"Reconnecting... 1/5","codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":null}}}}})));
+    let native_items = [
+        json!({"type":"commandExecution","id":"native-command","status":"completed"}),
+        json!({"type":"imageView","id":"native-image"}),
+        json!({"type":"fileChange","id":"native-edit","status":"completed"}),
+        json!({"type":"mcpToolCall","id":"native-mcp","status":"completed"}),
+        json!({"type":"collabAgentToolCall","id":"native-agent","status":"completed"}),
+        json!({"type":"webSearch","id":"native-web"}),
+        json!({"type":"imageGeneration","id":"native-generation"}),
+        json!({"type":"sleep","id":"native-sleep"}),
+    ];
+    let mut started = native_items[0].clone();
+    started["status"] = json!("inProgress");
+    script.extend(line(item_event("item/started", started)));
+    script.extend(line(
+        json!({"method":"item/commandExecution/outputDelta","params":{
+        "threadId":"synthetic-thread","turnId":"synthetic-turn","delta":"synthetic progress"}}),
+    ));
+    script.extend(line(json!({"method":"hook/completed","params":{
+        "threadId":null,"turnId":null,"status":"completed"}})));
+    for item in &native_items {
+        script.extend(line(item_event("item/completed", item.clone())));
+    }
+    for kind in [
+        "hookPrompt",
+        "functionCallOutput",
+        "plan",
+        "subAgentActivity",
+        "enteredReviewMode",
+        "exitedReviewMode",
+        "contextCompaction",
+    ] {
+        script.extend(line(item_event(
+            "item/completed",
+            json!({"type":kind,"id":kind}),
+        )));
+    }
+    script.extend(line(tool("native-finalize", "finalize")));
+    script.extend(line(item_event(
+        "item/completed",
+        json!({
+            "type":"dynamicToolCall","id":"native-finalize","namespace":NAMESPACE,"tool":TOOL
+        }),
+    )));
+    script.extend(finish_with_items(native_items.to_vec()));
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let mut backend = Backend::new();
+    let result = replay_control(&script, &mut backend, captured.clone(), &config).await?;
+    assert_eq!(backend.calls, 1);
+    assert!(backend.finalized);
+    assert!(result.verified_product.all_source_artifacts_verified);
+    assert!(!result.verified_product.model_inspection_complete);
+    assert!(!result.native_viewer_enabled);
+    assert!(!result.native_receipts_verified);
+    assert!(!result.native_image_influence_qualified);
+    let report = result.native_ptc.as_ref().unwrap();
+    assert_eq!(report.native_tool_calls, 8);
+    assert_eq!(report.dynamic_requests_charged, 1);
+    assert_eq!(report.combined_tool_calls, 9);
+    assert_eq!(result.tool_submissions, 9);
+    assert!(report.successful_turn_completed_observed);
+    assert!(!report.pre_execution_guard);
+    assert!(!report.budget_exceeded);
+    assert!(
+        report
+            .items
+            .iter()
+            .all(|item| item.completed_observed && item.final_snapshot_observed)
+    );
+    assert_eq!(
+        result.permission_observation,
+        Some(json!({
+            "source":"native_thread_start","permission_profile":"synthetic-native",
+            "sandbox":{"type":"dangerFullAccess","networkAccess":true},
+            "granular_enforcement_verified":false
+        }))
+    );
+    let frames = sent_frames(&captured);
+    for method in ["thread/start", "turn/start"] {
+        let params = &frames
+            .iter()
+            .find(|frame| frame["method"] == method)
+            .unwrap()["params"];
+        assert_eq!(params["permissions"], "synthetic-native");
+        assert!(params.get("sandbox").is_none());
+        assert_eq!(params["model"], DOCUMENT_MODEL);
+        assert_eq!(params["serviceTier"], "fast");
+    }
+    let params = &frames
+        .iter()
+        .find(|frame| frame["method"] == "thread/start")
+        .unwrap()["params"];
+    assert_eq!(params["config"]["features.code_mode.enabled"], true);
+    assert_eq!(params["config"]["features.code_mode_host.enabled"], true);
+    assert_eq!(params["config"]["web_search"], "live");
+    assert!(params["config"].get("mcp_servers").is_none());
+    assert!(params["config"].get("cloud.skills.enabled").is_none());
+    assert!(params["config"].get("project_doc_max_bytes").is_none());
+    for key in [
+        "environments",
+        "runtimeWorkspaceRoots",
+        "selectedCapabilityRoots",
+    ] {
+        assert!(params.get(key).is_none());
+    }
+    assert_eq!(params["dynamicTools"], tools());
+    assert_eq!(params["baseInstructions"], NATIVE_INSTRUCTIONS);
+    assert!(!NATIVE_INSTRUCTIONS.contains("eight-tools"));
+    assert!(
+        !NATIVE_INSTRUCTIONS.contains("Do not use first-N/answer-location/benchmark priors, shell")
+    );
+    let command = command(&config, None)?;
+    let args = command
+        .as_std()
+        .get_args()
+        .map(|arg| arg.to_string_lossy())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        &args[..4],
+        &["app-server", "--listen", "stdio://", "--strict-config"]
+    );
+    assert!(
+        !args
+            .iter()
+            .any(|arg| arg.starts_with("model_catalog_json="))
+    );
+    assert!(
+        !args
+            .iter()
+            .any(|arg| arg.starts_with("permissions.gptgrep_native_document."))
+    );
+    let legacy_command = super::command(&control()?, None)?;
+    let legacy_args = legacy_command
+        .as_std()
+        .get_args()
+        .map(|arg| arg.to_string_lossy())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        &legacy_args[..3],
+        &["--listen", "stdio://", "--strict-config"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_document_shares_dynamic_and_observed_budgets_before_backend_dispatch() -> Result<()>
+{
+    for native_first in [true, false] {
+        let mut config = native_execution_control()?;
+        config.limits.max_tool_calls = 1;
+        let mut script = native_execution_startup();
+        let native = line(item_event(
+            "item/completed",
+            json!({"type":"imageView","id":"native-one"}),
+        ));
+        let dynamic = line(tool("native-finalize", "finalize"));
+        if native_first {
+            script.extend(native);
+            script.extend(dynamic);
+        } else {
+            script.extend(dynamic);
+            script.extend(native);
+        }
+        script.extend(finish());
+        let mut backend = Backend::new();
+        let error = replay_control(
+            &script,
+            &mut backend,
+            Arc::new(Mutex::new(Vec::new())),
+            &config,
+        )
+        .await
+        .err()
+        .expect("combined budget must fail");
+        assert_eq!(error.to_string(), "host_native_ptc_tool_budget_exhausted");
+        assert_eq!(backend.calls, usize::from(!native_first));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_document_requires_typed_finalization_complete_observations_and_profile_ack()
+-> Result<()> {
+    let config = native_execution_control()?;
+    for (finalize, complete) in [(false, true), (true, false)] {
+        let mut script = native_execution_startup();
+        script.extend(line(item_event(
+            if complete {
+                "item/completed"
+            } else {
+                "item/started"
+            },
+            json!({"type":"commandExecution","id":"native-one",
+                "status":if complete {"completed"} else {"inProgress"}}),
+        )));
+        if finalize {
+            script.extend(line(tool("native-finalize", "finalize")));
+        }
+        script.extend(finish());
+        let mut backend = Backend::new();
+        let error = replay_control(
+            &script,
+            &mut backend,
+            Arc::new(Mutex::new(Vec::new())),
+            &config,
+        )
+        .await
+        .err()
+        .expect("incomplete execution must fail");
+        assert_eq!(
+            error.to_string(),
+            if finalize {
+                "host_native_ptc_incomplete_item"
+            } else {
+                "synthetic not finalized"
+            }
+        );
+    }
+    let mut script = startup("chatgpt"); // The legacy ACK cannot acknowledge the selected native profile.
+    script.extend(line(tool("native-finalize", "finalize")));
+    script.extend(finish());
+    let mut backend = Backend::new();
+    let error = replay_control(
+        &script,
+        &mut backend,
+        Arc::new(Mutex::new(Vec::new())),
+        &config,
+    )
+    .await
+    .err()
+    .expect("wrong profile must fail");
+    assert_eq!(error.to_string(), "document_permission_profile");
+    assert_eq!(backend.calls, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_document_keeps_tool_namespace_and_legacy_native_item_refusals() -> Result<()> {
+    let config = native_execution_control()?;
+    let mut wrong_tool = tool("wrong-tool", "finalize");
+    wrong_tool["params"]["namespace"] = json!("unregistered");
+    let mut script = native_execution_startup();
+    script.extend(line(wrong_tool));
+    let mut backend = Backend::new();
+    let error = replay_control(
+        &script,
+        &mut backend,
+        Arc::new(Mutex::new(Vec::new())),
+        &config,
+    )
+    .await
+    .err()
+    .expect("wrong tool must fail");
+    assert_eq!(error.to_string(), "document_tool_namespace");
+    assert_eq!(backend.calls, 0);
+    let mut script = startup("chatgpt");
+    script.extend(line(item_event(
+        "item/completed",
+        json!({"type":"hookPrompt","id":"hook"}),
+    )));
+    let error = replay(&script, &mut backend)
+        .await
+        .err()
+        .expect("legacy mode remains restricted");
+    assert_eq!(error.to_string(), "document_native_tool_not_admitted");
+    Ok(())
+}
+
+#[test]
+fn native_document_bindings_are_explicit_and_legacy_controls_remain_optional() -> Result<()> {
+    let mut config = native_execution_control()?;
+    let execution = config.native_execution.as_ref().unwrap();
+    let bindings = document_native_execution_bindings(execution)?;
+    assert_eq!(
+        bindings.descriptor_sha256,
+        sha(&serde_json::to_vec(&bindings.model_descriptor)?)
+    );
+    assert_eq!(
+        bindings.permissions_config_sha256,
+        sha(&serde_json::to_vec(&bindings.permissions_config)?)
+    );
+    assert_eq!(
+        bindings.permissions_template_sha256,
+        sha(&serde_json::to_vec(&native::canonical(
+            bindings.permissions_config.clone()
+        ))?)
+    );
+    assert_eq!(bindings.tools_sha256, document_tool_policy_sha256()?);
+    assert_ne!(bindings.instructions_sha256, document_instructions_sha256());
+    assert_eq!(
+        bindings.model_descriptor["model_catalog"],
+        "selected_native_runtime_configuration"
+    );
+    assert_eq!(
+        bindings.permissions_config["default_permissions"],
+        execution.permission_profile
+    );
+    assert!(
+        bindings
+            .permissions_config
+            .get("permissions.synthetic-native.network.enabled")
+            .is_none()
+    );
+    let legacy = serde_json::to_value(control()?)?;
+    assert!(legacy.get("native_execution").is_none());
+    assert!(
+        serde_json::from_value::<DocumentAgentControl>(legacy)?
+            .native_execution
+            .is_none()
+    );
+    let default_overrides: DocumentNativeExecution =
+        serde_json::from_value(json!({"permission_profile":"synthetic-native"}))?;
+    assert!(default_overrides.capabilities.is_empty());
+    let mut overridden = default_overrides.clone();
+    overridden
+        .capabilities
+        .insert("features.shell_tool".into(), json!(false));
+    assert_eq!(
+        document_native_execution_bindings(&overridden)?.permissions_config["features.shell_tool"],
+        false
+    );
+    for profile in ["", "invalid profile", "invalid/profile"] {
+        let mut invalid = default_overrides.clone();
+        invalid.permission_profile = profile.into();
+        assert!(document_native_execution_bindings(&invalid).is_err());
+    }
+    config.document_image_qualification = Some(DocumentImageQualification {
+        path: "/synthetic/qualification".into(),
+        bytes: 1,
+        sha256: "f".repeat(64),
+    });
+    assert_eq!(
+        validate_execution_mode(&config).unwrap_err().to_string(),
+        "document_native_execution_exclusive"
+    );
+    config.document_image_qualification = None;
+    config.native_viewer = Some(DocumentNativeControl {
+        image_root: "/synthetic/images".into(),
+        receipt_root: "/synthetic/receipts".into(),
+        admission_path: "/synthetic/admission.json".into(),
+        image_catalog_path: "/synthetic/catalog.json".into(),
+        owner_admission_sha256: "f".repeat(64),
+        image_wire_bytes: 33_554_432,
+        image_limits: document_native_image_limits(&ResourceBudget::default(), 33_554_432)?,
+    });
+    assert_eq!(
+        validate_execution_mode(&config).unwrap_err().to_string(),
+        "document_native_execution_exclusive"
+    );
+    Ok(())
+}
+
+#[test]
+fn native_document_duration_uses_caller_limits_without_legacy_ceiling() -> Result<()> {
+    let mut config = native_execution_control()?;
+    let bindings = document_native_execution_bindings(config.native_execution.as_ref().unwrap())?;
+    let mut profile: RuntimeProfile = serde_json::from_value(json!({
+        "schema":"gptgrep.parse-agent.document-runtime-profile.v1",
+        "source_revision":"1".repeat(40),"protocol_schema_sha256":"2".repeat(64),
+        "codex_binary_sha256":config.codex_bin.sha256,
+        "descriptor_sha256":bindings.descriptor_sha256,
+        "permissions_config_sha256":bindings.permissions_config_sha256,
+        "permissions_template_sha256":bindings.permissions_template_sha256,
+        "tools_sha256":bindings.tools_sha256,"instructions_sha256":bindings.instructions_sha256,
+        "standalone_app_server":true
+    }))?;
+    config.limits.timeout_ms = 7_200_000;
+    assert_eq!(profile.selected_max_seconds(&config)?, 7200);
+    profile.max_seconds = Some(7200);
+    assert_eq!(profile.selected_max_seconds(&config)?, 7200);
+    config.limits.timeout_ms = 7_200_001;
+    assert!(profile.selected_max_seconds(&config).is_err());
+    profile.max_seconds = None;
+    assert_eq!(profile.selected_max_seconds(&config)?, 7201);
+    config.limits.timeout_ms = 86_400_001;
+    assert!(profile.selected_max_seconds(&config).is_err());
+    config.limits.timeout_ms = 7_200_000;
+    config.native_execution = None;
+    profile.max_seconds = Some(7200);
+    assert!(profile.selected_max_seconds(&config).is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn current_named_acknowledgments_and_typed_schemas_reach_one_document_turn() -> Result<()> {
+    for sandbox in [
+        json!({"type":"readOnly","networkAccess":false}),
+        named_workspace_projection(),
+    ] {
+        let mut response = thread_response();
+        response["sandbox"] = sandbox;
+        assert!(response.get("permissions").is_none());
+        let mut script = startup_with_thread("chatgpt", response);
+        script.extend(line(tool("finalize-one", "finalize")));
+        script.extend(finish());
+        let mut backend = Backend::new();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        replay_captured(&script, &mut backend, captured.clone()).await?;
+        assert_eq!(backend.calls, 1);
+        let sent = sent_frames(&captured);
+        for method in ["thread/start", "turn/start"] {
+            let messages = sent
+                .iter()
+                .filter(|value| value["method"] == method)
+                .collect::<Vec<_>>();
+            assert_eq!(messages.len(), 1);
+            let params = &messages[0]["params"];
+            assert_eq!(params["permissions"], PERMISSIONS);
+            assert_eq!(params["approvalPolicy"], "never");
+            assert!(params.get("sandbox").is_none());
+            assert!(params.get("sandboxPolicy").is_none());
+        }
+        let thread = sent
+            .iter()
+            .find(|value| value["method"] == "thread/start")
+            .unwrap();
+        let branches = thread["params"]["dynamicTools"][0]["tools"][0]["inputSchema"]["oneOf"]
+            .as_array()
+            .unwrap();
+        assert_eq!(branches.len(), 10);
+        let mut operations = BTreeSet::new();
+        for branch in branches {
+            assert_eq!(branch["type"], "object");
+            assert_eq!(branch["additionalProperties"], false);
+            let properties = &branch["properties"];
+            assert_eq!(properties["op"]["type"], "string");
+            operations.insert(properties["op"]["const"].as_str().unwrap());
+            if properties.get("page_size").is_some() {
+                assert_eq!(properties["page_size"]["minimum"], 1);
+                assert_eq!(properties["page_size"]["maximum"], 64);
+            }
+            if properties.get("max_bytes").is_some() {
+                assert_eq!(properties["max_bytes"]["maximum"], 32768);
+            }
+            if properties.get("section").is_some() {
+                assert_eq!(properties["section"]["type"], "string");
+                assert_eq!(
+                    properties["section"]["enum"],
+                    json!(["tasks", "pages", "blockers"])
+                );
+            }
+            if properties.get("bbox").is_some() {
+                assert_eq!(properties["bbox"]["additionalProperties"], false);
+                for coordinate in ["x", "y", "width", "height"] {
+                    assert_eq!(
+                        properties["bbox"]["properties"][coordinate]["type"],
+                        "number"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            operations,
+            [
+                "inspect_document",
+                "finalize",
+                "inspect_pages",
+                "inspect_artifacts",
+                "read_metadata_window",
+                "read_artifact",
+                "inspect_images",
+                "inspect_ocr_plan",
+                "execute_ocr",
+                "crop"
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+        );
+        let turn = sent
+            .iter()
+            .find(|value| value["method"] == "turn/start")
+            .unwrap();
+        assert_eq!(
+            turn["params"]["outputSchema"]["properties"]["status"],
+            json!({"type":"string","enum":["complete","blocked"]})
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn incompatible_document_profile_or_projection_refuses_before_turn() -> Result<()> {
+    let mut cases = vec![
+        (
+            "activePermissionProfile",
+            None,
+            "document_permission_profile",
+        ),
+        (
+            "activePermissionProfile",
+            Some(Value::Null),
+            "document_permission_profile",
+        ),
+        (
+            "activePermissionProfile",
+            Some(json!({})),
+            "document_permission_profile",
+        ),
+        (
+            "activePermissionProfile",
+            Some(json!({"id":"different"})),
+            "document_permission_profile",
+        ),
+        (
+            "activePermissionProfile",
+            Some(json!({"id":17})),
+            "document_permission_profile",
+        ),
+        ("sandbox", None, "document_effective_permissions"),
+        (
+            "sandbox",
+            Some(json!({"type":"dangerFullAccess","networkAccess":false})),
+            "document_effective_permissions",
+        ),
+        (
+            "sandbox",
+            Some(json!({"type":"externalSandbox","networkAccess":false})),
+            "document_effective_permissions",
+        ),
+        (
+            "sandbox",
+            Some(json!({"type":"readOnly","networkAccess":true})),
+            "document_effective_permissions",
+        ),
+        (
+            "sandbox",
+            Some(json!({"type":"readOnly"})),
+            "document_effective_permissions",
+        ),
+        (
+            "approvalPolicy",
+            Some(json!("on-request")),
+            "document_thread_profile",
+        ),
+        ("model", Some(json!("different")), "document_thread_profile"),
+        (
+            "modelProvider",
+            Some(json!("different")),
+            "document_thread_profile",
+        ),
+        ("reasoningEffort", Some(json!("low")), "document_effort"),
+        ("serviceTier", Some(json!("flex")), "document_tier"),
+    ];
+    for (field, value) in [
+        ("writableRoots", None),
+        ("writableRoots", Some(Value::Null)),
+        ("writableRoots", Some(json!(["/corpus"]))),
+        ("excludeTmpdirEnvVar", None),
+        ("excludeTmpdirEnvVar", Some(json!(false))),
+        ("excludeSlashTmp", None),
+        ("excludeSlashTmp", Some(json!(false))),
+        ("networkAccess", None),
+        ("networkAccess", Some(json!(true))),
+    ] {
+        let mut sandbox = named_workspace_projection();
+        if let Some(value) = value {
+            sandbox[field] = value;
+        } else {
+            sandbox.as_object_mut().unwrap().remove(field);
+        }
+        cases.push(("sandbox", Some(sandbox), "document_effective_permissions"));
+    }
+    for (field, value, code) in cases {
+        let mut response = thread_response();
+        // The obsolete managed permissions object cannot substitute for a
+        // missing named acknowledgment or a rejected compatibility envelope.
+        response["permissions"] = native::permission_value(None);
+        if let Some(value) = value {
+            response[field] = value;
+        } else {
+            response.as_object_mut().unwrap().remove(field);
+        }
+        let mut script = startup_with_thread("chatgpt", response);
+        script.extend(line(tool("never-dispatch", "finalize")));
+        script.extend(finish());
+        let mut backend = Backend::new();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let error = replay_captured(&script, &mut backend, captured.clone())
+            .await
+            .err()
+            .expect("invalid acknowledgment");
+        assert_eq!(error.to_string(), code);
+        assert_eq!(backend.calls, 0);
+        assert!(
+            sent_frames(&captured)
+                .iter()
+                .all(|value| value["method"] != "turn/start")
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn typed_finalization_can_cover_all_pages_with_partial_model_inspection() -> Result<()> {
+    let mut script = startup("chatgpt");
+    // Native app-server may publish item/started BEFORE forwarding tool/call.
+    script.extend(line(json!({"method":"item/started","params":{"threadId":"synthetic-thread","turnId":"synthetic-turn",
+        "item":{"type":"dynamicToolCall","id":"call-one","namespace":NAMESPACE,"tool":TOOL}}})));
+    script.extend(line(tool("call-one", "finalize")));
+    script.extend(finish());
+    let mut backend = Backend::new();
+    let result = replay(&script, &mut backend).await?;
+    assert_eq!(result.verified_product.original_pages, 137);
+    assert_eq!(result.verified_product.delivered_pages, 0);
+    assert!(result.verified_product.parser_complete_original_pages);
+    assert!(!result.verified_product.model_inspection_complete);
+    assert_eq!(result.tool_submissions, 1);
+    assert_eq!(backend.calls, 1);
+    assert_eq!(result.deliveries.len(), 1);
+    assert!(!result.actual_served_profile_verified);
+    assert!(!result.provider_ingestion_verified);
+    Ok(())
+}
+#[tokio::test]
+async fn agent_prose_cannot_replace_typed_product_finalization() -> Result<()> {
+    let mut script = startup("chatgpt");
+    script.extend(finish());
+    let mut backend = Backend::new();
+    assert!(replay(&script, &mut backend).await.is_err());
+    assert_eq!(backend.calls, 0);
+    Ok(())
+}
+#[tokio::test]
+async fn wrong_auth_and_typed_backend_refusal_do_not_fall_back_or_retry() -> Result<()> {
+    let mut script = startup("apiKey");
+    script.extend(line(tool("one", "finalize")));
+    let mut backend = Backend::new();
+    assert!(replay(&script, &mut backend).await.is_err());
+    assert_eq!(backend.calls, 0);
+    let mut script = startup("chatgpt");
+    script.extend(line(tool("one", "finalize")));
+    script.extend(line(tool("two", "finalize")));
+    backend.refuse = true;
+    assert!(replay(&script, &mut backend).await.is_err());
+    assert_eq!(backend.calls, 1);
+    Ok(())
+}
+
+fn refused_selector_tool(call: &str) -> Value {
+    let mut request = tool(call, "read_metadata_window");
+    request["params"]["arguments"] = json!({"op":"read_metadata_window",
+        "artifact_id":format!("artifact-{}","b".repeat(64)),"cursor":null,"max_bytes":8192});
+    request
+}
+
+#[tokio::test]
+async fn application_refusal_is_delivered_then_a_different_call_can_complete() -> Result<()> {
+    let mut script = startup("chatgpt");
+    script.extend(line(refused_selector_tool("selector-one")));
+    script.extend(line(tool("inspect-two", "inspect_document")));
+    script.extend(line(tool("finalize-three", "finalize")));
+    script.extend(finish());
+    let mut backend = Backend::new();
+    backend.application_refusal = true;
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let outcome = replay_captured(&script, &mut backend, captured.clone()).await?;
+    assert_eq!(outcome.tool_submissions, 3);
+    assert_eq!(backend.calls, 3);
+    assert_eq!(outcome.deliveries.len(), 3);
+    let sent = sent_frames(&captured);
+    assert_eq!(
+        sent.iter()
+            .filter(|value| value["method"] == "turn/start")
+            .count(),
+        1
+    );
+    let replies: Vec<_> = sent.iter().filter(|value| value["id"] == 101).collect();
+    assert_eq!(replies.len(), 3);
+    assert_eq!(replies[0]["result"]["success"], true); // Delivery, not selector acceptance.
+    let refused: Value = serde_json::from_str(
+        replies[0]["result"]["contentItems"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )?;
+    assert_eq!(refused["ok"], false);
+    assert_eq!(refused["error"], "parse_toolbox_unknown_artifact");
+    assert!(refused.get("data").is_none());
+    assert!(!outcome.deliveries[0].mediated_image);
+    // The generic core-frame converter still rejects backend refusal frames.
+    assert!(DocumentToolReply::from_core_frame(serde_json::to_vec(&refused)?, 4096).is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn application_refusal_does_not_admit_duplicate_calls_or_fatal_backend_errors() -> Result<()>
+{
+    let mut script = startup("chatgpt");
+    script.extend(line(refused_selector_tool("same")));
+    script.extend(line(tool("same", "finalize")));
+    let mut backend = Backend::new();
+    backend.application_refusal = true;
+    let error = replay(&script, &mut backend)
+        .await
+        .err()
+        .expect("duplicate refusal");
+    assert_eq!(error.to_string(), "document_duplicate_tool_submission");
+    assert_eq!(backend.calls, 1);
+    assert!(!backend.finalized);
+    let mut script = startup("chatgpt");
+    script.extend(line(refused_selector_tool("one")));
+    script.extend(line(tool("two", "finalize")));
+    let mut backend = Backend::new();
+    backend.application_refusal = true;
+    backend.refuse = true;
+    assert!(replay(&script, &mut backend).await.is_err());
+    assert_eq!(backend.calls, 1);
+    assert!(!backend.finalized);
+    Ok(())
+}
+
+#[tokio::test]
+async fn application_refusals_consume_the_original_64_call_envelope() -> Result<()> {
+    for refused in [63, 64] {
+        let mut script = startup("chatgpt");
+        for number in 0..refused {
+            script.extend(line(refused_selector_tool(&format!("refused-{number}"))));
+        }
+        script.extend(line(tool("finalize", "finalize")));
+        script.extend(finish());
+        let mut backend = Backend::new();
+        backend.application_refusal = true;
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let result = replay_captured(&script, &mut backend, captured.clone()).await;
+        if refused == 63 {
+            assert_eq!(result?.tool_submissions, 64);
+            assert!(backend.finalized);
+        } else {
+            assert_eq!(
+                result.err().expect("64-call cap").to_string(),
+                "document_tool_count"
+            );
+            assert!(!backend.finalized);
+        }
+        assert_eq!(backend.calls, 64);
+        assert_eq!(
+            sent_frames(&captured)
+                .iter()
+                .filter(|value| value["method"] == "turn/start")
+                .count(),
+            1
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn backend_refusal_reports_only_opcode_and_bounded_error_fingerprint() -> Result<()> {
+    let mut script = startup("chatgpt");
+    script.extend(line(tool("one", "inspect_document")));
+    script.extend(line(tool("must-not-dispatch", "finalize")));
+    let mut backend = Backend::new();
+    backend.refuse = true;
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let error = replay_captured(&script, &mut backend, captured.clone())
+        .await
+        .err()
+        .expect("backend refusal");
+    let underlying = format!(
+        "parse_agent_operation_failed: MOCK-private-backend-context: {PRIVATE_BACKEND_ERROR}"
+    );
+    let expected = format!(
+        "document_backend_refused_or_timeout kind=backend_error operation=inspect_document error_bytes_hashed={} error_sha256={} error_truncated=false",
+        underlying.len(),
+        sha(underlying.as_bytes())
+    );
+    assert_eq!(error.to_string(), expected);
+    assert!(!format!("{error:?}").contains("MOCK-private"));
+    assert!(!format!("{error:#}").contains("/synthetic/private"));
+    let failure = error
+        .downcast_ref::<DocumentAgentFailure>()
+        .expect("document observation wrapper");
+    assert_eq!(failure.cause.chain().count(), 1);
+    assert_eq!(failure.cause.to_string(), expected);
+    assert_eq!(error.chain().count(), 2);
+    assert_eq!(backend.calls, 1);
+    let outgoing = String::from_utf8(captured.lock().unwrap().clone())?;
+    assert!(!outgoing.contains(PRIVATE_BACKEND_ERROR));
+    assert!(!outgoing.contains("MOCK-private"));
+    assert!(!outgoing.contains("/synthetic/private"));
+    let sent = sent_frames(&captured);
+    assert_eq!(sent.last().unwrap()["id"], 101);
+    assert_eq!(sent.last().unwrap()["error"]["code"], -32601);
+
+    // The cap is in bytes, including when it falls inside a UTF-8 character.
+    let oversized = format!("{PRIVATE_BACKEND_ERROR}x{}", "中".repeat(4096));
+    let fingerprint = backend_failure("read_artifact", Some(&anyhow!(oversized.clone())), None);
+    assert_eq!(
+        fingerprint.to_string(),
+        format!(
+            "document_backend_refused_or_timeout kind=backend_error operation=read_artifact error_bytes_hashed=4096 error_sha256={} error_truncated=true",
+            sha(&oversized.as_bytes()[..4096])
+        )
+    );
+    assert!(!format!("{fingerprint:?}").contains("MOCK-private"));
+    assert_eq!(
+        backend_failure("read_artifact", None, None).to_string(),
+        format!(
+            "document_backend_refused_or_timeout kind=timeout operation=read_artifact error_bytes_hashed=0 error_sha256={} error_truncated=false",
+            sha(b"")
+        )
+    );
+    Ok(())
+}
+
+#[test]
+fn backend_ocr_failure_preserves_sanitized_cause() {
+    let error = gptgrep_core::parse_agent::summarize_ocr_failure(
+        anyhow!("OCR region coordinates mismatch").context("private source canary"),
+    );
+    let failure = backend_failure("execute_ocr", Some(&error), None);
+    assert!(
+        failure
+            .to_string()
+            .contains("ocr_failure cause=region_coordinates")
+    );
+    assert!(!format!("{failure:#?}").contains("canary"));
+    assert_eq!(failure.chain().count(), 1);
+}
+
+#[tokio::test]
+async fn read_backend_refusal_reports_numeric_shape_without_artifact_or_cursor_identity()
+-> Result<()> {
+    let artifact_id = format!("artifact-{}", "f".repeat(64));
+    let cursor_id = "e".repeat(64);
+    for op in ["read_artifact", "read_metadata_window"] {
+        for (max_bytes, cursor_present) in [(0, false), (32_769, true), (usize::MAX, false)] {
+            let mut request = tool("private-call-not-retained", op);
+            request["params"]["arguments"] = json!({"op":op,"artifact_id":artifact_id,
+                "cursor":if cursor_present {Some(&cursor_id)} else {None},"max_bytes":max_bytes});
+            let mut script = startup("chatgpt");
+            script.extend(line(request));
+            script.extend(line(tool("must-not-dispatch", "finalize")));
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let mut backend = Backend::new();
+            backend.refuse = true;
+            let error = replay_captured(&script, &mut backend, captured.clone())
+                .await
+                .err()
+                .expect("backend refusal");
+            let diagnostic = error.to_string();
+            assert!(diagnostic.contains(&format!("operation={op} ")));
+            assert!(diagnostic.ends_with(&format!(
+                " max_bytes={max_bytes} cursor_present={cursor_present}"
+            )));
+            assert_eq!(backend.calls, 1);
+            let outgoing = String::from_utf8(captured.lock().unwrap().clone())?;
+            for value in [&diagnostic, &format!("{error:?}"), &outgoing] {
+                assert!(!value.contains(&artifact_id));
+                assert!(!value.contains(&cursor_id));
+                assert!(!value.contains("private-call-not-retained"));
+                assert!(!value.contains("MOCK-private"));
+                assert!(!value.contains("/synthetic/private"));
+            }
+            let sent = sent_frames(&captured);
+            assert_eq!(sent.last().unwrap()["id"], 101);
+            assert_eq!(sent.last().unwrap()["error"]["code"], -32601);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn startup_tool_events_and_auth_mode_changes_are_refused_before_backend_dispatch()
+-> Result<()> {
+    let mut script = line(
+        json!({"method":"item/started","params":{"item":{"type":"commandExecution","id":"unadmitted"}}}),
+    );
+    script.extend(startup("chatgpt"));
+    let mut backend = Backend::new();
+    assert!(replay(&script, &mut backend).await.is_err());
+    assert_eq!(backend.calls, 0);
+    let mut script = startup("chatgpt");
+    script.extend(line(
+        json!({"method":"account/updated","params":{"authMode":"apiKey"}}),
+    ));
+    script.extend(line(tool("one", "finalize")));
+    assert!(replay(&script, &mut backend).await.is_err());
+    assert_eq!(backend.calls, 0);
+    Ok(())
+}
+
+const PRIVATE_RUNTIME_DIAGNOSTIC: &str =
+    "MOCK-private-runtime-canary /synthetic/private/config Bearer mock-secret";
+
+fn document_runtime_notice(method: &str) -> Value {
+    let params = match method {
+        "error" => json!({
+            "threadId":"synthetic-thread","turnId":"synthetic-turn","willRetry":false,
+            "error":{"message":PRIVATE_RUNTIME_DIAGNOSTIC,
+                "additionalDetails":PRIVATE_RUNTIME_DIAGNOSTIC,
+                "codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":503}}}
+        }),
+        "configWarning" | "config/warning" => json!({
+            "summary":PRIVATE_RUNTIME_DIAGNOSTIC,"details":PRIVATE_RUNTIME_DIAGNOSTIC,
+            "path":"/synthetic/private/config","range":{"private":PRIVATE_RUNTIME_DIAGNOSTIC}
+        }),
+        "model/rerouted" => json!({
+            "threadId":"synthetic-thread","turnId":"synthetic-turn",
+            "fromModel":PRIVATE_RUNTIME_DIAGNOSTIC,"toModel":PRIVATE_RUNTIME_DIAGNOSTIC,
+            "reason":"highRiskCyberActivity"
+        }),
+        _ => panic!("closed synthetic notification"),
+    };
+    json!({"method":method,"params":params})
+}
+
+fn document_runtime_diagnostic(error: &anyhow::Error) -> &crate::DocumentRuntimeError {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::DocumentRuntimeError>())
+        .expect("typed Document runtime diagnostic survives wrappers")
+}
+
+fn assert_document_runtime_private(error: &anyhow::Error) {
+    for output in [
+        format!("{error}"),
+        format!("{error:#}"),
+        format!("{error:?}"),
+        format!("{error:#?}"),
+        serde_json::to_string(document_runtime_diagnostic(error)).unwrap(),
+    ] {
+        for forbidden in [
+            "MOCK-private",
+            "/synthetic/private",
+            "mock-secret",
+            "synthetic-thread",
+            "synthetic-turn",
+        ] {
+            assert!(!output.contains(forbidden), "{forbidden}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn document_runtime_startup_refusal_preserves_method_and_closed_event() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let skill_path = temp.path().join("SKILL.md");
+    fs::write(&skill_path, "# Synthetic\nOnly a protocol fixture.\n")?;
+    let skill_path = fs::canonicalize(skill_path)?;
+    let skill = crate::NativeSkillInput {
+        name: "synthetic".into(),
+        sha256: sha(&fs::read(&skill_path)?),
+        path: skill_path,
+    };
+    for (method, prefix, expected) in [
+        ("initialize", 0, crate::DocumentStartupMethod::Initialize),
+        ("account/read", 1, crate::DocumentStartupMethod::AccountRead),
+        ("config/read", 2, crate::DocumentStartupMethod::ConfigRead),
+        ("skills/list", 3, crate::DocumentStartupMethod::SkillsList),
+        ("thread/start", 3, crate::DocumentStartupMethod::ThreadStart),
+    ] {
+        for event in ["error", "configWarning", "config/warning", "model/rerouted"] {
+            let warning = event.starts_with("config");
+            if warning && method == "skills/list" {
+                // Skills discovery belongs to native mode, which accepts metadata warnings.
+                continue;
+            }
+            let mut config = if warning {
+                control()?
+            } else {
+                native_execution_control()?
+            };
+            let startup = if warning {
+                startup("chatgpt")
+            } else {
+                native_execution_startup()
+            };
+            let responses = startup
+                .split_inclusive(|byte| *byte == b'\n')
+                .map(<[u8]>::to_vec)
+                .collect::<Vec<_>>();
+            if method == "skills/list" {
+                config.native_execution.as_mut().unwrap().native_skills = vec![skill.clone()];
+            }
+            let mut script = responses[..prefix].concat();
+            script.extend(line(document_runtime_notice(event)));
+            script.extend(native_execution_startup());
+            script.extend(line(tool("must-not-dispatch", "finalize")));
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let mut backend = Backend::new();
+            let error = replay_control(&script, &mut backend, captured.clone(), &config)
+                .await
+                .err()
+                .expect("runtime startup refused");
+            let diagnostic = document_runtime_diagnostic(&error);
+            assert_eq!(diagnostic.stage, crate::DocumentRuntimeStage::Startup);
+            assert_eq!(diagnostic.startup_method, Some(expected));
+            assert_eq!(serde_json::to_value(diagnostic.event)?, json!(event));
+            assert_eq!(diagnostic.identity, crate::DocumentRuntimeIdentity::Startup);
+            assert!(diagnostic.usage.is_none());
+            assert!(diagnostic.provider_request_count.is_none());
+            assert!(!diagnostic.accounting_complete);
+            assert_eq!(
+                diagnostic.transport.thread_start_sent,
+                method == "thread/start"
+            );
+            assert!(!diagnostic.transport.thread_start_acknowledged);
+            assert!(!diagnostic.transport.turn_start_sent);
+            assert!(!diagnostic.transport.turn_start_acknowledged);
+            assert_eq!(backend.calls, 0);
+            let sent = sent_frames(&captured);
+            assert_eq!(sent.last().unwrap()["method"], method);
+            assert_eq!(
+                sent.iter()
+                    .filter(|frame| frame["method"] == method)
+                    .count(),
+                1
+            );
+            assert!(sent.iter().all(|frame| frame["method"] != "turn/start"));
+            assert_document_runtime_private(&error);
+            if event == "configWarning" || event == "config/warning" {
+                let details = diagnostic.diagnostics.as_ref().expect("warning projection");
+                assert_eq!(details["native_error_shape_valid"], false);
+                assert_eq!(details["warning_shape_valid"], true);
+                assert_eq!(
+                    details["message"]["sha256"],
+                    sha(PRIVATE_RUNTIME_DIAGNOSTIC.as_bytes())
+                );
+                assert_eq!(
+                    details["additional_details"]["sha256"],
+                    sha(PRIVATE_RUNTIME_DIAGNOSTIC.as_bytes())
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn document_runtime_turn_refusal_keeps_rpc_facts_without_retry_or_fallback() -> Result<()> {
+    for acknowledged in [false, true] {
+        for event in ["error", "configWarning", "config/warning", "model/rerouted"] {
+            let warning = event.starts_with("config");
+            let config = if warning {
+                control()?
+            } else {
+                native_execution_control()?
+            };
+            let startup = if warning {
+                startup("chatgpt")
+            } else {
+                native_execution_startup()
+            };
+            let responses = startup
+                .split_inclusive(|byte| *byte == b'\n')
+                .map(<[u8]>::to_vec)
+                .collect::<Vec<_>>();
+            let mut script = responses[..if acknowledged { 5 } else { 4 }].concat();
+            script.extend(line(document_runtime_notice(event)));
+            script.extend(line(tool("must-not-dispatch", "finalize")));
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let mut backend = Backend::new();
+            let error = replay_control(&script, &mut backend, captured.clone(), &config)
+                .await
+                .err()
+                .expect("runtime turn refused");
+            let diagnostic = document_runtime_diagnostic(&error);
+            assert_eq!(
+                diagnostic.stage,
+                if acknowledged {
+                    crate::DocumentRuntimeStage::ActiveTurn
+                } else {
+                    crate::DocumentRuntimeStage::TurnStart
+                }
+            );
+            assert!(diagnostic.startup_method.is_none());
+            assert_eq!(serde_json::to_value(diagnostic.event)?, json!(event));
+            assert_eq!(
+                diagnostic.identity,
+                if event.starts_with("config") {
+                    crate::DocumentRuntimeIdentity::GlobalNotification
+                } else {
+                    crate::DocumentRuntimeIdentity::Matched
+                }
+            );
+            assert!(diagnostic.transport.thread_start_sent);
+            assert!(diagnostic.transport.thread_start_acknowledged);
+            assert!(diagnostic.transport.turn_start_sent);
+            assert_eq!(diagnostic.transport.turn_start_acknowledged, acknowledged);
+            assert!(diagnostic.usage.is_none());
+            assert!(diagnostic.provider_request_count.is_none());
+            assert!(!diagnostic.accounting_complete);
+            assert_eq!(diagnostic.will_retry, (event == "error").then_some(false));
+            let sent = sent_frames(&captured);
+            for method in ["thread/start", "turn/start"] {
+                assert_eq!(
+                    sent.iter()
+                        .filter(|frame| frame["method"] == method)
+                        .count(),
+                    1
+                );
+            }
+            assert_eq!(sent.last().unwrap()["method"], "turn/start");
+            assert_eq!(backend.calls, 0);
+            assert_document_runtime_private(&error);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn document_runtime_restricted_mode_keeps_retry_notification_as_typed_refusal() -> Result<()>
+{
+    let mut notification = document_runtime_notice("error");
+    notification["params"]["willRetry"] = json!(true);
+    let mut script = startup("chatgpt");
+    script.extend(line(notification));
+    let mut backend = Backend::new();
+    let error = replay(&script, &mut backend)
+        .await
+        .err()
+        .expect("restricted retry refused");
+    let diagnostic = document_runtime_diagnostic(&error);
+    assert_eq!(diagnostic.identity, crate::DocumentRuntimeIdentity::Matched);
+    assert_eq!(diagnostic.will_retry, Some(true));
+    assert_eq!(backend.calls, 0);
+    assert_document_runtime_private(&error);
+    Ok(())
+}
+
+#[tokio::test]
+async fn document_runtime_usage_and_error_identity_do_not_attribute_foreign_observations()
+-> Result<()> {
+    let config = native_execution_control()?;
+    let usage = json!({"method":"thread/tokenUsage/updated","params":{
+        "threadId":"synthetic-thread","turnId":"synthetic-turn",
+        "tokenUsage":{"total":{"totalTokens":7,"inputTokens":3,"private":PRIVATE_RUNTIME_DIAGNOSTIC},
+            "last":{"outputTokens":4,"inputTokens":"private","reasoningOutputTokens":-1},
+            "modelContextWindow":128000,"private":PRIVATE_RUNTIME_DIAGNOSTIC}}});
+    for bound in [false, true] {
+        let mut observed = usage.clone();
+        if !bound {
+            observed["params"].as_object_mut().unwrap().remove("turnId");
+        }
+        let mut script = native_execution_startup();
+        script.extend(line(observed));
+        script.extend(line(document_runtime_notice("error")));
+        let mut backend = Backend::new();
+        let error = replay_control(&script, &mut backend, Arc::default(), &config)
+            .await
+            .err()
+            .expect("runtime error");
+        let diagnostic = document_runtime_diagnostic(&error);
+        assert_eq!(
+            error
+                .downcast_ref::<DocumentAgentFailure>()
+                .expect("document observation wrapper")
+                .observation()
+                .token_usage,
+            diagnostic.usage,
+            "outer observations retain the same identity-bound numeric usage"
+        );
+        assert_eq!(
+            diagnostic.usage,
+            bound.then(|| json!({
+                "total":{"totalTokens":7,"inputTokens":3},
+                "last":{"outputTokens":4},"modelContextWindow":128000
+            }))
+        );
+        assert_eq!(
+            diagnostic.codex_error_info,
+            Some(crate::CodexErrorInfo::ResponseStreamDisconnected)
+        );
+        assert_eq!(diagnostic.http_status_code, Some(503));
+        assert!(diagnostic.provider_request_count.is_none());
+        assert_document_runtime_private(&error);
+    }
+    for identity_field in ["threadId", "turnId"] {
+        let mut observed = usage.clone();
+        observed["params"][identity_field] = json!("foreign-private-identity");
+        let mut script = native_execution_startup();
+        script.extend(line(observed));
+        script.extend(line(document_runtime_notice("error")));
+        let mut backend = Backend::new();
+        let error = replay_control(&script, &mut backend, Arc::default(), &config)
+            .await
+            .err()
+            .expect("foreign usage refused");
+        assert!(error.chain().all(|cause| {
+            cause
+                .downcast_ref::<crate::DocumentRuntimeError>()
+                .is_none()
+        }));
+        assert_eq!(backend.calls, 0);
+        assert!(!format!("{error:#?}").contains("foreign-private"));
+    }
+    for event in ["error", "configWarning", "config/warning", "model/rerouted"] {
+        for identity_field in ["threadId", "turnId"] {
+            let mut notification = document_runtime_notice(event);
+            notification["params"]["threadId"] = json!("synthetic-thread");
+            notification["params"]["turnId"] = json!("synthetic-turn");
+            notification["params"][identity_field] = json!("foreign-private-identity");
+            let mut script = native_execution_startup();
+            script.extend(line(usage.clone()));
+            script.extend(line(notification));
+            let mut backend = Backend::new();
+            let error = replay_control(&script, &mut backend, Arc::default(), &config)
+                .await
+                .err()
+                .expect("foreign error refused");
+            let diagnostic = document_runtime_diagnostic(&error);
+            assert_eq!(
+                diagnostic.identity,
+                crate::DocumentRuntimeIdentity::Mismatch
+            );
+            assert!(diagnostic.codex_error_info.is_none());
+            assert!(diagnostic.http_status_code.is_none());
+            assert!(diagnostic.will_retry.is_none());
+            assert!(diagnostic.usage.is_none());
+            assert!(diagnostic.diagnostics.is_none());
+            assert!(diagnostic.usage_updates_without_numeric.is_none());
+            assert!(diagnostic.provider_request_count.is_none());
+            assert_eq!(backend.calls, 0);
+            assert_document_runtime_private(&error);
+            assert!(!format!("{error:#?}").contains("foreign-private"));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn document_runtime_unusable_usage_updates_preserve_last_valid_observation() -> Result<()> {
+    let config = native_execution_control()?;
+    let known = json!({"total":{"totalTokens":7,"inputTokens":3},
+        "last":{"outputTokens":4},"modelContextWindow":128000});
+    // Zero is a real token observation and must replace earlier known usage.
+    let updated = json!({"total":{"totalTokens":0}});
+    let notice = |usage: Value| {
+        json!({"method":"thread/tokenUsage/updated","params":{
+        "threadId":"synthetic-thread","turnId":"synthetic-turn","tokenUsage":usage}})
+    };
+    for initial in [false, true] {
+        for replacement in [false, true] {
+            for unusable in [
+                None,
+                Some(Value::Null),
+                Some(json!({})),
+                Some(json!({"modelContextWindow":200000})),
+                Some(
+                    json!({"total":{"totalTokens":"not-numeric","inputTokens":-1},
+                    "modelContextWindow":PRIVATE_RUNTIME_DIAGNOSTIC}),
+                ),
+            ] {
+                let mut script = native_execution_startup();
+                if initial {
+                    script.extend(line(notice(known.clone())));
+                }
+                let mut bad = notice(Value::Null);
+                if let Some(value) = unusable {
+                    bad["params"]["tokenUsage"] = value;
+                } else {
+                    bad["params"].as_object_mut().unwrap().remove("tokenUsage");
+                }
+                script.extend(line(bad));
+                if replacement {
+                    script.extend(line(notice(updated.clone())));
+                }
+                script.extend(line(document_runtime_notice("error")));
+                let mut backend = Backend::new();
+                let error = replay_control(&script, &mut backend, Arc::default(), &config)
+                    .await
+                    .err()
+                    .expect("runtime failure after usage observations");
+                let diagnostic = document_runtime_diagnostic(&error);
+                assert_eq!(
+                    diagnostic.usage,
+                    if replacement {
+                        Some(updated.clone())
+                    } else {
+                        initial.then(|| known.clone())
+                    }
+                );
+                assert_eq!(diagnostic.usage_updates_without_numeric, Some(1));
+                assert_eq!(diagnostic.stage, crate::DocumentRuntimeStage::ActiveTurn);
+                assert_eq!(
+                    diagnostic.codex_error_info,
+                    Some(crate::CodexErrorInfo::ResponseStreamDisconnected)
+                );
+                assert_eq!(diagnostic.http_status_code, Some(503));
+                assert_eq!(diagnostic.will_retry, Some(false));
+                assert_eq!(diagnostic.code(), "document_runtime_refused_no_retry");
+                assert!(diagnostic.provider_request_count.is_none());
+                assert!(!diagnostic.accounting_complete);
+                assert_eq!(backend.calls, 0);
+                assert_document_runtime_private(&error);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn document_runtime_foreign_usage_does_not_mutate_retained_observation() -> Result<()> {
+    let limits = limits();
+    let mut rpc = Rpc {
+        reader: BufReader::new(&b""[..]),
+        writer: Vec::new(),
+        limits: limits.clone(),
+        working: DocumentWorking::new(limits.working_bytes),
+        transport: TransportBudget::new(limits.total_rpc_bytes),
+        deadline: Instant::now() + Duration::from_secs(1),
+        messages: 0,
+        native_execution: true,
+        observation: crate::DocumentRuntimeTransport::default(),
+        usage: None,
+        usage_retained: None,
+        usage_updates_without_numeric: 0,
+    };
+    let mut turn = Some("synthetic-turn".into());
+    let observed = json!({"method":"thread/tokenUsage/updated","params":{
+        "threadId":"synthetic-thread","turnId":"synthetic-turn",
+        "tokenUsage":{"total":{"totalTokens":7}}}});
+    rpc.observe_usage(&observed, "synthetic-thread", &mut turn)?;
+    let mut unusable = observed.clone();
+    unusable["params"]["tokenUsage"] = json!({});
+    rpc.observe_usage(&unusable, "synthetic-thread", &mut turn)?;
+    let retained = rpc.usage.clone();
+    for identity_field in ["threadId", "turnId"] {
+        let mut foreign = observed.clone();
+        foreign["params"][identity_field] = json!("foreign-private-identity");
+        foreign["params"]["tokenUsage"] = json!({"total":{"totalTokens":999}});
+        let error = rpc
+            .observe_usage(&foreign, "synthetic-thread", &mut turn)
+            .expect_err("foreign observation must remain refused");
+        assert_eq!(rpc.usage, retained);
+        assert_eq!(rpc.usage_updates_without_numeric, 1);
+        assert_eq!(turn.as_deref(), Some("synthetic-turn"));
+        assert!(!format!("{error:#?}").contains("foreign-private"));
+    }
+    let mut unbound = observed;
+    unbound["params"].as_object_mut().unwrap().remove("turnId");
+    rpc.observe_usage(&unbound, "synthetic-thread", &mut turn)?;
+    assert_eq!(rpc.usage, retained);
+    assert_eq!(rpc.usage_updates_without_numeric, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn document_runtime_warning_oversize_and_cleanup_keep_bounded_typed_evidence() -> Result<()> {
+    let config = control()?;
+    let mut warning = document_runtime_notice("configWarning");
+    let oversized = format!("{PRIVATE_RUNTIME_DIAGNOSTIC}{}", "中".repeat(6000));
+    warning["params"]["summary"] = json!(oversized);
+    let mut script = line(warning);
+    script.extend(startup("chatgpt"));
+    let mut backend = Backend::new();
+    let error = replay_control(&script, &mut backend, Arc::default(), &config)
+        .await
+        .err()
+        .expect("oversized warning still refused");
+    let diagnostic = document_runtime_diagnostic(&error);
+    let details = diagnostic.diagnostics.as_ref().expect("warning projection");
+    assert_eq!(details["message"]["bytes"], oversized.len());
+    assert_eq!(details["message"]["inspected"], false);
+    assert!(details["message"]["sha256"].is_null());
+    assert_eq!(
+        details["additional_details"]["sha256"],
+        sha(PRIVATE_RUNTIME_DIAGNOSTIC.as_bytes())
+    );
+    assert_document_runtime_private(&error);
+
+    let config = native_execution_control()?;
+    for fail in [false, true] {
+        let mut script = native_execution_startup();
+        script.extend(line(document_runtime_notice("error")));
+        let mut inner = Backend::new();
+        let primary = replay_control(&script, &mut inner, Arc::default(), &config)
+            .await
+            .err()
+            .expect("primary protocol refusal");
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut backend = CleanupBackend {
+            inner,
+            calls: 0,
+            fail,
+            completed: completed.clone(),
+            ocr: None,
+            sleep_until: None,
+        };
+        let error = finish_document_cleanup::<()>(&mut backend, Err(primary), Some(Instant::now()))
+            .await
+            .expect_err("primary failure survives cleanup");
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(backend.calls, 1);
+        assert_eq!(
+            error.to_string().contains("document_ocr_cleanup_unknown"),
+            fail
+        );
+        assert_eq!(
+            document_runtime_diagnostic(&error).stage,
+            crate::DocumentRuntimeStage::ActiveTurn
+        );
+        assert_document_runtime_private(&error);
+    }
+    Ok(())
+}
+
+fn remote_control_notice(environment: Option<Value>) -> Value {
+    let mut notice = json!({"method":"remoteControl/status/changed","params":{
+        "installationId":"MOCK-private-installation","serverName":"MOCK-private-server",
+        "status":"disabled"}});
+    if let Some(environment) = environment {
+        notice["params"]["environmentId"] = environment;
+    }
+    notice
+}
+
+#[tokio::test]
+async fn disabled_remote_control_metadata_is_discarded_during_startup_and_active_turn() -> Result<()>
+{
+    for environment in [
+        None,
+        Some(Value::Null),
+        Some(json!("MOCK-private-environment")),
+    ] {
+        let notice = remote_control_notice(environment);
+        let mut script = Vec::new();
+        // Interleave all startup RPC waits, including the pending turn reply.
+        for frame in startup("chatgpt").split_inclusive(|byte| *byte == b'\n') {
+            script.extend(line(notice.clone()));
+            script.extend_from_slice(frame);
+        }
+        script.extend(line(notice));
+        script.extend(line(tool("finalize-one", "finalize")));
+        script.extend(finish());
+        let mut backend = Backend::new();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let outcome = replay_captured(&script, &mut backend, captured.clone()).await?;
+        assert_eq!(backend.calls, 1);
+        assert_eq!(outcome.tool_submissions, 1);
+        let outgoing = String::from_utf8(captured.lock().unwrap().clone())?;
+        let outcome_json = serde_json::to_string(&outcome)?;
+        for value in [&outgoing, &outcome_json] {
+            assert!(!value.contains("MOCK-private-"));
+            assert!(!value.contains("remoteControl/status/changed"));
+            assert!(!value.contains("installationId"));
+            assert!(!value.contains("serverName"));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn malformed_remote_control_metadata_and_requests_stop_before_backend_dispatch() -> Result<()>
+{
+    let valid = remote_control_notice(Some(Value::Null));
+    let mut refused = Vec::new();
+    for key in ["installationId", "serverName", "status"] {
+        let mut message = valid.clone();
+        message["params"].as_object_mut().unwrap().remove(key);
+        refused.push(message);
+    }
+    let mut missing = valid.clone();
+    missing.as_object_mut().unwrap().remove("params");
+    refused.push(missing);
+    for params in [Value::Null, json!(false), json!([]), json!("MOCK-private")] {
+        let mut message = valid.clone();
+        message["params"] = params;
+        refused.push(message);
+    }
+    for key in ["installationId", "serverName"] {
+        for value in [Value::Null, json!(false), json!(7), json!([]), json!({})] {
+            let mut message = valid.clone();
+            message["params"][key] = value;
+            refused.push(message);
+        }
+    }
+    for value in [json!(false), json!(7), json!([]), json!({})] {
+        let mut message = valid.clone();
+        message["params"]["environmentId"] = value;
+        refused.push(message);
+    }
+    for status in [
+        Value::Null,
+        json!(false),
+        json!(7),
+        json!([]),
+        json!({}),
+        json!("enabled"),
+        json!("connected"),
+        json!("connecting"),
+        json!("errored"),
+        json!("MOCK-unknown"),
+    ] {
+        let mut message = valid.clone();
+        message["params"]["status"] = status;
+        refused.push(message);
+    }
+    let mut unknown_field = valid.clone();
+    unknown_field["params"]["extra"] = json!("MOCK-private");
+    refused.push(unknown_field);
+    for id in [json!(101), json!("request"), Value::Null] {
+        let mut message = valid.clone();
+        message["id"] = id;
+        assert!(automatic(&message).is_err());
+        refused.push(message);
+    }
+    let mut unknown_method = valid;
+    unknown_method["method"] = json!("remoteControl/status/unknown");
+    refused.push(unknown_method);
+
+    for (case, message) in refused.into_iter().enumerate() {
+        for active in [false, true] {
+            let mut script = if active {
+                startup("chatgpt")
+            } else {
+                Vec::new()
+            };
+            script.extend(line(message.clone()));
+            if !active {
+                script.extend(startup("chatgpt"));
+            }
+            script.extend(line(tool("must-not-dispatch", "finalize")));
+            script.extend(finish());
+            let mut backend = Backend::new();
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            assert!(
+                replay_captured(&script, &mut backend, captured.clone())
+                    .await
+                    .is_err(),
+                "case={case} active={active}"
+            );
+            assert_eq!(backend.calls, 0, "case={case} active={active}");
+            assert_eq!(
+                sent_frames(&captured)
+                    .iter()
+                    .filter(|value| value["method"] == "turn/start")
+                    .count(),
+                usize::from(active),
+                "case={case} active={active}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn malformed_and_duplicate_submissions_consume_the_same_finite_counter() -> Result<()> {
+    let working = DocumentWorking::new(16384);
+    let mut calls = Calls {
+        submissions: 0,
+        ids: BTreeSet::new(),
+        events: BTreeSet::new(),
+        retained: working.reserve(0)?,
+    };
+    assert!(calls.submit("", 3).is_err());
+    assert_eq!(calls.submissions, 1);
+    assert_eq!(calls.submit("same", 3)?, 2);
+    assert!(calls.submit("same", 3).is_err());
+    assert_eq!(calls.submissions, 3);
+    assert!(calls.submit("next", 3).is_err());
+    assert_eq!(calls.submissions, 4);
+    assert_eq!(calls.ids.len(), 1);
+    Ok(())
+}
+#[tokio::test]
+async fn duplicate_tool_call_never_reinvokes_the_typed_backend() -> Result<()> {
+    let mut script = startup("chatgpt");
+    script.extend(line(tool("same", "inspect_document")));
+    script.extend(line(tool("same", "finalize")));
+    let mut backend = Backend::new();
+    assert!(replay(&script, &mut backend).await.is_err());
+    assert_eq!(backend.calls, 1);
+    Ok(())
+}
+#[test]
+fn closed_tool_json_cannot_supply_paths_budgets_tasks_or_paid_results() {
+    for value in [
+        json!({"op":"execute_ocr","task_sha256":"a".repeat(64),"result":{}}),
+        json!({"op":"inspect_document","source":"/private/source"}),
+        json!({"op":"finalize","resources":{}}),
+        json!({"op":"prepare","path":"/private/source"}),
+    ] {
+        assert!(serde_json::from_value::<DocumentToolOperation>(value).is_err());
+    }
+    for value in [json!({"op":"inspect_document"}), json!({"op":"finalize"})] {
+        let parsed = serde_json::from_value::<DocumentToolOperation>(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), value);
+    }
+}
+#[test]
+fn complete_mediated_images_and_escaped_frames_are_distinct_from_native_receipts() -> Result<()> {
+    let core = line(
+        json!({"ok":true,"data":{"kind":"complete_image","data_url":"data:image/png;base64,YWJj",
+        "artifact":{"id":"artifact-synthetic","sha256":"synthetic"},"extra":"quoted\\\"\u{0}中"}}),
+    );
+    let reply = DocumentToolReply::from_core_frame(core.clone(), 4096)?;
+    assert_eq!(reply.source_frame_sha256, sha(&core));
+    assert_eq!(
+        reply.image_url.as_deref(),
+        Some("data:image/png;base64,YWJj")
+    );
+    let text: Value = serde_json::from_str(&reply.text)?;
+    assert!(text["data"].get("data_url").is_none());
+    assert_eq!(text["data"]["extra"], "quoted\\\"\u{0}中");
+    let outer = json!({"id":"quoted\\\"\u{0}中","result":{"success":true,"contentItems":[{"type":"inputText","text":reply.text}]}});
+    let bytes = crate::transport::encode_frame(&outer, 4096)?;
+    assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 1);
+    assert!(crate::transport::encode_frame(&outer, bytes.len() - 1).is_err());
+    Ok(())
+}
+#[test]
+fn named_permissions_expose_only_the_private_image_directory() -> Result<()> {
+    let native = DocumentNativeControl {
+        image_root: "/synthetic/images".into(),
+        receipt_root: "/synthetic/receipts".into(),
+        admission_path: "/synthetic/admission.json".into(),
+        image_catalog_path: "/synthetic/catalog.ndjson".into(),
+        owner_admission_sha256: "a".repeat(64),
+        image_wire_bytes: 33_554_432,
+        image_limits: document_native_image_limits(&ResourceBudget::default(), 33_554_432).unwrap(),
+    };
+    let policy = document_permissions_config(Some(&native));
+    let text = policy.to_string();
+    assert!(text.contains("/synthetic/images"));
+    assert!(!text.contains("/synthetic/receipts"));
+    assert!(!text.contains("/synthetic/catalog.ndjson"));
+    assert!(!text.contains("/synthetic/admission.json"));
+    assert_eq!(
+        policy["permissions.gptgrep_native_document.network.enabled"],
+        false
+    );
+    assert_eq!(
+        policy["permissions.gptgrep_native_document.filesystem"][":root"],
+        "deny"
+    );
+    Ok(())
+}
+#[test]
+fn native_events_are_refused_without_the_separate_document_guard() -> Result<()> {
+    let working = DocumentWorking::new(16384);
+    let mut calls = Calls {
+        submissions: 0,
+        ids: BTreeSet::new(),
+        events: BTreeSet::new(),
+        retained: working.reserve(0)?,
+    };
+    assert!(
+        check_item(
+            &json!({"type":"imageView","id":"one","path":"/synthetic/images/one.png"}),
+            &mut calls,
+            None,
+            64
+        )
+        .is_err()
+    );
+    assert!(
+        check_item(
+            &json!({"type":"commandExecution","id":"shell"}),
+            &mut calls,
+            None,
+            64
+        )
+        .is_err()
+    );
+    Ok(())
+}
+#[tokio::test]
+async fn incoming_overflow_and_total_wire_failure_precede_tree_or_backend_allocation() -> Result<()>
+{
+    let mut limits = limits();
+    limits.incoming_frame_bytes = 1024;
+    let bytes = vec![b'a'; 1025];
+    let transport = TransportBudget::new(8192);
+    let mut rpc = Rpc {
+        reader: BufReader::new(BudgetedReader::new(bytes.as_slice(), transport.clone())),
+        writer: Vec::new(),
+        limits: limits.clone(),
+        working: DocumentWorking::new(67_108_864),
+        transport,
+        deadline: Instant::now() + Duration::from_secs(1),
+        messages: 0,
+        native_execution: false,
+        observation: crate::DocumentRuntimeTransport::default(),
+        usage: None,
+        usage_retained: None,
+        usage_updates_without_numeric: 0,
+    };
+    assert!(rpc.receive().await.is_err());
+    assert_eq!(rpc.messages, 0);
+    let transport = TransportBudget::new(4);
+    let mut rpc = Rpc {
+        reader: BufReader::new(&b""[..]),
+        writer: Vec::new(),
+        limits,
+        working: DocumentWorking::new(67_108_864),
+        transport,
+        deadline: Instant::now() + Duration::from_secs(1),
+        messages: 0,
+        native_execution: false,
+        observation: crate::DocumentRuntimeTransport::default(),
+        usage: None,
+        usage_retained: None,
+        usage_updates_without_numeric: 0,
+    };
+    assert!(rpc.send(json!({"id":1})).await.is_err());
+    assert!(rpc.writer.is_empty());
+    Ok(())
+}
+#[cfg(unix)]
+#[test]
+fn legacy_document_ready_cannot_authorize_a_turn_or_weaken_the_manifest_abi() -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().canonicalize()?;
+    for leaf in ["images", "receipts"] {
+        fs::DirBuilder::new().mode(0o700).create(root.join(leaf))?;
+    }
+    let payload = b"synthetic source bytes; no runtime image ingestion";
+    let source = root.join("images/image.png");
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    options.open(&source)?.write_all(payload)?;
+    let mut backend = Backend::new();
+    backend.prepared.original_rendition_artifacts = 1;
+    backend.images.push(DocumentImageGrant {
+        artifact: ArtifactRef {
+            id: format!("artifact-{}", "1".repeat(64)),
+            kind: gptgrep_parse::ArtifactKind::Rendition,
+            relative_path: "image.png".into(),
+            bytes: payload.len() as u64,
+            sha256: sha(payload),
+            profile_sha256: "2".repeat(64),
+            mime: "image/png".into(),
+            page: Some(1),
+            region_id: None,
+        },
+        copied_path: source,
+        source_sha256: backend.prepared.source_sha256.clone(),
+        prepared_sha256: backend.prepared.prepared_sha256.clone(),
+        width: 2,
+        height: 2,
+    });
+    let mut config = control()?;
+    config.deadline_unix_ms = u64::MAX;
+    let native = DocumentNativeControl {
+        image_root: root.join("images"),
+        receipt_root: root.join("receipts"),
+        admission_path: root.join("admission.json"),
+        image_catalog_path: root.join("catalog.ndjson"),
+        owner_admission_sha256: "3".repeat(64),
+        image_wire_bytes: 33_554_432,
+        image_limits: document_native_image_limits(&ResourceBudget::default(), 33_554_432).unwrap(),
+    };
+    let mut session = native::NativeSession::prepare(
+        &native,
+        &config,
+        &backend,
+        &DocumentWorking::new(67_108_864),
+        Instant::now() + Duration::from_secs(30),
+    )?;
+    let manifest_bytes = fs::read(&native.admission_path)?;
+    let manifest: Value = serde_json::from_slice(&manifest_bytes)?;
+    assert_eq!(manifest.as_object().expect("manifest object").len(), 16);
+    assert!(manifest.get("max_seconds").is_none());
+    let ready = json!({"schema_version":"gptgrep.native-document.ready.v1","required":true,
+        "admission_sha256":sha(&manifest_bytes),"task_sha256":backend.prepared.task_sha256,
+        "source_sha256":backend.prepared.source_sha256,"prepared_sha256":backend.prepared.prepared_sha256,
+        "runtime_profile_sha256":config.runtime_profile.sha256,"permissions_profile_id":"gptgrep_native_document",
+        "permissions_profile_sha256":manifest["permissions_profile_sha256"],"environment_ids":["local"],
+        "environment_id_argument_admitted":false,"max_tool_calls":64,"max_turns":1,"max_seconds":900,
+        "deadline_unix_ms":manifest["deadline_unix_ms"],"frame_bytes":4_194_304,"image_transport_reserved_bytes":33_554_432,"image_limits":manifest["image_limits"],
+        "tool_counter_before_lookup_hooks_handler":true,"tool_counter_before_argument_parse":true,
+        "normalized_request_profile_verified_before_send":true,"native_image_read_bounded":true,
+        "assembled_image_receipts_required":true,"requested_model":"gpt-6-luna","requested_effort":"max",
+        "normalized_request_service_tier":"priority","actual_served_profile_verified":false,
+        "image_catalog_sha256":manifest["image_catalog"]["sha256"],"image_catalog_count":1});
+    for field in [
+        "tool_counter_before_argument_parse",
+        "normalized_request_profile_verified_before_send",
+    ] {
+        let mut older = ready.clone();
+        older.as_object_mut().expect("ready object").remove(field);
+        assert!(
+            session
+                .initialize(&json!({"gptgrepNativeDocument":older}))
+                .is_err()
+        );
+    }
+    assert!(
+        session
+            .initialize(&json!({"gptgrepNativeOcr":ready.clone()}))
+            .is_err()
+    );
+    session.initialize(&json!({"gptgrepNativeDocument":ready}))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+struct RetainedNativeBackend {
+    inner: Backend,
+    resources: gptgrep_parse::ResourceBudget,
+    requests: Mutex<Vec<u64>>,
+}
+#[cfg(unix)]
+impl DocumentBackend for RetainedNativeBackend {
+    fn resource_budget(&self) -> ResourceBudget {
+        self.resources.clone()
+    }
+    fn prepared(&self) -> &DocumentPreparedState {
+        self.inner.prepared()
+    }
+    fn images(&self) -> &[DocumentImageGrant] {
+        self.inner.images()
+    }
+    fn reserve_retained(&self, bytes: u64) -> Result<()> {
+        self.requests
+            .lock()
+            .expect("synthetic retained requests")
+            .push(bytes);
+        self.resources.reserve_retained_staging(bytes)
+    }
+    fn call<'a>(
+        &'a mut self,
+        operation: DocumentToolOperation,
+    ) -> Pin<Box<dyn Future<Output = Result<DocumentToolReply>> + Send + 'a>> {
+        self.inner.call(operation)
+    }
+    fn verify_complete(&self) -> Result<DocumentVerifiedProduct> {
+        self.inner.verify_complete()
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn document_image_configuration_binds_original_resources_before_catalog_writes() -> Result<()> {
+    let (_temporary, config, mut native, mut backend) = retained_native_fixture()?;
+    let png = crate::ocr_tests::configured_image_fixture_png();
+    let image = &mut backend.inner.images[0];
+    fs::write(&image.copied_path, &png)?;
+    image.width = 1024;
+    image.height = 1024;
+    image.artifact.bytes = png.len() as u64;
+    image.artifact.sha256 = sha(&png);
+    backend.resources.image_file_bytes = 4_194_304;
+    backend.resources.image_base64_bytes = 5_592_408;
+    native.image_limits =
+        document_native_image_limits(&backend.resources, native.image_wire_bytes)?;
+    assert!(native.image_limits.image_wire_bytes > 4_194_304);
+    let mut wrong = native.clone();
+    wrong.image_limits.image_file_bytes -= 1;
+    assert!(
+        native::NativeSession::prepare(
+            &wrong,
+            &config,
+            &backend,
+            &DocumentWorking::new(67_108_864),
+            Instant::now() + Duration::from_secs(30)
+        )
+        .is_err()
+    );
+    assert!(!native.admission_path.exists());
+    assert!(!native.image_catalog_path.exists());
+    let _session = native::NativeSession::prepare(
+        &native,
+        &config,
+        &backend,
+        &DocumentWorking::new(67_108_864),
+        Instant::now() + Duration::from_secs(30),
+    )?;
+    let manifest: Value = serde_json::from_slice(&fs::read(&native.admission_path)?)?;
+    assert_eq!(
+        manifest["image_limits"],
+        serde_json::to_value(&native.image_limits)?
+    );
+    assert_eq!(
+        manifest["image_transport_reserved_bytes"],
+        native.image_wire_bytes
+    );
+    let catalog: Value = serde_json::from_slice(&fs::read(&native.image_catalog_path)?)?;
+    assert_eq!(catalog["bytes"], png.len());
+    assert_eq!(catalog["sha256"], sha(&png));
+    Ok(())
+}
+
+#[cfg(unix)]
+fn retained_native_fixture() -> Result<(
+    tempfile::TempDir,
+    DocumentAgentControl,
+    DocumentNativeControl,
+    RetainedNativeBackend,
+)> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().canonicalize()?;
+    for leaf in ["images", "receipts"] {
+        fs::DirBuilder::new().mode(0o700).create(root.join(leaf))?;
+    }
+    // The backend fixture owns this already-prepared source; no native/runtime
+    // execution or provider ingestion is claimed by these accounting tests.
+    let payload = b"synthetic retained image source";
+    let source = root.join("images/image.png");
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&source)?
+        .write_all(payload)?;
+    let mut inner = Backend::new();
+    inner.prepared.original_rendition_artifacts = 1;
+    inner.images.push(DocumentImageGrant {
+        artifact: ArtifactRef {
+            id: format!("artifact-{}", "1".repeat(64)),
+            kind: gptgrep_parse::ArtifactKind::Rendition,
+            relative_path: "image.png".into(),
+            bytes: payload.len() as u64,
+            sha256: sha(payload),
+            profile_sha256: "2".repeat(64),
+            mime: "image/png".into(),
+            page: Some(1),
+            region_id: None,
+        },
+        copied_path: source,
+        source_sha256: inner.prepared.source_sha256.clone(),
+        prepared_sha256: inner.prepared.prepared_sha256.clone(),
+        width: 2,
+        height: 2,
+    });
+    let mut config = control()?;
+    config.deadline_unix_ms = u64::MAX;
+    let native = DocumentNativeControl {
+        image_root: root.join("images"),
+        receipt_root: root.join("receipts"),
+        admission_path: root.join("admission.json"),
+        image_catalog_path: root.join("catalog.ndjson"),
+        owner_admission_sha256: "3".repeat(64),
+        image_wire_bytes: 33_554_432,
+        image_limits: document_native_image_limits(&ResourceBudget::default(), 33_554_432).unwrap(),
+    };
+    Ok((
+        temporary,
+        config,
+        native,
+        RetainedNativeBackend {
+            inner,
+            resources: gptgrep_parse::ResourceBudget::default(),
+            requests: Mutex::new(Vec::new()),
+        },
+    ))
+}
+
+#[cfg(unix)]
+#[test]
+fn native_document_reserves_all_258_receipts_on_the_original_counter_before_metadata() -> Result<()>
+{
+    let (_temporary, config, native, backend) = retained_native_fixture()?;
+    let original = backend.resources.clone();
+    let receipt_bound = (2 + 64 + 3 * 64) * 16_384u64;
+    assert_eq!(receipt_bound, 4_227_072);
+    let session = native::NativeSession::prepare(
+        &native,
+        &config,
+        &backend,
+        &DocumentWorking::new(67_108_864),
+        Instant::now() + Duration::from_secs(30),
+    )?;
+    assert_eq!(
+        backend.requests.lock().expect("requests").first(),
+        Some(&receipt_bound)
+    );
+    let metadata = fs::metadata(&native.image_catalog_path)?.len()
+        + fs::metadata(&native.admission_path)?.len();
+    assert_eq!(original.staging_used(), receipt_bound + metadata);
+    let charged = original.staging_used();
+    drop(session);
+    assert_eq!(original.staging_used(), charged);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn native_document_receipt_reservation_refuses_before_writes_and_keeps_later_failure_charge()
+-> Result<()> {
+    let (_temporary, config, native, backend) = retained_native_fixture()?;
+    let original = backend.resources.clone();
+    let receipt_bound = 4_227_072;
+    original.reserve_retained_staging(original.run_staging_bytes - receipt_bound + 1)?;
+    let before = original.staging_used();
+    assert!(
+        native::NativeSession::prepare(
+            &native,
+            &config,
+            &backend,
+            &DocumentWorking::new(67_108_864),
+            Instant::now() + Duration::from_secs(30)
+        )
+        .is_err()
+    );
+    assert_eq!(original.staging_used(), before);
+    assert_eq!(
+        *backend.requests.lock().expect("requests"),
+        vec![receipt_bound]
+    );
+    assert!(!native.image_catalog_path.exists() && !native.admission_path.exists());
+    assert!(fs::read_dir(&native.receipt_root)?.next().is_none());
+
+    // Exactly enough headroom for receipts still cannot fund the catalog. The
+    // successful receipt reservation is retained when that next write refuses.
+    let (_temporary, config, native, backend) = retained_native_fixture()?;
+    let original = backend.resources.clone();
+    original.reserve_retained_staging(original.run_staging_bytes - receipt_bound)?;
+    assert!(
+        native::NativeSession::prepare(
+            &native,
+            &config,
+            &backend,
+            &DocumentWorking::new(67_108_864),
+            Instant::now() + Duration::from_secs(30)
+        )
+        .is_err()
+    );
+    assert_eq!(original.staging_used(), original.run_staging_bytes);
+    assert!(!native.image_catalog_path.exists() && !native.admission_path.exists());
+    assert!(fs::read_dir(&native.receipt_root)?.next().is_none());
+    Ok(())
+}
+
+#[test]
+fn native_document_qualification_rejects_page_scope_and_different_binary_bindings() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().canonicalize()?;
+    let mut config = control()?;
+    config.native_viewer = Some(DocumentNativeControl {
+        image_root: root.join("images"),
+        receipt_root: root.join("receipts"),
+        admission_path: root.join("admission"),
+        image_catalog_path: root.join("catalog"),
+        owner_admission_sha256: "a".repeat(64),
+        image_wire_bytes: 33_554_432,
+        image_limits: document_native_image_limits(&ResourceBudget::default(), 33_554_432).unwrap(),
+    });
+    let profile = RuntimeProfile {
+        schema: "gptgrep.parse-agent.document-runtime-profile.v1".into(),
+        source_revision: "1".repeat(40),
+        protocol_schema_sha256: "2".repeat(64),
+        codex_binary_sha256: config.codex_bin.sha256.clone(),
+        descriptor_sha256: config.model_descriptor.sha256.clone(),
+        permissions_config_sha256: config.permissions_config.sha256.clone(),
+        permissions_template_sha256: sha(&serde_json::to_vec(&native::canonical(
+            document_permissions_template(true),
+        ))?),
+        tools_sha256: document_tool_policy_sha256()?,
+        instructions_sha256: document_instructions_sha256(),
+        standalone_app_server: true,
+        max_seconds: None,
+        native_document_guard: Some(NativeDocumentGuardProfile {
+            schema: "gptgrep.native-document.guard-profile.v1".into(),
+            source_sha256: "3".repeat(64),
+            contract_sha256: document_guard_contract_sha256()?,
+            image_limits: config.native_viewer.as_ref().unwrap().image_limits.clone(),
+        }),
+    };
+    assert!(qualification::accepted(&config, &profile).is_err());
+    let bindings = serde_json::to_value(qualification::expected(&config, &profile)?)?;
+    let assertions = json!({"native_view_image_executed":true,"native_source_prepared_assembled_verified":true,
+        "common_counter_before_argument_parse":true,"failed_duplicate_submissions_charged":true,
+        "unknown_or_missing_guard_state_refused":true,"normalized_request_profile_verified_before_send":true,
+        "complete_source_image_catalog_verified":true,"image_contrast_observed":true,"image_absence_refused":true,
+        "metadata_only_not_accepted_as_image_delivery":true,"provider_ingestion_verified":false,"actual_served_profile_verified":false});
+    fn store(root: &Path, name: &str, value: &Value) -> Result<DocumentFilePin> {
+        let path = root.join(name);
+        let bytes = serde_json::to_vec(value)?;
+        fs::write(&path, &bytes)?;
+        Ok(DocumentFilePin {
+            path,
+            bytes: bytes.len() as u64,
+            sha256: sha(&bytes),
+        })
+    }
+    for (schema, mutated) in [
+        (
+            "gptgrep.native-document.image-qualification.v1",
+            bindings.clone(),
+        ),
+        ("gptgrep.ocr.image-qualification.v1", bindings.clone()),
+        ("gptgrep.native-document.image-qualification.v1", {
+            let mut b = bindings.clone();
+            b["standalone_binary_sha256"] = json!("0".repeat(64));
+            b
+        }),
+        ("gptgrep.native-document.image-qualification.v1", {
+            let mut b = bindings.clone();
+            b["max_tool_calls"] = json!(8);
+            b
+        }),
+    ] {
+        let record = store(
+            &root,
+            "record.json",
+            &json!({"schema":schema,"accepted":true,"bindings":mutated,"assertions":assertions}),
+        )?;
+        let review = store(
+            &root,
+            "review.json",
+            &json!({"schema":"gptgrep.native-document.image-qualification-independent-review.v1",
+            "verdict":"ACCEPT_NATIVE_DOCUMENT_IMAGE_QUALIFICATION","accepted":true,"subjects":{"qualification_record":record},
+            "bindings":bindings,"assertions":assertions,"findings":[]}),
+        )?;
+        let selected = store(
+            &root,
+            "control.json",
+            &json!({"schema":"gptgrep.native-document.image-qualification-control.v1",
+            "qualification_record":record,"independent_review":review}),
+        )?;
+        config.document_image_qualification = Some(DocumentImageQualification {
+            path: selected.path,
+            bytes: selected.bytes,
+            sha256: selected.sha256,
+        });
+        assert_eq!(
+            qualification::accepted(&config, &profile).is_ok(),
+            schema == "gptgrep.native-document.image-qualification.v1" && mutated == bindings
+        );
+    }
+    // Equal record bytes/hash at another path cannot satisfy the three-field subject join.
+    let record = store(
+        &root,
+        "record.json",
+        &json!({"schema":"gptgrep.native-document.image-qualification.v1",
+        "accepted":true,"bindings":bindings,"assertions":assertions}),
+    )?;
+    let mut other = record.clone();
+    other.path = root.join("different-record.json");
+    fs::copy(&record.path, &other.path)?;
+    let review = store(
+        &root,
+        "review.json",
+        &json!({"schema":"gptgrep.native-document.image-qualification-independent-review.v1",
+        "verdict":"ACCEPT_NATIVE_DOCUMENT_IMAGE_QUALIFICATION","accepted":true,"subjects":{"qualification_record":other},
+        "bindings":bindings,"assertions":assertions,"findings":[]}),
+    )?;
+    let selected = store(
+        &root,
+        "control.json",
+        &json!({"schema":"gptgrep.native-document.image-qualification-control.v1",
+        "qualification_record":record,"independent_review":review}),
+    )?;
+    config.document_image_qualification = Some(DocumentImageQualification {
+        path: selected.path,
+        bytes: selected.bytes,
+        sha256: selected.sha256,
+    });
+    assert!(qualification::accepted(&config, &profile).is_err());
+    Ok(())
+}
+#[test]
+fn qualification_image_observations_are_bounded_private_evidence_not_product_fields() -> Result<()>
+{
+    let value = json!({"status":"complete","handle":"a".repeat(64),"image_observations":[{
+        "artifact_id":format!("artifact-{}","b".repeat(64)),"description":"synthetic red square; quoted \\\" 中"}]});
+    let item = json!({"text":value.to_string()});
+    assert!(final_signal(&item, false).is_err());
+    let signal = final_signal(&item, true)?;
+    assert_eq!(
+        signal
+            .image_observations
+            .as_ref()
+            .expect("observations")
+            .len(),
+        1
+    );
+    let mut oversized = value;
+    oversized["image_observations"][0]["description"] = json!("x".repeat(513));
+    assert!(final_signal(&json!({"text":oversized.to_string()}), true).is_err());
+    assert!(
+        final_signal(
+            &json!({"text":json!({"status":"complete","handle":"a".repeat(64)}).to_string()}),
+            true
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn emitted_document_qualification_requires_direct_native_view_without_broad_path_authority()
+-> Result<()> {
+    // Exercise emitted RPC instructions only. No native guard, provider or image
+    // delivery is simulated or accepted; the stream ends just after turn/start.
+    for qualification in [None, Some("synthetic-private-qualification")] {
+        let config = control()?;
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut backend = Backend::new();
+        // More catalog entries than the existing observation-output limit:
+        // qualification may choose any admitted original, without truncation.
+        for page in 1..=73 {
+            let payload = format!("synthetic schema source image {page}");
+            let digest = sha(payload.as_bytes());
+            backend.images.push(DocumentImageGrant {
+                artifact: ArtifactRef {
+                    id: format!("artifact-{digest}"),
+                    kind: gptgrep_parse::ArtifactKind::Rendition,
+                    relative_path: format!("image-{page}.png").into(),
+                    bytes: payload.len() as u64,
+                    sha256: digest,
+                    profile_sha256: sha(b"synthetic image profile"),
+                    mime: "image/png".into(),
+                    page: Some(page),
+                    region_id: None,
+                },
+                copied_path: format!("/synthetic/never-read/image-{page}.png").into(),
+                source_sha256: backend.prepared.source_sha256.clone(),
+                prepared_sha256: backend.prepared.prepared_sha256.clone(),
+                width: 2,
+                height: 2,
+            });
+        }
+        let expected_ids = backend
+            .images()
+            .iter()
+            .map(|image| image.artifact.id.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            run_protocol(
+                startup("chatgpt").as_slice(),
+                Captured(captured.clone()),
+                &config,
+                &mut backend,
+                DocumentRunBudget {
+                    working: DocumentWorking::new(config.limits.working_bytes),
+                    transport: TransportBudget::new(config.limits.total_rpc_bytes),
+                    deadline: Instant::now() + Duration::from_secs(30),
+                },
+                None,
+                qualification,
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(backend.calls, 0);
+        let frames = sent_frames(&captured);
+        let thread = frames
+            .iter()
+            .find(|frame| frame["method"] == "thread/start")
+            .expect("emitted thread/start");
+        let instructions = thread["params"]["baseInstructions"].as_str().unwrap();
+        assert!(instructions.contains("When native_images is exposed"));
+        assert!(instructions.contains(
+            "literal native view_image using only the exact issued original-image paths"
+        ));
+        assert!(instructions.contains("Do not invent or substitute paths or access other files"));
+        assert!(instructions.contains("Read windows require max_bytes from 1 through 32768"));
+        assert!(
+            instructions.contains("For an image read_artifact, use cursor=null and max_bytes=1")
+        );
+        assert!(
+            instructions.contains("complete image under the independent image and wire budgets")
+        );
+        assert!(instructions.contains(
+            "For toolbox operations, use only issued opaque artifact/cursor/task identities"
+        ));
+        assert!(instructions.contains(
+            "do not infer unread fields or claim complete model inspection from a partial window"
+        ));
+        assert!(!instructions.contains("using only gptgrep_parse.toolbox"));
+        assert!(!instructions.contains("transcription of the actual visible text"));
+        let turn = frames
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .expect("emitted turn/start");
+        let prompt: Value =
+            serde_json::from_str(turn["params"]["input"][0]["text"].as_str().unwrap())?;
+        let mut product_schema = turn["params"]["outputSchema"].clone();
+        assert_eq!(prompt["document_tool_budget"], 64);
+        if let Some(purpose) = qualification {
+            let observations = &product_schema["properties"]["image_observations"];
+            let artifact_schema = &observations["items"]["properties"]["artifact_id"];
+            assert_eq!(
+                artifact_schema,
+                &json!({"type":"string","enum":expected_ids})
+            );
+            assert_eq!(artifact_schema["enum"].as_array().unwrap().len(), 73);
+            assert_eq!(observations["minItems"], 1);
+            assert_eq!(observations["maxItems"], 64);
+            assert!(!artifact_schema.to_string().contains("/synthetic/"));
+            product_schema["properties"]
+                .as_object_mut()
+                .unwrap()
+                .remove("image_observations");
+            assert_eq!(
+                product_schema["required"].as_array_mut().unwrap().pop(),
+                Some(json!("image_observations"))
+            );
+            let observation = &prompt["private_qualification_observation"];
+            assert_eq!(observation["purpose_sha256"], purpose);
+            assert_eq!(observation["additional_authority"], false);
+            assert_eq!(
+                observation
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>(),
+                ["purpose_sha256", "task", "additional_authority"]
+                    .into_iter()
+                    .collect::<BTreeSet<_>>()
+            );
+            let task = observation["task"].as_str().unwrap();
+            assert!(task.contains("this Document agent must directly call literal native view_image on at least one admitted original image"));
+            assert!(task.contains(
+                "before describing each observed image and before finalize or finishing"
+            ));
+            assert!(task.contains("OCR-child text or OCR-child viewing, source metadata, and mediated images/crops do not satisfy"));
+            assert!(task.contains("does not require viewing every original page or grant access to new paths or other files"));
+            assert!(task.contains("When text is present, include a transcription of the actual visible text in each image description"));
+            assert!(
+                task.contains(
+                    "For nontext content, describe distinctive visible shapes and colors"
+                )
+            );
+            assert!(task.contains("State uncertainty for unclear content and do not guess"));
+            assert!(task.contains("Generic layout-only prose does not replace observed content"));
+            assert!(!task.contains(purpose));
+        } else {
+            assert!(prompt.get("private_qualification_observation").is_none());
+        }
+        assert_eq!(
+            product_schema,
+            json!({"type":"object","additionalProperties":false,"properties":{"status":{"type":"string","enum":["complete","blocked"]},"handle":{"type":"string","pattern":"^[a-f0-9]{64}$"}},"required":["status","handle"]})
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn duration_profile_value(config: &DocumentAgentControl, duration: Option<Value>) -> Result<Value> {
+    let mut value = json!({
+        "schema":"gptgrep.parse-agent.document-runtime-profile.v1",
+        "source_revision":"1".repeat(40), "protocol_schema_sha256":"2".repeat(64),
+        "codex_binary_sha256":config.codex_bin.sha256,
+        "descriptor_sha256":config.model_descriptor.sha256,
+        "permissions_config_sha256":config.permissions_config.sha256,
+        "permissions_template_sha256":sha(&serde_json::to_vec(&native::canonical(document_permissions_template(true)))?),
+        "tools_sha256":document_tool_policy_sha256()?,
+        "instructions_sha256":document_instructions_sha256(),
+        "standalone_app_server":true,
+        "native_document_guard":{
+            "schema":"gptgrep.native-document.guard-profile.v1",
+            "source_sha256":"3".repeat(64),
+            "contract_sha256":document_guard_contract_sha256()?,
+            "image_limits":config.native_viewer.as_ref().map(|n| &n.image_limits).cloned().unwrap_or(document_native_image_limits(&ResourceBudget::default(), 33_554_432)?)
+        }
+    });
+    if let Some(duration) = duration {
+        value["max_seconds"] = duration;
+    }
+    Ok(value)
+}
+#[cfg(unix)]
+fn duration_profile(
+    config: &DocumentAgentControl,
+    duration: Option<Value>,
+) -> Result<RuntimeProfile> {
+    Ok(serde_json::from_value(duration_profile_value(
+        config, duration,
+    )?)?)
+}
+
+#[cfg(unix)]
+#[test]
+fn document_qualification_binds_the_selected_cumulative_image_allowance() -> Result<()> {
+    let (_temporary, mut config, native, backend) = retained_native_fixture()?;
+    config.native_viewer = Some(native);
+    let baseline = qualification::expected(&config, &duration_profile(&config, None)?)?;
+    let native = config.native_viewer.as_mut().unwrap();
+    native.image_wire_bytes = 16_777_216;
+    native.image_limits =
+        document_native_image_limits(&backend.resources, native.image_wire_bytes)?;
+    let changed = qualification::expected(&config, &duration_profile(&config, None)?)?;
+    assert_eq!(baseline.image_transport_reserved_bytes, 33_554_432);
+    assert_eq!(changed.image_transport_reserved_bytes, 16_777_216);
+    assert_eq!(
+        changed.rpc_transport_reserved_bytes,
+        baseline.rpc_transport_reserved_bytes
+    );
+    assert_ne!(
+        changed.generic_runtime_profile_sha256,
+        baseline.generic_runtime_profile_sha256
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_document_duration_rejects_mismatch_non_native_and_nonfinite_inputs() -> Result<()> {
+    let (_temporary, mut config, native, _) = retained_native_fixture()?;
+    config.native_viewer = Some(native);
+    let legacy = duration_profile(&config, None)?;
+    assert_eq!(legacy.selected_max_seconds(&config)?, 900);
+    config.limits.timeout_ms = 3_600_000;
+    assert!(legacy.selected_max_seconds(&config).is_err());
+    let selected = duration_profile(&config, Some(json!(3600)))?;
+    assert_eq!(selected.selected_max_seconds(&config)?, 3600);
+    config.limits.timeout_ms = 3_600_001;
+    assert!(selected.selected_max_seconds(&config).is_err());
+    for seconds in [0, 3601, u64::MAX] {
+        let profile = duration_profile(&config, Some(json!(seconds)))?;
+        assert!(profile.selected_max_seconds(&config).is_err());
+        assert!(document_guard_contract_sha256_for(seconds).is_err());
+        assert!(native::duration_millis(seconds).is_err());
+    }
+    for value in [Value::Null, json!(-1), json!(1.5), json!("3600")] {
+        assert!(duration_profile(&config, Some(value)).is_err());
+    }
+    assert_eq!(native::duration_millis(1)?, 1000);
+    assert_eq!(native::duration_millis(3600)?, 3_600_000);
+    config.native_viewer = None;
+    config.limits.timeout_ms = 3_600_000;
+    assert!(selected.selected_max_seconds(&config).is_err());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn document_duration_binds_all_18_fields_and_preserves_absent_900_digest() -> Result<()> {
+    let (_temporary, mut config, native, _) = retained_native_fixture()?;
+    config.native_viewer = Some(native);
+    let mut profile = duration_profile(&config, None)?;
+    let legacy = qualification::expected(&config, &profile)?;
+    let guard = profile.native_document_guard.as_ref().expect("guard");
+    // Freeze the complete legacy generic descriptor: no max_seconds field.
+    let legacy_generic = native::canonical(json!({
+        "schema":"gptgrep.parse-agent.document-generic-runtime-profile.v1",
+        "source_revision":profile.source_revision,"protocol_schema_sha256":profile.protocol_schema_sha256,
+        "standalone_app_server":profile.standalone_app_server,"codex_binary_sha256":profile.codex_binary_sha256,
+        "descriptor_sha256":profile.descriptor_sha256,"permissions_template_sha256":profile.permissions_template_sha256,
+        "tools_sha256":profile.tools_sha256,"instructions_sha256":profile.instructions_sha256,
+        "native_document_guard":{"schema":guard.schema,"source_sha256":guard.source_sha256,"contract_sha256":guard.contract_sha256,"image_limits":guard.image_limits}
+    }));
+    assert!(legacy_generic.get("max_seconds").is_none());
+    assert_eq!(
+        legacy.generic_runtime_profile_sha256,
+        sha(&serde_json::to_vec(&legacy_generic)?)
+    );
+    assert_eq!(legacy.max_seconds, 900);
+    assert_eq!(
+        document_guard_contract_sha256()?,
+        document_guard_contract_sha256_for(900)?
+    );
+    assert_eq!(
+        serde_json::to_value(&legacy)?
+            .as_object()
+            .expect("18 bindings")
+            .len(),
+        18
+    );
+
+    profile.max_seconds = Some(3600);
+    config.limits.timeout_ms = 3_600_000;
+    profile
+        .native_document_guard
+        .as_mut()
+        .expect("guard")
+        .contract_sha256 = document_guard_contract_sha256_for(3600)?;
+    let selected = qualification::expected(&config, &profile)?;
+    assert_eq!(selected.max_seconds, 3600);
+    assert_ne!(selected.guard_contract_sha256, legacy.guard_contract_sha256);
+    assert_ne!(
+        selected.generic_runtime_profile_sha256,
+        legacy.generic_runtime_profile_sha256
+    );
+    let mut selected_fields = serde_json::to_value(&selected)?;
+    let mut legacy_fields = serde_json::to_value(&legacy)?;
+    for field in [
+        "max_seconds",
+        "guard_contract_sha256",
+        "generic_runtime_profile_sha256",
+    ] {
+        selected_fields.as_object_mut().unwrap().remove(field);
+        legacy_fields.as_object_mut().unwrap().remove(field);
+    }
+    assert_eq!(selected_fields, legacy_fields);
+    // The other source/binary fields above are held synthetic and identical only
+    // for this unit check. A real duration build must rebind its actual new pins.
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn selected_document_duration_is_emitted_in_admission_and_ready_only_when_explicit() -> Result<()> {
+    for duration in [None, Some(3600)] {
+        let (_temporary, mut config, native, backend) = retained_native_fixture()?;
+        let selected = duration.unwrap_or(900);
+        config.limits.timeout_ms = selected * 1000;
+        let mut session = native::NativeSession::prepare_with_duration(
+            &native,
+            &config,
+            &backend,
+            &DocumentWorking::new(67_108_864),
+            Instant::now() + Duration::from_secs(selected),
+            duration,
+        )?;
+        let bytes = fs::read(&native.admission_path)?;
+        let manifest: Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(
+            manifest.get("max_seconds"),
+            duration.map(|value| json!(value)).as_ref()
+        );
+        assert_eq!(
+            manifest.as_object().unwrap().len(),
+            if duration.is_some() { 17 } else { 16 }
+        );
+        let ready = json!({"schema_version":"gptgrep.native-document.ready.v1","required":true,
+            "admission_sha256":sha(&bytes),"task_sha256":backend.prepared().task_sha256,
+            "source_sha256":backend.prepared().source_sha256,"prepared_sha256":backend.prepared().prepared_sha256,
+            "runtime_profile_sha256":config.runtime_profile.sha256,"permissions_profile_id":"gptgrep_native_document",
+            "permissions_profile_sha256":manifest["permissions_profile_sha256"],"environment_ids":["local"],
+            "environment_id_argument_admitted":false,"max_tool_calls":64,"max_turns":1,"max_seconds":selected,
+            "deadline_unix_ms":manifest["deadline_unix_ms"],"frame_bytes":4_194_304,"image_transport_reserved_bytes":33_554_432,"image_limits":manifest["image_limits"],
+            "tool_counter_before_lookup_hooks_handler":true,"tool_counter_before_argument_parse":true,
+            "normalized_request_profile_verified_before_send":true,"native_image_read_bounded":true,
+            "assembled_image_receipts_required":true,"requested_model":"gpt-6-luna","requested_effort":"max",
+            "normalized_request_service_tier":"priority","actual_served_profile_verified":false,
+            "image_catalog_sha256":manifest["image_catalog"]["sha256"],"image_catalog_count":1});
+        let mut wrong = ready.clone();
+        wrong["max_seconds"] = json!(selected + 1);
+        assert!(
+            session
+                .initialize(&json!({"gptgrepNativeDocument":wrong}))
+                .is_err()
+        );
+        session.initialize(&json!({"gptgrepNativeDocument":ready}))?;
+    }
+    Ok(())
+}
+
+struct CleanupBackend {
+    inner: Backend,
+    calls: usize,
+    fail: bool,
+    completed: Arc<std::sync::atomic::AtomicBool>,
+    ocr: Option<crate::OcrCleanup>,
+    sleep_until: Option<Instant>,
+}
+impl DocumentBackend for CleanupBackend {
+    fn prepared(&self) -> &DocumentPreparedState {
+        self.inner.prepared()
+    }
+    fn images(&self) -> &[DocumentImageGrant] {
+        self.inner.images()
+    }
+    fn reserve_retained(&self, bytes: u64) -> Result<()> {
+        self.inner.reserve_retained(bytes)
+    }
+    fn call<'a>(
+        &'a mut self,
+        operation: DocumentToolOperation,
+    ) -> Pin<Box<dyn Future<Output = Result<DocumentToolReply>> + Send + 'a>> {
+        let sleep_until = self.sleep_until;
+        Box::pin(async move {
+            let reply = self.inner.call(operation).await?;
+            if let Some(target) = sleep_until {
+                tokio::time::sleep_until(target).await;
+            }
+            Ok(reply)
+        })
+    }
+    fn verify_complete(&self) -> Result<DocumentVerifiedProduct> {
+        self.inner.verify_complete()
+    }
+    fn cancel_ocr_on_drop(&mut self) {
+        if let Some(ocr) = &self.ocr {
+            ocr.cancel_on_drop();
+        }
+    }
+    fn cancel_and_drain_ocr<'a>(
+        &'a mut self,
+        deadline: Instant,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        self.calls += 1;
+        Box::pin(async move {
+            if let Some(ocr) = &self.ocr {
+                ocr.cancel_and_drain(deadline).await?;
+            }
+            tokio::task::yield_now().await;
+            self.completed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            ensure!(!self.fail, "synthetic_cleanup_failure");
+            Ok(())
+        })
+    }
+}
+#[tokio::test]
+async fn document_cleanup_is_awaited_and_primary_timeout_survives_cleanup_failure() -> Result<()> {
+    for fail in [false, true] {
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut backend = CleanupBackend {
+            inner: Backend::new(),
+            calls: 0,
+            fail,
+            completed: completed.clone(),
+            ocr: None,
+            sleep_until: None,
+        };
+        let primary = backend_failure("execute_ocr", None, None);
+        let original = primary.to_string();
+        let error = finish_document_cleanup::<()>(&mut backend, Err(primary), Some(Instant::now()))
+            .await
+            .expect_err("primary timeout");
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(backend.calls, 1);
+        assert!(error.to_string().starts_with(&original));
+        assert_eq!(
+            error.to_string().contains("document_ocr_cleanup_unknown"),
+            fail
+        );
+        assert!(error.chain().any(|cause| cause.to_string() == original));
+    }
+    Ok(())
+}
+#[tokio::test]
+async fn document_validation_return_also_waits_for_backend_cleanup() -> Result<()> {
+    let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut backend = CleanupBackend {
+        inner: Backend::new(),
+        calls: 0,
+        fail: false,
+        completed: completed.clone(),
+        ocr: None,
+        sleep_until: None,
+    };
+    let mut invalid = control()?;
+    invalid.schema = "invalid-before-any-runtime".into();
+    let error = drive_document_agent(
+        &invalid,
+        &mut backend,
+        DocumentWorking::new(67_108_864),
+        Instant::now(),
+    )
+    .await
+    .err()
+    .expect("validation refusal");
+    assert_eq!(error.to_string(), "document_control_schema");
+    assert_eq!(backend.calls, 1);
+    assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn document_profile_validation_requires_the_selected_duration_contract_and_exact_caller()
+-> Result<()> {
+    fn pin_json(root: &Path, name: &str, value: &Value) -> Result<DocumentFilePin> {
+        let bytes = serde_json::to_vec(value)?;
+        let path = root.join(name);
+        fs::write(&path, &bytes)?;
+        Ok(DocumentFilePin {
+            path,
+            bytes: bytes.len() as u64,
+            sha256: sha(&bytes),
+        })
+    }
+    let (temporary, mut config, native, _) = retained_native_fixture()?;
+    config.native_viewer = Some(native);
+    config.model_descriptor = pin_json(
+        temporary.path(),
+        "descriptor.json",
+        &document_model_descriptor(),
+    )?;
+    config.permissions_config = pin_json(
+        temporary.path(),
+        "permissions.json",
+        &document_permissions_config(config.native_viewer.as_ref()),
+    )?;
+    config.limits.timeout_ms = 3_600_000;
+    let mut selected = duration_profile_value(&config, Some(json!(3600)))?;
+    config.runtime_profile = pin_json(temporary.path(), "profile.json", &selected)?;
+    assert!(validate_profile(&config).is_err()); // Legacy 900 contract cannot authorize 3600.
+    selected["native_document_guard"]["contract_sha256"] =
+        json!(document_guard_contract_sha256_for(3600)?);
+    config.runtime_profile = pin_json(temporary.path(), "profile.json", &selected)?;
+    assert_eq!(
+        validate_profile(&config)?.selected_max_seconds(&config)?,
+        3600
+    );
+    config.limits.timeout_ms = 900_000;
+    assert!(validate_profile(&config).is_err());
+    let legacy = duration_profile_value(&config, None)?;
+    assert!(legacy.get("max_seconds").is_none());
+    config.runtime_profile = pin_json(temporary.path(), "profile.json", &legacy)?;
+    assert_eq!(
+        validate_profile(&config)?.selected_max_seconds(&config)?,
+        900
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn document_return_barrier_waits_for_real_owned_mock_after_submitted_timeout() -> Result<()> {
+    let fixture = crate::ocr_tests::Fixture::new();
+    let (executor, context, pid_file) = crate::ocr_tests::mock_executor(&fixture, "hang", true);
+    let cleanup = crate::OcrCleanup::new(64)?;
+    let executor = executor.with_cleanup(cleanup.clone());
+    let cancel = crate::OcrCancellation::default();
+    let mut operation = Box::pin(executor.execute_cancellable(fixture.task.clone(), cancel));
+    tokio::select! {
+        result = &mut operation => panic!("mock ended before submission: {result:?}"),
+        () = crate::ocr_tests::wait_for_submitted_mock(&pid_file) => {}
+    }
+    let pids: Vec<u32> = serde_json::from_slice(&fs::read(&pid_file)?)?;
+    assert!(
+        timeout_at(Instant::now() + Duration::from_millis(1), operation)
+            .await
+            .is_err()
+    );
+    let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut backend = CleanupBackend {
+        inner: Backend::new(),
+        calls: 0,
+        fail: false,
+        completed: completed.clone(),
+        ocr: Some(cleanup),
+        sleep_until: None,
+    };
+    let original = backend_failure("execute_ocr", None, None).to_string();
+    let error = finish_document_cleanup::<()>(
+        &mut backend,
+        Err(backend_failure("execute_ocr", None, None)),
+        Some(Instant::now()),
+    )
+    .await
+    .expect_err("original timeout");
+    assert_eq!(error.to_string(), original);
+    assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(backend.calls, 1);
+    let leader = std::process::Command::new("/bin/ps")
+        .args(["-o", "stat=", "-p", &pids[0].to_string()])
+        .output()?;
+    assert!(
+        leader.stdout.is_empty(),
+        "Document returned before OCR leader reap"
+    );
+    let snapshot = context.snapshot()?;
+    assert_eq!(snapshot.charged_admissions, 1);
+    assert_eq!(snapshot.terminal_admissions, 0);
+    assert_eq!(snapshot.quarantined_slots, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn document_agent_retains_token_usage_on_success_and_partial_observation_on_failure()
+-> Result<()> {
+    let mut script = startup("chatgpt");
+    script.extend(line(json!({
+        "method":"thread/tokenUsage/updated",
+        "params":{
+            "threadId":"synthetic-thread",
+            "turnId":"synthetic-turn",
+            "tokenUsage":{
+                "total":{"totalTokens":120,"inputTokens":90,"outputTokens":30},
+                "last":{"totalTokens":120,"inputTokens":90,"outputTokens":30},
+                "modelContextWindow":128000,
+                "unallowlisted":"discarded"
+            }
+        }
+    })));
+    script.extend(line(tool("call-finalize", "finalize")));
+    script.extend(line(json!({
+        "method":"thread/tokenUsage/updated",
+        "params":{
+            "threadId":"synthetic-thread",
+            "turnId":"synthetic-turn",
+            "tokenUsage":{
+                "total":{"totalTokens":340,"inputTokens":240,"outputTokens":100,"reasoningOutputTokens":40},
+                "last":{"totalTokens":220,"inputTokens":150,"outputTokens":70}
+            }
+        }
+    })));
+    script.extend(finish());
+    let mut backend = Backend::new();
+    let outcome = replay(&script, &mut backend).await?;
+    assert_eq!(
+        outcome.token_usage,
+        Some(json!({
+            "total":{"totalTokens":340,"inputTokens":240,"outputTokens":100,"reasoningOutputTokens":40},
+            "last":{"totalTokens":220,"inputTokens":150,"outputTokens":70},
+            "modelContextWindow":128000
+        }))
+    );
+
+    let mut failing_script = startup("chatgpt");
+    failing_script.extend(line(json!({
+        "method":"thread/tokenUsage/updated",
+        "params":{
+            "threadId":"synthetic-thread",
+            "turnId":"synthetic-turn",
+            "tokenUsage":{"total":{"totalTokens":210,"inputTokens":160,"outputTokens":50}}
+        }
+    })));
+    failing_script.extend(line(tool("call-inspect", "inspect_document")));
+    failing_script.extend(line(json!({
+        "method":"turn/completed",
+        "params":{
+            "threadId":"synthetic-thread",
+            "turn":{"id":"synthetic-turn","status":"failed","error":{"message":"provider_failed"}}
+        }
+    })));
+    let mut failing_backend = Backend::new();
+    let error = replay(&failing_script, &mut failing_backend)
+        .await
+        .err()
+        .expect("terminal turn failure");
+    assert_eq!(error.to_string(), "document_turn_terminal_failure");
+    let failure = error
+        .downcast_ref::<DocumentAgentFailure>()
+        .expect("partial document turn observation retained");
+    assert!(failure.completed_outcome().is_none());
+    let observed = failure.observation();
+    assert_eq!(observed.thread_id.as_deref(), Some("synthetic-thread"));
+    assert_eq!(observed.turn_id.as_deref(), Some("synthetic-turn"));
+    assert_eq!(observed.tool_submissions, 1);
+    assert_eq!(observed.deliveries.len(), 1);
+    assert_eq!(observed.deliveries[0].operation, "inspect_document");
+    assert_eq!(
+        observed.token_usage,
+        Some(json!({"total":{"totalTokens":210,"inputTokens":160,"outputTokens":50}}))
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn live_native_mock_control(
+    root: &Path,
+    script_body: &str,
+    timeout_ms: u64,
+) -> Result<DocumentAgentControl> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    for rel in ["auth", "state", "state/logs", "cwd"] {
+        let dir = root.join(rel);
+        if !dir.exists() {
+            fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        }
+    }
+    let bin_path = root.join("mock-codex.sh");
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o700)
+            .open(&bin_path)?;
+        file.write_all(script_body.as_bytes())?;
+        file.sync_all()?;
+    }
+    let bin_bytes = fs::read(&bin_path)?;
+    let codex_bin = DocumentFilePin {
+        path: bin_path,
+        bytes: bin_bytes.len() as u64,
+        sha256: sha(&bin_bytes),
+    };
+    let mut config = native_execution_control()?;
+    config.limits.timeout_ms = timeout_ms;
+    let bindings = document_native_execution_bindings(config.native_execution.as_ref().unwrap())?;
+    let write_pin = |name: &str, value: &Value| -> Result<DocumentFilePin> {
+        let path = root.join(name);
+        let bytes = serde_json::to_vec(value)?;
+        fs::write(&path, &bytes)?;
+        Ok(DocumentFilePin {
+            path,
+            bytes: bytes.len() as u64,
+            sha256: sha(&bytes),
+        })
+    };
+    let model_descriptor = write_pin("descriptor.json", &bindings.model_descriptor)?;
+    let permissions_config = write_pin("permissions.json", &bindings.permissions_config)?;
+    let runtime_profile = write_pin(
+        "profile.json",
+        &json!({
+            "schema":"gptgrep.parse-agent.document-runtime-profile.v1",
+            "source_revision":"1".repeat(40),
+            "protocol_schema_sha256":"2".repeat(64),
+            "codex_binary_sha256":codex_bin.sha256,
+            "descriptor_sha256":bindings.descriptor_sha256,
+            "permissions_config_sha256":bindings.permissions_config_sha256,
+            "permissions_template_sha256":bindings.permissions_template_sha256,
+            "tools_sha256":bindings.tools_sha256,
+            "instructions_sha256":bindings.instructions_sha256,
+            "standalone_app_server":true
+        }),
+    )?;
+    let clock = RunClockAnchor::capture(std::time::SystemTime::now() + Duration::from_secs(60))?;
+    config.deadline_unix_ms = clock.deadline_unix_ms();
+    config.original_clock = clock;
+    config.codex_bin = codex_bin;
+    config.runtime_profile = runtime_profile;
+    config.model_descriptor = model_descriptor;
+    config.permissions_config = permissions_config;
+    config.auth_home = root.join("auth");
+    config.state_dir = root.join("state");
+    config.cwd = root.join("cwd");
+    Ok(config)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn document_drive_compares_protocol_completion_before_process_cleanup_and_retains_outcome_on_cleanup_failure()
+-> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().canonicalize()?;
+    let script = r#"#!/bin/sh
+trap '' TERM
+read -r _init
+printf '%s\n' '{"id":1,"result":{}}'
+read -r _initialized
+read -r _account
+printf '%s\n' '{"id":2,"result":{"account":{"type":"chatgpt"}}}'
+read -r _config
+printf '%s\n' '{"id":3,"result":{"config":{"mcp_servers":{},"tools":{},"web_search":"live"}}}'
+read -r _thread
+printf '%s\n' '{"id":4,"result":{"thread":{"id":"synthetic-thread"},"model":"gpt-6-luna","modelProvider":"openai","approvalPolicy":"never","activePermissionProfile":{"id":"synthetic-native","extends":null},"sandbox":{"type":"dangerFullAccess","networkAccess":true},"reasoningEffort":"max","serviceTier":"priority"}}'
+read -r _turn
+printf '%s\n' '{"id":5,"result":{"turn":{"id":"synthetic-turn"}}}'
+printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"synthetic-thread","turnId":"synthetic-turn","tokenUsage":{"total":{"totalTokens":144,"inputTokens":100,"outputTokens":44}}}}'
+printf '%s\n' '{"id":101,"method":"item/tool/call","params":{"threadId":"synthetic-thread","turnId":"synthetic-turn","callId":"call-finalize","namespace":"gptgrep_parse","tool":"toolbox","arguments":{"op":"finalize"}}}'
+read -r _tool_reply
+printf '%s\n' '{"method":"item/completed","params":{"threadId":"synthetic-thread","turnId":"synthetic-turn","item":{"type":"dynamicToolCall","id":"call-finalize","namespace":"gptgrep_parse","tool":"toolbox"}}}'
+printf '%s\n' '{"method":"item/completed","params":{"threadId":"synthetic-thread","turnId":"synthetic-turn","item":{"type":"agentMessage","id":"synthetic-answer","phase":"final_answer","text":"{\"status\":\"complete\",\"handle\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}"}}}'
+printf '%s\n' '{"method":"turn/completed","params":{"threadId":"synthetic-thread","turnId":"synthetic-turn","turn":{"id":"synthetic-turn","status":"completed","error":null,"items":[]}}}'
+sleep 5
+"#;
+    // Allow 2000ms for subprocess startup under parallel test load, then hold
+    // Finalize until 100ms before deadline so turn/completed finishes with <100ms
+    // remaining while OwnedGroup::stop's 200ms SIGTERM->SIGKILL grace exceeds deadline.
+    let config = live_native_mock_control(&root, script, 2_000)?;
+    let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let started = Instant::now();
+    let mut backend = CleanupBackend {
+        inner: Backend::new(),
+        calls: 0,
+        fail: false,
+        completed: completed.clone(),
+        ocr: None,
+        sleep_until: Some(started + Duration::from_millis(1_900)),
+    };
+    let outcome = drive_document_agent(
+        &config,
+        &mut backend,
+        DocumentWorking::new(config.limits.working_bytes),
+        started,
+    )
+    .await?;
+    assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(
+        outcome.token_usage,
+        Some(json!({"total":{"totalTokens":144,"inputTokens":100,"outputTokens":44}}))
+    );
+
+    let config = live_native_mock_control(&root, script, 2_000)?;
+    let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let started = Instant::now();
+    let mut failing_cleanup_backend = CleanupBackend {
+        inner: Backend::new(),
+        calls: 0,
+        fail: true,
+        completed,
+        ocr: None,
+        sleep_until: Some(started + Duration::from_millis(1_900)),
+    };
+    let error = drive_document_agent(
+        &config,
+        &mut failing_cleanup_backend,
+        DocumentWorking::new(config.limits.working_bytes),
+        started,
+    )
+    .await
+    .err()
+    .expect("cleanup failure after completed turn");
+    assert_eq!(error.to_string(), "document_ocr_cleanup_unknown");
+    let failure = error
+        .downcast_ref::<DocumentAgentFailure>()
+        .expect("completed turn retained on cleanup failure");
+    let retained = failure
+        .completed_outcome()
+        .expect("completed outcome attached");
+    assert_eq!(retained.thread_id, "synthetic-thread");
+    assert_eq!(retained.turn_id, "synthetic-turn");
+    assert_eq!(
+        retained.token_usage,
+        Some(json!({"total":{"totalTokens":144,"inputTokens":100,"outputTokens":44}}))
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dropping_document_agent_future_synchronously_cancels_owned_ocr_cleanup() -> Result<()> {
+    let fixture = crate::ocr_tests::Fixture::new();
+    let (executor, _context, pid_file) = crate::ocr_tests::mock_executor(&fixture, "hang", true);
+    let cleanup = crate::OcrCleanup::new(64)?;
+    let executor = executor.with_cleanup(cleanup.clone());
+    let cancel = crate::OcrCancellation::default();
+    let mut ocr_op = Box::pin(executor.execute_cancellable(fixture.task.clone(), cancel.clone()));
+    tokio::select! {
+        result = &mut ocr_op => panic!("mock ended before submission: {result:?}"),
+        () = crate::ocr_tests::wait_for_submitted_mock(&pid_file) => {}
+    }
+    drop(ocr_op);
+
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().canonicalize()?;
+    let hang_script = "#!/bin/sh\nsleep 30\n";
+    let config = live_native_mock_control(&root, hang_script, 30_000)?;
+    let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut backend = CleanupBackend {
+        inner: Backend::new(),
+        calls: 0,
+        fail: false,
+        completed,
+        ocr: Some(cleanup.clone()),
+        sleep_until: None,
+    };
+    assert!(!cleanup.is_closed());
+    let drive_future = drive_document_agent(
+        &config,
+        &mut backend,
+        DocumentWorking::new(config.limits.working_bytes),
+        Instant::now(),
+    );
+    let _ = timeout_at(Instant::now() + Duration::from_millis(50), drive_future).await;
+    // Dropping drive_document_agent before finish_document_cleanup must synchronously close
+    // and cancel the backend's OcrCleanup registry.
+    assert!(cleanup.is_closed());
+    cleanup
+        .cancel_and_drain(Instant::now() + Duration::from_secs(5))
+        .await?;
+    Ok(())
+}

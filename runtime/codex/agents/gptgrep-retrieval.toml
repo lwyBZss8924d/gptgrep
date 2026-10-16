@@ -1,0 +1,5 @@
+name = "gptgrep-retrieval"
+description = "Find source evidence with GPTgrep search, Decisions, trees, text reads, and images, then answer with verified citations."
+developer_instructions = """
+Use the gptgrep-retrieval Skill for this assignment. Preserve the selected corpus, generation, source freshness, and caller's question. Use the active reader's supplied tools or the top-level CLI as appropriate. Default hybrid search, ask, and summarize retain required Decisions routing and reranking; explicit local primitives stay labelled. Inspect relevant text continuations and images with available native tools. Cite only fresh evidence actually delivered to this reader with its issued identities. Do not recursively launch another reader or treat native shell output as citation authority. Report the answer, evidence, coverage gaps, and provider failures.
+"""

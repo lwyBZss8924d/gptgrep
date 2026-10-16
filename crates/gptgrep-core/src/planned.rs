@@ -57,6 +57,10 @@ pub struct PlannedCoverage {
     pub reranked_candidates: usize,
     pub filtered_candidates: usize,
     pub retained_literal_anchors: usize,
+    /// Below-floor union candidates delivered as the flagged low-confidence
+    /// fallback because none met the relevance floor (see `Coverage`).
+    #[serde(default)]
+    pub below_threshold_fallback: usize,
     pub stale_files: Vec<String>,
     pub truncated: bool,
 }
@@ -67,7 +71,9 @@ pub struct PlannedCoverage {
 pub struct PlannedSearchEvent {
     /// q0.route, q1.route, q2.route, or union.rerank.
     pub operation_id: String,
-    /// admitted, before_call, after_reply, finished, failed, or interrupted.
+    /// admitted, before_call, before_retry, after_reply, finished, failed, or
+    /// interrupted. One operation makes one logical call; an admitted bounded
+    /// transient retry adds one attempt and one `jev_retried_attempts` entry.
     pub event: String,
     pub query_sha256: String,
     pub original_question_sha256: String,
@@ -232,6 +238,16 @@ impl<'a, 'b> Operation<'a, 'b> {
         event.event = "failed".into();
         event.accounting_complete = false;
         event.cause = Some(sanitized_cause(&error));
+        // A typed Jev failure carries this operation's final metrics, including
+        // a bounded retry's failed attempt. Adopt them unless that would regress.
+        if let Some(failure) = error.downcast_ref::<JevSearchError>()
+            && failure.metrics.jev_calls_attempted >= event.metrics.jev_calls_attempted
+            && failure.metrics.jev_requests >= event.metrics.jev_requests
+            && failure.metrics.jev_retried_attempts.len()
+                >= event.metrics.jev_retried_attempts.len()
+        {
+            event.metrics = failure.metrics.clone();
+        }
         // If persistence itself failed, retain the observed slot in the typed
         // error and let the caller report its ledger failure separately.
         let _ = self.emit(event);
@@ -287,7 +303,13 @@ fn aggregate(operations: &[PlannedSearchEvent], started: Instant) -> Metrics {
         result
             .jev_models
             .extend(operation.metrics.jev_models.clone());
+        result
+            .jev_requested_models
+            .extend(operation.metrics.jev_requested_models.clone());
         result.jev_usage.extend(operation.metrics.jev_usage.clone());
+        result
+            .jev_retried_attempts
+            .extend(operation.metrics.jev_retried_attempts.clone());
     }
     result
 }
@@ -367,7 +389,7 @@ pub async fn search_planned_with_policy_and_observer(
         let mut seen = HashSet::from([original_question.trim()]);
         for query in alternate_queries {
             ensure!(
-                !query.trim().is_empty() && query.len() <= 1024 && !tokens(query).is_empty(),
+                !query.trim().is_empty() && query.len() <= 1024 && !query_tokens(query).is_empty(),
                 "alternate queries must contain 1..1024 UTF-8 bytes and a word"
             );
             ensure!(
@@ -496,6 +518,7 @@ pub async fn search_planned_with_policy_and_observer(
         coverage.reranked_candidates = union.coverage.reranked_candidates;
         coverage.filtered_candidates = union.coverage.filtered_candidates;
         coverage.retained_literal_anchors = union.coverage.retained_literal_anchors;
+        coverage.below_threshold_fallback = union.coverage.below_threshold_fallback;
         if let Err(error) = reranked {
             return Err(operation.fail(error));
         }
@@ -514,6 +537,7 @@ pub async fn search_planned_with_policy_and_observer(
         coverage.reranked_candidates = union.coverage.reranked_candidates;
         coverage.filtered_candidates = union.coverage.filtered_candidates;
         coverage.retained_literal_anchors = union.coverage.retained_literal_anchors;
+        coverage.below_threshold_fallback = union.coverage.below_threshold_fallback;
         coverage.stale_files = union.coverage.stale_files.clone();
         coverage.truncated |= union.coverage.truncated;
         let operations = recorder.events();
@@ -523,8 +547,8 @@ pub async fn search_planned_with_policy_and_observer(
             query: original_question.into(),
             mode: options.mode.clone(),
             document_scope: options.document.clone(),
-            root: snapshot.manifest.root,
-            generation: snapshot.manifest.generation,
+            root: snapshot.manifest.root.clone(),
+            generation: snapshot.manifest.generation.clone(),
             index_used: true,
             source_fresh: if union.hits.is_empty() {
                 None
@@ -583,6 +607,7 @@ async fn score_evidence_roles(
     )?;
     metrics.jev_candidate_bytes = prepared.candidate_bytes();
     metrics.jev_calls_attempted = 1;
+    metrics.jev_requested_models = vec![client.requested_model().to_owned()];
     let mut before = operation.current();
     before.event = "before_call".into();
     before.metrics = metrics.clone();
@@ -592,6 +617,7 @@ async fn score_evidence_roles(
         .decide_evidence_roles(prepared)
         .await
         .map_err(|error| {
+            record_validated_retry_reply(metrics, &error);
             jev_search_error(
                 "evidence_reranking",
                 error,

@@ -1,18 +1,38 @@
 # GPTgrep project navigation
 
 - [Project authority](AGENTS.md): implementation, verification, review and delivery.
+- [Execution and delivery workflow](workspace/harness-config/workflow.txt): proportionate changes, validation, private evidence and closeout.
+- [Checkpoint template](workspace/harness-config/templates/checkpoint.json): fields for a local continuation cursor.
+- [GPTgrep agent Skill](skills/gptgrep/SKILL.md): source-linked evidence working memory and product tool composition.
 - [Product specification](SPEC.md): interfaces, initial release and long-horizon research goal.
-- [Goal contract](workspace/harness-config/goal-contract.json): live PageIndex comparison gates; a preview release alone does not meet them.
+- [Evaluation protocol](docs/evaluation.md): matched native Codex with GPTgrep versus bare on XL-DocBench, fixed denominators, separate preparation/SEARCH/Judge accounting and frozen confirmation.
+- [Goal contract](workspace/harness-config/goal-contract.json): 0.2 models, matched arms, development selection and distinct XL release acceptance; small live runs and source delivery do not establish canary readiness.
 - Local research gaps: `workspace/issues/research-gaps.json` (ignored and untracked).
 - Local execution plans: `workspace/exec-plans/` (ignored and untracked).
 - [Architecture](docs/architecture.md): parsing, trees, trigram filtering, Jev and the local Codex host.
+- [PTC multimodal design](docs/design/ptc-multimodal-retrieval.md): implemented batch retrieval, Luna Decisions, rich parsing and Agentic OCR contracts; complete live integration and release gates remain pending.
+- [Development setup](docs/development.md): external build storage, native runtime, authentication, parse/OCR controls and evaluation environment.
+- [Codex auth supervisor](workspace/harness-tooling/codex-auth/README.md): shared-login lease, per-run CODEX_HOME, single refresh owner; route every shared-login live consumer through it.
+- [Experimental status](docs/experimental-status.md): retained product baseline and current 0.2 validation/acceptance limits.
 - Local research entry: `docs/research/README.md` (ignored and untracked).
 - [Flash stage coverage](crates/gptgrep-pageindex/FLASH_STAGE_COVERAGE.md): verified port stages, LiteParse alternatives and pending parity.
-- Local paired plan: `docs/research/paired-baseline-plan.md` (ignored and untracked).
-- [Baseline runner](scripts/pageindex_baseline/README.md): reproducible controls, execution and accounting.
-- [Local host defaults](config/codex-host.toml): gpt-5.6-luna / max; account selected at runtime.
-- [Release workflow](docs/release.md): source binding, native dependency notices and relocation.
+- [XL benchmark source contract](benchmark/UPSTREAM.md): pinned release/scorer, raw-source verification, complete cross-document context and rights.
+- [Native benchmark runner](benchmark/NATIVE-RUNNER.md): isolated readers, independent judge, exact profiles and runtime evidence.
+- [Self-opt CLI](self-opt/src/cli.ts): compare complete retained measurements and plan isolated product iterations.
+- [Local host defaults](config/codex-host.toml): gpt-6-luna / max; account selected at runtime.
+- [Release workflow](docs/release.md): source binding, native dependency notices, relocation and the experimental version policy.
+- Native parse/OCR indexing: `gptgrep parse-agent serve|run|agent|qualify` and `gptgrep index ROOT --parse-agent-config ... --document-agent-controls ...`; see the [prepared-document agent](docs/architecture.md#prepared-document-agent).
+- `search|ask --multimodal` (v2 text/visual routing and reranking) and `ask --native-ptc --codex-permissions PROFILE` (native final reader sharing the tool budget; no citation authority from native output).
+- [Rich batch](docs/rich-batch.md), [native metadata](docs/native-metadata.md), [Decisions images](docs/decisions-images.md), [Rust SDK](docs/rust-sdk.md), [runtime package](runtime/codex/STAGING.md), [incur wrapper](packages/cli/README.md).
 
 Private continuation evidence lives under `.local/runs/`; exact source revision,
 native identities and run receipt hashes belong there and in private Git PoUW
 notes. Read the current source and exact selected checkpoint before continuing.
+
+- Explicit paid rich batch: `gptgrep batch --rich --input operations.json --json` supports `search_multimodal` and source-bound `rerank` alongside seven local operations (`inspect_documents`, `inspect_pages`, `inspect_native_metadata`, `read_artifact`, `search_artifacts`, `inspect_visual`, `read_visual`). It retains one pinned reader and finite Decisions context, admits all complete output/call shares before submission, returns ordered failures/not_executed, and has no paid cursor or citation grant. `budget.max_decisions_submissions` defaults to 8 within the parent cap of 200. `--decisions-budget FILE` joins the existing original clock; `--model` and `--multimodal-timeout` apply to paid rich operations. Shared context observations are not exact per-batch provider counts; inspect projected cost/usage and unknown fields.
+
+- Decisions submission budget: `gptgrep decisions-budget init --run-id ID --plan-file FILE --deadline-seconds N --max-submissions N --ledger ABS_PATH --output ABS_CONTROL_JSON` creates a new ledger and a 0600 control file; it refuses existing paths and never resets or renews. `gptgrep decisions-budget status --control FILE --json` is read-only. Paid commands join with `--decisions-budget FILE`. Alias selectors such as `~typesafe/jev-latest` are text-only and admit only same-author, same-family builds. See docs/development.md.
+
+- [Source-bound rerank](docs/rerank.md): `gptgrep rerank --root ROOT --input FILE_OR_DASH --json` accepts only unique stored native/OCR/visual EvidenceRef candidates; content is resolved from one fixed reader. It reranks the supplied pool without document routing, inference cursors, initial-pass or reader citation rights. The rich batch `rerank` member shares the original context and complete prepaid output/call shares.
+
+Foreground OCR: native `gptgrep ocr serve --config CONTROL_JSON --token-env GPTGREP_OCR_SERVE_TOKEN`; authenticated loopback, exact server-held task custody, create-only original-anchor phase and separate PNG confidence-mode qualification. Ordinary queries never start it. The optional incur wrapper's `ocr serve` supervises the same native process in the foreground and streams its lifecycle records (POSIX only); a prepared record is not listener readiness or job completion. See docs/ocr-serve.md. Runtime qualification remains pending.

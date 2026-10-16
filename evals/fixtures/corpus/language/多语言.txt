@@ -1,8 +1,0 @@
-多语言维护笔记
-
-恢复步骤：从签名快照还原日志。
-城市：杭州；维护窗口：凌晨两点。
-
-Café archive keeps naïve names unchanged.
-Emoji marker: ✅ ready.
-

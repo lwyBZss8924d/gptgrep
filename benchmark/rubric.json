@@ -1,0 +1,18 @@
+{
+  "schema": "gptgrep.xl-grounding-rubric.v1",
+  "version": "1.0.0",
+  "primary": "grounded_success",
+  "criteria": {
+    "grounded_success": "Binary success: the answer satisfies all material task requirements, correctly handles answerability, has no material contradiction, and its material factual claims are supported by the supplied original documents with valid document/page citations. Correct alternative evidence is allowed. A correct guess without document support fails.",
+    "atomic_coverage": "Fraction of material required answer atoms that are both correct and supported by original-document evidence. Report 0 to 1 with the required and supported atom counts. This diagnostic never replaces the primary binary success.",
+    "answerability": "Judge whether the supplied context determines an answer. A justified abstention succeeds for an unanswerable task; abstention on an answerable task fails. Do not treat unrelated missing information as a reason to abstain.",
+    "citations": "Document IDs must belong to the public task context. Pages are one-based physical PDF pages. Check the actual cited page content; a matching page number or copied gold quote alone is insufficient. Gold evidence is a reference, not an exhaustive allowlist."
+  },
+  "operational_policy": {
+    "started_reader_failure": "observed zero; retain the task in the enrolled denominator",
+    "setup_failure": "unknown; retain in denominator and refuse final promotion",
+    "judge_failure": "unknown; retain in denominator; do not convert to zero or silently rerun the reader",
+    "regrade": "same frozen answer and corpus bytes, with separately recorded judge identity, rubric version and cost"
+  },
+  "native_scores": "Run the pinned XL evaluator independently for accuracy, token F1 and ANLS. Keep these dimensions separate from evidence-grounded success."
+}
