@@ -124,6 +124,34 @@ def write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 
+def validate_rewardkit_scores(metrics: dict[str, float], rewards: dict[str, float], details: dict[str, Any]) -> None:
+    """Bind each raw criterion to its source and its four-place presentation."""
+    if not isinstance(rewards, dict) or not isinstance(details, dict) or set(rewards) != set(metrics) or set(details) != set(metrics):
+        raise ValueError("RewardKit changed dimension membership")
+    for key, source in metrics.items():
+        if key not in (*NATIVE_KEYS, *GROUNDING_KEYS) or not bounded_score(source):
+            raise ValueError("Invalid validated reward dimension")
+        detail = details[key]
+        if not isinstance(detail, dict) or detail.get("kind") != "programmatic" or detail.get("error") is not None:
+            raise ValueError("RewardKit dimension detail is missing or invalid")
+        criteria = detail.get("criteria")
+        if not isinstance(criteria, list) or len(criteria) != 1 or not isinstance(criteria[0], dict):
+            raise ValueError("RewardKit must retain exactly one criterion per metric")
+        criterion = criteria[0]
+        if (criterion.get("name") != f"xl_metric:{key}" or criterion.get("error") is not None
+                or not bounded_score(criterion.get("weight")) or criterion["weight"] != 1):
+            raise ValueError("RewardKit criterion identity or weight changed")
+        raw = criterion.get("raw")
+        if not bounded_score(raw) or raw != source:
+            raise ValueError("RewardKit raw metric differs from validated source")
+        # The pinned RewardKit 0.2.3 rounds both aggregate scores and serialized
+        # criterion values to four places; raw retains the original score.
+        rounded = round(source, 4)
+        for value in (rewards[key], detail.get("score"), criterion.get("value")):
+            if not bounded_score(value) or value != rounded:
+                raise ValueError("RewardKit metric differs from its specified rounding")
+
+
 def run_rewardkit(output_dir: Path, report_path: Path) -> dict[str, float]:
     """Each metric is its own dimension directory; no cross-metric mean exists."""
     import rewardkit as rk
@@ -160,11 +188,7 @@ def run_rewardkit(output_dir: Path, report_path: Path) -> dict[str, float]:
                    f"rk.xl_metric({key!r}, {str(report_path)!r})\n")
         (dimension / "score.py").write_text(content, encoding="utf-8")
     rewards = rk.run(criteria, workspace=output_dir, output=output_dir / "reward.json")
-    if set(rewards) != set(report["metrics"]):
-        raise ValueError("RewardKit changed dimension membership")
-    for key, value in rewards.items():
-        if not bounded_score(value) or abs(value - report["metrics"][key]) > 1e-6:
-            raise ValueError("RewardKit metric differs from validated source")
+    validate_rewardkit_scores(report["metrics"], rewards, read_object(output_dir / "reward-details.json"))
     return rewards
 
 

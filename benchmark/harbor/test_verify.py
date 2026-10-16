@@ -1,13 +1,14 @@
 """Synthetic binding tests only; these are not live evaluation evidence."""
 
 import json
+import copy
 import tempfile
 import unittest
 from unittest.mock import patch
 from argparse import Namespace
 from pathlib import Path
 
-from verify import digest, main, read_answer, run_rewardkit, validate_grounding
+from verify import digest, main, read_answer, run_rewardkit, validate_grounding, validate_rewardkit_scores
 
 
 class JudgmentBindingTests(unittest.TestCase):
@@ -85,6 +86,72 @@ class JudgmentBindingTests(unittest.TestCase):
                                      "metrics": {"native_accuracy": 1.0, "grounded_success": 0, "atomic_coverage": 0.3}}))
         rewards = run_rewardkit(self.root, report)
         self.assertEqual(rewards, {"native_accuracy": 1.0, "grounded_success": 0, "atomic_coverage": 0.3})
+
+    def test_rewardkit_preserves_raw_fraction_and_validates_rounded_aggregate(self):
+        report = self.root / "feedback.json"
+        metrics = {"native_token_f1": 0.181818, "native_anls": 0.666667}
+        report.write_text(json.dumps({"schema": "gptgrep.xl-verifier-feedback.v1",
+                                     "native": {"status": "complete"}, "grounding": {"status": "unknown"},
+                                     "metrics": metrics}))
+        self.assertEqual(run_rewardkit(self.root, report), {"native_token_f1": 0.1818, "native_anls": 0.6667})
+        self.assertEqual(json.loads(report.read_text())["metrics"], metrics)
+        details = json.loads((self.root / "reward-details.json").read_text())
+        self.assertEqual(details["native_token_f1"]["criteria"][0]["raw"], 0.181818)
+
+    def test_rewardkit_rejects_divergent_or_missing_evidence(self):
+        metrics = {"native_token_f1": 0.181818}
+        rewards = {"native_token_f1": 0.1818}
+        detail = {"kind": "programmatic", "score": 0.1818,
+                  "criteria": [{"name": "xl_metric:native_token_f1", "raw": 0.181818,
+                                "value": 0.1818, "weight": 1.0}]}
+        validate_rewardkit_scores(metrics, rewards, {"native_token_f1": detail})
+        for value in [0.181810, None, True, "0.181818", float("nan"), float("inf"), -0.1, 1.1]:
+            with self.subTest(raw=value):
+                changed = copy.deepcopy(detail)
+                changed["criteria"][0]["raw"] = value
+                with self.assertRaises(ValueError):
+                    validate_rewardkit_scores(metrics, rewards, {"native_token_f1": changed})
+        for field in ["raw", "value", "weight", "name"]:
+            with self.subTest(missing=field):
+                changed = copy.deepcopy(detail)
+                del changed["criteria"][0][field]
+                with self.assertRaises(ValueError):
+                    validate_rewardkit_scores(metrics, rewards, {"native_token_f1": changed})
+        for changed in [{}, {"native_token_f1": None}, {"native_token_f1": detail, "grounded_success": detail}]:
+            with self.subTest(details=changed), self.assertRaises(ValueError):
+                validate_rewardkit_scores(metrics, rewards, changed)
+        for field, value in [("score", 0.182), ("kind", "llm"), ("error", "failed"),
+                             ("criteria", []), ("criteria", detail["criteria"] * 2)]:
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                validate_rewardkit_scores(metrics, rewards, {"native_token_f1": {**detail, field: value}})
+        for field, value in [("value", 0.182), ("name", "xl_metric:native_accuracy"),
+                             ("weight", 0.5), ("weight", True), ("error", "failed")]:
+            with self.subTest(criterion_field=field):
+                changed = copy.deepcopy(detail)
+                changed["criteria"][0][field] = value
+                with self.assertRaises(ValueError):
+                    validate_rewardkit_scores(metrics, rewards, {"native_token_f1": changed})
+        for changed in [{}, {"native_token_f1": 0.182}, {"native_token_f1": float("nan")},
+                        {"native_token_f1": True}, {"native_token_f1": 0.1818, "native_accuracy": 0}]:
+            with self.subTest(rewards=changed), self.assertRaises(ValueError):
+                validate_rewardkit_scores(metrics, changed, {"native_token_f1": detail})
+
+    def test_rewardkit_validation_failure_keeps_feedback_unknown(self):
+        self.path.write_text(json.dumps(self.judgment))
+        expected = self.root / "expected.json"
+        expected.write_text(json.dumps({**self.expected, "schema": "gptgrep.verifier-binding.v1"}))
+        output = self.root / "unknown-reward"
+        args = Namespace(answer=self.answer, judgment=self.path, expected=expected, gold=self.root / "gold.jsonl",
+                         native_scorer=self.root / "scorer.py", output_dir=output, rewardkit=True)
+        metrics = {"native_token_f1": 0.181818}
+        with patch("verify.parse_args", return_value=args), patch("verify.native_score", return_value={"status": "complete", "metrics": metrics}), \
+                patch("verify.validate_rewardkit_scores", side_effect=ValueError("synthetic raw mismatch")):
+            self.assertEqual(main(), 2)
+        feedback = json.loads((output / "feedback.json").read_text())
+        self.assertEqual(feedback["status"], "unknown")
+        self.assertEqual(feedback["rewardkit_status"], "unknown")
+        self.assertFalse(feedback["promotion_allowed"])
+        self.assertEqual(feedback["metrics"]["native_token_f1"], 0.181818)
 
     def test_partial_answer_cannot_rescue_failed_reader_and_setup_stays_unknown(self):
         self.path.write_text(json.dumps(self.judgment))
