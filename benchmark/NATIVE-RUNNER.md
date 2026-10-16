@@ -39,6 +39,26 @@ package. The bare workspace must contain no GPTgrep instructions, roles, skills,
 binary or prepared products. Do not place gold, judge output, other tasks,
 private controller files or the source checkout under either reader workspace.
 
+To make a prepared generation discoverable, the treatment's `ReaderWorkspace`
+may declare `preparedIndex` with `relativeRoot`, `generation` and
+`manifestSha256`. The root must be `prepared` or a directory beneath it. Both
+its `CURRENT.json` and selected generation manifest must be pinned prepared
+artifacts, agree with that capability, and bind the full raw document context.
+The runner checks those identities and all prepared artifact bytes before
+exclusively staging a read-only `gptgrep-workspace.json` at the task root:
+
+```json
+{"prepared_index":{"root":"prepared","snapshot":{"generation":"g1-1","manifest_sha256":"64-lowercase-hex-characters"}},"schema":"gptgrep.workspace.v1"}
+```
+
+The descriptor contains no question, answer, document selection or judge state.
+It stays outside the indexed root and leaves the common prompt and
+`context.json` unchanged. Packaged supervisor instructions describe how to
+discover it and preserve the snapshot. Without the capability the runner
+stages no descriptor; final verification requires the exact descriptor bytes
+when the capability is present and rejects the file otherwise. The bare arm
+rejects both the capability and the descriptor.
+
 The auth owner must supply a named permission profile, including its credential
 denies. The runner requires `/` denied, the exact task/runtime read grants,
 optional writes confined to the task workspace, optional `:minimal` system read

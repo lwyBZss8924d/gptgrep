@@ -1,10 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { runNativeForTest, validatePermissionProfile, type NativeRunOptions, type NativeTestTransport } from "../src/native";
-import { parseReaderAnswer, readerOrder, readerPrompt, verifyReaderWorkspace } from "../src/runner";
-import { sha256 } from "../src/io";
+import { parseReaderAnswer, readerOrder, readerPrompt, stagePreparedWorkspace, verifyReaderWorkspace, type ReaderWorkspace } from "../src/runner";
+import { canonical, sha256 } from "../src/io";
 
 type Message = Record<string, any>;
 const options: NativeRunOptions = {
@@ -52,6 +52,53 @@ class FakeServer implements NativeTestTransport {
     });
   }
   async close() { this.closeCalled = true; return this.cleanup; }
+}
+
+async function preparedWorkspaceFixture() {
+  const root = await mkdtemp(join(tmpdir(), "prepared-workspace-"));
+  const bindingName = "ENVIRONMENTS_HARNESS_STORAGE_BINDING", digestName = "ENVIRONMENTS_HARNESS_STORAGE_DIGEST";
+  const previous = { [bindingName]: process.env[bindingName], [digestName]: process.env[digestName] };
+  const dispose = async () => {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    await rm(root, { recursive: true, force: true });
+  };
+  try {
+    const task = { id: "synthetic-task", question: "Synthetic document question", contextDocumentIds: ["d1", "d2"],
+      contextId: "synthetic-context", groupId: "synthetic-group", taskType: "cross_doc" as const };
+    const documents = task.contextDocumentIds.map(documentId => ({ documentId, relativePath: `documents/${documentId}.pdf`, sha256: sha256(documentId) }));
+    const contextBytes = canonical({ documents: documents.map(doc => ({ document_id: doc.documentId, path: doc.relativePath, sha256: doc.sha256 })) }) + "\n";
+    const workspace: ReaderWorkspace = { cwd: join(root, "treatment"), documents, preparedArtifacts: [], preparedContextDocumentIds: [...task.contextDocumentIds] };
+    const bare: ReaderWorkspace = { cwd: join(root, "bare"), documents };
+    for (const selected of [workspace, bare]) {
+      await mkdir(join(selected.cwd, "documents"), { recursive: true });
+      for (const doc of documents) await writeFile(join(selected.cwd, doc.relativePath), doc.documentId);
+      await writeFile(join(selected.cwd, "context.json"), contextBytes);
+    }
+    const writePrepared = async (relativePath: string, bytes: string) => {
+      await mkdir(dirname(join(workspace.cwd, relativePath)), { recursive: true });
+      await writeFile(join(workspace.cwd, relativePath), bytes);
+      workspace.preparedArtifacts = [...workspace.preparedArtifacts!.filter(pin => pin.relativePath !== relativePath), { relativePath, sha256: sha256(bytes) }];
+    };
+    for (const doc of documents) await writePrepared(`prepared/${doc.documentId}.pdf`, doc.documentId);
+    const generation = "g1-1";
+    const manifest = { schema_version: "gptgrep.v1", generation, root: join(workspace.cwd, "prepared"),
+      documents: documents.map(doc => ({ path: `${doc.documentId}.pdf`, source_sha256: doc.sha256, source_bytes: doc.documentId.length })) };
+    const publish = async (value: Record<string, unknown>) => {
+      const bytes = canonical(value) + "\n", manifestSha256 = sha256(bytes);
+      await writePrepared(`prepared/.gptgrep/generations/${generation}/manifest.json`, bytes);
+      await writePrepared("prepared/.gptgrep/CURRENT.json", canonical({ schema_version: value.schema_version, generation, manifest_sha256: manifestSha256 }) + "\n");
+      workspace.preparedIndex = { relativeRoot: "prepared", generation, manifestSha256 };
+    };
+    await publish(manifest);
+    // Synthetic input to requireStorage's binding checks; owner admission belongs to the outer test run.
+    const binding = join(root, "synthetic-binding.json"), bytes = canonical({ plan: { targets: { output: root } } }) + "\n";
+    await writeFile(binding, bytes);
+    process.env[bindingName] = binding;
+    process.env[digestName] = sha256(bytes);
+    return { workspace, bare, task, contextBytes, manifest, publish, writePrepared, dispose };
+  } catch (error) { await dispose(); throw error; }
 }
 
 describe("native protocol lifecycle", () => {
@@ -322,5 +369,75 @@ describe("native experiment boundary", () => {
       await symlink(join(cwd, "documents", "d1.pdf"), join(cwd, "alias.pdf"));
       await expect(verifyReaderWorkspace({ cwd, documents }, task, "bare")).rejects.toThrow("physical directories");
     } finally { await rm(cwd, { recursive: true, force: true }); }
+  });
+
+  test("prepared capability stages an exact isolated descriptor without changing shared reader inputs", async () => {
+    const fixture = await preparedWorkspaceFixture();
+    const { workspace, bare, task, contextBytes } = fixture;
+    const descriptor = join(workspace.cwd, "gptgrep-workspace.json");
+    const noCapability = { ...workspace, preparedIndex: undefined };
+    const promptBefore = readerPrompt(task);
+    try {
+      await stagePreparedWorkspace(noCapability, task, "gptgrep");
+      await expect(stat(descriptor)).rejects.toThrow();
+      await verifyReaderWorkspace(noCapability, task, "gptgrep");
+      await expect(verifyReaderWorkspace(workspace, task, "gptgrep")).rejects.toThrow();
+      await expect(stagePreparedWorkspace({ ...bare, preparedIndex: workspace.preparedIndex }, task, "bare")).rejects.toThrow();
+      await expect(stagePreparedWorkspace(noCapability, task, "gptgrep", ["gptgrep-workspace.json"])).rejects.toThrow();
+      await stagePreparedWorkspace(workspace, task, "gptgrep");
+      const expectedBytes = canonical({ schema: "gptgrep.workspace.v1", prepared_index: { root: "prepared",
+        snapshot: { generation: workspace.preparedIndex!.generation, manifest_sha256: workspace.preparedIndex!.manifestSha256 } } }) + "\n";
+      expect(await readFile(descriptor, "utf8")).toBe(expectedBytes);
+      expect((await stat(descriptor)).mode & 0o777).toBe(0o444);
+      const verified = await verifyReaderWorkspace(workspace, task, "gptgrep");
+      expect(verified).toEqual(await verifyReaderWorkspace(bare, task, "bare"));
+      expect(await readFile(join(workspace.cwd, "context.json"), "utf8")).toBe(contextBytes);
+      expect(await readFile(join(bare.cwd, "context.json"), "utf8")).toBe(contextBytes);
+      expect(readerPrompt(task)).toBe(promptBefore);
+      expect(promptBefore).not.toContain("gptgrep-workspace.json");
+      expect(expectedBytes).not.toContain(task.id);
+      expect(expectedBytes).not.toContain(task.question);
+      await expect(stagePreparedWorkspace(workspace, task, "gptgrep")).rejects.toThrow();
+      expect(await readFile(descriptor, "utf8")).toBe(expectedBytes);
+      await expect(verifyReaderWorkspace(noCapability, task, "gptgrep")).rejects.toThrow();
+      await expect(verifyReaderWorkspace(noCapability, task, "gptgrep", ["gptgrep-workspace.json"])).rejects.toThrow();
+      await writeFile(join(bare.cwd, "gptgrep-workspace.json"), expectedBytes);
+      await expect(verifyReaderWorkspace(bare, task, "bare")).rejects.toThrow();
+    } finally { await fixture.dispose(); }
+  });
+
+  test("prepared snapshot validation rejects repinned semantic drift and accepts the nested manifest schema", async () => {
+    const fixture = await preparedWorkspaceFixture();
+    const { workspace, task, manifest, publish, writePrepared } = fixture;
+    const descriptor = join(workspace.cwd, "gptgrep-workspace.json");
+    const refusesBeforeWriting = async () => {
+      await expect(stagePreparedWorkspace(workspace, task, "gptgrep")).rejects.toThrow();
+      await expect(stat(descriptor)).rejects.toThrow();
+    };
+    try {
+      await writeFile(join(workspace.cwd, "prepared/d2.pdf"), "unpinned-change");
+      await refusesBeforeWriting();
+      await writeFile(join(workspace.cwd, "prepared/d2.pdf"), "d2");
+      workspace.preparedContextDocumentIds = ["d1"];
+      await refusesBeforeWriting();
+      workspace.preparedContextDocumentIds = [...task.contextDocumentIds];
+      await writePrepared("prepared/.gptgrep/CURRENT.json", canonical({ schema_version: "gptgrep.v1", generation: "g2-2",
+        manifest_sha256: workspace.preparedIndex!.manifestSha256 }) + "\n");
+      await refusesBeforeWriting();
+      await publish({ ...manifest, root: fixture.bare.cwd });
+      await refusesBeforeWriting();
+      await publish(manifest);
+      workspace.preparedIndex = { ...workspace.preparedIndex!, relativeRoot: "../outside" };
+      await refusesBeforeWriting();
+      await writePrepared("prepared/d1.pdf", "replacement-source");
+      await publish({ ...manifest, documents: manifest.documents.map((doc, index) => index === 0
+        ? { ...doc, source_sha256: sha256("replacement-source"), source_bytes: "replacement-source".length } : doc) });
+      await refusesBeforeWriting();
+      await writePrepared("prepared/d1.pdf", "d1");
+      await publish({ ...manifest, schema_version: "gptgrep.manifest.v2", documents: manifest.documents.map(document => ({ document })) });
+      await stagePreparedWorkspace(workspace, task, "gptgrep");
+      expect((await verifyReaderWorkspace(workspace, task, "gptgrep")).context).toBe(sha256(fixture.contextBytes));
+      expect((await stat(descriptor)).mode & 0o777).toBe(0o444);
+    } finally { await fixture.dispose(); }
   });
 });

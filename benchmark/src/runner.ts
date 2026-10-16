@@ -3,7 +3,7 @@ import { chmod, copyFile, lstat, mkdir, readFile, readdir, writeFile } from "nod
 import { dirname, isAbsolute, resolve } from "node:path";
 import { corpusDigest } from "./adapter";
 import type { ReaderTask } from "./dataset";
-import { digest, fileHash, physicalPath, requireStorage, within, writeJson } from "./io";
+import { canonical, digest, fileHash, physicalPath, readJson, requireStorage, sha256, within, writeJson } from "./io";
 import { runNative, type NativeRunOptions, type NativeRunResult } from "./native";
 
 export const SUPERVISOR_MODEL = "gpt-6.1-sol";
@@ -18,6 +18,8 @@ export interface ReaderWorkspace {
   /** Additional context-derived products; GPTgrep arm only. Paths and bytes are pinned. */
   preparedArtifacts?: Array<{ relativePath: string; sha256: string }>;
   preparedContextDocumentIds?: string[];
+  /** Optional discovery capability for an exact prepared generation; GPTgrep arm only. */
+  preparedIndex?: { relativeRoot: string; generation: string; manifestSha256: string };
 }
 export interface PinnedRuntime {
   packageRoot: string;
@@ -97,6 +99,7 @@ const RUNTIME_PATHS: Record<string, string> = {
   "skills/gptgrep-ocr/SKILL.md": ".agents/skills/gptgrep-ocr/SKILL.md",
   "skills/gptgrep-retrieval/SKILL.md": ".agents/skills/gptgrep-retrieval/SKILL.md",
 };
+const WORKSPACE_DESCRIPTOR = "gptgrep-workspace.json";
 const ANSWER_SCHEMA = {
   type: "object", properties: { answer: { type: "string" }, citations: { type: "array", items: {
     type: "object", properties: { document_id: { type: "string" }, page: { type: "integer", minimum: 1 } },
@@ -176,8 +179,45 @@ export function readerPrompt(task: ReaderTask, helperModel: typeof HELPER_MODELS
     "Each page must be the one-based physical PDF page number. If the supplied documents do not determine an answer, use \"not answerable\" and explain what is missing.\n";
 }
 
-export async function verifyReaderWorkspace(workspace: ReaderWorkspace, task: ReaderTask, arm: ReaderArm, runtimeFiles: string[] = []): Promise<{ corpus: string; context: string }> {
+async function preparedDescriptor(workspace: ReaderWorkspace): Promise<string | null> {
+  const capability = workspace.preparedIndex;
+  if (capability === undefined) return null;
+  if (!capability || typeof capability !== "object" || Object.keys(capability).some(key => !["relativeRoot", "generation", "manifestSha256"].includes(key)) ||
+      typeof capability.relativeRoot !== "string" || typeof capability.generation !== "string" || typeof capability.manifestSha256 !== "string" ||
+      !/^g[0-9]+-[0-9]+$/.test(capability.generation) || !/^[a-f0-9]{64}$/.test(capability.manifestSha256)) throw new Error("Invalid prepared index capability");
+  const root = relativePath(capability.relativeRoot);
+  if (root !== "prepared" && !root.startsWith("prepared/")) throw new Error("Prepared index root must remain under prepared/");
+  const pins = new Map(workspace.preparedArtifacts?.map(artifact => [artifact.relativePath, artifact.sha256]));
+  const currentPath = `${root}/.gptgrep/CURRENT.json`;
+  const manifestPath = `${root}/.gptgrep/generations/${capability.generation}/manifest.json`;
+  if (!pins.has(currentPath) || pins.get(manifestPath) !== capability.manifestSha256) throw new Error("Prepared index pointer and manifest must be pinned artifacts");
+  if ((await lstat(resolve(workspace.cwd, currentPath))).size > 4096) throw new Error("Prepared index pointer exceeds its bound");
+  const current = await readJson(resolve(workspace.cwd, currentPath));
+  // Match the core's MAX_MANIFEST_BYTES for both supported generation schemas.
+  const manifestFile = resolve(workspace.cwd, manifestPath);
+  if ((await lstat(manifestFile)).size > 128 * 1024 * 1024) throw new Error("Prepared manifest exceeds its bound");
+  const manifest = JSON.parse(await readFile(manifestFile, "utf8"));
+  if (!current || !manifest || !["gptgrep.v1", "gptgrep.manifest.v2"].includes(current.schema_version) || manifest.schema_version !== current.schema_version ||
+      current.generation !== capability.generation || current.manifest_sha256 !== capability.manifestSha256 ||
+      manifest.generation !== capability.generation || manifest.root !== resolve(workspace.cwd, root) || !Array.isArray(manifest.documents)) throw new Error("Prepared index snapshot identity mismatch");
+  const sourceHashes: string[] = [];
+  const sourcePaths = new Set<string>();
+  for (const entry of manifest.documents) {
+    const doc = manifest.schema_version === "gptgrep.manifest.v2" ? entry?.document : entry;
+    if (!doc || typeof doc.path !== "string" || typeof doc.source_sha256 !== "string" || !Number.isSafeInteger(doc.source_bytes) || doc.source_bytes < 0) throw new Error("Invalid prepared source identity");
+    const path = `${root}/${relativePath(doc.path)}`;
+    if (sourcePaths.has(path) || pins.get(path) !== doc.source_sha256 || (await lstat(resolve(workspace.cwd, path))).size !== doc.source_bytes) throw new Error("Prepared source must match a pinned raw document");
+    sourcePaths.add(path);
+    sourceHashes.push(doc.source_sha256);
+  }
+  if (JSON.stringify(sourceHashes.sort()) !== JSON.stringify(workspace.documents.map(doc => doc.sha256).sort())) throw new Error("Prepared index must cover the exact full raw document context");
+  return `${canonical({ schema: "gptgrep.workspace.v1", prepared_index: { root, snapshot: { generation: capability.generation, manifest_sha256: capability.manifestSha256 } } })}\n`;
+}
+
+async function inspectReaderWorkspace(workspace: ReaderWorkspace, task: ReaderTask, arm: ReaderArm, runtimeFiles: string[], phase: "before_descriptor" | "complete"): Promise<{ corpus: string; context: string; descriptor: string | null }> {
   await physicalPath(workspace.cwd);
+  const allowedRuntime = new Set([...Object.values(RUNTIME_PATHS), "bin/gptgrep"]);
+  if (new Set(runtimeFiles).size !== runtimeFiles.length || runtimeFiles.some(path => !allowedRuntime.has(path)) || arm === "bare" && runtimeFiles.length) throw new Error("Reader runtime files must be unique product-owned assets");
   const ids = workspace.documents.map(doc => doc.documentId).sort();
   if (new Set(ids).size !== ids.length || JSON.stringify(ids) !== JSON.stringify([...task.contextDocumentIds].sort())) throw new Error("Workspace must contain the full exact task context");
   const expected = new Set(["context.json", ...runtimeFiles]);
@@ -187,13 +227,20 @@ export async function verifyReaderWorkspace(workspace: ReaderWorkspace, task: Re
     expected.add(path); await regular(resolve(workspace.cwd, path), doc.sha256);
   }
   const prepared = workspace.preparedArtifacts ?? [];
-  if (arm === "bare" && prepared.length) throw new Error("Bare reader cannot receive prepared products");
+  if (arm === "bare" && (prepared.length || workspace.preparedIndex !== undefined)) throw new Error("Bare reader cannot receive prepared products");
   if (prepared.length && JSON.stringify([...(workspace.preparedContextDocumentIds ?? [])].sort()) !== JSON.stringify(ids)) throw new Error("Prepared products must bind the exact full task context");
   for (const artifact of prepared) {
     const path = relativePath(artifact.relativePath);
     if (!path.startsWith("prepared/") || expected.has(path)) throw new Error("Prepared products require unique paths under prepared/");
     expected.add(path); await regular(resolve(workspace.cwd, path), artifact.sha256);
   }
+  const descriptor = await preparedDescriptor(workspace);
+  const descriptorPath = resolve(workspace.cwd, WORKSPACE_DESCRIPTOR);
+  if (phase === "complete" && descriptor !== null) {
+    expected.add(WORKSPACE_DESCRIPTOR);
+    await regular(descriptorPath, sha256(descriptor));
+    if (((await lstat(descriptorPath)).mode & 0o777) !== 0o444) throw new Error("Prepared workspace descriptor must be read-only");
+  } else await absent(descriptorPath);
   const contextPath = resolve(workspace.cwd, "context.json");
   await physicalPath(contextPath);
   const context = JSON.parse(await readFile(contextPath, "utf8"));
@@ -201,7 +248,23 @@ export async function verifyReaderWorkspace(workspace: ReaderWorkspace, task: Re
   if (!context || !Array.isArray(context.documents) || Object.keys(context).some(key => key !== "documents") || digest(context.documents.slice().sort((a: any, b: any) => a.document_id.localeCompare(b.document_id))) !== digest(wanted)) throw new Error("context.json must contain only the exact public document mapping");
   for (const path of await files(workspace.cwd)) if (!expected.has(path)) throw new Error(`Unadmitted reader workspace file: ${path}`);
   if (arm === "bare") for (const path of ["AGENTS.md", ".agents", ".codex", "bin"]) await absent(resolve(workspace.cwd, path));
-  return { corpus: corpusDigest(workspace.documents), context: await fileHash(contextPath) };
+  return { corpus: corpusDigest(workspace.documents), context: await fileHash(contextPath), descriptor };
+}
+
+/** Stage only the validated task-local discovery capability, outside the indexed source root. */
+export async function stagePreparedWorkspace(workspace: ReaderWorkspace, task: ReaderTask, arm: ReaderArm, runtimeFiles: string[] = []): Promise<void> {
+  await requireStorage(workspace.cwd);
+  const { descriptor } = await inspectReaderWorkspace(workspace, task, arm, runtimeFiles, "before_descriptor");
+  if (descriptor === null) return;
+  const path = resolve(workspace.cwd, WORKSPACE_DESCRIPTOR);
+  await writeFile(path, descriptor, { flag: "wx", mode: 0o444 });
+  await chmod(path, 0o444);
+  await regular(path, sha256(descriptor));
+}
+
+export async function verifyReaderWorkspace(workspace: ReaderWorkspace, task: ReaderTask, arm: ReaderArm, runtimeFiles: string[] = []): Promise<{ corpus: string; context: string }> {
+  const { corpus, context } = await inspectReaderWorkspace(workspace, task, arm, runtimeFiles, "complete");
+  return { corpus, context };
 }
 
 export function parseReaderAnswer(text: string, task: ReaderTask): unknown {
@@ -231,6 +294,7 @@ export async function runReaderArm(options: ReaderArmOptions): Promise<ReaderArm
   await writeJson(resolve(directory, "attempt-start.json"), { ...attempt, completedAt: null, status: "starting" });
   try {
       const runtimeFiles = options.arm === "gptgrep" ? await stageTreatmentRuntime(options.runtime, options.workspace.cwd) : [];
+      await stagePreparedWorkspace(options.workspace, options.task, options.arm, runtimeFiles);
       const verified = await verifyReaderWorkspace(options.workspace, options.task, options.arm, runtimeFiles);
       attempt.corpusSha256 = verified.corpus;
       attempt.contextSha256 = verified.context;

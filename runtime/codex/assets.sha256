@@ -1,4 +1,4 @@
-aedd7c59c04a2534343bf59e873ea6884a3f468fc5d0c7713e736220c3dc5a19  runtime/codex/AGENTS.md
+8fee974e571f353de73df3dc793c41ab46a77a942b63fe5c5ffb1dae4ebc3229  runtime/codex/AGENTS.md
 1fa1bd81ef4af4260e64f9b7c7f6aa16f4c7428de054381689134f39723d19ff  runtime/codex/agents/gptgrep-document.toml
 655debf7121b3bbd32eeabaf9411ad9966474c70145b6e5163f9ab184fb409c5  runtime/codex/agents/gptgrep-ocr.toml
 0c1f13ec2f33ad28f8770cf5899a04f81d2c393dcfda7d077d2c420678d3a75b  runtime/codex/agents/gptgrep-retrieval.toml

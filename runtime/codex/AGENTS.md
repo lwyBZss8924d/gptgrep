@@ -6,6 +6,8 @@ Use the packaged `gptgrep` Skill for workflow routing. Delegate independent work
 
 Discover product interfaces through `gptgrep --help`, `gptgrep --llms`, `gptgrep --schema`, and relevant subcommand help. Check actual dependencies with `gptgrep doctor --json` and the selected workflow's readiness checks. LiteParse, PageIndex, tgrep-core, and Decisions are components of those interfaces, not invented shell aliases.
 
+When the task root contains `gptgrep-workspace.json`, read its `gptgrep.workspace.v1` descriptor to locate the prepared index. Resolve `prepared_index.root` relative to the task workspace and preserve its `snapshot.generation` and `snapshot.manifest_sha256` when inspecting or reading that generation. Verify source freshness through the selected interface; keep mutable findings outside the indexed root.
+
 Choose native CLI calls, an installed incur wrapper, or direct public Rust APIs as the task requires. If the selected package includes SDK source and a usable build environment, inspect its public exports and examples, then write the needed Rust code. Preserve the same source, resource, generation, and result-validation contracts. Verify actual source and toolchain availability; a binary or Skill does not imply that an SDK, Node, Cargo, or language FFI is installed.
 
 Use shell, code execution, image viewing, and other native tools when available and useful. The outer runtime owns the isolation boundary, native configuration, resource ceilings, and effects policy. These project instructions and role files do not install dependencies, change global configuration, or widen permissions.

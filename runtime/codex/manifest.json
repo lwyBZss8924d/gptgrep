@@ -4,8 +4,8 @@
     {
       "source_path": "runtime/codex/AGENTS.md",
       "target_path": "AGENTS.md",
-      "bytes": 3525,
-      "sha256": "aedd7c59c04a2534343bf59e873ea6884a3f468fc5d0c7713e736220c3dc5a19"
+      "bytes": 3932,
+      "sha256": "8fee974e571f353de73df3dc793c41ab46a77a942b63fe5c5ffb1dae4ebc3229"
     },
     {
       "source_path": "runtime/codex/agents/gptgrep-document.toml",
