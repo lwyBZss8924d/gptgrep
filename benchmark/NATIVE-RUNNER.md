@@ -8,6 +8,19 @@ models. The thread's model and permission-profile readback must match before a
 turn starts. A backend reroute or observed worker model mismatch invalidates the
 frozen model comparison.
 
+Before admitting a new experiment, the controller must verify the
+[latest official Codex OSS release](https://github.com/openai/codex/releases/latest).
+Its private launch manifest records the observation time, release tag, asset
+hashes and observed binary versions. Stage the CLI and all required companions,
+including `codex-code-mode-host`, from that same release. An older qualified
+runtime is historical evidence, not an eligible current base agent. Qualify
+actual model-mediated file tools, PDF extraction/rendering and the declared
+filesystem boundaries before launching benchmark readers or judges; CLI help,
+successful model text and direct command execution alone do not establish this.
+Keep the resulting runtime fixed across every arm and judge in the declared
+experiment, then resolve latest again before the next experiment. Do not change
+the requested model, reasoning effort or service tier as part of a runtime update.
+
 `runReaderArm` is the child entrypoint. Invoke it once per arm inside a separately
 admitted owner storage run and auth-supervisor role. The controller must create
 one isolated task workspace containing only `context.json` and its full raw PDF

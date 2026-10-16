@@ -27,6 +27,12 @@ Read docs/architecture.md for module boundaries and SPEC.md for acceptance.
 Use docs/development.md for portable Dev/Test/Eval setup, docs/experimental-status.md
 for the dated public progress summary, benchmark/README.md for the XL adapter,
 and self-opt/README.md for isolated development loops.
+GPTgrep Harness Codex base agents must use the latest official Codex OSS release.
+Verify the official latest release before each new experiment or standalone run;
+stage its CLI and required companion runtimes from that same release, record
+their versions and hashes, and qualify actual native tool execution. Freeze this
+runtime for every arm and judge in one paired experiment; recheck latest before
+the next experiment. Retained older runs are historical evidence only.
 Route every live Codex consumer that shares one login through
 workspace/harness-tooling/codex-auth/README.md (lease, per-run CODEX_HOME, single
 refresh owner); entry points it lists as unmanaged stay blocked for shared-login

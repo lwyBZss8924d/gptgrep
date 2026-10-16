@@ -11,6 +11,16 @@ Local Codex workflows default to `gpt-6-luna`, reasoning effort `max`, and servi
 tier `fast`. Account selection belongs to the caller's private runtime environment;
 workstation-specific account aliases and routing are not part of the public product.
 
+Every new GPTgrep Harness Codex base-agent run uses the latest official Codex OSS
+release. Resolve the official latest release before admitting a standalone run or
+a new experiment, and record the observed release, observation time, executable
+versions and asset hashes. The CLI and required companion runtimes, including
+the Code Mode host, must come from that same release and pass an actual native
+tool qualification before evaluation. A paired experiment freezes one verified
+runtime across all arms and judges; a later experiment checks latest again.
+Historical runtime pins remain attached to their original results and cannot
+serve as the current baseline merely because they were previously qualified.
+
 The final retrieval reader may explicitly opt into native execution with
 `gptgrep ask --native-ptc --codex-permissions PROFILE`, where PROFILE is an
 existing named permission profile acknowledged by the runtime. Native execution

@@ -53,13 +53,22 @@ gateway policy. Local IPC and provider egress are separate readiness checks.
 | --- | --- |
 | GPTgrep | Rust/Cargo with edition 2024; CI selects Rust 1.96.0, rustfmt and Clippy; use `Cargo.lock` |
 | Native parsing | Pinned LiteParse Rust source and PDFium `chromium/8058`; an existing LibreOffice installation for Office conversion |
-| Codex login and ordinary reader | Caller-selected official Codex CLI; pin the same native runtime revision in both comparison arms |
-| Native Document/OCR runtime | Caller-selected pinned standalone app-server; retained fixed-image profiles use the derivative described below |
+| Codex login and ordinary reader | Latest official Codex OSS release, verified before a new run or experiment; freeze the same release and companion runtimes in every comparison arm |
+| Native Document/OCR runtime | The same latest-release requirement applies to new harness runs; retained standalone derivatives and fixed-image profiles are historical qualifications |
 | Python tools | uv-managed Python 3.12+; CI uses Python 3.13 for the locked Harbor verifier |
 | Raw-document evaluation tools | The same explicitly qualified PDF extraction/rendering tools, shell and Codex/Code Mode runtime in both arms |
 | Benchmark and self-opt kits | Bun 1.3.14; synthetic contract tests need no npm dependencies |
 | Harbor verifier | `harbor-rewardkit==0.2.3` with its `benchmark/harbor/uv.lock`; a separate Harbor/container execution environment is required only for that optional route |
 | Optional wrapper | Node 24 and pnpm 11.24.0, using `packages/cli/pnpm-lock.yaml` |
+
+Resolve the [official latest release](https://github.com/openai/codex/releases/latest)
+at run admission. Keep the CLI and required companion executables, including the
+Code Mode host, from the same release in the admitted runtime directory. Record
+the release observation time, versions and hashes, then perform the actual tool
+qualification described by the [native launch contract](../benchmark/NATIVE-RUNNER.md).
+Use that fixed runtime throughout a paired experiment; check latest again for
+the next one. Upgrading a project runtime does not authorize changing global
+toolchain ownership, PATH, credentials or model selection.
 
 ```sh
 cargo build --release --locked -p gptgrep-cli
@@ -217,13 +226,15 @@ three roles, actual working-directory projection and explicit role bindings.
 The [incur CLI](../packages/cli/README.md) exposes the same native operations;
 [Rust API composition](rust-sdk.md) provides a direct API example.
 
-For retained fixed-image execution, build the derivative at
+The historical fixed-image derivative is retained at
 [patches/codex-native-viewer](../patches/codex-native-viewer/README.md). Its upstream
 pin is Codex `rust-v0.162.1`, commit
 `092d3acd6bec3e3a14bdc7e7a2810ab628ab759d`; the derived version is
-`0.162.1-gptgrep.1`. Keep the source patch, build identity and licenses together.
-Page and Document image qualifications bind the actual binary and profile;
-another build cannot reuse the owner's private acceptance by copying a digest.
+`0.162.1-gptgrep.1`. This pin records the old implementation and its qualifications;
+new harness runs must use the latest official runtime required above. Keep the
+historical source patch, build identity and licenses together. Page and Document
+image qualifications bind the actual binary and profile; another build cannot
+reuse the owner's private acceptance by copying a digest.
 
 The advanced workflow requires operator-created inputs:
 
