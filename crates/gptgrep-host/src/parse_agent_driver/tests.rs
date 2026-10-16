@@ -306,7 +306,14 @@ async fn native_document_inherits_capabilities_and_observes_tools_without_legacy
     let config = native_execution_control()?;
     let mut script = line(json!({"method":"mcpServer/startupStatus/updated",
         "params":{"name":"synthetic","status":"ready"}}));
+    script.extend(line(json!({"method":"configWarning",
+        "params":{"summary":"Codex could not find bubblewrap on PATH.","details":null}})));
     script.extend(native_execution_startup());
+    script.extend(line(json!({"method":"warning",
+        "params":{"threadId":"synthetic-thread","message":"Under-development features enabled: code_mode."}})));
+    script.extend(line(json!({"method":"error",
+        "params":{"threadId":"synthetic-thread","turnId":"synthetic-turn","willRetry":true,
+        "error":{"message":"Reconnecting... 1/5","codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":null}}}}})));
     let native_items = [
         json!({"type":"commandExecution","id":"native-command","status":"completed"}),
         json!({"type":"imageView","id":"native-image"}),
@@ -423,6 +430,10 @@ async fn native_document_inherits_capabilities_and_observes_tools_without_legacy
         .get_args()
         .map(|arg| arg.to_string_lossy())
         .collect::<Vec<_>>();
+    assert_eq!(
+        &args[..4],
+        &["app-server", "--listen", "stdio://", "--strict-config"]
+    );
     assert!(
         !args
             .iter()
@@ -432,6 +443,16 @@ async fn native_document_inherits_capabilities_and_observes_tools_without_legacy
         !args
             .iter()
             .any(|arg| arg.starts_with("permissions.gptgrep_native_document."))
+    );
+    let legacy_command = super::command(&control()?, None)?;
+    let legacy_args = legacy_command
+        .as_std()
+        .get_args()
+        .map(|arg| arg.to_string_lossy())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        &legacy_args[..3],
+        &["--listen", "stdio://", "--strict-config"]
     );
     Ok(())
 }
@@ -1060,7 +1081,12 @@ async fn backend_refusal_reports_only_opcode_and_bounded_error_fingerprint() -> 
     assert_eq!(error.to_string(), expected);
     assert!(!format!("{error:?}").contains("MOCK-private"));
     assert!(!format!("{error:#}").contains("/synthetic/private"));
-    assert_eq!(error.chain().count(), 1);
+    let failure = error
+        .downcast_ref::<DocumentAgentFailure>()
+        .expect("document observation wrapper");
+    assert_eq!(failure.cause.chain().count(), 1);
+    assert_eq!(failure.cause.to_string(), expected);
+    assert_eq!(error.chain().count(), 2);
     assert_eq!(backend.calls, 1);
     let outgoing = String::from_utf8(captured.lock().unwrap().clone())?;
     assert!(!outgoing.contains(PRIVATE_BACKEND_ERROR));
@@ -1174,7 +1200,7 @@ const PRIVATE_RUNTIME_DIAGNOSTIC: &str =
 fn document_runtime_notice(method: &str) -> Value {
     let params = match method {
         "error" => json!({
-            "threadId":"synthetic-thread","turnId":"synthetic-turn","willRetry":true,
+            "threadId":"synthetic-thread","turnId":"synthetic-turn","willRetry":false,
             "error":{"message":PRIVATE_RUNTIME_DIAGNOSTIC,
                 "additionalDetails":PRIVATE_RUNTIME_DIAGNOSTIC,
                 "codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":503}}}
@@ -1231,10 +1257,6 @@ async fn document_runtime_startup_refusal_preserves_method_and_closed_event() ->
         sha256: sha(&fs::read(&skill_path)?),
         path: skill_path,
     };
-    let responses = native_execution_startup()
-        .split_inclusive(|byte| *byte == b'\n')
-        .map(<[u8]>::to_vec)
-        .collect::<Vec<_>>();
     for (method, prefix, expected) in [
         ("initialize", 0, crate::DocumentStartupMethod::Initialize),
         ("account/read", 1, crate::DocumentStartupMethod::AccountRead),
@@ -1243,7 +1265,25 @@ async fn document_runtime_startup_refusal_preserves_method_and_closed_event() ->
         ("thread/start", 3, crate::DocumentStartupMethod::ThreadStart),
     ] {
         for event in ["error", "configWarning", "config/warning", "model/rerouted"] {
-            let mut config = native_execution_control()?;
+            let warning = event.starts_with("config");
+            if warning && method == "skills/list" {
+                // Skills discovery belongs to native mode, which accepts metadata warnings.
+                continue;
+            }
+            let mut config = if warning {
+                control()?
+            } else {
+                native_execution_control()?
+            };
+            let startup = if warning {
+                startup("chatgpt")
+            } else {
+                native_execution_startup()
+            };
+            let responses = startup
+                .split_inclusive(|byte| *byte == b'\n')
+                .map(<[u8]>::to_vec)
+                .collect::<Vec<_>>();
             if method == "skills/list" {
                 config.native_execution.as_mut().unwrap().native_skills = vec![skill.clone()];
             }
@@ -1303,13 +1343,23 @@ async fn document_runtime_startup_refusal_preserves_method_and_closed_event() ->
 
 #[tokio::test]
 async fn document_runtime_turn_refusal_keeps_rpc_facts_without_retry_or_fallback() -> Result<()> {
-    let config = native_execution_control()?;
-    let responses = native_execution_startup()
-        .split_inclusive(|byte| *byte == b'\n')
-        .map(<[u8]>::to_vec)
-        .collect::<Vec<_>>();
     for acknowledged in [false, true] {
         for event in ["error", "configWarning", "config/warning", "model/rerouted"] {
+            let warning = event.starts_with("config");
+            let config = if warning {
+                control()?
+            } else {
+                native_execution_control()?
+            };
+            let startup = if warning {
+                startup("chatgpt")
+            } else {
+                native_execution_startup()
+            };
+            let responses = startup
+                .split_inclusive(|byte| *byte == b'\n')
+                .map(<[u8]>::to_vec)
+                .collect::<Vec<_>>();
             let mut script = responses[..if acknowledged { 5 } else { 4 }].concat();
             script.extend(line(document_runtime_notice(event)));
             script.extend(line(tool("must-not-dispatch", "finalize")));
@@ -1345,7 +1395,7 @@ async fn document_runtime_turn_refusal_keeps_rpc_facts_without_retry_or_fallback
             assert!(diagnostic.usage.is_none());
             assert!(diagnostic.provider_request_count.is_none());
             assert!(!diagnostic.accounting_complete);
-            assert_eq!(diagnostic.will_retry, (event == "error").then_some(true));
+            assert_eq!(diagnostic.will_retry, (event == "error").then_some(false));
             let sent = sent_frames(&captured);
             for method in ["thread/start", "turn/start"] {
                 assert_eq!(
@@ -1360,6 +1410,26 @@ async fn document_runtime_turn_refusal_keeps_rpc_facts_without_retry_or_fallback
             assert_document_runtime_private(&error);
         }
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn document_runtime_restricted_mode_keeps_retry_notification_as_typed_refusal() -> Result<()>
+{
+    let mut notification = document_runtime_notice("error");
+    notification["params"]["willRetry"] = json!(true);
+    let mut script = startup("chatgpt");
+    script.extend(line(notification));
+    let mut backend = Backend::new();
+    let error = replay(&script, &mut backend)
+        .await
+        .err()
+        .expect("restricted retry refused");
+    let diagnostic = document_runtime_diagnostic(&error);
+    assert_eq!(diagnostic.identity, crate::DocumentRuntimeIdentity::Matched);
+    assert_eq!(diagnostic.will_retry, Some(true));
+    assert_eq!(backend.calls, 0);
+    assert_document_runtime_private(&error);
     Ok(())
 }
 
@@ -1386,6 +1456,15 @@ async fn document_runtime_usage_and_error_identity_do_not_attribute_foreign_obse
             .err()
             .expect("runtime error");
         let diagnostic = document_runtime_diagnostic(&error);
+        assert_eq!(
+            error
+                .downcast_ref::<DocumentAgentFailure>()
+                .expect("document observation wrapper")
+                .observation()
+                .token_usage,
+            diagnostic.usage,
+            "outer observations retain the same identity-bound numeric usage"
+        );
         assert_eq!(
             diagnostic.usage,
             bound.then(|| json!({
@@ -1513,7 +1592,7 @@ async fn document_runtime_unusable_usage_updates_preserve_last_valid_observation
                     Some(crate::CodexErrorInfo::ResponseStreamDisconnected)
                 );
                 assert_eq!(diagnostic.http_status_code, Some(503));
-                assert_eq!(diagnostic.will_retry, Some(true));
+                assert_eq!(diagnostic.will_retry, Some(false));
                 assert_eq!(diagnostic.code(), "document_runtime_refused_no_retry");
                 assert!(diagnostic.provider_request_count.is_none());
                 assert!(!diagnostic.accounting_complete);
@@ -1573,12 +1652,12 @@ fn document_runtime_foreign_usage_does_not_mutate_retained_observation() -> Resu
 
 #[tokio::test]
 async fn document_runtime_warning_oversize_and_cleanup_keep_bounded_typed_evidence() -> Result<()> {
-    let config = native_execution_control()?;
+    let config = control()?;
     let mut warning = document_runtime_notice("configWarning");
     let oversized = format!("{PRIVATE_RUNTIME_DIAGNOSTIC}{}", "中".repeat(6000));
     warning["params"]["summary"] = json!(oversized);
     let mut script = line(warning);
-    script.extend(native_execution_startup());
+    script.extend(startup("chatgpt"));
     let mut backend = Backend::new();
     let error = replay_control(&script, &mut backend, Arc::default(), &config)
         .await
@@ -1595,6 +1674,7 @@ async fn document_runtime_warning_oversize_and_cleanup_keep_bounded_typed_eviden
     );
     assert_document_runtime_private(&error);
 
+    let config = native_execution_control()?;
     for fail in [false, true] {
         let mut script = native_execution_startup();
         script.extend(line(document_runtime_notice("error")));
@@ -1610,6 +1690,7 @@ async fn document_runtime_warning_oversize_and_cleanup_keep_bounded_typed_eviden
             fail,
             completed: completed.clone(),
             ocr: None,
+            sleep_until: None,
         };
         let error = finish_document_cleanup::<()>(&mut backend, Err(primary), Some(Instant::now()))
             .await
@@ -2764,6 +2845,7 @@ struct CleanupBackend {
     fail: bool,
     completed: Arc<std::sync::atomic::AtomicBool>,
     ocr: Option<crate::OcrCleanup>,
+    sleep_until: Option<Instant>,
 }
 impl DocumentBackend for CleanupBackend {
     fn prepared(&self) -> &DocumentPreparedState {
@@ -2779,10 +2861,22 @@ impl DocumentBackend for CleanupBackend {
         &'a mut self,
         operation: DocumentToolOperation,
     ) -> Pin<Box<dyn Future<Output = Result<DocumentToolReply>> + Send + 'a>> {
-        self.inner.call(operation)
+        let sleep_until = self.sleep_until;
+        Box::pin(async move {
+            let reply = self.inner.call(operation).await?;
+            if let Some(target) = sleep_until {
+                tokio::time::sleep_until(target).await;
+            }
+            Ok(reply)
+        })
     }
     fn verify_complete(&self) -> Result<DocumentVerifiedProduct> {
         self.inner.verify_complete()
+    }
+    fn cancel_ocr_on_drop(&mut self) {
+        if let Some(ocr) = &self.ocr {
+            ocr.cancel_on_drop();
+        }
     }
     fn cancel_and_drain_ocr<'a>(
         &'a mut self,
@@ -2811,6 +2905,7 @@ async fn document_cleanup_is_awaited_and_primary_timeout_survives_cleanup_failur
             fail,
             completed: completed.clone(),
             ocr: None,
+            sleep_until: None,
         };
         let primary = backend_failure("execute_ocr", None, None);
         let original = primary.to_string();
@@ -2837,6 +2932,7 @@ async fn document_validation_return_also_waits_for_backend_cleanup() -> Result<(
         fail: false,
         completed: completed.clone(),
         ocr: None,
+        sleep_until: None,
     };
     let mut invalid = control()?;
     invalid.schema = "invalid-before-any-runtime".into();
@@ -2930,6 +3026,7 @@ async fn document_return_barrier_waits_for_real_owned_mock_after_submitted_timeo
         fail: false,
         completed: completed.clone(),
         ocr: Some(cleanup),
+        sleep_until: None,
     };
     let original = backend_failure("execute_ocr", None, None).to_string();
     let error = finish_document_cleanup::<()>(
@@ -2953,5 +3050,294 @@ async fn document_return_barrier_waits_for_real_owned_mock_after_submitted_timeo
     assert_eq!(snapshot.charged_admissions, 1);
     assert_eq!(snapshot.terminal_admissions, 0);
     assert_eq!(snapshot.quarantined_slots, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn document_agent_retains_token_usage_on_success_and_partial_observation_on_failure()
+-> Result<()> {
+    let mut script = startup("chatgpt");
+    script.extend(line(json!({
+        "method":"thread/tokenUsage/updated",
+        "params":{
+            "threadId":"synthetic-thread",
+            "turnId":"synthetic-turn",
+            "tokenUsage":{
+                "total":{"totalTokens":120,"inputTokens":90,"outputTokens":30},
+                "last":{"totalTokens":120,"inputTokens":90,"outputTokens":30},
+                "modelContextWindow":128000,
+                "unallowlisted":"discarded"
+            }
+        }
+    })));
+    script.extend(line(tool("call-finalize", "finalize")));
+    script.extend(line(json!({
+        "method":"thread/tokenUsage/updated",
+        "params":{
+            "threadId":"synthetic-thread",
+            "turnId":"synthetic-turn",
+            "tokenUsage":{
+                "total":{"totalTokens":340,"inputTokens":240,"outputTokens":100,"reasoningOutputTokens":40},
+                "last":{"totalTokens":220,"inputTokens":150,"outputTokens":70}
+            }
+        }
+    })));
+    script.extend(finish());
+    let mut backend = Backend::new();
+    let outcome = replay(&script, &mut backend).await?;
+    assert_eq!(
+        outcome.token_usage,
+        Some(json!({
+            "total":{"totalTokens":340,"inputTokens":240,"outputTokens":100,"reasoningOutputTokens":40},
+            "last":{"totalTokens":220,"inputTokens":150,"outputTokens":70},
+            "modelContextWindow":128000
+        }))
+    );
+
+    let mut failing_script = startup("chatgpt");
+    failing_script.extend(line(json!({
+        "method":"thread/tokenUsage/updated",
+        "params":{
+            "threadId":"synthetic-thread",
+            "turnId":"synthetic-turn",
+            "tokenUsage":{"total":{"totalTokens":210,"inputTokens":160,"outputTokens":50}}
+        }
+    })));
+    failing_script.extend(line(tool("call-inspect", "inspect_document")));
+    failing_script.extend(line(json!({
+        "method":"turn/completed",
+        "params":{
+            "threadId":"synthetic-thread",
+            "turn":{"id":"synthetic-turn","status":"failed","error":{"message":"provider_failed"}}
+        }
+    })));
+    let mut failing_backend = Backend::new();
+    let error = replay(&failing_script, &mut failing_backend)
+        .await
+        .err()
+        .expect("terminal turn failure");
+    assert_eq!(error.to_string(), "document_turn_terminal_failure");
+    let failure = error
+        .downcast_ref::<DocumentAgentFailure>()
+        .expect("partial document turn observation retained");
+    assert!(failure.completed_outcome().is_none());
+    let observed = failure.observation();
+    assert_eq!(observed.thread_id.as_deref(), Some("synthetic-thread"));
+    assert_eq!(observed.turn_id.as_deref(), Some("synthetic-turn"));
+    assert_eq!(observed.tool_submissions, 1);
+    assert_eq!(observed.deliveries.len(), 1);
+    assert_eq!(observed.deliveries[0].operation, "inspect_document");
+    assert_eq!(
+        observed.token_usage,
+        Some(json!({"total":{"totalTokens":210,"inputTokens":160,"outputTokens":50}}))
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn live_native_mock_control(
+    root: &Path,
+    script_body: &str,
+    timeout_ms: u64,
+) -> Result<DocumentAgentControl> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    for rel in ["auth", "state", "state/logs", "cwd"] {
+        let dir = root.join(rel);
+        if !dir.exists() {
+            fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        }
+    }
+    let bin_path = root.join("mock-codex.sh");
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o700)
+            .open(&bin_path)?;
+        file.write_all(script_body.as_bytes())?;
+        file.sync_all()?;
+    }
+    let bin_bytes = fs::read(&bin_path)?;
+    let codex_bin = DocumentFilePin {
+        path: bin_path,
+        bytes: bin_bytes.len() as u64,
+        sha256: sha(&bin_bytes),
+    };
+    let mut config = native_execution_control()?;
+    config.limits.timeout_ms = timeout_ms;
+    let bindings = document_native_execution_bindings(config.native_execution.as_ref().unwrap())?;
+    let write_pin = |name: &str, value: &Value| -> Result<DocumentFilePin> {
+        let path = root.join(name);
+        let bytes = serde_json::to_vec(value)?;
+        fs::write(&path, &bytes)?;
+        Ok(DocumentFilePin {
+            path,
+            bytes: bytes.len() as u64,
+            sha256: sha(&bytes),
+        })
+    };
+    let model_descriptor = write_pin("descriptor.json", &bindings.model_descriptor)?;
+    let permissions_config = write_pin("permissions.json", &bindings.permissions_config)?;
+    let runtime_profile = write_pin(
+        "profile.json",
+        &json!({
+            "schema":"gptgrep.parse-agent.document-runtime-profile.v1",
+            "source_revision":"1".repeat(40),
+            "protocol_schema_sha256":"2".repeat(64),
+            "codex_binary_sha256":codex_bin.sha256,
+            "descriptor_sha256":bindings.descriptor_sha256,
+            "permissions_config_sha256":bindings.permissions_config_sha256,
+            "permissions_template_sha256":bindings.permissions_template_sha256,
+            "tools_sha256":bindings.tools_sha256,
+            "instructions_sha256":bindings.instructions_sha256,
+            "standalone_app_server":true
+        }),
+    )?;
+    let clock = RunClockAnchor::capture(std::time::SystemTime::now() + Duration::from_secs(60))?;
+    config.deadline_unix_ms = clock.deadline_unix_ms();
+    config.original_clock = clock;
+    config.codex_bin = codex_bin;
+    config.runtime_profile = runtime_profile;
+    config.model_descriptor = model_descriptor;
+    config.permissions_config = permissions_config;
+    config.auth_home = root.join("auth");
+    config.state_dir = root.join("state");
+    config.cwd = root.join("cwd");
+    Ok(config)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn document_drive_compares_protocol_completion_before_process_cleanup_and_retains_outcome_on_cleanup_failure()
+-> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().canonicalize()?;
+    let script = r#"#!/bin/sh
+trap '' TERM
+read -r _init
+printf '%s\n' '{"id":1,"result":{}}'
+read -r _initialized
+read -r _account
+printf '%s\n' '{"id":2,"result":{"account":{"type":"chatgpt"}}}'
+read -r _config
+printf '%s\n' '{"id":3,"result":{"config":{"mcp_servers":{},"tools":{},"web_search":"live"}}}'
+read -r _thread
+printf '%s\n' '{"id":4,"result":{"thread":{"id":"synthetic-thread"},"model":"gpt-6-luna","modelProvider":"openai","approvalPolicy":"never","activePermissionProfile":{"id":"synthetic-native","extends":null},"sandbox":{"type":"dangerFullAccess","networkAccess":true},"reasoningEffort":"max","serviceTier":"priority"}}'
+read -r _turn
+printf '%s\n' '{"id":5,"result":{"turn":{"id":"synthetic-turn"}}}'
+printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"synthetic-thread","turnId":"synthetic-turn","tokenUsage":{"total":{"totalTokens":144,"inputTokens":100,"outputTokens":44}}}}'
+printf '%s\n' '{"id":101,"method":"item/tool/call","params":{"threadId":"synthetic-thread","turnId":"synthetic-turn","callId":"call-finalize","namespace":"gptgrep_parse","tool":"toolbox","arguments":{"op":"finalize"}}}'
+read -r _tool_reply
+printf '%s\n' '{"method":"item/completed","params":{"threadId":"synthetic-thread","turnId":"synthetic-turn","item":{"type":"dynamicToolCall","id":"call-finalize","namespace":"gptgrep_parse","tool":"toolbox"}}}'
+printf '%s\n' '{"method":"item/completed","params":{"threadId":"synthetic-thread","turnId":"synthetic-turn","item":{"type":"agentMessage","id":"synthetic-answer","phase":"final_answer","text":"{\"status\":\"complete\",\"handle\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}"}}}'
+printf '%s\n' '{"method":"turn/completed","params":{"threadId":"synthetic-thread","turnId":"synthetic-turn","turn":{"id":"synthetic-turn","status":"completed","error":null,"items":[]}}}'
+sleep 5
+"#;
+    // Allow 2000ms for subprocess startup under parallel test load, then hold
+    // Finalize until 100ms before deadline so turn/completed finishes with <100ms
+    // remaining while OwnedGroup::stop's 200ms SIGTERM->SIGKILL grace exceeds deadline.
+    let config = live_native_mock_control(&root, script, 2_000)?;
+    let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let started = Instant::now();
+    let mut backend = CleanupBackend {
+        inner: Backend::new(),
+        calls: 0,
+        fail: false,
+        completed: completed.clone(),
+        ocr: None,
+        sleep_until: Some(started + Duration::from_millis(1_900)),
+    };
+    let outcome = drive_document_agent(
+        &config,
+        &mut backend,
+        DocumentWorking::new(config.limits.working_bytes),
+        started,
+    )
+    .await?;
+    assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(
+        outcome.token_usage,
+        Some(json!({"total":{"totalTokens":144,"inputTokens":100,"outputTokens":44}}))
+    );
+
+    let config = live_native_mock_control(&root, script, 2_000)?;
+    let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let started = Instant::now();
+    let mut failing_cleanup_backend = CleanupBackend {
+        inner: Backend::new(),
+        calls: 0,
+        fail: true,
+        completed,
+        ocr: None,
+        sleep_until: Some(started + Duration::from_millis(1_900)),
+    };
+    let error = drive_document_agent(
+        &config,
+        &mut failing_cleanup_backend,
+        DocumentWorking::new(config.limits.working_bytes),
+        started,
+    )
+    .await
+    .err()
+    .expect("cleanup failure after completed turn");
+    assert_eq!(error.to_string(), "document_ocr_cleanup_unknown");
+    let failure = error
+        .downcast_ref::<DocumentAgentFailure>()
+        .expect("completed turn retained on cleanup failure");
+    let retained = failure
+        .completed_outcome()
+        .expect("completed outcome attached");
+    assert_eq!(retained.thread_id, "synthetic-thread");
+    assert_eq!(retained.turn_id, "synthetic-turn");
+    assert_eq!(
+        retained.token_usage,
+        Some(json!({"total":{"totalTokens":144,"inputTokens":100,"outputTokens":44}}))
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dropping_document_agent_future_synchronously_cancels_owned_ocr_cleanup() -> Result<()> {
+    let fixture = crate::ocr_tests::Fixture::new();
+    let (executor, _context, pid_file) = crate::ocr_tests::mock_executor(&fixture, "hang", true);
+    let cleanup = crate::OcrCleanup::new(64)?;
+    let executor = executor.with_cleanup(cleanup.clone());
+    let cancel = crate::OcrCancellation::default();
+    let mut ocr_op = Box::pin(executor.execute_cancellable(fixture.task.clone(), cancel.clone()));
+    tokio::select! {
+        result = &mut ocr_op => panic!("mock ended before submission: {result:?}"),
+        () = crate::ocr_tests::wait_for_submitted_mock(&pid_file) => {}
+    }
+    drop(ocr_op);
+
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().canonicalize()?;
+    let hang_script = "#!/bin/sh\nsleep 30\n";
+    let config = live_native_mock_control(&root, hang_script, 30_000)?;
+    let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut backend = CleanupBackend {
+        inner: Backend::new(),
+        calls: 0,
+        fail: false,
+        completed,
+        ocr: Some(cleanup.clone()),
+        sleep_until: None,
+    };
+    assert!(!cleanup.is_closed());
+    let drive_future = drive_document_agent(
+        &config,
+        &mut backend,
+        DocumentWorking::new(config.limits.working_bytes),
+        Instant::now(),
+    );
+    let _ = timeout_at(Instant::now() + Duration::from_millis(50), drive_future).await;
+    // Dropping drive_document_agent before finish_document_cleanup must synchronously close
+    // and cancel the backend's OcrCleanup registry.
+    assert!(cleanup.is_closed());
+    cleanup
+        .cancel_and_drain(Instant::now() + Duration::from_secs(5))
+        .await?;
     Ok(())
 }

@@ -483,6 +483,48 @@ async fn planned_bootstrap_keeps_a_validated_retry_reply_when_a_local_step_fails
 }
 
 #[tokio::test]
+async fn planned_bootstrap_keeps_a_validated_single_attempt_reply_when_a_local_step_fails() {
+    let (result, accounting, requests, _root) =
+        planned_retry_bootstrap(vec![200], Some(std::sync::Arc::new(RejectValidated))).await;
+    assert!(result.is_err());
+    assert_eq!(requests.len(), 1);
+    let summary = accounting.summary();
+    assert_eq!(summary.initial_status, "failed");
+    assert_eq!((summary.attempted_calls, summary.requests), (1, 1));
+    assert_eq!(summary.unobserved_attempts, 0);
+    assert_eq!(
+        summary.usage,
+        [json!({"input_tokens":11,"output_tokens":2,"cost":0.001})]
+    );
+    assert_eq!(summary.models, ["openai/gpt-6-luna-decisions-20261006"]);
+    assert!(!summary.accounting_complete);
+    let search = &summary.searches[0];
+    assert_eq!(search.status, "failed");
+    assert!(search.metrics.jev_retried_attempts.is_empty());
+    let union = &search.plan.as_ref().unwrap().operations["union.rerank"];
+    assert_eq!(union.event, "failed");
+    assert_eq!(
+        (
+            union.metrics.jev_calls_attempted,
+            union.metrics.jev_requests,
+            union.metrics.jev_usage.len()
+        ),
+        (1, 1, 1)
+    );
+    assert!(union.cause.as_deref().is_some_and(|cause| {
+        cause.contains("observer callbacks failed: validated_response")
+            && cause.contains("request was not retried")
+    }));
+    let ledger = std::fs::read_to_string(accounting.path()).unwrap();
+    let last: Value = serde_json::from_str(ledger.lines().last().unwrap()).unwrap();
+    assert_eq!(
+        (last["attempted_calls"].as_u64(), last["requests"].as_u64()),
+        (Some(1), Some(1))
+    );
+    assert!(!ledger.contains("synthetic-local-ledger-failure"));
+}
+
+#[tokio::test]
 async fn planned_bootstrap_accounts_disjoint_stages_and_issues_only_delivered_spans() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(

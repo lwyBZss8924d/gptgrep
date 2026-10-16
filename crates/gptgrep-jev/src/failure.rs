@@ -20,6 +20,11 @@ pub enum DecisionFailureKind {
     /// The bounded transient retry submission was not admitted or was stopped
     /// before its HTTP send; any reservation it took remains charged.
     RetryAdmission,
+    /// A submission was sent, then a local step failed: its terminal ledger
+    /// record, a caller observer, or local response handling. The provider may
+    /// have completed and billed it. A validated response's usage is kept in
+    /// `reported_usage`; otherwise usage is unknown.
+    LocalPostSend,
     /// The bounded transient retry submission was sent, then a local step
     /// failed: its terminal ledger record, a caller observer, or local response
     /// handling. The provider may have completed and billed it. A validated
@@ -364,6 +369,25 @@ impl DecisionFailure {
         )
     }
 
+    /// A submission was sent, then a local step failed. When its response had
+    /// already been validated, that response's usage and identity are kept;
+    /// otherwise its usage is unknown. The local error text is not kept.
+    pub(crate) fn local_post_send(
+        validated: Option<(FailedResponseUsage, FailedResponseMetadata)>,
+    ) -> Self {
+        let message = if validated.is_some() {
+            "Jev request was sent and validated, then a local accounting or observer step failed; its reported usage is retained"
+        } else {
+            "Jev request was sent, then a local accounting or observer step failed; the provider may have completed it and its usage is unknown"
+        };
+        let mut failure = Self::new(DecisionFailureKind::LocalPostSend, message, None, None);
+        if let Some((usage, metadata)) = validated {
+            failure.diagnostic.reported_usage = Some(usage);
+            failure.diagnostic.response_metadata = Some(metadata);
+        }
+        failure
+    }
+
     /// The bounded retry submission was sent, then a local step failed. When its
     /// response had already been validated, that response's usage and identity
     /// are kept; otherwise its usage is unknown. The local error text is not kept.
@@ -583,7 +607,7 @@ impl DecisionFailure {
             DecisionFailureKind::RetryAdmission => f.write_str(
                 "not admitted or sent, any reserved retry submission remains charged",
             ),
-            DecisionFailureKind::RetryPostSend => f.write_str(
+            DecisionFailureKind::LocalPostSend | DecisionFailureKind::RetryPostSend => f.write_str(
                 if diagnostic.reported_usage.is_some() {
                     "sent and validated, then a local accounting or observer step failed, its reported usage is retained"
                 } else {

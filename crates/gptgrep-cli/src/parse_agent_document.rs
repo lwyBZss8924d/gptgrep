@@ -1107,6 +1107,9 @@ impl DocumentBackend for Backend {
     ) -> Pin<Box<dyn Future<Output = Result<DocumentToolReply>> + Send + 'a>> {
         Box::pin(self.operation(operation))
     }
+    fn cancel_ocr_on_drop(&mut self) {
+        self.ocr_cleanup.cancel_on_drop();
+    }
     fn cancel_and_drain_ocr<'a>(
         &'a mut self,
         deadline: Instant,

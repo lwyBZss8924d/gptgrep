@@ -133,7 +133,10 @@ impl JudgeFailure {
                     | DecisionFailureKind::InvalidJson
                     | DecisionFailureKind::ResponseSchema
                     | DecisionFailureKind::ResponseValidation
-            )
+            ) || matches!(
+                d.kind,
+                DecisionFailureKind::LocalPostSend | DecisionFailureKind::RetryPostSend
+            ) && d.reported_usage.is_some()
         });
         let submission = if !send_started {
             "not_submitted"
@@ -155,6 +158,14 @@ impl JudgeFailure {
                 Some(DecisionFailureKind::InvalidJson) => "response_invalid_json",
                 Some(DecisionFailureKind::ResponseSchema)
                 | Some(DecisionFailureKind::ResponseValidation) => "usage_not_reported",
+                Some(DecisionFailureKind::LocalPostSend)
+                | Some(DecisionFailureKind::RetryPostSend)
+                    if diagnostic
+                        .as_ref()
+                        .is_some_and(|d| d.reported_usage.is_some()) =>
+                {
+                    "usage_not_reported"
+                }
                 _ => "outcome_unknown_no_response",
             }
         };

@@ -256,6 +256,14 @@ impl DocumentWorkingLease {
             .map_err(|_| anyhow!("document_agent_working"))
     }
 }
+impl std::fmt::Debug for DocumentWorkingLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("DocumentWorkingLease")
+            .field(&self.bytes())
+            .finish()
+    }
+}
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -336,7 +344,7 @@ pub struct DocumentImageGrant {
     pub width: u32,
     pub height: u32,
 }
-#[derive(Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct DocumentVerifiedProduct {
     pub handle: String,
     pub source_sha256: String,
@@ -368,6 +376,9 @@ pub trait DocumentBackend: Send {
         operation: DocumentToolOperation,
     ) -> Pin<Box<dyn Future<Output = Result<DocumentToolReply>> + Send + 'a>>;
     fn verify_complete(&self) -> Result<DocumentVerifiedProduct>;
+    /// Synchronously signal owned OCR workers when the enclosing Document turn
+    /// future is dropped before `cancel_and_drain_ocr` can run.
+    fn cancel_ocr_on_drop(&mut self) {}
     /// Implemented by the caller that owns OCR workers. Empty backends have none.
     /// Called after the timed protocol future has been dropped on every return.
     fn cancel_and_drain_ocr<'a>(
@@ -474,7 +485,7 @@ pub fn decode_document_image(
     );
     Ok(bytes)
 }
-#[derive(Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct DocumentToolDelivery {
     pub ordinal: usize,
     pub call_id_sha256: String,
@@ -484,6 +495,61 @@ pub struct DocumentToolDelivery {
     pub assembled_rpc_bytes: usize,
     pub mediated_image: bool,
     pub provider_ingestion_verified: bool,
+}
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct DocumentTurnObservation {
+    pub thread_id: Option<String>,
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<Value>,
+    pub tool_submissions: usize,
+    pub deliveries: Vec<DocumentToolDelivery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_ptc: Option<crate::NativePtcReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_observation: Option<Value>,
+}
+pub struct DocumentAgentFailure {
+    observation: DocumentTurnObservation,
+    completed_outcome: Option<DocumentAgentOutcome>,
+    cause: anyhow::Error,
+}
+impl DocumentAgentFailure {
+    pub fn observation(&self) -> &DocumentTurnObservation {
+        &self.observation
+    }
+    pub fn completed_outcome(&self) -> Option<&DocumentAgentOutcome> {
+        self.completed_outcome.as_ref()
+    }
+    pub fn into_completed_outcome(self) -> Option<DocumentAgentOutcome> {
+        self.completed_outcome
+    }
+}
+impl std::fmt::Debug for DocumentAgentFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DocumentAgentFailure")
+            .field("thread_observed", &self.observation.thread_id.is_some())
+            .field("turn_observed", &self.observation.turn_id.is_some())
+            .field("usage_observed", &self.observation.token_usage.is_some())
+            .field("tool_submissions", &self.observation.tool_submissions)
+            .field(
+                "completed_outcome_present",
+                &self.completed_outcome.is_some(),
+            )
+            .field("cause", &self.cause)
+            .finish()
+    }
+}
+impl std::fmt::Display for DocumentAgentFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.cause)
+    }
+}
+impl std::error::Error for DocumentAgentFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.cause.as_ref())
+    }
 }
 #[derive(Serialize)]
 pub struct DocumentAgentOutcome {
@@ -499,6 +565,8 @@ pub struct DocumentAgentOutcome {
     pub tool_submissions: usize,
     pub rpc_bytes: usize,
     pub stderr_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<Value>,
     pub verified_product: DocumentVerifiedProduct,
     pub deliveries: Vec<DocumentToolDelivery>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -519,7 +587,7 @@ pub struct DocumentAgentOutcome {
     #[serde(skip)]
     _retained: DocumentWorkingLease,
 }
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DocumentImageObservation {
     pub artifact_id: String,
@@ -848,6 +916,117 @@ fn validate_profile(control: &DocumentAgentControl) -> Result<RuntimeProfile> {
     Ok(profile)
 }
 
+struct DocumentTurnDropGuard<'a> {
+    backend: &'a mut dyn DocumentBackend,
+    cleanup_completed: bool,
+}
+impl Drop for DocumentTurnDropGuard<'_> {
+    fn drop(&mut self) {
+        if !self.cleanup_completed {
+            self.backend.cancel_ocr_on_drop();
+        }
+    }
+}
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if !self.0.is_finished() {
+            self.0.abort();
+        }
+    }
+}
+impl DocumentTurnObservation {
+    fn from_outcome(outcome: &DocumentAgentOutcome) -> Self {
+        Self {
+            thread_id: Some(outcome.thread_id.clone()),
+            turn_id: Some(outcome.turn_id.clone()),
+            token_usage: outcome.token_usage.clone(),
+            tool_submissions: outcome.tool_submissions,
+            deliveries: outcome.deliveries.clone(),
+            native_ptc: outcome.native_ptc.clone(),
+            permission_observation: outcome.permission_observation.clone(),
+        }
+    }
+}
+trait IntoDocumentCompletedOutcome {
+    fn into_completed_outcome(self) -> Option<DocumentAgentOutcome>;
+}
+impl IntoDocumentCompletedOutcome for DocumentAgentOutcome {
+    fn into_completed_outcome(self) -> Option<DocumentAgentOutcome> {
+        Some(self)
+    }
+}
+impl IntoDocumentCompletedOutcome for () {
+    fn into_completed_outcome(self) -> Option<DocumentAgentOutcome> {
+        None
+    }
+}
+fn attach_document_failure(
+    error: anyhow::Error,
+    observation: &DocumentTurnObservation,
+    completed_outcome: Option<DocumentAgentOutcome>,
+) -> anyhow::Error {
+    match error.downcast::<DocumentAgentFailure>() {
+        Ok(mut existing) => {
+            if existing.observation.thread_id.is_none() {
+                existing.observation = observation.clone();
+            }
+            if existing.completed_outcome.is_none() {
+                existing.completed_outcome = completed_outcome;
+            }
+            existing.into()
+        }
+        Err(cause) => DocumentAgentFailure {
+            observation: observation.clone(),
+            completed_outcome,
+            cause,
+        }
+        .into(),
+    }
+}
+fn finish_document_owned_cleanup<T: IntoDocumentCompletedOutcome>(
+    primary: Result<T>,
+    cleanup: Result<()>,
+    code: &'static str,
+    observation: &DocumentTurnObservation,
+) -> Result<T> {
+    match (primary, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(primary), Ok(())) => Err(attach_document_failure(primary, observation, None)),
+        (Ok(value), Err(_)) => {
+            let completed = value.into_completed_outcome();
+            let observed = completed.as_ref().map_or_else(
+                || observation.clone(),
+                DocumentTurnObservation::from_outcome,
+            );
+            Err(attach_document_failure(anyhow!(code), &observed, completed))
+        }
+        (Err(primary), Err(cleanup_err)) => {
+            let (observed, completed, inner) = match primary.downcast::<DocumentAgentFailure>() {
+                Ok(existing) => (
+                    if existing.observation.thread_id.is_some() {
+                        existing.observation
+                    } else {
+                        observation.clone()
+                    },
+                    existing.completed_outcome,
+                    existing.cause,
+                ),
+                Err(cause) => (observation.clone(), None, cause),
+            };
+            let combined =
+                crate::ocr::finish_owned_cleanup::<()>(Err(inner), Err(cleanup_err), code)
+                    .expect_err("both primary and cleanup failed");
+            Err(DocumentAgentFailure {
+                observation: observed,
+                completed_outcome: completed,
+                cause: combined,
+            }
+            .into())
+        }
+    }
+}
+
 /// Exactly one document process/turn. Root must independently admit the selected
 /// binary, profile and working allowance before calling this function.
 pub async fn drive_document_agent(
@@ -856,7 +1035,12 @@ pub async fn drive_document_agent(
     working: DocumentWorking,
     started: Instant,
 ) -> Result<DocumentAgentOutcome> {
+    let mut guard = DocumentTurnDropGuard {
+        backend,
+        cleanup_completed: false,
+    };
     let mut cleanup_started = None;
+    let mut observation = DocumentTurnObservation::default();
     let outcome = async {
         validate_control(control)?;
         let profile = validate_profile(control)?;
@@ -867,7 +1051,7 @@ pub async fn drive_document_agent(
         };
         drive(
             control,
-            backend,
+            guard.backend,
             working,
             started,
             DocumentDriveSelection {
@@ -876,11 +1060,20 @@ pub async fn drive_document_agent(
                 max_seconds: profile.max_seconds,
             },
             &mut cleanup_started,
+            &mut observation,
         )
         .await
     }
     .await;
-    finish_document_cleanup(backend, outcome, cleanup_started).await
+    let result = finish_document_cleanup_with_observation(
+        guard.backend,
+        outcome,
+        cleanup_started,
+        &observation,
+    )
+    .await;
+    guard.cleanup_completed = true;
+    result
 }
 /// Explicit qualification purpose over the same complete source-bound backend.
 /// It can produce private evidence, never a product/publication qualification.
@@ -891,7 +1084,12 @@ pub async fn drive_document_image_qualification(
     started: Instant,
     request: &DocumentImageQualificationRequest,
 ) -> Result<DocumentAgentOutcome> {
+    let mut guard = DocumentTurnDropGuard {
+        backend,
+        cleanup_completed: false,
+    };
     let mut cleanup_started = None;
+    let mut observation = DocumentTurnObservation::default();
     let outcome = async {
         ensure!(
             control.native_execution.is_none(),
@@ -899,10 +1097,10 @@ pub async fn drive_document_image_qualification(
         );
         validate_control(control)?;
         let profile = validate_profile(control)?;
-        qualification::validate_request(request, control, &profile, backend.prepared())?;
+        qualification::validate_request(request, control, &profile, guard.backend.prepared())?;
         drive(
             control,
-            backend,
+            guard.backend,
             working,
             started,
             DocumentDriveSelection {
@@ -911,16 +1109,40 @@ pub async fn drive_document_image_qualification(
                 max_seconds: profile.max_seconds,
             },
             &mut cleanup_started,
+            &mut observation,
         )
         .await
     }
     .await;
-    finish_document_cleanup(backend, outcome, cleanup_started).await
+    let result = finish_document_cleanup_with_observation(
+        guard.backend,
+        outcome,
+        cleanup_started,
+        &observation,
+    )
+    .await;
+    guard.cleanup_completed = true;
+    result
 }
-async fn finish_document_cleanup<T>(
+#[cfg(test)]
+async fn finish_document_cleanup<T: IntoDocumentCompletedOutcome>(
     backend: &mut dyn DocumentBackend,
     outcome: Result<T>,
     cleanup_started: Option<Instant>,
+) -> Result<T> {
+    finish_document_cleanup_with_observation(
+        backend,
+        outcome,
+        cleanup_started,
+        &DocumentTurnObservation::default(),
+    )
+    .await
+}
+async fn finish_document_cleanup_with_observation<T: IntoDocumentCompletedOutcome>(
+    backend: &mut dyn DocumentBackend,
+    outcome: Result<T>,
+    cleanup_started: Option<Instant>,
+    observation: &DocumentTurnObservation,
 ) -> Result<T> {
     // The allowance starts at protocol exit and includes the Document child's
     // own stop/drain. Earlier validation failures still close an empty registry.
@@ -929,7 +1151,12 @@ async fn finish_document_cleanup<T>(
         .await
         .map_err(|_| anyhow!("document_ocr_cleanup_unknown"))
         .and_then(|result| result);
-    crate::ocr::finish_owned_cleanup(outcome, cleanup, "document_ocr_cleanup_unknown")
+    finish_document_owned_cleanup(
+        outcome,
+        cleanup,
+        "document_ocr_cleanup_unknown",
+        observation,
+    )
 }
 struct DocumentDriveSelection {
     accepted: Option<DocumentAcceptedImageQualification>,
@@ -943,6 +1170,7 @@ async fn drive(
     started: Instant,
     selection: DocumentDriveSelection,
     cleanup_started: &mut Option<Instant>,
+    observation: &mut DocumentTurnObservation,
 ) -> Result<DocumentAgentOutcome> {
     let DocumentDriveSelection {
         accepted,
@@ -1023,7 +1251,7 @@ async fn drive(
         .take()
         .ok_or_else(|| anyhow!("document_stdio"))?;
     let stderr_budget = transport.clone();
-    let mut stderr_task = tokio::spawn(async move {
+    let mut stderr_task = AbortOnDrop(tokio::spawn(async move {
         let mut reader = BudgetedReader::new(stderr, stderr_budget);
         let mut scratch = [0; 4096];
         let mut bytes = 0u64;
@@ -1039,8 +1267,8 @@ async fn drive(
                 .checked_add(n as u64)
                 .ok_or_else(|| anyhow!("document_stderr"))?;
         }
-    });
-    let run = run_protocol(
+    }));
+    let run = run_protocol_observed(
         output,
         input,
         control,
@@ -1052,6 +1280,7 @@ async fn drive(
         },
         native.as_mut(),
         qualification_request.as_deref(),
+        observation,
     );
     let captured = timeout_at(deadline, async {
         tokio::select! {biased;
@@ -1059,75 +1288,89 @@ async fn drive(
     })
     .await;
     // timeout_at owns and has now dropped run_protocol, including its tool future.
-    *cleanup_started = Some(Instant::now());
+    let completed_at = Instant::now();
+    let original_remaining = control
+        .original_clock
+        .remaining()
+        .map_err(|_| anyhow!("document_original_deadline"));
+    *cleanup_started = Some(completed_at);
     let captured = captured
         .map_err(|_| anyhow!("document_deadline_completion_unknown"))
         .and_then(|result| result);
     if group.stop(&mut child).await.is_err() {
-        stderr_task.abort();
-        return crate::ocr::finish_owned_cleanup(
+        stderr_task.0.abort();
+        return finish_document_owned_cleanup(
             captured,
             Err(anyhow!("cleanup")),
             "document_cleanup_unknown",
+            observation,
         );
     }
-    let stderr = tokio::time::timeout(Duration::from_secs(2), &mut stderr_task).await;
+    let stderr = tokio::time::timeout(Duration::from_secs(2), &mut stderr_task.0).await;
     let stderr = match stderr {
         Ok(Ok(Ok(n))) => n,
         _ => {
-            stderr_task.abort();
-            return crate::ocr::finish_owned_cleanup(
+            stderr_task.0.abort();
+            return finish_document_owned_cleanup(
                 captured,
                 Err(anyhow!("cleanup")),
                 "document_stderr_cleanup_unknown",
+                observation,
             );
         }
     };
-    let mut outcome = captured?;
-    transport
-        .check()
-        .map_err(|_| anyhow!("document_transport_limit"))?;
-    control
-        .original_clock
-        .remaining()
-        .map_err(|_| anyhow!("document_original_deadline"))?;
-    ensure!(Instant::now() < deadline, "document_deadline");
-    if let Some(native) = &native {
-        let native_calls = native.finish(&outcome, backend)?;
-        if qualification_request.is_some() {
-            ensure!(
-                native_calls > 0 && !outcome.qualification_image_observations.is_empty(),
-                "document_qualification_native_observation_required"
-            );
-            let observed = native.observed_artifacts(backend)?;
-            let mut unique = BTreeSet::new();
-            ensure!(
-                outcome
-                    .qualification_image_observations
-                    .iter()
-                    .all(|row| observed.contains(&row.artifact_id)
-                        && unique.insert(row.artifact_id.as_str())),
-                "document_qualification_unviewed_image_observation"
-            );
+    let mut outcome = match captured {
+        Ok(outcome) => outcome,
+        Err(error) => return Err(attach_document_failure(error, observation, None)),
+    };
+    let finalize_result = (|| -> Result<()> {
+        transport
+            .check()
+            .map_err(|_| anyhow!("document_transport_limit"))?;
+        original_remaining?;
+        ensure!(completed_at < deadline, "document_deadline");
+        if let Some(native) = &native {
+            let native_calls = native.finish(&outcome, backend)?;
+            if qualification_request.is_some() {
+                ensure!(
+                    native_calls > 0 && !outcome.qualification_image_observations.is_empty(),
+                    "document_qualification_native_observation_required"
+                );
+                let observed = native.observed_artifacts(backend)?;
+                let mut unique = BTreeSet::new();
+                ensure!(
+                    outcome
+                        .qualification_image_observations
+                        .iter()
+                        .all(|row| observed.contains(&row.artifact_id)
+                            && unique.insert(row.artifact_id.as_str())),
+                    "document_qualification_unviewed_image_observation"
+                );
+            }
+            outcome.tool_submissions = outcome
+                .tool_submissions
+                .checked_add(native_calls)
+                .ok_or_else(|| anyhow!("document_tool_count"))?;
+            observation.tool_submissions = outcome.tool_submissions;
+            outcome.native_receipts_verified = true;
+            outcome.native_image_source_prepared_assembled_verified = native_calls > 0;
         }
-        outcome.tool_submissions = outcome
-            .tool_submissions
-            .checked_add(native_calls)
-            .ok_or_else(|| anyhow!("document_tool_count"))?;
-        outcome.native_receipts_verified = true;
-        outcome.native_image_source_prepared_assembled_verified = native_calls > 0;
+        outcome.verified_product = backend.verify_complete()?;
+        outcome.rpc_bytes = transport.used();
+        outcome.stderr_bytes = stderr;
+        outcome.purpose = if qualification_request.is_some() {
+            "native_document_image_qualification"
+        } else {
+            "product"
+        };
+        outcome.qualification_request_sha256 = qualification_request;
+        outcome.native_image_influence_qualified = accepted.is_some();
+        outcome.native_image_qualification = accepted;
+        Ok(())
+    })();
+    if let Err(error) = finalize_result {
+        return Err(attach_document_failure(error, observation, Some(outcome)));
     }
-    outcome.verified_product = backend.verify_complete()?;
-    outcome.rpc_bytes = transport.used();
-    outcome.stderr_bytes = stderr;
-    outcome.purpose = if qualification_request.is_some() {
-        "native_document_image_qualification"
-    } else {
-        "product"
-    };
-    outcome.qualification_request_sha256 = qualification_request;
-    outcome.native_image_influence_qualified = accepted.is_some();
-    outcome.native_image_qualification = accepted;
     Ok(outcome)
 }
 fn command(
@@ -1136,6 +1379,9 @@ fn command(
 ) -> Result<Command> {
     let mut command = Command::new(&control.codex_bin.path);
     crate::process_group::configure(&mut command);
+    if control.native_execution.is_some() {
+        command.arg("app-server");
+    }
     command
         .args(["--listen", "stdio://", "--strict-config"])
         .current_dir(
@@ -1381,6 +1627,9 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Rpc<R, W> {
                     self.deny(server.clone()).await?;
                     return Err(anyhow!("document_startup_request"));
                 }
+                if self.native_execution && native_metadata(&reply.value)? {
+                    continue;
+                }
                 if let Some(event) = crate::DocumentRuntimeEvent::parse(&reply.value["method"]) {
                     return Err(self.refusal(
                         crate::DocumentRuntimeStage::Startup,
@@ -1440,7 +1689,33 @@ struct DocumentRunBudget {
     transport: TransportBudget,
     deadline: Instant,
 }
+#[cfg(test)]
 async fn run_protocol<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: R,
+    writer: W,
+    control: &DocumentAgentControl,
+    backend: &mut dyn DocumentBackend,
+    budget: DocumentRunBudget,
+    native: Option<&mut native::NativeSession>,
+    qualification_request: Option<&str>,
+) -> Result<DocumentAgentOutcome> {
+    let mut observation = DocumentTurnObservation::default();
+    run_protocol_observed(
+        reader,
+        writer,
+        control,
+        backend,
+        budget,
+        native,
+        qualification_request,
+        &mut observation,
+    )
+    .await
+    .map_err(|error| attach_document_failure(error, &observation, None))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_protocol_observed<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: R,
     writer: W,
     control: &DocumentAgentControl,
@@ -1448,6 +1723,7 @@ async fn run_protocol<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     budget: DocumentRunBudget,
     mut native: Option<&mut native::NativeSession>,
     qualification_request: Option<&str>,
+    observation: &mut DocumentTurnObservation,
 ) -> Result<DocumentAgentOutcome> {
     validate_execution_mode(control)?;
     let native_execution = control.native_execution.as_ref();
@@ -1632,6 +1908,8 @@ async fn run_protocol<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         "document_tier"
     );
     let thread_id = identifier(&thread.value["thread"]["id"])?;
+    observation.thread_id = Some(thread_id.clone());
+    observation.permission_observation = permission_observation.clone();
     drop(thread);
     let mut prompt = serde_json::to_value(backend.prepared())?;
     prompt["document_tool_budget"] = json!(control.limits.max_tool_calls);
@@ -1702,7 +1980,6 @@ async fn run_protocol<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     rpc.observation.turn_start_sent = true;
     drop(output_schema);
     drop(qualification_enum_lease);
-    let mut turn_id = None;
     let mut calls = Calls {
         submissions: 0,
         ids: BTreeSet::new(),
@@ -1716,7 +1993,6 @@ async fn run_protocol<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             })?,
         },
     };
-    let mut deliveries = Vec::new();
     let mut answer = None;
     loop {
         let mut message = rpc.receive().await?;
@@ -1730,18 +2006,29 @@ async fn run_protocol<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             let params = &mut message.value["params"];
             let call_id = params["callId"].as_str().unwrap_or("");
             let ordinal = calls.submit(call_id, control.limits.max_tool_calls)?;
+            observation.tool_submissions = calls.submissions;
             let call_id = call_id.to_owned();
             ensure!(params["threadId"] == thread_id, "document_tool_thread");
-            bind_turn(&mut turn_id, &params["turnId"])?;
+            bind_turn(&mut observation.turn_id, &params["turnId"])?;
             ensure!(
                 params["namespace"] == NAMESPACE && params["tool"] == TOOL,
                 "document_tool_namespace"
             );
-            if let Some(tracker) = native_ptc.as_mut()
-                && let Err(error) = tracker.charge_dynamic(&params["callId"])
-            {
-                let _ = rpc.deny(id).await;
-                return Err(error);
+            if let Some(tracker) = native_ptc.as_mut() {
+                if let Err(error) = tracker.charge_dynamic(&params["callId"]) {
+                    observation.native_ptc = Some(tracker.report());
+                    observation.tool_submissions = observation
+                        .native_ptc
+                        .as_ref()
+                        .map_or(calls.submissions, |report| report.combined_tool_calls);
+                    let _ = rpc.deny(id).await;
+                    return Err(error);
+                }
+                observation.native_ptc = Some(tracker.report());
+                observation.tool_submissions = observation
+                    .native_ptc
+                    .as_ref()
+                    .map_or(calls.submissions, |report| report.combined_tool_calls);
             }
             bounded_json(&params["arguments"], control.limits.tool_argument_bytes)?;
             let arguments = params
@@ -1799,10 +2086,11 @@ async fn run_protocol<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             let (assembled_rpc_sha256, assembled_rpc_bytes) = rpc
                 .send(json!({"id":id,"result":{"success":true,"contentItems":contents}}))
                 .await?;
-            deliveries
+            observation
+                .deliveries
                 .try_reserve_exact(1)
                 .map_err(|_| anyhow!("document_agent_working"))?;
-            deliveries.push(DocumentToolDelivery {
+            observation.deliveries.push(DocumentToolDelivery {
                 ordinal,
                 call_id_sha256: sha(call_id.as_bytes()),
                 operation: name.into(),
@@ -1819,7 +2107,10 @@ async fn run_protocol<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 message.value["id"] == 5 && message.value.get("error").is_none(),
                 "document_turn_start"
             );
-            bind_turn(&mut turn_id, &message.value["result"]["turn"]["id"])?;
+            bind_turn(
+                &mut observation.turn_id,
+                &message.value["result"]["turn"]["id"],
+            )?;
             rpc.observation.turn_start_acknowledged = true;
             continue;
         }
@@ -1839,12 +2130,25 @@ async fn run_protocol<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             let identity = if global_warning {
                 crate::DocumentRuntimeIdentity::GlobalNotification
             } else if same_thread(&message.value, &thread_id).is_ok()
-                && bind_turn(&mut turn_id, &params["turnId"]).is_ok()
+                && bind_turn(&mut observation.turn_id, &params["turnId"]).is_ok()
             {
                 crate::DocumentRuntimeIdentity::Matched
             } else {
                 crate::DocumentRuntimeIdentity::Mismatch
             };
+            if native_execution.is_some() && identity != crate::DocumentRuntimeIdentity::Mismatch {
+                if native_metadata(&message.value)? {
+                    continue;
+                }
+                if identity == crate::DocumentRuntimeIdentity::Matched
+                    && event == crate::DocumentRuntimeEvent::Error
+                    && params["willRetry"] == json!(true)
+                    && crate::codex_error::ParsedError::retryable_transport(&params["error"])
+                {
+                    // The native server continues the same turn under the original deadline.
+                    continue;
+                }
+            }
             return Err(rpc.refusal(stage, None, event, identity, params));
         }
         if native_execution.is_some() && native_metadata(&message.value)? {
@@ -1852,7 +2156,7 @@ async fn run_protocol<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 same_thread(&message.value, &thread_id)?;
             }
             if !message.value["params"]["turnId"].is_null() {
-                bind_turn(&mut turn_id, &message.value["params"]["turnId"])?;
+                bind_turn(&mut observation.turn_id, &message.value["params"]["turnId"])?;
             }
             continue;
         }
@@ -1862,11 +2166,14 @@ async fn run_protocol<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         match message.value["method"].as_str() {
             Some("turn/started") => {
                 same_thread(&message.value, &thread_id)?;
-                bind_turn(&mut turn_id, &message.value["params"]["turn"]["id"])?;
+                bind_turn(
+                    &mut observation.turn_id,
+                    &message.value["params"]["turn"]["id"],
+                )?;
             }
             Some("item/started" | "item/completed") => {
                 same_thread(&message.value, &thread_id)?;
-                bind_turn(&mut turn_id, &message.value["params"]["turnId"])?;
+                bind_turn(&mut observation.turn_id, &message.value["params"]["turnId"])?;
                 let item = &message.value["params"]["item"];
                 check_protocol_item(
                     item,
@@ -1880,6 +2187,12 @@ async fn run_protocol<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     native_ptc.as_mut(),
                     control.limits.max_tool_calls,
                 )?;
+                observation.native_ptc =
+                    native_ptc.as_ref().map(crate::native_ptc::Tracker::report);
+                observation.tool_submissions = observation
+                    .native_ptc
+                    .as_ref()
+                    .map_or(calls.submissions, |report| report.combined_tool_calls);
                 if message.value["method"] == "item/completed"
                     && item["type"] == "agentMessage"
                     && item["phase"] != "commentary"
@@ -1888,12 +2201,16 @@ async fn run_protocol<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 }
             }
             Some("thread/tokenUsage/updated") => {
-                rpc.observe_usage(&message.value, &thread_id, &mut turn_id)?;
+                rpc.observe_usage(&message.value, &thread_id, &mut observation.turn_id)?;
+                crate::model_attempts::merge_observed_usage(
+                    &mut observation.token_usage,
+                    rpc.usage.as_ref(),
+                );
             }
             Some("turn/completed") => {
                 same_thread(&message.value, &thread_id)?;
                 let turn = &message.value["params"]["turn"];
-                bind_turn(&mut turn_id, &turn["id"])?;
+                bind_turn(&mut observation.turn_id, &turn["id"])?;
                 ensure!(
                     turn["status"] == "completed" && turn["error"].is_null(),
                     "document_turn_terminal_failure"
@@ -1916,6 +2233,12 @@ async fn run_protocol<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 if let Some(tracker) = native_ptc.as_mut() {
                     tracker.finish()?;
                 }
+                observation.native_ptc =
+                    native_ptc.as_ref().map(crate::native_ptc::Tracker::report);
+                observation.tool_submissions = observation
+                    .native_ptc
+                    .as_ref()
+                    .map_or(calls.submissions, |report| report.combined_tool_calls);
                 ensure!(
                     calls.events.is_subset(&calls.ids),
                     "document_unmediated_dynamic_item"
@@ -1926,24 +2249,27 @@ async fn run_protocol<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     "document_agent_blocked"
                 );
                 let verified_product = backend.verify_complete()?;
-                let native_ptc = native_ptc.as_ref().map(crate::native_ptc::Tracker::report);
+                let native_ptc = observation.native_ptc.clone();
+                let turn_id = observation
+                    .turn_id
+                    .clone()
+                    .ok_or_else(|| anyhow!("document_turn_id"))?;
                 return Ok(DocumentAgentOutcome {
                     schema: "gptgrep.parse-agent.document-outcome.v1",
                     thread_id,
-                    turn_id: turn_id.ok_or_else(|| anyhow!("document_turn_id"))?,
+                    turn_id,
                     requested_model: DOCUMENT_MODEL,
                     requested_reasoning_effort: "max",
                     requested_service_tier: "fast",
                     normalized_request_service_tier: "priority",
                     actual_served_profile_verified: false,
                     auth_mode: "chatgpt",
-                    tool_submissions: native_ptc
-                        .as_ref()
-                        .map_or(calls.submissions, |report| report.combined_tool_calls),
+                    tool_submissions: observation.tool_submissions,
                     rpc_bytes: rpc.transport.used(),
                     stderr_bytes: 0,
+                    token_usage: observation.token_usage.clone(),
                     verified_product,
-                    deliveries,
+                    deliveries: observation.deliveries.clone(),
                     native_ptc,
                     permission_observation,
                     native_viewer_enabled: native.is_some(),
@@ -2083,6 +2409,10 @@ fn native_metadata(message: &Value) -> Result<bool> {
                 | "skills/changed"
                 | "hook/started"
                 | "hook/completed"
+                | "warning"
+                | "configWarning"
+                | "config/warning"
+                | "deprecationNotice"
         )
     );
     if recognized {

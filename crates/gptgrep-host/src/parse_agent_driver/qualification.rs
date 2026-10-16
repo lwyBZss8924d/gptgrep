@@ -106,7 +106,7 @@ struct Review {
     assertions: Assertions,
     findings: Vec<Value>,
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct DocumentAcceptedImageQualification {
     pub control_sha256: String,
     pub qualification_record_sha256: String,

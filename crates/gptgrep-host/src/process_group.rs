@@ -20,10 +20,10 @@ impl OwnedGroup {
     pub fn new(child: &Child) -> Result<Self> {
         let id = child
             .id()
-            .ok_or_else(|| anyhow!("Owned Codex child has no process identity"))?;
+            .ok_or_else(|| anyhow!("host_codex_process_identity_unavailable"))?;
         ensure!(
             id > 1 && id <= i32::MAX as u32,
-            "Invalid owned process identity"
+            "host_codex_process_identity_invalid"
         );
         Ok(Self {
             #[cfg(unix)]
@@ -43,11 +43,7 @@ impl OwnedGroup {
         {
             let _ = child.start_kill();
         }
-        let reaped = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-        ensure!(
-            matches!(reaped, Ok(Ok(_))),
-            "Could not reap the owned Codex app-server within the cleanup limit"
-        );
+        reap_outcome(tokio::time::timeout(Duration::from_secs(5), child.wait()).await)?;
         self.armed = false;
         Ok(())
     }
@@ -65,7 +61,7 @@ impl OwnedGroup {
         if let Err(error) = self.signal(signal) {
             // Darwin can return EPERM for a group containing only an unreaped zombie.
             if error.raw_os_error() != Some(libc::EPERM) || self.has_live_members().await? {
-                return Err(anyhow!("Could not signal the owned Codex process group"));
+                return Err(anyhow!("host_codex_process_group_signal_failed"));
             }
         }
         Ok(())
@@ -80,27 +76,27 @@ impl OwnedGroup {
                 .output(),
         )
         .await
-        .map_err(|_| anyhow!("Owned process-group verification timed out"))?
-        .map_err(|_| anyhow!("Owned process-group verification failed"))?;
+        .map_err(|_| anyhow!("host_codex_process_group_check_timeout"))?
+        .map_err(|_| anyhow!("host_codex_process_group_check_failed"))?;
         ensure!(
             output.status.success() && output.stdout.len() <= 512 * 1024,
-            "Owned process-group verification unavailable"
+            "host_codex_process_group_check_unavailable"
         );
-        let text =
-            std::str::from_utf8(&output.stdout).map_err(|_| anyhow!("Invalid process metadata"))?;
+        let text = std::str::from_utf8(&output.stdout)
+            .map_err(|_| anyhow!("host_codex_process_metadata_invalid"))?;
         for line in text.lines() {
             let mut fields = line.split_whitespace();
             let _pid = fields
                 .next()
                 .and_then(|v| v.parse::<i32>().ok())
-                .ok_or_else(|| anyhow!("Invalid process metadata"))?;
+                .ok_or_else(|| anyhow!("host_codex_process_metadata_invalid"))?;
             let group = fields
                 .next()
                 .and_then(|v| v.parse::<i32>().ok())
-                .ok_or_else(|| anyhow!("Invalid process metadata"))?;
+                .ok_or_else(|| anyhow!("host_codex_process_metadata_invalid"))?;
             let status = fields
                 .next()
-                .ok_or_else(|| anyhow!("Invalid process metadata"))?;
+                .ok_or_else(|| anyhow!("host_codex_process_metadata_invalid"))?;
             if group == self.id && !status.starts_with('Z') {
                 return Ok(true);
             }
@@ -116,5 +112,48 @@ impl Drop for OwnedGroup {
             // the leader through Tokio's child lifecycle.
             let _ = self.signal(libc::SIGKILL);
         }
+    }
+}
+
+/// The owned leader must be reaped within the cleanup limit. A reap that is
+/// still pending at the limit and a wait that fails are reported apart; the
+/// group stays armed in both cases.
+fn reap_outcome<T>(
+    reaped: std::result::Result<std::io::Result<T>, tokio::time::error::Elapsed>,
+) -> Result<T> {
+    reaped
+        .map_err(|_| anyhow!("host_codex_process_reap_timeout"))?
+        .map_err(|_| anyhow!("host_codex_process_reap_failed"))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_failed_reap_wait_is_not_reported_as_a_reap_timeout() {
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let pid = child.id().unwrap() as libc::pid_t;
+        // Reap the child outside Tokio, so its owned wait fails at once.
+        // SAFETY: pid is this test's own child and is not yet reaped.
+        unsafe {
+            assert_eq!(libc::kill(pid, libc::SIGKILL), 0);
+            let mut status = 0;
+            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+        }
+        let reaped = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+        assert!(matches!(reaped, Ok(Err(_))));
+        assert_eq!(
+            format!("{:#}", reap_outcome(reaped).unwrap_err()),
+            "host_codex_process_reap_failed"
+        );
+        let elapsed = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            format!("{:#}", reap_outcome::<()>(Err(elapsed)).unwrap_err()),
+            "host_codex_process_reap_timeout"
+        );
+        assert_eq!(reap_outcome(Ok(Ok(7))).unwrap(), 7);
     }
 }

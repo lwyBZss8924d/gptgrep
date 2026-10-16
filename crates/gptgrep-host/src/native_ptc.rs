@@ -1,6 +1,6 @@
 //! Native runtime tools. Item notifications are observations, not
 //! pre-execution admission: the runtime may already have started the operation.
-use crate::{HostConfig, model_attempts::ModelAttemptObserver};
+use crate::{HostConfig, ToolBudgetDiagnostics, model_attempts::ModelAttemptObserver};
 use anyhow::{Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -84,16 +84,29 @@ pub struct NativePtcReport {
     /// Validated GPTgrep request identities charged before existing dispatch.
     /// Existing tool receipts, not this counter, determine delivery or success.
     pub dynamic_requests_charged: usize,
+    /// GPTgrep requests refused past the shared budget and never charged: the
+    /// retrieval reader's recoverable denials plus at most one request refused
+    /// with a JSON-RPC error when the workflow fails.
     pub dynamic_requests_denied: usize,
     /// Unique observed native IDs, including the first over-budget observation.
     pub native_tool_calls: usize,
+    /// Charged GPTgrep requests plus observed native items; denials are excluded.
     pub combined_tool_calls: usize,
+    /// A request or observation past the budget stopped the host. Recoverable
+    /// denials alone do not set it.
     pub budget_exceeded: bool,
     pub successful_turn_completed_observed: bool,
     /// Failure snapshot projection only: complete, partial, or unknown.
     /// "complete" does not claim full native execution/notification coverage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_snapshot_accounting: Option<String>,
+    /// Retrieval reader only, after its first recoverable denial: the restricted
+    /// reader's diagnostics for this shared budget. admitted_tool_calls counts
+    /// observed native items plus charged GPTgrep requests, so it equals
+    /// max_tool_calls as in the restricted reader; dynamic_requests_charged and
+    /// native_tool_calls keep the split.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_budget: Option<ToolBudgetDiagnostics>,
     /// At most max_tool_calls + 1 entries; the excess observation stops the host.
     pub items: Vec<NativeToolObservation>,
 }
@@ -111,6 +124,7 @@ impl NativePtcReport {
             budget_exceeded: false,
             successful_turn_completed_observed: false,
             failure_snapshot_accounting: None,
+            tool_budget: None,
             items: vec![],
         }
     }
@@ -170,11 +184,24 @@ pub(crate) enum ItemEvent {
     FinalSnapshot,
 }
 
+/// How the retrieval reader handles one GPTgrep request under the shared budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DynamicCharge {
+    /// Charged: dispatch through the existing GPTgrep handler.
+    Admit,
+    /// The budget is used: after the existing request checks, answer with the
+    /// restricted reader's recoverable denial recorded by `deny_dynamic`.
+    Deny,
+}
+
 /// A single reader's bounded observation state; no execution or evidence rights.
 pub(crate) struct Tracker {
     maximum: usize,
     dynamic_ids: BTreeSet<String>,
+    /// Retrieval-reader requests answered with the recoverable denial.
+    denied_ids: BTreeSet<String>,
     native: BTreeMap<String, NativeToolObservation>,
+    /// Recoverable denials plus at most one refused request.
     denied: usize,
     exceeded: bool,
     turn_completed: bool,
@@ -189,6 +216,7 @@ impl Tracker {
         Ok(Self {
             maximum,
             dynamic_ids: BTreeSet::new(),
+            denied_ids: BTreeSet::new(),
             native: BTreeMap::new(),
             denied: 0,
             exceeded: false,
@@ -197,7 +225,46 @@ impl Tracker {
         })
     }
 
+    /// Hard limit for workflows without a recoverable denial (rich readers and
+    /// the Document driver): the first request past the budget fails.
     pub(crate) fn charge_dynamic(&mut self, value: &Value) -> Result<()> {
+        let id = self.dynamic_id(value)?;
+        if self.budget_used() {
+            return self.refuse();
+        }
+        self.dynamic_ids.insert(id);
+        Ok(())
+    }
+
+    /// Retrieval reader: past the shared budget a request is denied, not
+    /// charged, up to the restricted reader's bound of max_tool_calls denials.
+    /// The next request fails. Native items keep their hard limit in `observe`.
+    pub(crate) fn charge_retrieval(&mut self, value: &Value) -> Result<DynamicCharge> {
+        let id = self.dynamic_id(value)?;
+        if !self.budget_used() {
+            self.dynamic_ids.insert(id);
+            return Ok(DynamicCharge::Admit);
+        }
+        if self.denied_ids.len() >= self.maximum {
+            return self.refuse();
+        }
+        Ok(DynamicCharge::Deny)
+    }
+
+    /// Record the recoverable denial of a request that `charge_retrieval`
+    /// returned as `Deny`. Denials never add to the charged or native counts.
+    pub(crate) fn deny_dynamic(&mut self, value: &Value) -> Result<ToolBudgetDiagnostics> {
+        let id = self.dynamic_id(value)?;
+        ensure!(
+            self.budget_used() && self.denied_ids.len() < self.maximum,
+            "host_native_ptc_denial_unavailable"
+        );
+        self.denied_ids.insert(id);
+        self.denied += 1;
+        Ok(self.diagnostics())
+    }
+
+    fn dynamic_id(&self, value: &Value) -> Result<String> {
         ensure!(!self.exceeded, "host_native_ptc_tool_budget_exhausted");
         let id = item_id(value)?;
         ensure!(
@@ -205,16 +272,44 @@ impl Tracker {
             "host_native_ptc_item_kind_changed"
         );
         ensure!(
-            !self.dynamic_ids.contains(&id),
+            !self.dynamic_ids.contains(&id) && !self.denied_ids.contains(&id),
             "host_native_ptc_dynamic_call_replayed"
         );
-        if self.dynamic_ids.len() + self.native.len() >= self.maximum {
-            self.denied = 1;
-            self.exceeded = true;
-            return Err(anyhow!("host_native_ptc_tool_budget_exhausted"));
+        Ok(id)
+    }
+
+    fn budget_used(&self) -> bool {
+        self.dynamic_ids.len() + self.native.len() >= self.maximum
+    }
+
+    fn refuse<T>(&mut self) -> Result<T> {
+        self.denied += 1;
+        self.exceeded = true;
+        Err(anyhow!("host_native_ptc_tool_budget_exhausted"))
+    }
+
+    /// The restricted reader's diagnostics: the same limit and denial bound, and
+    /// admitted counts every call admitted to the shared budget, observed native
+    /// items included. A denial requires a used budget, so admitted equals
+    /// max_tool_calls at every denial, as in the restricted reader. The native
+    /// observation past the budget that stops the host is reported in
+    /// native_tool_calls, never admitted.
+    fn diagnostics(&self) -> ToolBudgetDiagnostics {
+        ToolBudgetDiagnostics {
+            max_tool_calls: self.maximum,
+            admitted_tool_calls: (self.dynamic_ids.len() + self.native.len()).min(self.maximum),
+            denied_tool_calls: self.denied_ids.len(),
+            max_denied_tool_calls: self.maximum,
         }
-        self.dynamic_ids.insert(id);
-        Ok(())
+    }
+
+    /// GPTgrep requests charged to the shared budget; denials are excluded.
+    pub(crate) fn charged_dynamic_calls(&self) -> usize {
+        self.dynamic_ids.len()
+    }
+
+    pub(crate) fn native_tool_calls(&self) -> usize {
+        self.native.len()
     }
 
     pub(crate) fn check_non_native(&self, item: &Value) -> Result<()> {
@@ -233,7 +328,7 @@ impl Tracker {
             .ok_or_else(|| anyhow!("host_native_ptc_unknown_item_kind"))?;
         let id = item_id(&item["id"])?;
         ensure!(
-            !self.dynamic_ids.contains(&id),
+            !self.dynamic_ids.contains(&id) && !self.denied_ids.contains(&id),
             "host_native_ptc_item_kind_changed"
         );
         let status = match kind {
@@ -393,6 +488,7 @@ impl Tracker {
             budget_exceeded: self.exceeded,
             successful_turn_completed_observed: self.turn_completed,
             failure_snapshot_accounting: self.failure_snapshot_accounting.map(str::to_owned),
+            tool_budget: (!self.denied_ids.is_empty()).then(|| self.diagnostics()),
             items: self.native.values().cloned().collect(),
             ..NativePtcReport::empty(self.maximum)
         }

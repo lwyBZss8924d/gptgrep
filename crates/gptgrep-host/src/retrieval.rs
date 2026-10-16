@@ -478,9 +478,11 @@ impl Evidence {
     }
 
     fn ensure_generation(&self) -> Result<()> {
+        let catalog =
+            gptgrep_core::catalog(&self.root).map_err(|_| anyhow!("host_index_unavailable"))?;
         ensure!(
-            gptgrep_core::catalog(&self.root)?["generation"] == self.generation,
-            "Index generation changed during the host workflow"
+            catalog["generation"] == self.generation,
+            "host_generation_changed"
         );
         if let Some(navigation) = &self.navigation {
             navigation.verify(&self.root)?;
@@ -524,10 +526,11 @@ impl Evidence {
                 (value, false)
             }
         };
-        let text = serde_json::to_string(&value)?;
+        let text =
+            serde_json::to_string(&value).map_err(|_| anyhow!("host_tool_result_encoding"))?;
         let mut payload =
             json!({"contentItems":[{"type":"inputText","text":text}],"success":success});
-        if serde_json::to_vec(&payload)?.len() > MAX_TOOL_BYTES {
+        if payload_bytes(&payload)?.len() > MAX_TOOL_BYTES {
             success = false;
             let error = json!({"error":"tool_output_limit","message":format!("Serialized result exceeds {MAX_TOOL_BYTES} bytes. Retry with a smaller limit, or a smaller max_bytes for read. No evidence from this response was delivered.")});
             payload = json!({"contentItems":[{"type":"inputText","text":error.to_string()}],"success":false});
@@ -550,7 +553,7 @@ impl Evidence {
             arguments: args,
             generation: self.generation.clone(),
             success,
-            output_sha256: hash(&serde_json::to_vec(&payload)?),
+            output_sha256: hash(&payload_bytes(&payload)?),
             evidence,
             required_initial: self.initial_in_progress,
             search: self.last_search.clone(),
@@ -579,7 +582,7 @@ impl Evidence {
             .as_array()
             .and_then(|tools| tools.iter().find(|spec| spec["name"] == tool))
             .map(|spec| &spec["inputSchema"])
-            .ok_or_else(|| anyhow!("Tool is not allowed"))?;
+            .ok_or_else(|| anyhow!("host_tool_budget_unknown_tool"))?;
         ensure!(
             jsonschema::is_valid(schema, args)
                 && args.as_object().is_some_and(|args| args
@@ -588,7 +591,7 @@ impl Evidence {
                 && args["query"]
                     .as_str()
                     .is_none_or(|query| query.len() <= 2048),
-            "Invalid dynamic tool arguments after tool-budget exhaustion"
+            "host_tool_budget_invalid_arguments"
         );
         Ok(())
     }
@@ -613,7 +616,7 @@ impl Evidence {
             arguments: args,
             generation: self.generation.clone(),
             success: false,
-            output_sha256: hash(&serde_json::to_vec(&payload)?),
+            output_sha256: hash(&payload_bytes(&payload)?),
             evidence: vec![],
             required_initial: false,
             search: None,
@@ -853,7 +856,7 @@ impl Evidence {
                 if let (Some(accounting), Some(index)) = (&self.accounting, index) {
                     self.last_search = Some(accounting.failure(index, &error)?);
                 }
-                return Err(error);
+                return Err(coded_search_error(error));
             }
         };
         if let (Some(accounting), Some(index)) = (&self.accounting, index) {
@@ -870,9 +873,10 @@ impl Evidence {
         let original_hits = found.hits.len();
         if self.initial_in_progress {
             loop {
-                let value = serde_json::to_value(&found)?;
+                let value = serde_json::to_value(&found)
+                    .map_err(|_| anyhow!("host_tool_result_encoding"))?;
                 let payload = json!({"contentItems":[{"type":"inputText","text":value.to_string()}],"success":true});
-                if serde_json::to_vec(&payload)?.len() <= MAX_TOOL_BYTES - 256 {
+                if payload_bytes(&payload)?.len() <= MAX_TOOL_BYTES - 256 {
                     break;
                 }
                 ensure!(!found.hits.is_empty(), "host_jev_seed_delivery_failed");
@@ -903,7 +907,8 @@ impl Evidence {
             }
         }
         self.last_search_fatal = false;
-        let mut value = serde_json::to_value(found)?;
+        let mut value =
+            serde_json::to_value(found).map_err(|_| anyhow!("host_tool_result_encoding"))?;
         value["host_delivery"] = json!({"omitted_hits":original_hits-evidence.len()});
         Ok(value)
     }
@@ -915,7 +920,7 @@ impl Evidence {
         }
         let node_offset = hit
             .node_offset
-            .ok_or_else(|| anyhow!("Evidence interval is not contained in its node"))?;
+            .ok_or_else(|| anyhow!("host_evidence_interval_uncontained"))?;
         let citation = Citation {
             node_id: hit.node_id.clone(),
             path: hit.path.clone(),
@@ -954,21 +959,23 @@ impl Evidence {
             citations: Vec<String>,
             insufficient_evidence: bool,
         }
-        ensure!(
-            raw.len() <= 16 * 1024,
-            "Host final response exceeded its byte limit"
-        );
-        let answer: Answer = serde_json::from_str(raw).map_err(|_| {
-            anyhow!("Codex final answer did not match the structured evidence contract")
+        ensure!(raw.len() <= 16 * 1024, "host_answer_too_large");
+        // Only the classification of a rejected answer is kept, never its text.
+        let answer: Answer = serde_json::from_str(raw).map_err(|error| {
+            if error.is_data() {
+                anyhow!("host_answer_schema_mismatch")
+            } else {
+                anyhow!("host_answer_invalid_json")
+            }
         })?;
         ensure!(
             !answer.answer.trim().is_empty() && answer.answer.len() <= 8192,
-            "Host answer length is invalid"
+            "host_answer_length_invalid"
         );
-        ensure!(answer.citations.len() <= 24, "Too many final citations");
+        ensure!(answer.citations.len() <= 24, "host_answer_citation_limit");
         ensure!(
             answer.insufficient_evidence || !answer.citations.is_empty(),
-            "Answer contains no issued evidence citations"
+            "host_answer_citations_missing"
         );
         self.ensure_generation()?;
         let mut seen = BTreeSet::new();
@@ -979,22 +986,23 @@ impl Evidence {
         }
         let mut citations = vec![];
         for id in answer.citations {
-            ensure!(seen.insert(id.clone()), "Repeated final citation");
+            ensure!(seen.insert(id.clone()), "host_answer_citation_repeated");
             let issued = self
                 .issued
                 .get(&id)
-                .ok_or_else(|| anyhow!("Final citation was not issued as evidence"))?;
+                .ok_or_else(|| anyhow!("host_answer_citation_unissued"))?;
             for item in issued {
                 let bytes = item
                     .byte_end
                     .checked_sub(item.byte_start)
                     .filter(|bytes| (1..=MAX_TEXT_BYTES).contains(bytes))
-                    .ok_or_else(|| anyhow!("Invalid issued evidence window"))?;
+                    .ok_or_else(|| anyhow!("host_answer_citation_window_invalid"))?;
                 let fresh =
-                    gptgrep_core::read_node_window(&self.root, &id, bytes, item.node_offset)?;
+                    gptgrep_core::read_node_window(&self.root, &id, bytes, item.node_offset)
+                        .map_err(|_| anyhow!("host_answer_citation_window_unreadable"))?;
                 ensure!(
                     fresh.source_fresh && fresh.source_sha256 == item.source_sha256,
-                    "Cited source changed during the workflow"
+                    "host_answer_citation_source_changed"
                 );
                 ensure!(
                     fresh.node_offset == Some(item.node_offset)
@@ -1007,7 +1015,7 @@ impl Evidence {
                         && fresh.page_end == item.page_end
                         && fresh.column_start == item.column_start
                         && fresh.coordinate_system == item.coordinate_system,
-                    "Cited evidence window no longer matches the issued bytes"
+                    "host_answer_citation_window_changed"
                 );
             }
             citations.extend(issued.iter().cloned());
@@ -1018,22 +1026,42 @@ impl Evidence {
 }
 
 /// Public failure telemetry is a fixed code, never the model's answer or source text.
+/// The cause codes predate the stable `host_answer_*` error codes and are kept.
 pub(crate) fn citation_validation_code(error: &anyhow::Error) -> &'static str {
     match error.to_string().as_str() {
-        "Host final response exceeded its byte limit" => "final_response_byte_limit",
-        "Codex final answer did not match the structured evidence contract" => {
-            "final_response_schema"
-        }
-        "Host answer length is invalid" => "answer_length",
-        "Too many final citations" => "citation_count",
-        "Answer contains no issued evidence citations" => "missing_citations",
-        "Repeated final citation" => "duplicate_citation",
-        "Final citation was not issued as evidence" => "unissued_citation",
-        "Invalid issued evidence window" => "invalid_issued_window",
-        "Cited source changed during the workflow" => "stale_cited_source",
-        "Cited evidence window no longer matches the issued bytes" => "changed_cited_window",
+        "host_answer_too_large" => "final_response_byte_limit",
+        "host_answer_invalid_json" | "host_answer_schema_mismatch" => "final_response_schema",
+        "host_answer_length_invalid" => "answer_length",
+        "host_answer_citation_limit" => "citation_count",
+        "host_answer_citations_missing" => "missing_citations",
+        "host_answer_citation_repeated" => "duplicate_citation",
+        "host_answer_citation_unissued" => "unissued_citation",
+        "host_answer_citation_window_invalid" => "invalid_issued_window",
+        "host_answer_citation_window_unreadable" => "unreadable_cited_window",
+        "host_answer_citation_source_changed" => "stale_cited_source",
+        "host_answer_citation_window_changed" => "changed_cited_window",
+        "host_generation_changed" => "generation_changed",
+        "host_index_unavailable" => "index_unavailable",
         _ if error.downcast_ref::<crate::HostCapabilityError>().is_some() => "no_evidence_tools",
         _ => "unclassified_citation_validation",
+    }
+}
+
+/// Host-built tool payloads; a serializer failure keeps no text.
+fn payload_bytes(payload: &Value) -> Result<Vec<u8>> {
+    serde_json::to_vec(payload).map_err(|_| anyhow!("host_tool_result_encoding"))
+}
+
+/// A failed search keeps typed Jev failures and host codes for accounting and
+/// the ask code; any other cause, such as local index text, becomes one code.
+fn coded_search_error(error: anyhow::Error) -> anyhow::Error {
+    let typed = error.is::<gptgrep_core::JevSearchError>()
+        || error.is::<gptgrep_core::PlannedSearchError>()
+        || error.is::<crate::jev_accounting::InitializationError>();
+    if typed || crate::model_attempts::is_host_code(&error.to_string()) {
+        error
+    } else {
+        anyhow!("host_search_failed")
     }
 }
 
@@ -1147,17 +1175,15 @@ mod citation_code_tests {
     #[test]
     fn citation_failure_telemetry_is_bounded_and_redacted() {
         assert_eq!(
-            citation_validation_code(&anyhow::anyhow!(
-                "Final citation was not issued as evidence"
-            )),
+            citation_validation_code(&anyhow::anyhow!("host_answer_citation_unissued")),
             "unissued_citation"
         );
-        assert_eq!(
-            citation_validation_code(&anyhow::anyhow!(
-                "Codex final answer did not match the structured evidence contract"
-            )),
-            "final_response_schema"
-        );
+        for code in ["host_answer_invalid_json", "host_answer_schema_mismatch"] {
+            assert_eq!(
+                citation_validation_code(&anyhow::anyhow!(code)),
+                "final_response_schema"
+            );
+        }
         assert_eq!(
             citation_validation_code(&anyhow::anyhow!("Unrecognized source detail: private text")),
             "unclassified_citation_validation"

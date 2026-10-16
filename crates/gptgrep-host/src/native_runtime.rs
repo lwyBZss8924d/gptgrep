@@ -213,7 +213,8 @@ mod implementation {
             .map(|agent| {
                 Ok((
                     format!("agents.{}.config_file", agent.name),
-                    serde_json::to_value(cwd.join(&agent.target_path))?,
+                    serde_json::to_value(cwd.join(&agent.target_path))
+                        .map_err(|_| anyhow!("host_native_runtime_path"))?,
                 ))
             })
             .collect::<Result<_>>()?;

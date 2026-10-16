@@ -39,11 +39,10 @@ const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 
 /// Generic answer rules for the retrieval reader. They add to, and never
-/// replace or relax, the evidence and citation rules around them: they say
-/// when to commit to an answer, never when to stop abstaining. The text is
-/// part of the GPTgrep treatment. The full62 primary raw-only arm does not
-/// receive these rules (workspace/harness-tooling/harbor-ablation/full62).
-pub(crate) const READER_ANSWER_RULES: &str = "Answer rules: Lead with the direct answer in the form the question asks for. When the evidence you have read answers the question as asked, commit to that answer and cite it rather than hedging. When the question depends on a specific passage, resolve the in-text references it relies on before answering by reading the referenced note or section, for example footnote or endnote markers, citation numbers, and see Table or see Section pointers.";
+/// replace or relax, the evidence, citation and abstention rules around them.
+/// They are specific to the GPTgrep reader and omit answer-commitment guidance
+/// so evidence can still require abstention.
+pub(crate) const READER_ANSWER_RULES: &str = "Answer rules: Lead with the direct answer in the form the question asks for. When the question depends on a specific passage, resolve the in-text references it relies on before answering by reading the referenced note or section, for example footnote or endnote markers, citation numbers, and see Table or see Section pointers.";
 pub(crate) const SOURCE_CONTINUATION_GUIDANCE: &str = "Source continuation policy: next_offset=null on an issued window means that node's EOF, not that the requested evidence is complete. If a requested claim, relation, or referent remains unresolved, inspect verified tree information and adjacent or related nodes within the same document scope, then read relevant source windows before finalizing. Use only node IDs exposed by the existing tools; never invent IDs, widen the document scope, infer unread text, or rely on stale source. Only issued source spans support citations; tree descriptors and navigation hints are not citable evidence. Stay within the existing tool-call, deadline, and output budgets. If a required claim remains unresolved when those budgets prevent further verification, state the unresolved limitation and return insufficient_evidence=true.";
 
 pub(crate) fn append_source_continuation(
@@ -133,15 +132,15 @@ pub(crate) fn toml_override(value: &Value) -> Result<String> {
     if let Value::Object(entries) = value {
         ensure!(
             entries.values().all(Value::is_string),
-            "Unsupported startup override table"
+            "host_codex_startup_override_table_unsupported"
         );
         let entries = entries
             .iter()
             .map(|(key, value)| {
                 Ok(format!(
                     "{} = {}",
-                    serde_json::to_string(key)?,
-                    serde_json::to_string(value)?
+                    override_json(key)?,
+                    override_json(value)?
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -152,9 +151,14 @@ pub(crate) fn toml_override(value: &Value) -> Result<String> {
             || value
                 .as_array()
                 .is_some_and(|values| values.iter().all(Value::is_string)),
-        "Unsupported startup override"
+        "host_codex_startup_override_unsupported"
     );
-    Ok(serde_json::to_string(value)?)
+    override_json(value)
+}
+
+/// JSON-encode one startup override value; serializer text is not retained.
+pub(crate) fn override_json<T: serde::Serialize + ?Sized>(value: &T) -> Result<String> {
+    serde_json::to_string(value).map_err(|_| anyhow!("host_codex_startup_override_encoding"))
 }
 
 #[cfg(test)]
@@ -338,7 +342,7 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
         .await?;
     ensure!(
         account["account"]["type"] == "chatgpt",
-        "The selected Codex runtime requires an existing ChatGPT login"
+        "host_codex_chatgpt_login_required"
     );
     drop(account);
     // Extract server names only. No config values, auth fields, or environment data are logged.
@@ -347,7 +351,7 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
         .await?;
     let configuration = configured["config"]
         .as_object()
-        .ok_or_else(|| anyhow!("Codex effective configuration unavailable"))?;
+        .ok_or_else(|| anyhow!("host_codex_config_unavailable"))?;
     let mut thread_config = if native_ptc_enabled {
         crate::native_ptc::runtime_config(config)?
     } else {
@@ -358,8 +362,8 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
         if let Some(servers) = configuration.get("mcp_servers") {
             let servers = servers
                 .as_object()
-                .ok_or_else(|| anyhow!("Codex MCP configuration has an unsupported shape"))?;
-            ensure!(servers.len() <= 128, "Too many inherited MCP servers");
+                .ok_or_else(|| anyhow!("host_codex_mcp_config_unsupported"))?;
+            ensure!(servers.len() <= 128, "host_codex_mcp_server_limit");
             for name in servers.keys() {
                 disabled.insert(name.clone(), json!({"enabled":false}));
             }
@@ -503,21 +507,18 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
     let thread_id = identifier(&thread["thread"]["id"])?;
     let model = identifier(&thread["model"])?;
     let provider = identifier(&thread["modelProvider"])?;
-    ensure!(
-        provider == "openai",
-        "Codex changed the requested model provider"
-    );
-    ensure!(model == config.model, "Codex changed the requested model");
+    ensure!(provider == "openai", "host_codex_model_provider_changed");
+    ensure!(model == config.model, "host_codex_model_changed");
     ensure!(
         thread["approvalPolicy"] == "never",
-        "Codex did not accept the required approval policy"
+        "host_codex_approval_policy_rejected"
     );
     let mut permission_observation = if let Some(profile) = &config.permission_profile {
         // The explicitly selected native profile owns policy resolution and
         // enforcement. Its legacy sandbox projection is observation only.
         ensure!(
             thread["activePermissionProfile"]["id"].as_str() == Some(profile.as_str()),
-            "Codex did not acknowledge the requested permission profile"
+            "host_codex_permission_profile_unacknowledged"
         );
         Some(json!({
             "source":"native_thread_start",
@@ -528,7 +529,7 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
     } else {
         ensure!(
             thread["sandbox"]["type"] == "readOnly" && thread["sandbox"]["networkAccess"] == false,
-            "Codex did not accept the required read-only sandbox"
+            "host_codex_sandbox_rejected"
         );
         None
     };
@@ -542,7 +543,7 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
     if let Some(ref value) = effort {
         ensure!(
             value == &config.reasoning_effort,
-            "Codex changed the requested reasoning effort"
+            "host_codex_reasoning_effort_changed"
         );
     }
     let service_tier = acknowledged_service_tier(&thread, &config.service_tier)?;
@@ -643,7 +644,7 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
             let params = &message["params"];
             ensure!(
                 params["threadId"] == thread_id,
-                "Dynamic tool call came from a different thread"
+                "host_codex_tool_call_thread_mismatch"
             );
             bind_turn(&mut turn_id, &params["turnId"])?;
             observe_turn(options.observer, &turn_id)?;
@@ -651,9 +652,13 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
                 rpc.deny(id.clone()).await?;
                 return Err(anyhow!("host_native_task_unregistered_dynamic_tool"));
             }
+            // Set when the native retrieval reader must answer this request
+            // with the restricted reader's denial after the checks below.
+            let mut native_budget_denial = false;
             if let Some(native) = native_ptc.as_mut() {
+                let rich = workflow.rich().is_some();
                 let allowed = params["tool"].as_str().is_some_and(|tool| {
-                    if workflow.rich().is_some() {
+                    if rich {
                         crate::rich_text::allowed(tool)
                     } else {
                         retrieval::allowed(tool)
@@ -663,11 +668,24 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
                     params["namespace"] == "gptgrep" && allowed,
                     "host_native_ptc_dynamic_tool_not_allowed"
                 );
-                let charged = native.charge_dynamic(&params["callId"]);
+                // Rich readers keep the hard limit. Native items are never
+                // denied; their bound is enforced when they are observed.
+                let charged = if rich {
+                    native
+                        .charge_dynamic(&params["callId"])
+                        .map(|()| crate::native_ptc::DynamicCharge::Admit)
+                } else {
+                    native.charge_retrieval(&params["callId"])
+                };
                 native.publish(options.observer)?;
-                if let Err(error) = charged {
-                    rpc.deny(id.clone()).await?;
-                    return Err(error);
+                match charged {
+                    Ok(charge) => {
+                        native_budget_denial = charge == crate::native_ptc::DynamicCharge::Deny;
+                    }
+                    Err(error) => {
+                        rpc.deny(id.clone()).await?;
+                        return Err(error);
+                    }
                 }
             }
             if let Some(evidence) = workflow.rich_mut() {
@@ -769,48 +787,63 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
             let call_id = identifier(&params["callId"])?;
             ensure!(
                 calls.insert(call_id.clone()),
-                "Codex repeated a dynamic call ID"
+                "host_codex_tool_call_repeated"
             );
             let tool = params["tool"]
                 .as_str()
-                .ok_or_else(|| anyhow!("Invalid dynamic tool name"))?;
+                .ok_or_else(|| anyhow!("host_codex_tool_name_invalid"))?;
             if params["namespace"] != "gptgrep" || !retrieval::allowed(tool) {
                 rpc.deny(id.clone()).await?;
-                return Err(anyhow!(
-                    "Codex requested a tool outside the GPTgrep allowlist"
-                ));
+                return Err(anyhow!("host_codex_tool_not_allowed"));
             }
             let args = params["arguments"].clone();
+            let argument_bytes = serde_json::to_vec(&args)
+                .map_err(|_| anyhow!("host_codex_tool_arguments_encoding"))?
+                .len();
             ensure!(
-                serde_json::to_vec(&args)?.len() <= 4096,
-                "Dynamic tool arguments exceeded the limit"
+                argument_bytes <= 4096,
+                "host_codex_tool_arguments_too_large"
             );
             let result = match &mut workflow {
                 Workflow::Retrieval { evidence, .. } => {
-                    if calls.len() > config.max_tool_calls {
+                    let over_budget = if native_ptc.is_some() {
+                        native_budget_denial
+                    } else {
+                        calls.len() > config.max_tool_calls
+                    };
+                    if over_budget {
                         evidence.validate_budget_request(tool, &args)?;
                         // At most N denials tolerate parallel requests without
                         // admitting more retrieval. The original turn and enclosing
                         // deadline remain unchanged; no client retry is started.
-                        let budget = tool_budget.get_or_insert(ToolBudgetDiagnostics {
-                            max_tool_calls: config.max_tool_calls,
-                            admitted_tool_calls: config.max_tool_calls,
-                            denied_tool_calls: 0,
-                            max_denied_tool_calls: config.max_tool_calls,
-                        });
-                        if budget.denied_tool_calls == budget.max_denied_tool_calls {
-                            return Err(HostProtocolError::new(
-                                HostProtocolErrorKind::ToolBudgetExhausted,
-                                &ParsedError::default(),
-                                None,
-                                server_retry_notifications,
-                                usage.as_ref(),
-                                Some(*budget),
-                            )
-                            .into());
-                        }
-                        budget.denied_tool_calls += 1;
-                        evidence.deny_budget(&call_id, tool, args, *budget)?
+                        let budget = if let Some(native) = native_ptc.as_mut() {
+                            // The shared native tracker owns these counts and the
+                            // same bound; its next excess request fails the turn.
+                            let denied = native.deny_dynamic(&params["callId"]);
+                            native.publish(options.observer)?;
+                            *tool_budget.insert(denied?)
+                        } else {
+                            let budget = tool_budget.get_or_insert(ToolBudgetDiagnostics {
+                                max_tool_calls: config.max_tool_calls,
+                                admitted_tool_calls: config.max_tool_calls,
+                                denied_tool_calls: 0,
+                                max_denied_tool_calls: config.max_tool_calls,
+                            });
+                            if budget.denied_tool_calls == budget.max_denied_tool_calls {
+                                return Err(HostProtocolError::new(
+                                    HostProtocolErrorKind::ToolBudgetExhausted,
+                                    &ParsedError::default(),
+                                    None,
+                                    server_retry_notifications,
+                                    usage.as_ref(),
+                                    Some(*budget),
+                                )
+                                .into());
+                            }
+                            budget.denied_tool_calls += 1;
+                            *budget
+                        };
+                        evidence.deny_budget(&call_id, tool, args, budget)?
                     } else {
                         evidence.call(&call_id, tool, args).await?
                     }
@@ -820,7 +853,7 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
                 }
                 Workflow::Completion { .. } => {
                     rpc.deny(id.clone()).await?;
-                    return Err(anyhow!("Pure completion attempted to invoke a tool"));
+                    return Err(anyhow!("host_codex_completion_tool_request"));
                 }
                 Workflow::NativeTask { .. } => {
                     unreachable!("native task dynamic requests are rejected before dispatch")
@@ -830,7 +863,10 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
             continue;
         }
         if message.get("id") == Some(&json!(4)) {
-            ensure!(message.get("error").is_none(), "Codex rejected turn/start");
+            ensure!(
+                message.get("error").is_none(),
+                "host_codex_turn_start_rejected"
+            );
             bind_turn(&mut turn_id, &message["result"]["turn"]["id"])?;
             observe_turn(options.observer, &turn_id)?;
             continue;
@@ -868,7 +904,7 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
                 );
                 ensure!(
                     !(is_completion && kind == "dynamicToolCall"),
-                    "Pure completion emitted a tool item"
+                    "host_codex_completion_tool_item"
                 );
                 if method == Some("item/completed")
                     && kind == "agentMessage"
@@ -876,7 +912,7 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
                 {
                     let text = item["text"]
                         .as_str()
-                        .ok_or_else(|| anyhow!("Codex agent message has no text"))?;
+                        .ok_or_else(|| anyhow!("host_codex_agent_message_without_text"))?;
                     output_limit(text.len(), max_output_bytes, is_structured)?;
                     answer = Some(text.to_owned());
                 }
@@ -925,12 +961,10 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
                     // This trusted terminal frame may be the only observation
                     // of native items. Preserve its primary error even when
                     // snapshot projection or observer persistence fails.
+                    let _ = observe_turn(options.observer, &turn_id);
                     if let Some(native) = native_ptc.as_mut() {
-                        let _ = observe_turn(options.observer, &turn_id);
                         native.observe_failure_snapshot(&turn["items"]);
                         let _ = native.publish(options.observer);
-                    } else {
-                        observe_turn(options.observer, &turn_id)?;
                     }
                     return Err(primary.into());
                 }
@@ -958,12 +992,12 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
                         );
                         ensure!(
                             !(is_completion && item["type"] == "dynamicToolCall"),
-                            "Pure completion emitted a tool item"
+                            "host_codex_completion_tool_item"
                         );
                         if item["type"] == "agentMessage" && item["phase"] != "commentary" {
                             let text = item["text"]
                                 .as_str()
-                                .ok_or_else(|| anyhow!("Invalid final message"))?;
+                                .ok_or_else(|| anyhow!("host_codex_final_message_invalid"))?;
                             output_limit(text.len(), max_output_bytes, is_structured)?;
                             answer = Some(text.to_owned());
                         }
@@ -995,13 +1029,15 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
                 {
                     return Err(failure(HostProtocolErrorKind::IdentityMismatch).into());
                 }
-                observe_turn(options.observer, &turn_id)?;
                 if !parsed.valid || will_retry.is_none() {
+                    let _ = observe_turn(options.observer, &turn_id);
                     return Err(failure(HostProtocolErrorKind::MalformedError).into());
                 }
                 if will_retry == Some(false) {
+                    let _ = observe_turn(options.observer, &turn_id);
                     return Err(failure(HostProtocolErrorKind::TerminalError).into());
                 }
+                observe_turn(options.observer, &turn_id)?;
                 // The app-server owns this recovery. Continue the same turn under the
                 // outer timeout_at deadline and existing frame/message limits.
                 server_retry_notifications += 1;
@@ -1019,20 +1055,30 @@ pub(crate) async fn run_observed_budget<R: AsyncRead + Unpin, W: AsyncWrite + Un
         warnings.push(format!("Codex reported {server_retry_notifications} transient retry notifications during this turn. This counts server events, not physical or billed requests."));
     }
     if let Some(budget) = tool_budget {
-        warnings.push(format!(
-            "The dynamic tool budget was exhausted after {} admitted calls; {} additional requests were denied without retrieval. The answer uses previously issued evidence.",
-            budget.admitted_tool_calls, budget.denied_tool_calls
-        ));
+        warnings.push(match native_ptc.as_ref() {
+            // The diagnostics' admitted count includes native items; the
+            // warning keeps the split.
+            Some(native) => format!(
+                "The shared native tool budget was exhausted after {} admitted GPTgrep calls and {} observed native items; {} additional GPTgrep requests were denied without retrieval. The answer uses previously issued evidence.",
+                native.charged_dynamic_calls(),
+                native.native_tool_calls(),
+                budget.denied_tool_calls
+            ),
+            None => format!(
+                "The dynamic tool budget was exhausted after {} admitted calls; {} additional requests were denied without retrieval. The answer uses previously issued evidence.",
+                budget.admitted_tool_calls, budget.denied_tool_calls
+            ),
+        });
     }
     Ok(Outcome {
         thread_id,
-        turn_id: turn_id.ok_or_else(|| anyhow!("Codex turn identity unavailable"))?,
+        turn_id: turn_id.ok_or_else(|| anyhow!("host_codex_turn_identity_missing"))?,
         model,
         provider,
         effort,
         service_tier,
         server_retry_notifications,
-        answer: answer.ok_or_else(|| anyhow!("Codex completed without a final answer"))?,
+        answer: answer.ok_or_else(|| anyhow!("host_codex_no_final_answer"))?,
         usage,
         warnings,
         permission_observation,
@@ -1051,12 +1097,12 @@ fn acknowledged_service_tier(thread: &Value, requested: &str) -> Result<Option<S
     let actual = match thread.get("serviceTier") {
         None | Some(Value::Null) => return Ok(None),
         Some(Value::String(value)) => value,
-        Some(_) => return Err(anyhow!("Codex reported an invalid service tier")),
+        Some(_) => return Err(anyhow!("host_codex_service_tier_invalid")),
     };
     let equivalent = actual == requested
         || (matches!(actual.as_str(), "fast" | "priority")
             && matches!(requested, "fast" | "priority"));
-    ensure!(equivalent, "Codex changed the requested service tier");
+    ensure!(equivalent, "host_codex_service_tier_changed");
     Ok(Some(actual.clone()))
 }
 
@@ -1093,7 +1139,7 @@ fn validate_item_tool(item: &Value, rich: bool) -> Result<()> {
             kind,
             "userMessage" | "agentMessage" | "reasoning" | "dynamicToolCall"
         ),
-        "Codex emitted an item outside the restricted workflow"
+        "host_codex_item_not_allowed"
     );
     if kind == "dynamicToolCall" {
         ensure!(
@@ -1102,7 +1148,7 @@ fn validate_item_tool(item: &Value, rich: bool) -> Result<()> {
             } else {
                 retrieval::allowed(tool)
             }) && item["namespace"] == "gptgrep",
-            "Codex emitted an unapproved dynamic tool"
+            "host_codex_item_tool_not_allowed"
         );
     }
     Ok(())
@@ -1113,7 +1159,7 @@ fn output_limit(length: usize, limit: usize, completion: bool) -> Result<()> {
         if completion {
             return Err(crate::CompletionError::OutputLimit.into());
         }
-        return Err(anyhow!("Codex final response exceeded the limit"));
+        return Err(anyhow!("host_codex_final_response_too_large"));
     }
     Ok(())
 }
@@ -1121,17 +1167,17 @@ fn output_limit(length: usize, limit: usize, completion: bool) -> Result<()> {
 fn identifier(value: &Value) -> Result<String> {
     let value = value
         .as_str()
-        .ok_or_else(|| anyhow!("Codex identity field is unavailable"))?;
+        .ok_or_else(|| anyhow!("host_codex_identity_missing"))?;
     ensure!(
         !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control),
-        "Invalid Codex identity field"
+        "host_codex_identity_invalid"
     );
     Ok(value.to_owned())
 }
 fn bind_turn(existing: &mut Option<String>, value: &Value) -> Result<()> {
     let id = identifier(value)?;
     if let Some(previous) = existing {
-        ensure!(*previous == id, "Codex event changed turn identity");
+        ensure!(*previous == id, "host_codex_turn_identity_changed");
     } else {
         *existing = Some(id);
     }
@@ -1140,9 +1186,21 @@ fn bind_turn(existing: &mut Option<String>, value: &Value) -> Result<()> {
 fn same_thread(message: &Value, id: &str) -> Result<()> {
     ensure!(
         message["params"]["threadId"] == id,
-        "Codex event came from a different thread"
+        "host_codex_event_thread_mismatch"
     );
     Ok(())
+}
+
+/// A rejected startup request is named by its method; others share one code.
+fn rejected_request(method: &str) -> &'static str {
+    match method {
+        "initialize" => "host_codex_initialize_rejected",
+        "account/read" => "host_codex_account_read_rejected",
+        "config/read" => "host_codex_config_read_rejected",
+        "skills/list" => "host_codex_skills_list_rejected",
+        "thread/start" => "host_codex_thread_start_rejected",
+        _ => "host_codex_request_rejected",
+    }
 }
 
 #[derive(Default)]
@@ -1213,6 +1271,16 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CheckedWriter<'_, W> {
             return Poll::Ready(Err(error));
         }
         Pin::new(&mut *self.writer).poll_shutdown(cx)
+    }
+}
+
+/// A failed write or flush keeps the code of the deadline or transport failure
+/// that the checked writer observed, so a frame still pending at the deadline
+/// is a timeout. Any other write error means the app-server input closed.
+fn input_failure(error: std::io::Error) -> anyhow::Error {
+    match error.get_ref().map(ToString::to_string) {
+        Some(code) if crate::model_attempts::is_host_code(&code) => anyhow!(code),
+        _ => anyhow!("host_codex_input_transport_closed"),
     }
 }
 
@@ -1294,14 +1362,8 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Rpc<R, W> {
                 deadline: self.deadline,
                 execution: self.startup.execution.as_ref(),
             };
-            writer
-                .write_all(&bytes)
-                .await
-                .map_err(|_| anyhow!("Codex input transport closed"))?;
-            writer
-                .flush()
-                .await
-                .map_err(|_| anyhow!("Codex input transport closed"))?;
+            writer.write_all(&bytes).await.map_err(input_failure)?;
+            writer.flush().await.map_err(input_failure)?;
             self.check()?;
             Ok::<(), anyhow::Error>(())
         };
@@ -1317,7 +1379,8 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Rpc<R, W> {
             result_sha256: value
                 .get("result")
                 .map(serde_json::to_vec)
-                .transpose()?
+                .transpose()
+                .map_err(|_| anyhow!("host_codex_frame_encoding"))?
                 .map(|bytes| crate::rich_text::hash(&bytes)),
         };
         self.check()?;
@@ -1341,18 +1404,15 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Rpc<R, W> {
                 .map_err(|error| {
                     anyhow::Error::new(error).context("host_receive_deadline_unknown")
                 })?
-                .map_err(|_| anyhow!("Codex output transport failed"))?;
-            ensure!(
-                !data.is_empty(),
-                "Codex app-server closed before completion"
-            );
+                .map_err(|_| anyhow!("host_codex_output_transport_failed"))?;
+            ensure!(!data.is_empty(), "host_codex_app_server_closed");
             let count = data
                 .iter()
                 .position(|b| *b == b'\n')
                 .map_or(data.len(), |i| i + 1);
             ensure!(
                 line.len() + count <= MAX_FRAME_BYTES,
-                "Codex frame exceeded the byte limit"
+                "host_codex_frame_too_large"
             );
             line.extend_from_slice(&data[..count]);
             let complete = data[count - 1] == b'\n';
@@ -1362,9 +1422,9 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Rpc<R, W> {
             }
         }
         self.messages += 1;
-        ensure!(self.messages <= 4096, "Codex exceeded the message limit");
+        ensure!(self.messages <= 4096, "host_codex_message_limit");
         let message: Value =
-            serde_json::from_slice(&line).map_err(|_| anyhow!("Codex emitted invalid JSON"))?;
+            serde_json::from_slice(&line).map_err(|_| anyhow!("host_codex_invalid_json"))?;
         if let Some(trace) = &mut self.trace {
             trace.record("receive", &message)?;
         }
@@ -1387,11 +1447,13 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Rpc<R, W> {
                 continue;
             }
             if reply["id"] == id {
-                ensure!(reply.get("error").is_none(), "Codex rejected {method}");
+                if reply.get("error").is_some() {
+                    return Err(anyhow!(rejected_request(method)));
+                }
                 return reply
                     .get("result")
                     .cloned()
-                    .ok_or_else(|| anyhow!("Codex response has no result"));
+                    .ok_or_else(|| anyhow!("host_codex_response_without_result"));
             }
         }
     }

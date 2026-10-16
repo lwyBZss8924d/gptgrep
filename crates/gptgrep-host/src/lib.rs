@@ -326,8 +326,9 @@ async fn execute_with_client(
                 report.duplicates_removed = plan.duplicates_removed;
             }
         }
-        planner.finish(planned.as_ref().err())?;
+        let finish_result = planner.finish(planned.as_ref().err());
         let plan = planned?;
+        finish_result?;
         stage="initial_search";
         tokio::time::timeout_at(deadline, evidence.bootstrap_planned(question, &plan.alternate_queries)).await
             .map_err(|_| anyhow!("host_jev_initial_timeout"))??;
@@ -356,8 +357,9 @@ async fn execute_with_client(
     let validated = evidence.finish(&completed.result.answer)?;
     Ok((completed, validated))
     }.await;
-    reader.finish(validated.as_ref().err())?;
+    let finish_result = reader.finish(validated.as_ref().err());
     let (completed, (answer, citations, insufficient)) = validated?;
+    finish_result?;
     let ProcessOutcome {
         result,
         home,
@@ -419,21 +421,7 @@ async fn execute_with_client(
         Ok(report) => Ok(report),
         Err(error) => {
             let _ = accounting.finish("failed");
-            let code = if error
-                .downcast_ref::<gptgrep_core::JevSearchError>()
-                .is_some()
-                || error
-                    .downcast_ref::<gptgrep_core::PlannedSearchError>()
-                    .is_some()
-            {
-                "host_jev_search_failed".to_owned()
-            } else if let Some(protocol) = error.downcast_ref::<HostProtocolError>() {
-                protocol.code().to_owned()
-            } else if error.to_string().starts_with("host_") {
-                error.to_string()
-            } else {
-                format!("host_{stage}_failed")
-            };
+            let code = failure_code(&error, stage);
             let cause = error
                 .downcast_ref::<gptgrep_core::JevSearchError>()
                 .and_then(|error| serde_json::to_value(error).ok())
@@ -481,6 +469,26 @@ async fn execute_with_client(
     }
 }
 
+/// The ask-level failure code: typed Jev and protocol failures first, then a
+/// host code carried by the error; any other error keeps only its stage.
+fn failure_code(error: &anyhow::Error, stage: &str) -> String {
+    if error
+        .downcast_ref::<gptgrep_core::JevSearchError>()
+        .is_some()
+        || error
+            .downcast_ref::<gptgrep_core::PlannedSearchError>()
+            .is_some()
+    {
+        "host_jev_search_failed".to_owned()
+    } else if let Some(protocol) = error.downcast_ref::<HostProtocolError>() {
+        protocol.code().to_owned()
+    } else if error.to_string().starts_with("host_") {
+        error.to_string()
+    } else {
+        format!("host_{stage}_failed")
+    }
+}
+
 fn planner_runtime_config(config: &HostConfig, query_config: &QueryPlanConfig) -> HostConfig {
     let mut planner = config.clone();
     planner.navigation = None;
@@ -524,15 +532,22 @@ async fn run_process_until(
     let home = config
         .codex_home
         .canonicalize()
-        .map_err(|_| anyhow!("Selected CODEX_HOME is unavailable"))?;
+        .map_err(|_| anyhow!("host_codex_home_unavailable"))?;
     let temporary_cwd = if config.working_dir.is_none() {
-        Some(tempfile::Builder::new().prefix("gptgrep-host-").tempdir()?)
+        Some(
+            tempfile::Builder::new()
+                .prefix("gptgrep-host-")
+                .tempdir()
+                .map_err(|_| anyhow!("host_codex_working_directory_unavailable"))?,
+        )
     } else {
         None
     };
     let cwd = match &config.working_dir {
         Some(path) => {
-            let canonical = path.canonicalize()?;
+            let canonical = path
+                .canonicalize()
+                .map_err(|_| anyhow!("host_native_working_directory"))?;
             ensure!(
                 canonical == *path && canonical.is_dir(),
                 "host_native_working_directory"
@@ -568,11 +583,11 @@ async fn run_process_until(
     let binary = if Path::new(&config.codex_bin).components().count() > 1 {
         PathBuf::from(&config.codex_bin)
             .canonicalize()
-            .map_err(|_| anyhow!("Configured Codex binary is unavailable"))?
+            .map_err(|_| anyhow!("host_codex_binary_unavailable"))?
     } else {
         PathBuf::from(&config.codex_bin)
     };
-    ensure!(home.is_dir(), "Selected CODEX_HOME must be a directory");
+    ensure!(home.is_dir(), "host_codex_home_not_directory");
     let capabilities = if native_ptc {
         native_ptc::runtime_config(config)?
     } else {
@@ -609,7 +624,7 @@ async fn run_process_until(
             .arg("-c")
             .arg(format!(
                 "default_permissions={}",
-                serde_json::to_string(profile)?
+                protocol::override_json(profile)?
             ))
             .arg("-c")
             .arg("cli_auth_credentials_store=\"file\"")
@@ -631,7 +646,7 @@ async fn run_process_until(
     );
     let mut child = command
         .spawn()
-        .map_err(|_| anyhow!("Could not start the configured Codex app-server"))?;
+        .map_err(|_| anyhow!("host_codex_spawn_failed"))?;
     if let Some(proof) = options.cleanup_proof {
         proof.store(false, std::sync::atomic::Ordering::SeqCst);
     }
@@ -639,15 +654,15 @@ async fn run_process_until(
     let stdin = child
         .stdin
         .take()
-        .ok_or_else(|| anyhow!("Codex stdin unavailable"))?;
+        .ok_or_else(|| anyhow!("host_codex_stdin_unavailable"))?;
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| anyhow!("Codex stdout unavailable"))?;
+        .ok_or_else(|| anyhow!("host_codex_stdout_unavailable"))?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| anyhow!("Codex stderr unavailable"))?;
+        .ok_or_else(|| anyhow!("host_codex_stderr_unavailable"))?;
     let stderr_budget = transport.clone();
     let mut stderr_task = tokio::spawn(async move {
         let mut stderr = transport::BudgetedReader::new(stderr, stderr_budget);
@@ -728,7 +743,9 @@ fn invocation_timeout(observed: bool) -> anyhow::Error {
     if observed {
         anyhow!("host_model_attempt_timeout")
     } else {
-        anyhow!("Codex host exceeded its time limit; owned app-server was terminated")
+        // Unobserved invocations (independent completion, native tasks): the
+        // owned app-server was terminated at the deadline.
+        anyhow!("host_codex_process_timeout")
     }
 }
 
@@ -760,23 +777,22 @@ fn finalize_captured_invocation<T>(
 }
 
 fn native_state_paths(state: Option<&Path>) -> Result<Option<(PathBuf, PathBuf)>> {
+    // The state and logs directories must be absolute, existing, canonical
+    // directories; symlinks and symlink ancestors are unsupported.
     fn directory(path: &Path) -> Result<PathBuf> {
-        ensure!(
-            path.is_absolute(),
-            "Codex state and logs directories must be absolute"
-        );
+        ensure!(path.is_absolute(), "host_codex_state_dir_not_absolute");
         let metadata = std::fs::symlink_metadata(path)
-            .map_err(|_| anyhow!("Selected Codex state or logs directory is unavailable"))?;
+            .map_err(|_| anyhow!("host_codex_state_dir_unavailable"))?;
         ensure!(
             metadata.is_dir() && !metadata.file_type().is_symlink(),
-            "Codex state and logs paths must be existing directories, not symlinks"
+            "host_codex_state_dir_not_directory"
         );
         let canonical = path
             .canonicalize()
-            .map_err(|_| anyhow!("Selected Codex state or logs directory is unavailable"))?;
+            .map_err(|_| anyhow!("host_codex_state_dir_unavailable"))?;
         ensure!(
             canonical.as_os_str() == path.as_os_str(),
-            "Codex state and logs directories must be canonical; symlink ancestors are unsupported"
+            "host_codex_state_dir_not_canonical"
         );
         Ok(canonical)
     }
@@ -830,13 +846,17 @@ fn process_command_with_config(
     // Preserve the original home binding unless a separate state root is explicit.
     // CLI overrides win over inherited CODEX_SQLITE_HOME and profile settings.
     let sqlite = state.as_ref().map_or(home, |(state, _)| state.as_path());
+    // A path that is not valid UTF-8 cannot be encoded as an override.
+    let path_override = |path: &Path| {
+        serde_json::to_string(path).map_err(|_| anyhow!("host_codex_state_path_encoding"))
+    };
     command
         .arg("-c")
-        .arg(format!("sqlite_home={}", serde_json::to_string(sqlite)?));
+        .arg(format!("sqlite_home={}", path_override(sqlite)?));
     if let Some((_, logs)) = state {
         command
             .arg("-c")
-            .arg(format!("log_dir={}", serde_json::to_string(&logs)?));
+            .arg(format!("log_dir={}", path_override(logs.as_path())?));
     }
     for (key, value) in capabilities
         .as_object()

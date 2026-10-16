@@ -183,18 +183,30 @@ async fn recoverable_argument_errors_still_consume_the_admitted_call_budget() {
 #[tokio::test]
 async fn malformed_and_unsupported_excess_requests_remain_fatal() {
     let mut invalid = vec![];
-    for (key, value) in [
-        ("threadId", json!("foreign-thread")),
-        ("turnId", json!("foreign-turn")),
-        ("callId", json!("call-10")),
-        ("callId", Value::Null),
-        ("namespace", json!("functions")),
-        ("tool", json!("exec")),
-        ("tool", Value::Null),
+    for (key, value, code) in [
+        (
+            "threadId",
+            json!("foreign-thread"),
+            "host_codex_tool_call_thread_mismatch",
+        ),
+        (
+            "turnId",
+            json!("foreign-turn"),
+            "host_codex_turn_identity_changed",
+        ),
+        ("callId", json!("call-10"), "host_codex_tool_call_repeated"),
+        ("callId", Value::Null, "host_codex_identity_missing"),
+        (
+            "namespace",
+            json!("functions"),
+            "host_codex_tool_not_allowed",
+        ),
+        ("tool", json!("exec"), "host_codex_tool_not_allowed"),
+        ("tool", Value::Null, "host_codex_tool_name_invalid"),
     ] {
         let mut message = excess(11);
         message["params"][key] = value;
-        invalid.push(message);
+        invalid.push((message, code));
     }
     for arguments in [
         Value::Null,
@@ -208,16 +220,23 @@ async fn malformed_and_unsupported_excess_requests_remain_fatal() {
         json!({"query":"test","limit":1.0}),
         json!({"query":"test","limit":4}),
         json!({"query":"é".repeat(1025)}),
-        json!({"query":"x".repeat(4096)}),
     ] {
-        invalid.push(request(11, "gptgrep_search", arguments));
+        invalid.push((
+            request(11, "gptgrep_search", arguments),
+            "host_tool_budget_invalid_arguments",
+        ));
     }
-    for message in invalid {
+    invalid.push((
+        request(11, "gptgrep_search", json!({"query":"x".repeat(4096)})),
+        "host_codex_tool_arguments_too_large",
+    ));
+    for (message, code) in invalid {
         let (result, evidence, responses) = after_budget(1, json!({}), vec![message]).await;
         let error = result
             .err()
             .expect("Malformed request received a recoverable denial");
         assert!(error.downcast_ref::<HostProtocolError>().is_none());
+        assert_eq!(format!("{error:#}"), code);
         assert!(!format!("{error:?}").contains("private-"));
         assert_eq!(evidence.receipts.len(), 1);
         assert!(
@@ -366,7 +385,7 @@ sleep 30
     .await
     .expect("The original deadline was extended during finalization");
     let error = result.err().unwrap();
-    assert!(error.to_string().contains("time limit"), "{error}");
+    assert_eq!(error.to_string(), "host_codex_process_timeout");
     assert_eq!(evidence.receipts.len(), 2);
     assert_eq!(
         evidence.receipts[1].tool_budget.unwrap().denied_tool_calls,

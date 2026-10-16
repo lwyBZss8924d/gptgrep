@@ -160,12 +160,12 @@ pub(crate) struct BoundNavigation {
 }
 impl BoundNavigation {
     pub fn verify(&self, root: &Path) -> Result<()> {
-        ensure!(
-            self.overlay
-                .selected_document_hints(root, &self.document)?
-                .is_some(),
-            "host_navigation_document_missing"
-        );
+        // Runs before every reader tool call; the overlay's error text is not kept.
+        let hints = self
+            .overlay
+            .selected_document_hints(root, &self.document)
+            .map_err(|_| anyhow!("host_navigation_overlay_unavailable"))?;
+        ensure!(hints.is_some(), "host_navigation_document_missing");
         Ok(())
     }
 }

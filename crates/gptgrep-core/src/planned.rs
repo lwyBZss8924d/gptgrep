@@ -617,6 +617,7 @@ async fn score_evidence_roles(
         .decide_evidence_roles(prepared)
         .await
         .map_err(|error| {
+            record_validated_retry_reply(metrics, &error);
             jev_search_error(
                 "evidence_reranking",
                 error,

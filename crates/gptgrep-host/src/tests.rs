@@ -1,8 +1,10 @@
 use super::*;
 #[path = "mandatory_tests.rs"]
-mod mandatory;
+pub(crate) mod mandatory;
 #[path = "protocol_error_tests.rs"]
 mod protocol_errors;
+#[path = "reader_failure_code_tests.rs"]
+mod reader_failure_codes;
 #[path = "source_continuation_tests.rs"]
 mod source_continuation;
 #[path = "tool_budget_tests.rs"]
@@ -90,12 +92,12 @@ async fn service_tier_acknowledgement_preserves_absence_and_fast_aliases() {
 #[tokio::test]
 async fn changed_or_malformed_service_tier_stops_before_inference_without_fallback() {
     let cwd = tempfile::tempdir().unwrap();
-    for reported in [
-        json!("default"),
-        json!("flex"),
-        json!(""),
-        json!(true),
-        json!([]),
+    for (reported, code) in [
+        (json!("default"), "host_codex_service_tier_changed"),
+        (json!("flex"), "host_codex_service_tier_changed"),
+        (json!(""), "host_codex_service_tier_changed"),
+        (json!(true), "host_codex_service_tier_invalid"),
+        (json!([]), "host_codex_service_tier_invalid"),
     ] {
         let (client, server) = tokio::io::duplex(65536);
         let (reader, writer) = tokio::io::split(client);
@@ -134,7 +136,7 @@ async fn changed_or_malformed_service_tier_stops_before_inference_without_fallba
         .await
         .err()
         .unwrap();
-        assert!(error.to_string().contains("service tier"), "{error}");
+        assert_eq!(error.to_string(), code);
         server.await.unwrap();
     }
 }
@@ -177,7 +179,7 @@ async fn broader_effective_permissions_are_rejected_before_turn_start() {
     .await
     .err()
     .unwrap();
-    assert!(error.to_string().contains("read-only sandbox"));
+    assert_eq!(error.to_string(), "host_codex_sandbox_rejected");
     assert!(evidence.receipts.is_empty());
     server.await.unwrap();
 }
@@ -214,8 +216,7 @@ async fn unexpected_execution_item_aborts_the_workflow() {
     .await
     .err()
     .unwrap();
-    assert!(error.to_string().contains("restricted workflow"));
-    assert!(!error.to_string().contains("private-command-sentinel"));
+    assert_eq!(format!("{error:#}"), "host_codex_item_not_allowed");
     server.await.unwrap();
 }
 
@@ -250,7 +251,7 @@ exec sleep 60
         wait_for_live_mock_pid(&pid_file),
     );
     let error = result.unwrap_err();
-    assert!(error.to_string().contains("time limit"), "{error}");
+    assert_eq!(error.to_string(), "host_codex_process_timeout");
     let pid = ready.expect("owned mock did not become ready before its independent startup limit");
     let status = std::process::Command::new("/bin/kill")
         .args(["-0", pid.trim()])
@@ -730,7 +731,7 @@ wait "$descendant"
         wait_for_live_mock_pid(&pid_file),
     );
     let error = result.unwrap_err();
-    assert!(error.to_string().contains("time limit"), "{error}");
+    assert_eq!(error.to_string(), "host_codex_process_timeout");
     let pid = ready.expect("mock descendant did not become ready before its startup limit");
     let status = std::process::Command::new("/bin/kill")
         .args(["-0", pid.trim()])
@@ -827,7 +828,7 @@ async fn pure_completion_rejects_any_dynamic_tool_request() {
     .await
     .err()
     .unwrap();
-    assert!(error.to_string().contains("Pure completion"));
+    assert_eq!(error.to_string(), "host_codex_completion_tool_request");
     server.await.unwrap();
 }
 
@@ -945,29 +946,41 @@ fn invalid_native_state_or_logs_refuse_command_before_spawn() {
     std::fs::create_dir(&state).unwrap();
     let file = root.join("not-a-directory");
     std::fs::write(&file, b"fixture").unwrap();
-    let rejected = |path: &Path| {
-        assert!(process_command(Path::new("never-spawned"), &root, &root, Some(path)).is_err());
+    let rejected = |path: &Path, code: &str| {
+        let error = process_command(Path::new("never-spawned"), &root, &root, Some(path))
+            .expect_err("invalid state directory accepted");
+        assert_eq!(format!("{error:#}"), code);
     };
-    rejected(Path::new("relative-state"));
-    rejected(&root.join("missing"));
-    rejected(&file);
-    rejected(&state); // Missing logs is not silently created.
+    rejected(
+        Path::new("relative-state"),
+        "host_codex_state_dir_not_absolute",
+    );
+    rejected(&root.join("missing"), "host_codex_state_dir_unavailable");
+    rejected(&file, "host_codex_state_dir_not_directory");
+    // Missing logs is not silently created.
+    rejected(&state, "host_codex_state_dir_unavailable");
     std::fs::write(state.join("logs"), b"not a directory").unwrap();
-    rejected(&state);
+    rejected(&state, "host_codex_state_dir_not_directory");
     std::fs::remove_file(state.join("logs")).unwrap();
     std::fs::create_dir(state.join("logs")).unwrap();
-    rejected(&state.join("..").join("state"));
+    rejected(
+        &state.join("..").join("state"),
+        "host_codex_state_dir_not_canonical",
+    );
     #[cfg(unix)]
     {
         let linked_state = root.join("linked-state");
         std::os::unix::fs::symlink(&state, &linked_state).unwrap();
-        rejected(&linked_state);
+        rejected(&linked_state, "host_codex_state_dir_not_directory");
         let linked_parent = root.join("linked-parent");
         std::os::unix::fs::symlink(&root, &linked_parent).unwrap();
-        rejected(&linked_parent.join("state"));
+        rejected(
+            &linked_parent.join("state"),
+            "host_codex_state_dir_not_canonical",
+        );
         std::fs::rename(state.join("logs"), root.join("real-logs")).unwrap();
         std::os::unix::fs::symlink(root.join("real-logs"), state.join("logs")).unwrap();
-        rejected(&state);
+        rejected(&state, "host_codex_state_dir_not_directory");
     }
 }
 
@@ -1249,7 +1262,7 @@ async fn replacing_current_generation_invalidates_even_an_uncertain_answer() {
     let error = evidence
         .finish(r#"{"answer":"Insufficient evidence","citations":[],"insufficient_evidence":true}"#)
         .unwrap_err();
-    assert!(error.to_string().contains("generation"));
+    assert_eq!(error.to_string(), "host_generation_changed");
 }
 
 #[tokio::test]

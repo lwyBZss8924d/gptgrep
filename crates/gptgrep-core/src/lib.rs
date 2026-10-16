@@ -417,7 +417,11 @@ fn record_validated_retry_reply(metrics: &mut Metrics, error: &anyhow::Error) {
                         gptgrep_jev::response_model_matches(&observer.requested_model, served)
                     })
             });
-    if diagnostic.kind != DecisionFailureKind::RetryPostSend && !validated_initial {
+    if !matches!(
+        diagnostic.kind,
+        DecisionFailureKind::LocalPostSend | DecisionFailureKind::RetryPostSend
+    ) && !validated_initial
+    {
         return;
     }
     if let (Some(usage), Some(served)) = (&diagnostic.reported_usage, served) {
@@ -676,6 +680,7 @@ fn jev_search_error(
         !diagnostic.prior_attempts.is_empty()
             || diagnostic.retry_after_refusal.is_some()
             || diagnostic.observer_failure.is_some()
+            || diagnostic.kind == DecisionFailureKind::LocalPostSend
     });
     let cause = if let Some(failure) = typed_diagnostic {
         // Fixed wording plus numeric statuses, validation codes and fixed

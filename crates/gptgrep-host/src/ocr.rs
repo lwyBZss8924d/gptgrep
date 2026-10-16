@@ -805,6 +805,7 @@ struct OcrCleanupState {
     workers: Vec<OcrCleanupWorker>,
     limit: usize,
     closed: bool,
+    drained: bool,
 }
 struct OcrCleanupWorker {
     cancel: OcrCancellation,
@@ -848,6 +849,7 @@ impl OcrCleanup {
                 workers,
                 limit: max_operations,
                 closed: false,
+                drained: false,
             })),
         })
     }
@@ -885,6 +887,19 @@ impl OcrCleanup {
         state.workers.push(OcrCleanupWorker { cancel, handle });
         Ok(receive)
     }
+    /// Synchronously close registration and signal every owned worker when the
+    /// enclosing Document turn future is dropped before `cancel_and_drain` runs.
+    pub fn cancel_on_drop(&self) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.closed = true;
+            for worker in &state.workers {
+                worker.cancel.cancel();
+            }
+        }
+    }
+    pub fn is_closed(&self) -> bool {
+        self.inner.lock().map(|state| state.closed).unwrap_or(true)
+    }
     /// Close registration, cancel every owned worker, then join within the
     /// caller's one local cleanup allowance. No execution clock is renewed.
     pub async fn cancel_and_drain(&self, deadline: tokio::time::Instant) -> Result<()> {
@@ -894,8 +909,9 @@ impl OcrCleanup {
                 .inner
                 .lock()
                 .map_err(|_| anyhow!("ocr_owned_execution_cleanup_unknown"))?;
-            ensure!(!state.closed, "ocr_cleanup_already_closed");
+            ensure!(!state.drained, "ocr_cleanup_already_closed");
             state.closed = true;
+            state.drained = true;
             std::mem::take(&mut state.workers)
         });
         for worker in &workers.0 {

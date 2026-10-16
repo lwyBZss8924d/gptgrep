@@ -66,7 +66,7 @@ async fn typed_outer_and_inner_timeouts_keep_the_intended_invocation_code() {
         Err(anyhow!("host_stderr_cleanup_unknown")),
     )
     .unwrap_err();
-    assert!(error.to_string().contains("time limit"));
+    assert_eq!(error.to_string(), "host_codex_process_timeout");
 }
 
 #[test]

@@ -685,7 +685,13 @@ impl JevClient {
                 .await
             {
                 Ok(response) => return Ok(response),
-                Err(error) => error,
+                Err(error) => {
+                    if progress.sent && !error.is::<DecisionFailure>() {
+                        DecisionFailure::local_post_send(progress.validated.clone()).into()
+                    } else {
+                        error
+                    }
+                }
             };
             let Some(retry_body) = retry_body else {
                 return Err(error);
