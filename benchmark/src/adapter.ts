@@ -5,6 +5,9 @@ import { createReadStream } from "node:fs";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { selectReaderTasks, sha256, XL_NATIVE_SCORER_SHA256, type ReaderTask, type XlRelease } from "./dataset";
+import { assertTaskAdmitted, dependencyProjection, loadAdmission, verifyRequiredPreprocessing, type AdmissionReference } from "./availability";
+import { digest, writeJson } from "./io";
+import { indexTaskFiles } from "./harbor-launch";
 
 export interface RawDocument {
   documentId: string;
@@ -23,6 +26,7 @@ export interface PreparedArtifact {
 }
 
 export interface HarborAdapterOptions {
+  admission: AdmissionReference;
   release: XlRelease;
   outputDir: string;
   rawDocuments: RawDocument[];
@@ -153,6 +157,10 @@ export async function writeHarborTasks(options: HarborAdapterOptions): Promise<G
   if (options.rubricSha256) requireHash(options.rubricSha256, "rubricSha256");
   const tasks = selectReaderTasks(options.release.readerTasks, options);
   if (!tasks.length) throw new Error("No tasks selected");
+  const admission = await loadAdmission(options.admission, options.outputDir);
+  if (admission.assessment.release.revision !== options.release.revision || digest(admission.assessment.release.fileHashes) !== digest(options.release.fileHashes)) throw new Error("Release differs from assessed source");
+  for (const task of tasks) assertTaskAdmitted(admission, task, options.arm, options.rawDocuments);
+  await verifyRequiredPreprocessing(admission, tasks, (options.preparedArtifacts ?? []).map(p => p.sha256));
   const outputRoot = resolve(options.outputDir);
   const sourceRoot = options.release.releaseRoot && resolve(options.release.releaseRoot);
   if (sourceRoot && (outputRoot === sourceRoot || !relative(sourceRoot, outputRoot).startsWith(`..${sep}`) && !isAbsolute(relative(sourceRoot, outputRoot)))) {
@@ -235,6 +243,10 @@ export async function writeHarborTasks(options: HarborAdapterOptions): Promise<G
         writeFile(resolve(staging, "adapter-manifest.json"), JSON.stringify({ schema: "gptgrep.xl-harbor-task.v1",
           task_id: task.id, source_revision: options.release.revision, source_file_hashes: options.release.fileHashes,
           group_id: task.groupId, context_id: task.contextId, corpus_sha256: corpusSha256, arm: options.arm,
+          availability: { assessmentSha256: admission.acceptance.assessment.sha256, assessmentRevision: admission.assessment.revision,
+            generation: admission.assessment.generation, dependencySha256: admission.assessment.dependencySha256,
+            profileId: options.admission.profileId, profileSha256: digest(admission.assessment.profiles.find(p => p.id === options.admission.profileId)),
+            taskDependencySha256: digest(dependencyProjection(task)) },
           prepared_artifacts: prepared.map((p) => ({ relative_path: p.relativePath, sha256: p.sha256, scope: p.scope ?? "context" })),
           prepared_context_document_ids: options.preparedContextDocumentIds ?? [],
           oracle_status: "not_provided", parity_status: "not_run" }, null, 2) + "\n"),
@@ -248,6 +260,11 @@ export async function writeHarborTasks(options: HarborAdapterOptions): Promise<G
     generated.push({ id: task.id, name: harborTaskName(task.id), directory: target,
       contextId: task.contextId, groupId: task.groupId, corpusSha256, arm: options.arm });
   }
+  await writeJson(resolve(outputRoot, "harbor-export.json"), { schema: "gptgrep.harbor-export.v1", status: "generated_pending_acceptance",
+    assessmentSha256: admission.acceptance.assessment.sha256, generation: admission.assessment.generation,
+    releaseRevision: options.release.revision, profileId: options.admission.profileId, arm: options.arm,
+    tasks: await Promise.all(generated.map(async task => ({ taskId: task.id, directory: task.directory,
+      files: await indexTaskFiles(task.directory) }))) });
   return generated;
 }
 

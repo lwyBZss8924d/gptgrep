@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { runNativeForTest, validatePermissionProfile, type NativeRunOptions, type NativeTestTransport } from "../src/native";
-import { parseReaderAnswer, readerOrder, readerPrompt, stagePreparedWorkspace, verifyReaderWorkspace, type ReaderWorkspace } from "../src/runner";
+import { parseReaderAnswer, readerOrder, readerPrompt, runReaderArm, runReaderPair, stagePreparedWorkspace, verifyReaderWorkspace, type ReaderWorkspace } from "../src/runner";
 import { canonical, sha256 } from "../src/io";
 
 type Message = Record<string, any>;
@@ -102,6 +102,29 @@ async function preparedWorkspaceFixture() {
 }
 
 describe("native protocol lifecycle", () => {
+  test("direct reader and paired APIs deny absent admission before staging or model callbacks", async () => {
+    const fixture = await preparedWorkspaceFixture();
+    const outputDir = join(dirname(fixture.bare.cwd), "denied-reader");
+    const runtime = { packageRoot: "/must-not-read", manifestSha256: sha256("manifest"), binaryPath: "/must-not-start", binarySha256: sha256("binary") };
+    let launches = 0;
+    try {
+      await expect(runReaderPair({ admission: undefined, task: fixture.task, pairIndex: 0, seed: "fixed", outputDir,
+        native: options, bare: fixture.bare, gptgrep: fixture.workspace, runtime, helperModel: "openai/gpt-6-luna-decisions",
+        launchArm: async () => { launches++; throw new Error("must not run"); } } as any)).rejects.toThrow("admission reference");
+      expect(launches).toBe(0);
+      await expect(runReaderArm({ admission: undefined, task: fixture.task, arm: "bare", order: 0, workspace: fixture.bare,
+        outputDir, native: options, runtime, helperModel: "openai/gpt-6-luna-decisions" } as any)).rejects.toThrow("admission reference");
+      await expect(stat(join(outputDir, "attempt-start.json"))).rejects.toThrow();
+      await expect(stat(join(outputDir, "pair.json"))).rejects.toThrow();
+      const denials = (await readdir(outputDir)).filter(name => name.startsWith("prelaunch-denial-"));
+      expect(denials).toHaveLength(2);
+      for (const file of denials) {
+        const denial = JSON.parse(await readFile(join(outputDir, file), "utf8"));
+        expect(denial.readerStarted).toBe(false); expect(denial.measurement).toBeNull();
+      }
+      expect(await readFile(join(fixture.bare.cwd, "context.json"), "utf8")).toBe(fixture.contextBytes);
+    } finally { await fixture.dispose(); }
+  });
   test("empty completed text is an invalid answer while explicit abstention is valid", () => {
     const task = { id: "test", question: "test question", contextDocumentIds: ["doc"] } as any;
     expect(() => parseReaderAnswer(JSON.stringify({ answer: "   ", citations: [], explanation: "" }), task)).toThrow("nonempty");

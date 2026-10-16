@@ -24,13 +24,23 @@ export interface SourceDocument {
 }
 
 /** The only task shape allowed in a reader session or a preparation manifest. */
-export interface ReaderTask {
+export interface TaskDependency {
   id: string;
-  question: string;
   taskType: "single_doc" | "cross_doc";
   contextDocumentIds: string[];
   contextId: string;
   groupId: string;
+}
+
+export interface ReaderTask extends TaskDependency { question: string; }
+
+/** Controller metadata only. No question, answer, evidence or scorer output. */
+export interface DependencyRelease {
+  revision: string;
+  documents: SourceDocument[];
+  tasks: TaskDependency[];
+  groups: SourceGroup[];
+  fileHashes: Record<string, string>;
 }
 
 /** Verifier-only. Do not log or serialize XlRelease into an agent workspace. */
@@ -165,7 +175,7 @@ export function normalizeManifest(value: unknown): ReleaseManifest {
 }
 
 /** Projection only: evidence, answer and answerability are not inspected here. */
-export function projectReaderTask(value: unknown, expectedType?: ReaderTask["taskType"]): ReaderTask {
+export function projectTaskDependency(value: unknown, expectedType?: TaskDependency["taskType"]): TaskDependency {
   const row = object(value, "task");
   const id = string(row.question_id, "task.question_id");
   const type = row.task_type;
@@ -183,7 +193,6 @@ export function projectReaderTask(value: unknown, expectedType?: ReaderTask["tas
   const sorted = [...ids].sort();
   return {
     id,
-    question: string(row.question, `${id}.question`),
     taskType: type,
     contextDocumentIds: sorted,
     contextId: `context-${sha256(JSON.stringify(sorted)).slice(0, 20)}`,
@@ -191,8 +200,32 @@ export function projectReaderTask(value: unknown, expectedType?: ReaderTask["tas
   };
 }
 
+export function projectReaderTask(value: unknown, expectedType?: ReaderTask["taskType"]): ReaderTask {
+  const dependency = projectTaskDependency(value, expectedType);
+  return { ...dependency, question: string(object(value, "task").question, `${dependency.id}.question`) };
+}
+
+export function normalizeDependencyRelease(input: NormalizeReleaseInput): DependencyRelease {
+  const revision = input.revision ?? XL_RELEASE_REVISION;
+  if (revision !== XL_RELEASE_REVISION) throw new Error("Unsupported dependency release revision");
+  const manifest = normalizeManifest(input.manifest);
+  const documents = input.documents.map(normalizeDocument).sort((a, b) => a.documentId.localeCompare(b.documentId));
+  const single = input.singleDocQuestions.map(row => projectTaskDependency(row, "single_doc"));
+  const cross = input.crossDocQuestions.map(row => projectTaskDependency(row, "cross_doc"));
+  const tasks = [...single, ...cross].sort((a, b) => a.id.localeCompare(b.id));
+  unique(documents.map(d => d.documentId), "documents"); unique(tasks.map(t => t.id), "tasks");
+  if (documents.length !== manifest.document_count || tasks.length !== manifest.qa_count ||
+      single.length !== manifest.single_doc_qa_count || cross.length !== manifest.cross_doc_qa_count) throw new Error("Dependency counts disagree with release");
+  const known = new Set(documents.map(d => d.documentId)), used = new Set(tasks.flatMap(t => t.contextDocumentIds));
+  if (known.size !== used.size || [...used].some(id => !known.has(id))) throw new Error("Dependency contexts must cover exactly the released documents");
+  const groups = buildSourceGroups(documents, tasks, input);
+  const taskGroups = new Map(groups.flatMap(g => g.taskIds.map(id => [id, g.id] as const)));
+  for (const task of tasks) task.groupId = taskGroups.get(task.id)!;
+  return { revision, documents, tasks, groups, fileHashes: { ...input.fileHashes } };
+}
+
 /** Connected components of public context membership, source identity and reviewed families. */
-export function buildSourceGroups(documents: SourceDocument[], tasks: ReaderTask[], options: GroupingOptions = {}): SourceGroup[] {
+export function buildSourceGroups(documents: SourceDocument[], tasks: TaskDependency[], options: GroupingOptions = {}): SourceGroup[] {
   const parent = new Map(documents.map((d) => [d.documentId, d.documentId]));
   const find = (id: string): string => {
     let root = parent.get(id);
@@ -299,6 +332,16 @@ function parseJsonl(text: string, filename: string): unknown[] {
 
 /** Reads a locally acquired release. No network, model calls or implicit downloads. */
 export async function loadXlRelease(options: { releaseRoot: string; revision?: string } & GroupingOptions): Promise<XlRelease> {
+  const { root, scorerPath, input } = await loadReleaseInput(options);
+  return { ...normalizeXlRelease(input), releaseRoot: root, nativeScorerPath: scorerPath };
+}
+
+/** Parses the pinned local rows but selects only their complete public dependencies. */
+export async function loadDependencyRelease(options: { releaseRoot: string; revision?: string } & GroupingOptions): Promise<DependencyRelease> {
+  return normalizeDependencyRelease((await loadReleaseInput(options)).input);
+}
+
+async function loadReleaseInput(options: { releaseRoot: string; revision?: string } & GroupingOptions) {
   const root = resolve(options.releaseRoot);
   const manifestBytes = await readFile(resolve(root, "manifest.json"));
   const manifest = normalizeManifest(JSON.parse(manifestBytes.toString("utf8")));
@@ -316,11 +359,11 @@ export async function loadXlRelease(options: { releaseRoot: string; revision?: s
   const fileHashes = Object.fromEntries(names.map((name, i) => [name, sha256(bytes[i]!)]));
   fileHashes["manifest.json"] = sha256(manifestBytes);
   fileHashes["code/evaluate.py"] = scorerHash;
-  const release = normalizeXlRelease({ ...options, manifest,
+  const input: NormalizeReleaseInput = { ...options, manifest,
     documents: parseJsonl(bytes[0]!.toString("utf8"), names[0]!),
     singleDocQuestions: parseJsonl(bytes[1]!.toString("utf8"), names[1]!),
-    crossDocQuestions: parseJsonl(bytes[2]!.toString("utf8"), names[2]!), fileHashes });
-  return { ...release, releaseRoot: root, nativeScorerPath: scorerPath };
+    crossDocQuestions: parseJsonl(bytes[2]!.toString("utf8"), names[2]!), fileHashes };
+  return { root, scorerPath, input };
 }
 
 export interface SplitManifest {

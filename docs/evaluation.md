@@ -123,10 +123,12 @@ bun run --cwd benchmark test
 bun benchmark/src/cli.ts freeze \
   --release "$XL_RELEASE_ROOT" --corpus "$XL_CORPUS_ROOT" \
   --output "$XL_RUN_ROOT/cohort" --seed "$XL_SEED" \
-  --sample-size "$DEV_SAMPLE_SIZE"
+  --sample-size "$DEV_SAMPLE_SIZE" --profile "$PROFILE_ID" \
+  --acceptance "$CONTROLLER_ACCEPTANCE" --acceptance-sha256 "$CONTROLLER_ACCEPTANCE_SHA256"
 
 # One independently supervised child for each invocation.
-bun benchmark/src/cli.ts reader --config "$READER_CONFIG"
+bun benchmark/src/cli.ts reader --config "$READER_CONFIG" \
+  --acceptance "$CONTROLLER_ACCEPTANCE" --acceptance-sha256 "$CONTROLLER_ACCEPTANCE_SHA256"
 bun benchmark/src/cli.ts judge --config "$JUDGE_CONFIG"
 
 # Compare retained measurements; this command does not execute an experiment.
@@ -147,3 +149,26 @@ not execution authority. Keep model outcomes, process status, storage receipts,
 auth cleanup, source revision, independent review and release state separate in
 the final private checkpoint. Public reports contain no private corpus, native
 session identifiers, account routing or workstation paths.
+
+Prospective execution also binds a current immutable task-availability assessment.
+The dependency projection includes every released public context document, including
+non-evidence members of a full-series task. Missing one member blocks that task;
+source-group membership does not freeze unrelated tasks with complete contexts.
+Acquisition failures remain recovery pending while reasonable exact-source routes
+remain unresolved. Final unavailability requires reviewed recovery evidence and
+the frozen expected document identity. A newer or similar edition cannot replace
+it. RAW eligibility and profile-specific complete OCR preparation are separate.
+
+Report the full released document/task partitions, eligible-before-enrollment
+tasks, explicitly enrolled N and historical measurements separately. Prelaunch
+denials have no fabricated numeric reward. Keep already enrolled tasks in their
+fixed denominator and preserve prior results when a new assessment changes current
+launchability. No current release-wide eligible/frozen task count can be inferred
+from document counts alone; it needs the verified complete dependency projection.
+
+The [benchmark admission contract](../benchmark/README.md#current-availability-and-launch-admission)
+guards direct export/native APIs and the task-aware Harbor launch front door.
+Harbor requires a separately accepted complete export and qualified exact runtime;
+synthetic no-launch tests, generated tasks and metadata pins cannot qualify a live
+Linux/container rollout. Existing frozen code snapshots and consumed runs retain
+their historical contracts until explicitly re-admitted for prospective work.

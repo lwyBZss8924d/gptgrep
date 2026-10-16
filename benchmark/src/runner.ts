@@ -5,6 +5,7 @@ import { corpusDigest } from "./adapter";
 import type { ReaderTask } from "./dataset";
 import { canonical, digest, fileHash, physicalPath, readJson, requireStorage, sha256, within, writeJson } from "./io";
 import { runNative, type NativeRunOptions, type NativeRunResult } from "./native";
+import { assertTaskAdmitted, loadAdmission, verifyRequiredPreprocessing, type AdmissionReference } from "./availability";
 
 export const SUPERVISOR_MODEL = "gpt-6.1-sol";
 export const WORKER_MODEL = "gpt-6-luna";
@@ -28,6 +29,7 @@ export interface PinnedRuntime {
   binarySha256: string;
 }
 export interface ReaderPairOptions {
+  admission: Record<ReaderArm, AdmissionReference>;
   task: ReaderTask;
   pairIndex: number;
   seed: string;
@@ -56,6 +58,7 @@ export interface ReaderAttempt {
   error: string | null;
 }
 export interface ReaderArmOptions {
+  admission: AdmissionReference;
   task: ReaderTask;
   arm: ReaderArm;
   order: number;
@@ -277,6 +280,7 @@ export function parseReaderAnswer(text: string, task: ReaderTask): unknown {
 /** One admitted child only. Pair orchestration must use a fresh auth/storage run per arm. */
 export async function runReaderArm(options: ReaderArmOptions): Promise<ReaderArmResult> {
   const storage = await requireStorage(options.outputDir, options.workspace.cwd);
+  await admitReader(options.admission, options.task, options.arm, options.workspace, options.outputDir);
   if (!HELPER_MODELS.includes(options.helperModel)) throw new Error("Unsupported frozen helper model");
   if (options.arm !== "bare" && options.arm !== "gptgrep") throw new Error("Unknown reader arm");
   for (const root of options.native.readableRoots) {
@@ -298,6 +302,7 @@ export async function runReaderArm(options: ReaderArmOptions): Promise<ReaderArm
       const verified = await verifyReaderWorkspace(options.workspace, options.task, options.arm, runtimeFiles);
       attempt.corpusSha256 = verified.corpus;
       attempt.contextSha256 = verified.context;
+      await admitReader(options.admission, options.task, options.arm, options.workspace, options.outputDir);
       attempt.native = await runNative({ ...options.native, cwd: options.workspace.cwd, model: SUPERVISOR_MODEL, input: prompt,
         tracePath: resolve(directory, "native-trace.jsonl"), readableRoots: [...options.native.readableRoots, options.workspace.cwd],
         config: { ...options.native.config, "agents.default_subagent_model": WORKER_MODEL }, outputSchema: ANSWER_SCHEMA });
@@ -327,6 +332,7 @@ export async function runReaderArm(options: ReaderArmOptions): Promise<ReaderArm
 /** Serial controller. launchArm crosses the separate owner-auth/storage boundary. */
 export async function runReaderPair(options: ReaderPairOptions): Promise<ReaderPairResult> {
   await requireStorage(options.outputDir);
+  for (const arm of ["bare", "gptgrep"] as const) await admitReader(options.admission?.[arm], options.task, arm, options[arm], options.outputDir);
   if (within(options.bare.cwd, options.gptgrep.cwd) || within(options.gptgrep.cwd, options.bare.cwd)) throw new Error("Reader workspaces must be disjoint");
   const bareCorpus = corpusDigest(options.bare.documents);
   if (bareCorpus !== corpusDigest(options.gptgrep.documents)) throw new Error("Declared paired source identities differ");
@@ -337,7 +343,8 @@ export async function runReaderPair(options: ReaderPairOptions): Promise<ReaderP
     runtimeManifestSha256: options.runtime.manifestSha256, binarySha256: options.runtime.binarySha256, attempts: [] };
   await absent(resolve(options.outputDir, "pair.json"));
   for (const [index, arm] of order.entries()) {
-    const attempt = await options.launchArm({ task: options.task, arm, order: index, workspace: options[arm], outputDir: resolve(options.outputDir, arm),
+    await admitReader(options.admission[arm], options.task, arm, options[arm], options.outputDir);
+    const attempt = await options.launchArm({ admission: options.admission[arm], task: options.task, arm, order: index, workspace: options[arm], outputDir: resolve(options.outputDir, arm),
       native: options.native, runtime: options.runtime, helperModel: options.helperModel });
     if (attempt.executionMode !== "live" || attempt.arm !== arm || attempt.taskId !== options.task.id || attempt.order !== index) throw new Error("Arm result has the wrong execution or task identity");
     if (attempt.native && attempt.native.executionMode !== "live") throw new Error("A test run cannot enter live evidence");
@@ -355,4 +362,19 @@ export async function runReaderPair(options: ReaderPairOptions): Promise<ReaderP
     if (attempt.native?.authFailure || attempt.native && !attempt.native.cleanup.completed) break;
   }
   return result;
+}
+
+async function admitReader(reference: AdmissionReference, task: ReaderTask, arm: ReaderArm, workspace: ReaderWorkspace, output: string): Promise<void> {
+  try {
+    const admission = await loadAdmission(reference, output);
+    assertTaskAdmitted(admission, task, arm, workspace.documents);
+    await verifyRequiredPreprocessing(admission, [task], (workspace.preparedArtifacts ?? []).map(p => p.sha256));
+  } catch (error) {
+    await mkdir(output, { recursive: true });
+    await writeFile(resolve(output, `prelaunch-denial-${crypto.randomUUID()}.json`), JSON.stringify({
+      schema: "gptgrep.reader-prelaunch-denial.v1", taskId: task.id, arm, status: "denied_before_reader",
+      readerStarted: false, measurement: null, reason: error instanceof Error ? error.message : "Admission failed",
+    }) + "\n", { flag: "wx", mode: 0o600 });
+    throw error;
+  }
 }
