@@ -16,16 +16,18 @@ GPTgrep 返回可核查的源文档证据。默认 `search` 使用 `hybrid`，�
 [覆盖全部原生操作的 incur CLI](packages/cli/README.md)，以及
 [可直接调用的 Rust API 与可运行的组合示例](docs/rust-sdk.md)。
 Document／OCR 调用方自行选择原生能力、权限、作业预算和包根目录；GPTgrep 会把选定的指引放入每个实际工作目录。
-核心优化目标是真实的 **GPTgrep harness 与裸 Codex 消融研究**：在 62 对任务上使用相同的 Codex reader
-运行时，INDEX 与 SEARCH 的奖励和成本分开报告。GPTgrep 的 reader 合同（基础指令、引用与弃答规则以及回答规则）
-属于实验处理（treatment）的一部分；裸 Codex 一组只收到共同的任务提示，并使用 Codex 默认的基础指令。
-源码已包含原生流水线和 full62 Harbor adapter；完整 34 文档的原生索引尚未验收，124 次成对 SEARCH 试验尚未运行。
-组件资格验证和仅含实验组的开发运行为这一比较提供支持，但不能替代它。该 Goal 与 G5 发布门槛相互独立。
+当前 `0.2.0-alpha.1` 开发线在固定的 XL-DocBench 任务集合上比较 **同一原生 Codex 智能体使用
+GPTgrep 与裸 Codex**。两组接收相同问题、完整的原始文档上下文与输出要求，保留共同的原生工具；
+GPTgrep 组额外接收固定版本的二进制、通用 Skills／角色和该上下文的完整预处理产物。
+监督模型为 `gpt-6.1-sol`，worker 与 OCR 使用 `gpt-6-luna`，辅助模型显式选择 Luna Decisions 或 Jev 1.14。
+比较前固定模型、运行时、权限与预算，分别记录配置与实际观测；这些比较配置不改变产品的 CLI 默认值。
+查询前的准备成本单列，所有依赖问题的工作计入 SEARCH，判分成本另计。
 
-这是开发中的源码，版本为 `0.1.0-alpha.1`，属于实验性预发布版本；版本策略见 [SPEC](SPEC.md)。
-第一个实验版发布前，必须在 PageIndex-OSS-Benchmark 的真实运行中，证明相对 PageIndex Flash 加 GPT-5.6 的最小优势。
-原始本地 PageIndex OSS `results.json` 在 Luna/high 下为 60/62；另行验收的 SDK/Codex live 对照
-在 Luna/max 下同为 60/62。两次运行的模型、后端和证据来源分别记录。
+[评估协议](docs/evaluation.md)规定当前验收条件，[基准工具包](benchmark/UPSTREAM.md)维护来源与任务契约，
+[自优化工具包](self-opt/src/evaluate.ts)比较开发迭代。默认开发目标是在相同完整入组任务集合上取得更高的
+有证据支持的成功率。发布／canary 结论还需要事先固定的完整确认集合、匹配比较优势和独立审查。
+小规模 live／调试检查、离线测试、源码交付或仅含 GPTgrep 组的运行均不能代表完整 XL 结果或 canary 验收。
+旧 PageIndex／full62 评估及其首发门槛已退役，历史测量不构成新的 XL 结果。版本与交付规则见 [SPEC](SPEC.md)。
 请参阅[架构说明](docs/architecture.zh-CN.md)和明确列出的
 [Flash 阶段覆盖情况](crates/gptgrep-pageindex/FLASH_STAGE_COVERAGE.md)。
 维护者的研究记录保存在 `docs/research/` 下，仅供本地使用，不纳入版本控制。
@@ -132,7 +134,7 @@ GPTgrep 不会自动加载凭据文件。可选的开发辅助脚本 `scripts/wi
 gptgrep search 'how can a damaged journal be recovered?' ./documents \
   --model typesafe/jev-1.13 --min-score 0.5 --json
 
-gptgrep judge --input evals/requests/decision-smoke.json \
+gptgrep judge --input ./decision-request.json \
   --model '~typesafe/jev-latest' --json
 ```
 
@@ -257,8 +259,8 @@ gptgrep summarize DOCUMENT_ID:NODE_ID --root ./documents \
 后续搜索默认使用 hybrid；树节点读取和显式精确检索可在初始结果基础上继续补充证据。
 报告同时保留 Jev 的覆盖范围、实际模型和用量，以及 Codex 用量。
 
-文本检索 reader（受限模式或原生模式）还会收到通用回答规则。这些规则要求它按问题要求的形式先给出直接答案；
-当已读证据按问题原意回答了问题时，确定该答案并引用证据；并通过阅读被引用的段落来解析文内引用
+文本检索 reader（受限模式或原生模式）还会收到通用回答规则。这些规则要求它按问题要求的形式先给出直接答案，
+并通过阅读被引用的段落来解析问题所依赖的文内引用
 （注释标记、引文编号、“见表”或“见节”之类的指引）。这些规则从不放宽证据、引用或
 `insufficient_evidence` 规则。富文本与多模态 reader 不接收这些规则。它们属于 GPTgrep 的 reader 合同。
 
@@ -327,7 +329,6 @@ gptgrep ask 'How are offline exports recovered?' ./documents \
 其输入为 `{instructions, state, schema}`，输出包含通过 schema 校验的 `value`、
 模型与推理强度、用量及输入摘要值。默认总输入预算为 256 KiB，可以显式调整，最高为 1 MiB；
 提示词绝不会被静默截断。此补全模式不声明具备引用验证能力。
-它支持已声明的提供方桥接接口，用于在对比评估中运行原版 PageIndex 的摘要与优化提示词。
 
 app-server API 尚处于实验阶段。已支持的能力边界和配置记录在
 [宿主 crate 文档](crates/gptgrep-host/README.md)中。
@@ -401,19 +402,14 @@ GPTGREP_BIN=/absolute/path/to/gptgrep node src/cli.js search \
 
 ## 验证与证据
 
-运行这些检查之前，请先按[开发说明](docs/development.md)配置显式的外置输出路径和 uv 环境。
-Python 检查使用 Python 3.12 或更新版本以及仓库中的锁定文件。
+运行这些检查之前，请先按[开发说明](docs/development.md)取得经存储所有者核验的外置运行目录。
+当前离线基准与自优化契约测试使用 Bun，不需要安装 npm 依赖。
 
 ```sh
 cargo fmt --all -- --check
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
-uv venv --python 3.13 "$GPTGREP_DEV_ROOT/eval-venv"
-uv pip sync --python "$GPTGREP_DEV_ROOT/eval-venv/bin/python" evals/requirements.lock
-"$GPTGREP_DEV_ROOT/eval-venv/bin/python" -B -m unittest discover -s evals -p 'test_*.py'
-"$GPTGREP_DEV_ROOT/eval-venv/bin/python" -B scripts/eval.py \
-  --binary "$CARGO_TARGET_DIR/release/gptgrep" \
-  --output "$GPTGREP_DEV_ROOT/results/offline-eval.json"
+bun run --cwd benchmark test
 ```
 
 测试样例覆盖正则匹配正确性、词法检索、Unicode、精确的源文件摘要值与字节区间、
@@ -421,10 +417,32 @@ uv pip sync --python "$GPTGREP_DEV_ROOT/eval-venv/bin/python" evals/requirements
 无文本层文档的拒绝处理，以及超过 1,000 页的文档。合并阶段的测试样例会执行固定版本上游的纯函数，
 以进行对比。模拟 Codex/HTTP 测试用于验证传输层必须保持的性质；真实宿主或提供方调用的回执属于另一类证据。
 
-外部 PageIndex 数据通过固定版本的清单引用，不随项目重新分发。
-在该数据子集上运行 GPTgrep，与执行原版 PageIndex SDK 基线是不同的评估。
-上游历史基准数据不属于 GPTgrep 的实测结果。
-[基线运行器说明](scripts/pageindex_baseline/README.md)记录了统计分母、消融实验边界、失败案例与费用核算方式。
+[XL 来源契约](benchmark/UPSTREAM.md)固定发布版本、评分器、文档权利与本地布局。
+每个任务必须验证完整原始上下文。索引准备只接收原始文档，不接收问题、标准答案或证据标注；
+reader 接收任务问题，但不得接收标准答案、证据标注或判分状态。
+以下入口使用调用方选定的外置路径；采集与 live 提供方调用需要相应授权，各 reader 与独立 judge
+必须有各自已准入的存储、认证状态和权限。配置字段与隔离要求见[评估协议](docs/evaluation.md)。
+
+```sh
+# 仅从已验证的本地材料选择开发样本。
+bun benchmark/src/cli.ts freeze \
+  --release "$XL_RELEASE_ROOT" --corpus "$XL_CORPUS_ROOT" \
+  --output "$XL_RUN_ROOT/cohort" --seed "$XL_SEED" \
+  --sample-size "$DEV_SAMPLE_SIZE"
+
+# 每次调用只监督一个独立子进程。
+bun benchmark/src/cli.ts reader --config "$READER_CONFIG"
+bun benchmark/src/cli.ts judge --config "$JUDGE_CONFIG"
+
+# 比较已保存的测量；本命令不执行实验。
+bun self-opt/src/cli.ts compare \
+  --incumbent "$INCUMBENT_RUN" --candidate "$CANDIDATE_RUN" \
+  --output "$XL_RUN_ROOT/opt-comparison.json"
+```
+
+`freeze` 只登记开发样本。原生 XL 准确率与独立的证据支持成功率／原子覆盖率分别报告；
+已启动的 reader 操作失败在证据支持成功率中计为零，准备或判分不可用保持未知，并保留固定分母。
+缺失的用量、请求数与费用保持不可用。`self-opt` 报告始终保留 `releaseAccepted: false`。
 详细的本地研究和实验解读仍保存在被忽略的 `docs/research/` 路径下。
 
 ## 当前版本的限制
@@ -437,8 +455,6 @@ uv pip sync --python "$GPTGREP_DEV_ROOT/eval-venv/bin/python" evals/requirements
   验收仍未完成；缺失或无效的必需提取会明确失败。
 - 默认（v1）索引在任何受支持的文档没有可提取文本（例如扫描版 PDF）时，会拒绝整个构建，
   上一个索引版本保持当前状态。这类文档集合需要使用 `--ocr auto` 的显式 rich ingestion 或 parse-agent 索引。
-- reader 的“确定答案”规则仍在评估中：在引入该规则的 Opt-1 改动的开发测量中，失败运行减少了，
-  但对不可回答问题给出答案的情况增加了；见[实验状态](docs/experimental-status.md)。
 - 语义候选预算可能使相关文档或节点未被选中。Jev 无法补回上游已排除的证据；其分数也不保证内容真实。
 - 文档集合的新鲜度以快照为准。新增文件需要重新索引；搜索仅重新检查与本次检索相关的源文件，
   而 `status` 会检查现有索引中的全部文档。

@@ -1,263 +1,124 @@
 {
-  "schema_version": "gptgrep.goal.v1",
-  "id": "GPTGREP-RESEARCH-PREVIEW",
+  "schema_version": "gptgrep.goal.v2",
+  "id": "GPTGREP-XL-DOCBENCH-0.2",
   "status": "active",
-  "objective": "Build and iteratively optimize Rust-first GPTgrep with measured SEARCH advantages over raw-only bare Codex using the same base agent; retain PageIndex G5 separately for the first release",
-  "authority": "User project ownership mandate; routine implementation, harness, CI and releases authorized within the agreed direction",
-  "host_defaults": {
-    "model": "gpt-5.6-luna",
-    "experimental_query_planner_model": "gpt-6-luna",
-    "model_reasoning_effort": "max",
-    "service_tier": "fast"
-  },
-  "acceptance_scopes": {
-    "main_goal_convergence": "main_goal_acceptance",
-    "first_release_only": {
-      "gate_ids": [
-        "G3",
-        "G4",
-        "G5"
-      ],
-      "contract_fields": [
-        "advantage_rule",
-        "release_policy",
-        "first_release_gate",
-        "live_execution_rule"
-      ]
-    },
-    "historical_and_first_release_reference": "benchmark",
-    "legacy_host_defaults": "Retained compatibility metadata; the main comparison uses the explicit matched_runtime in main_goal_acceptance, not the historical model in host_defaults",
-    "separation": "Main Goal convergence does not grant first-tag permission; pending PageIndex/G5 conditions do not block same-Codex SEARCH convergence",
-    "shared_engineering_gate_ids": [
-      "G0",
-      "G1",
-      "G2",
-      "G6"
-    ],
-    "existing_delivery_obligations": "D1-D7 implementation, verification and source-delivery obligations remain; comparative convergence does not complete unfinished code, PoUW or backup"
-  },
-  "main_goal_acceptance": {
-    "status": "pending_complete_paired_live_comparison",
-    "protocol": "docs/design/agentic-search-evaluation.md",
-    "estimand": "Actual query experience: raw-only bare Codex versus the same Codex with GPTgrep and a frozen prebuilt index; not isolated algorithm causality",
-    "default_cohort": {
-      "source": "benchmark.repository at benchmark.revision, bound by benchmark.questions_sha256",
-      "task_count": 62,
-      "document_count": 34,
-      "exposure": "historical_development_compatibility_not_unseen",
-      "complete_frozen_cohort_required": true,
-      "pilot_substitution": false,
-      "broader_fresh_cohort": "optional future evidence, not a dependency"
-    },
-    "matched_runtime": {
-      "model": "gpt-6-luna",
-      "model_reasoning_effort": "max",
-      "service_tier": "fast",
-      "policy": "Freeze the same actual reader/base-agent/runtime/common tools and declared resources in both arms; bind judge settings separately and identically"
-    },
-    "arms": {
-      "baseline": "Raw documents only, no precomputed parse/OCR/tree/index; ordinary permitted inspection, extraction, rendering and search tools remain available during the online query budget; the common task prompt with Codex's default base instructions and no GPTgrep answer rules",
-      "treatment": "Same raw documents and base agent/tools, plus GPTgrep tools, its reader contract as base instructions and a frozen index built from raw documents alone"
-    },
-    "treatment_feature_profile": {
-      "declaration": "Freeze exact commands, preparation mode, enabled route/rerank provider/model and available tree/structure/text/OCR/visual paths",
-      "actual_observation": "Distinguish configured availability from actual use, failure or unknown in the trace",
-      "deterministic_harbor_pilot": "Deterministic rich-batch tools without Luna Decisions are protocol/tool-use development evidence only, not a full routing/reranking or System One helper claim",
-      "claim_scope": "No requirement that every mechanism be enabled or win; report the capabilities actually configured and observed",
-      "reader_contract": "GPTgrep's reader contract (base instructions, structured answer/citation/insufficient_evidence schema, abstention rule and generic answer rules) is a declared part of the treatment; the comparison measures the GPTgrep harness, not retrieval alone. An optional bare-Codex-plus-answer-rules arm is a diagnostic, not the primary claim"
-    },
-    "cost_time_boundary": {
-      "excluded": "All pre-query build, parse, render, OCR, enrichment, tree/index preparation costs; judge costs reported separately",
-      "included": "All question-dependent query work, including baseline on-demand raw-document processing and treatment routing/Decisions, retrieval, reading and answering",
-      "accounting": "Retain allowed failed/retried attempts, observed usage/cost and nulls; API-price equivalents are not ChatGPT subscription bills"
-    },
-    "default_primary": {
-      "metric": "task_answer_equivalence",
-      "comparison": "Q_treatment - Q_baseline > 0",
-      "denominator": "All tasks in the frozen paired cohort",
-      "selection": "Preregister before scoring; do not switch metrics or pick best-of task answers after results"
-    },
-    "efficiency_alternative": {
-      "default_selected": false,
-      "selection": "A separate preregistered configuration before results, never an automatic fallback from the default quality claim",
-      "quality_constraint": "Q_treatment >= Q_baseline",
-      "resource_metric": "Exactly one preselected query_cost_per_correct_answer or query_latency endpoint; lower is better",
-      "cost_per_correct": "Sum all selected query-attempt costs divided by confirmed correct answers; unavailable with zero correct answers or incomplete required cost observations",
-      "latency": "Predeclare mean capped time-to-correct: confirmed correct completion before the matching query deadline uses actual duration; incorrect answers and operational failures use that deadline. Judge unknowns remain unresolved. If the treatment has zero confirmed correct answers this endpoint is unavailable; a zero-correct baseline remains comparable at its declared deadlines. Report actual wall time separately from the capped metric",
-      "improvement_threshold": "Strictly lower selected metric; any practical minimum must be declared before results, not imposed as a new default gate"
-    },
-    "failure_and_unknown_policy": {
-      "operational_failure": "Zero score for startup/reader/timeout/missing-answer failure; an empty failed response is not intentional correct abstention",
-      "judge_unknown": "Keep unknown in the fixed denominator; no zero-imputation or omission; report bounds and paired sensitivity, or resolve judging on retained answers",
-      "claim_with_unknowns": "Do not claim the selected advantage if permissible unresolved outcomes can reverse it"
-    },
-    "grounding": "Auxiliary common document/page/quote support where both arms can be assessed; baseline does not require GPTgrep issued IDs; missing common support is unknown",
-    "uncertainty": "Report paired and document-grouped uncertainty where estimable; disclose small/degenerate samples. No required significance, power target or every-slice win",
-    "diagnostics": "INDEX and lexical/tree/Decisions/visual/OCR mechanism ablations are optional explanations, not independent win gates; do not claim an unused rich navigation overlay",
-    "judge_and_integrity": "Freeze rubric and bind each verdict to exact answer/configuration; blind arm identity; isolate gold and prior judge state from fresh readers; retain historical exposure/splits",
-    "stop_rule": "Complete the frozen cohort or declared budget and report partial/failure outcomes; a single pilot or favorable early subset is not completion",
-    "pageindex_third_arm_required": false,
-    "first_release_gate_is_main_goal_dependency": false
+  "objective": "Iteratively improve the Rust-first GPTgrep product and generic harness with measured same-agent SEARCH advantages over raw-only bare Codex on XL-DocBench.",
+  "authority": "User project ownership mandate and explicit 0.2 XL evaluation replacement; routine development, tests, CI and delivery within this direction.",
+  "protocol": "docs/evaluation.md",
+  "benchmark_kit": "benchmark/",
+  "optimization_kit": "self-opt/",
+  "baseline": {
+    "revision": "7fc95f4244e5635a7c5ed29974d63a33e10151f5",
+    "role": "retained reviewed 0.1 product source baseline",
+    "comparison_accepted": false
   },
   "benchmark": {
-    "repository": "https://github.com/VectifyAI/PageIndex-OSS-Benchmark",
-    "revision": "ad4c0b92970a6f4801f09ff2e647389e8f5874fa",
-    "questions_sha256": "f0cc046c0e3bdd4c8c4a4dc977e08e107d21d6a2d22fb8237914111d0f6e256e",
-    "task_count": 62,
-    "document_count": 34,
-    "baseline": "Actual pinned PageIndex Flash/local SDK execution; local Codex backend substitution explicitly identified",
-    "original_oss_reference": {
-      "source": "PageIndex-OSS-Benchmark/results.json at benchmark revision ad4c0b92970a6f4801f09ff2e647389e8f5874fa",
-      "results_sha256": "c3e5f7b6f35dbe312ab54f778a0417cb1b9ecf6f7e2790af07b6372d20fe297e",
-      "runtime": "original local PageIndexClient Flash; no PageIndex Cloud key, OpenAI API key required for hosted LLM",
-      "index_model": "gpt-5.6-luna default, indexing effort unspecified by original run",
-      "chat_model": "gpt-5.6-luna",
-      "chat_reasoning_effort": "high",
-      "correct": 60,
-      "total": 62,
-      "avg_answer_cost_usd": 0.003607,
-      "cost_scope": "answering only; shared one-off indexing omitted; estimated with the original litellm price map; original speed tier is not recorded, Standard alignment is an inference",
-      "original_indexing_cost": {"source": "PageIndex-OSS-Benchmark/documents.json", "source_sha256": "f2625e712db1251976a135e000853df82fa182d547e52ab39d0ea1766d0c44d2", "known_documents": 28, "total_documents": 34, "known_subtotal_usd": 1.619953, "complete": false, "role": "separate descriptive comparison only; six missing costs are unknown"},
-      "role": "published native aggregate quality reference; no per-task paired evidence in results.json"
-    },
-    "qualified_live_reference": "R8 original PageIndex SDK/Flash tools through Codex adapter: index Luna/medium, reader Luna/max/fast, judge Luna/high/fast; 60/62 with paired per-task and tool evidence. Distinct from original results.json.",
-    "first_release_external_model_policy": "Keep the frozen original PageIndex Flash + gpt-5.6-luna results.json baseline without rerunning PageIndex indexing or answering. From this cursor onward GPTgrep candidate/recovery/confirmation builder, planner, reader and judge roles use only gpt-6-luna Fast at xhigh or max; earlier 5.6/high arms remain historical diagnostics. This is a disclosed cross-model and cross-judge whole-system comparison, not a retrieval-only causal comparison. Original results.json has no per-task predictions for rejudging; R8 adapted predictions may be rejudged separately without replacing the original aggregate.",
-    "historical_readme_scores_are_acceptance": false,
-    "gptgrep_only_subset_run_is_baseline": false,
-    "index_reasoning_effort": "medium (documented API default, explicit through adapted runtime)",
-    "index_concurrency": {
-      "summary_upstream": 64,
-      "expansion_upstream": 32,
-      "host_ceiling": 64,
-      "reported_measurement": "observed process overlap; no inferred provider concurrency"
-    },
-    "reader_judge_concurrency": {
-      "reader_ceiling": 5,
-      "judge_ceiling": 5,
-      "strategy": "bounded reader stage followed by bounded independent judge stage",
-      "paired_policy": "Use matching ceilings and stage strategy in both systems; bind changes into new run identities",
-      "accounting": "Include in-flight reservations, failures and interrupted attempts in the shared cap; report measured overlap and actual stage wall time separately"
-    }
+    "source": "https://huggingface.co/datasets/microsoft/XL-DocBench",
+    "revision": "72954bd70ffffe230f08b57c57fa9274ec14d7ea",
+    "manifest": "xldocbench_strict_1345_v1",
+    "document_count": 292,
+    "task_count": 1345,
+    "native_scorer_sha256": "efc56cb25ba136e09ceaccb5d8006ea9461f71a68998f2987073387682a5e547",
+    "source_contract": "benchmark/UPSTREAM.md",
+    "full_context_required": true,
+    "raw_source_verification_required": true
   },
-  "gates": [
-    {
-      "id": "G0",
-      "name": "Source, interface and license evidence",
-      "required": true
-    },
-    {
-      "id": "G1",
-      "name": "Offline correctness, source freshness, bounded execution and independent review",
-      "required": true
-    },
-    {
-      "id": "G2",
-      "name": "Real Jev and local Codex useful outcomes, not transport-only success",
-      "required": true
-    },
-    {
-      "id": "G3",
-      "name": "Actual full-system and upstream SDK execution with qualified tools in the live benchmark",
-      "required": true
-    },
-    {
-      "id": "G4",
-      "name": "Full cohort paired benchmark and ablations under declared comparable conditions",
-      "required": true
-    },
-    {
-      "id": "G5",
-      "name": "Demonstrated advantage with no hidden quality, citation or ingestion regression",
-      "required": true
-    },
-    {
-      "id": "G6",
-      "name": "Verified source/release artifacts, PoUW, backup and continuation",
-      "required": true
-    }
-  ],
-  "advantage_rule": {
-    "quality": "One frozen, independently confirmed complete GPTgrep gpt-6-luna/Fast xhigh/max configuration with gpt-6-luna judge strictly exceeds original PageIndex results.json 60/62: at least 61 correct of all 62 tasks, retaining failures and abstentions in the denominator; original aggregate cannot be rejudged from absent predictions, so disclose cross-judge uncertainty and retain adapted R8 paired disagreements separately",
-    "grounding": "No stale source accepted; citation validity and ingestion coverage at least baseline under the declared scope",
-    "efficiency": "The same qualifying GPTgrep run has complete QA Codex reasoning tokens priced at current Standard API rates plus observed Jev cost, with typed communication/remote-service failed attempts excluded from experimental comparison cost but retained as separate failure/usage/unknown-billing signals, strictly below original PageIndex answer-only estimated $0.003607/question over all 62 tasks; report Fast experimental API-equivalent, both indexing costs and judge cost separately",
-    "uncertainty": "Report repetitions/sample count and paired uncertainty; a small smoke suite cannot establish the complete goal",
-    "missing_metrics": "Unavailable, never zero or success; missing required non-excluded QA model usage, effective tier, Jev cost or price provenance blocks QA cost acceptance; typed communication/remote-service failures may be excluded only from the comparison numerator with separate attempted/known-usage/unknown-billing reporting; generic legacy failures are unclassified; incomplete index cost is a subtotal"
-  },
-  "release_policy": "The first experimental/research-preview publication requires accepted G3-G5: full-system live paired PageIndex-OSS-Benchmark evidence of a minimum verified advantage. Source commits and CI may proceed; no first release tag/publication from partial progress or smoke-only evidence.",
-  "rsi_policy": "Use failures to propose and test scoped changes; keep raw receipts, learned findings and executable policy distinct; no unreviewed global ingestion",
-  "system_contract": {
-    "core": "Jev routing and evidence reranking are mandatory for default search, ask and summarize",
-    "failure_policy": "Missing credentials or provider/schema failures are explicit; no silent local-only downgrade",
-    "primitives": "Explicit regex and lexical operations remain available for exact inspection and controlled ablations",
-    "indexing": "Current parsing and index publication are deterministic local preparation; Jev indexing assistance is not yet implemented",
-    "scope": "Exact source-relative document filtering is applied before lexical/semantic candidate budgets"
-  },
-  "diagnostic_signals": [
-    "answer equivalence",
-    "evidence page recall",
-    "issued citation validity",
-    "tool failures and invalid arguments",
-    "ingestion coverage and time",
-    "end-to-end and stage latency",
-    "model usage",
-    "observed provider cost and missing accounting"
-  ],
-  "embedding_rag_comparator": {
-    "status": "deferred_after_first_research_preview",
-    "required_comparison": false,
-    "milestone": "next-version backlog after successful first research-preview release",
-    "first_release_dependency": false,
-    "execution": "preparation, experiments and benchmarks pending until that milestone",
-    "runtime_scope": "evaluation only; GPTgrep remains vectorless",
-    "requirements": [
-      "pin encoder revision and license",
-      "declare chunking, overlap, cosine/top-k and context budget",
-      "same documents and task scope",
-      "matched reader and judge",
-      "record parser/runtime differences",
-      "retain failures and cost unknowns"
-    ]
-  },
-  "first_release_gate": {
-    "required": "G5",
-    "baseline": "PageIndex Flash + GPT-5.6, exact role profiles recorded and unchanged for the first-release target",
-    "system": "RAW documents -> LiteParse/Rust PageIndex/tgrep build -> required Jev routing/reranking -> local Codex GPT-6 Luna/Fast xhigh/max for builder, planner, reader and judge",
-    "model_ablation": "Earlier predeclared GPTgrep 5.6/high and GPT-6/high arms remain historical diagnostics. Do not launch new GPTgrep 5.6 or high-effort arms or recoveries for this preview. Explore GPT-6 xhigh/max with GPT-6 xhigh/max judge as labelled whole-configuration variants, then freeze a candidate and run a fresh full-cohort confirmation without per-task best-of selection.",
-    "quality_threshold": {"correct_at_least": 61, "denominator": 62, "reference_correct": 60},
-    "cost_threshold": {"usd_equivalent_per_question_strictly_less_than": 0.003607, "gptgrep_scope": "62-question answering Codex planner/reader measured tokens normalized to Standard API prices plus observed Jev routing/reranking cost; exclude only attempts typed as communication/remote-service failures from the comparison numerator, retain them in failure and billing-unknown sidecars; index construction excluded", "reference_scope": "original PageIndex results.json answer-only litellm estimate; indexing excluded; Standard-tier alignment inferred because original speed tier is not recorded", "fast_experiment_cost": "report separately from the Standard-normalized G5 comparison using the actually observed effective Fast/priority tier", "index_cost": "report each system separately; original PageIndex documents.json cost is incomplete for six PDFs and only a known subtotal may be shown", "judge_cost": "reported separately, excluded from both compared retrieval systems", "billing_interpretation": "public API price-card equivalent from observed tokens, not observed ChatGPT subscription charge; exclusion does not assert zero provider bill", "unknown_policy": "no pass when any required non-excluded QA usage, Jev cost, observed experimental tier or applicable price is missing; generic legacy failures do not qualify for exclusion"},
-    "interpretation": "Cross-model results measure whole-system advantage against the user-selected PageIndex baseline; disclose model and adapter effects, and do not claim model-independent retrieval superiority.",
-    "method": "General improvements from clean development signals; complete62-task live A/B, report historical8/54 split separately, no smoke substitution",
-    "partial_source_delivery_is_release": false
-  },
-  "benchmark_integrity": {
-    "hardcoded_task_logic": "forbidden",
-    "forbidden_product_inputs": [
-      "reference answers",
-      "annotated evidence pages",
-      "task identifiers used as answer or route selectors"
+  "matched_runtime": {
+    "supervisor_model": "gpt-6.1-sol",
+    "worker_model": "gpt-6-luna",
+    "ocr_model": "gpt-6-luna",
+    "helper_choices": [
+      "openai/gpt-6-luna-decisions",
+      "typesafe/jev-1.14"
     ],
-    "dataset_loading": "runtime from pinned source, no vendored task question/answer literals",
-    "reader_inputs": "question, protocol-permitted document scope, retrieved source evidence",
-    "scoring_inputs": "gold answers and evidence annotations are isolated to judge/scorer",
-    "regression_tests": "synthetic corpus variations; no benchmark task special cases",
-    "split_policy": "preserve preregistered development/heldout membership; no post-result split redefinition",
-    "pattern_specialization": "Forbidden: benchmark-specific document types/question templates/answer formats/location priors/few-shot task examples",
-    "index_inputs": "Raw documents only; no evaluation questions or annotations",
-    "cross_question_state": "No judge state/gold/previous verdicts in subsequent reader sessions or indexes",
-    "metamorphic_checks": [
-      "renamed files",
-      "moved pages",
-      "reordered sections",
-      "rephrased queries",
-      "changed source facts"
+    "helper_choice_frozen_before_run": true,
+    "reasoning_effort": "freeze exact selected value",
+    "service_tier": "freeze exact selected value",
+    "observed_model_substitution": "failure or separately named experiment; no silent fallback",
+    "native_contract": "benchmark/NATIVE-RUNNER.md"
+  },
+  "arms": {
+    "bare": "Native Codex base, common question/output instructions, complete original PDFs and ordinary shared tools; no GPTgrep Skills, binary, preparation or answer rules.",
+    "gptgrep": "Same native base, question/output instructions, raw context and shared tools plus pinned GPTgrep binary, generic Skills/roles and complete context-scoped preparation."
+  },
+  "isolation": {
+    "roles": "Distinct admitted storage/auth/native state for each reader and judge",
+    "reader_access": "One task workspace plus exact common runtime roots; evaluator material, other tasks and controller output denied",
+    "readback_is_physical_enforcement": false,
+    "gold": "Judge/scorer only",
+    "preparation_inputs": "Raw documents only"
+  },
+  "accounting": {
+    "preparation": "All pre-query build/parse/OCR/render/enrichment/index costs separately reported",
+    "search": "All question-dependent work, including bare raw processing and GPTgrep routing/Decisions",
+    "judge": "Separate from SEARCH",
+    "missing_telemetry": null,
+    "root_usage_is_total_multi_agent_usage": false
+  },
+  "optimization": {
+    "cohort": "Complete enrolled development source groups, frozen before results",
+    "split": "Related contexts, URLs, identical hashes and reviewed families stay together; exposed groups become development",
+    "endpoint": "grounded_success",
+    "comparison": "candidate grounded_success > incumbent grounded_success",
+    "minimum_improvement": "Preregister before results; default strictly positive",
+    "cost_constraint": "Optional and preregistered; missing required observations block it",
+    "scenario_identity": "Dataset/corpus/rubric/scorer/models/effort/tier/environment/preparation/seed/cohort must match",
+    "iteration": "New isolated worktree from frozen 0.2 baseline plus explicit accepted parent delta",
+    "confirmation_feedback_selects_next_parent": false
+  },
+  "outcomes": {
+    "operational_failure": "Started reader failure is zero and retained in the fixed denominator",
+    "setup_failed": "Unknown, retained",
+    "judge_unknown": "Unknown, retained",
+    "pending": "Unknown, retained",
+    "post_result_task_exclusion": false,
+    "per_task_best_of": false,
+    "metrics": [
+      "native_accuracy",
+      "native_token_f1",
+      "native_anls",
+      "grounded_success",
+      "atomic_coverage",
+      "latency",
+      "usage",
+      "available_cost"
     ]
   },
-  "live_execution_rule": {
-    "scope": "complete62-task/34-document live A/B",
-    "smoke_substitution": "forbidden",
-    "offline_tests": "implementation correctness only, not benchmark results",
-    "failures": "all selected tasks remain in denominator",
-    "adapter_qualification": "actual successful source-bound SDK tool roundtrip retained from live benchmark, not process-only acceptance"
+  "release_acceptance": {
+    "status": "pending_separately_enrolled_frozen_confirmation",
+    "scope": "Complete explicitly frozen XL confirmation cohort and matched preregistered advantage; a full-XL claim covers the complete released benchmark",
+    "small_live_substitution": false,
+    "offline_test_substitution": false,
+    "source_delivery_substitution": false,
+    "self_opt_report_grants_release": false,
+    "canary_requires_comparison_acceptance": true,
+    "independent_review_required": true,
+    "engineering_checks_required": true
   },
-  "runtime_privacy": "Use caller-selected authenticated runtime with portable public parameters; custom workstation launchers/account routing remain ignored local-only"
+  "engineering_checks": [
+    "cargo fmt --all -- --check",
+    "cargo test --workspace --locked",
+    "cargo clippy --workspace --all-targets --locked -- -D warnings",
+    "bun run --cwd benchmark test",
+    "applicable wrapper tests",
+    "package self-tests",
+    "runtime staging",
+    "platform source/license and package qualification"
+  ],
+  "delivery": [
+    "commit intended source",
+    "private machine-readable refs/notes/commits PoUW",
+    "verified external Git and notes bundle",
+    "authorized source/tag delivery after applicable checks"
+  ],
+  "integrity": [
+    "No benchmark-specific product code, routing, answer-location priors or examples",
+    "No question/gold/annotation inputs to preparation",
+    "No cross-question judge state in readers",
+    "No private corpus, machine paths or native session identities in public artifacts"
+  ],
+  "retired": {
+    "PageIndex_first_release_gate": "retired by explicit user direction",
+    "full62_evaluation_stack": "removed from active source; retained in Git history"
+  }
 }

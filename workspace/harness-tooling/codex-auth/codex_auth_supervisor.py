@@ -55,7 +55,7 @@ import time
 import unicodedata
 import urllib.parse
 
-SUPERVISOR_VERSION = "1.3.1"
+SUPERVISOR_VERSION = "1.4.0"
 CONFIG_SCHEMA = "gptgrep.codex-auth.config.v1"
 RUN_SCHEMA = "gptgrep.codex-auth.run.v1"
 LEDGER_SCHEMA = "gptgrep.codex-auth.ledger.v1"
@@ -144,8 +144,19 @@ EXTRA_CODEX_CONFIG_KEYS = frozenset({
 SUPERVISOR_PERMISSION_PROFILE = "gptgrep_codex_auth"
 TOOL_PERMISSION_BASES = (":workspace", ":read-only")
 TOOL_PERMISSION_MODES = ("consumer-managed", "unrestricted")
-TOOL_PERMISSION_KEYS = frozenset({"extends", "network_enabled", "deny_paths", "read_paths"})
+TOOL_PERMISSION_KEYS = frozenset({"extends", "network_enabled", "deny_paths", "read_paths",
+                                  "write_paths", "minimal_read", "network_allowed_domains"})
 MAX_PROFILE_PATHS = 64
+MAX_NETWORK_DOMAINS = 64
+DOMAIN_LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+# These apply only to roles that explicitly select an exact-domain proxy policy.
+RESTRICTED_NETWORK_FEATURES = frozenset({"network_proxy", "web_search", "web_search_cached", "web_search_request"})
+RESTRICTED_NETWORK_CONFIG = {
+    "enabled": True, "proxy_url": "http://127.0.0.1:3128", "mode": "full",
+    "enable_socks5": False, "enable_socks5_udp": False, "allow_upstream_proxy": False,
+    "allow_local_binding": False, "dangerously_allow_non_loopback_proxy": False,
+    "dangerously_allow_all_unix_sockets": False, "unix_sockets": {},
+}
 STOP_SCOPES = ("tree", "root-first")
 # Codex 0.162.1 arguments that replace the generated profile for model tool
 # commands. `--sandbox` and every flag that implies it switch config resolution
@@ -181,7 +192,7 @@ CODEX_PINNED_FEATURES = frozenset(PINNED_CODEX_CONFIG["features"])
 # A root inside a denied path is the more specific entry, so it reopens that path.
 CODEX_WORKSPACE_ROOT_FLAGS = frozenset({"-C", "--cd", "--add-dir"})
 CODEX_INSPECTED_VALUE_FLAGS = (CODEX_CONFIG_FLAGS | CODEX_PERMISSION_PROFILE_FLAGS | CODEX_WORKSPACE_ROOT_FLAGS |
-                               {"--enable"})
+                               {"--enable", "--disable"})
 CODEX_BOOLEAN_SHORT_FLAGS = frozenset("hVy")
 # Codex executables: `codex`, release binaries (`codex-aarch64-apple-darwin`) and
 # shims (`codex.js`), in any letter case; not `codex_auth_supervisor.py`.
@@ -461,15 +472,34 @@ def _tool_permissions(value, key):
     if isinstance(value, dict) and set(value) <= TOOL_PERMISSION_KEYS:
         extends = value.get("extends", ":workspace")
         network = value.get("network_enabled", False)
-        if extends in TOOL_PERMISSION_BASES and isinstance(network, bool):
+        minimal_read = value.get("minimal_read", False)
+        if extends in TOOL_PERMISSION_BASES and isinstance(network, bool) and isinstance(minimal_read, bool):
             paths = {name: _profile_paths(value.get(name, []), key + ".tool_permissions." + name,
                                           "config_role_tool_permissions_invalid")
-                     for name in ("deny_paths", "read_paths")}
-            denied = {_path_key(path) for path in paths["deny_paths"]}
-            for path in paths["read_paths"]:
-                if _path_key(path) in denied:
-                    raise SupervisorError("config_role_read_path_equals_deny_path",
-                                          detail=key + ".tool_permissions.read_paths:" + path)
+                     for name in ("deny_paths", "read_paths", "write_paths")}
+            _check_profile_path_conflicts(paths, key)
+            # Preserve the old normalized configuration and receipt shape unless opted in.
+            if not paths["write_paths"]:
+                del paths["write_paths"]
+            if minimal_read:
+                paths["minimal_read"] = True
+            if "network_allowed_domains" in value:
+                domains = value["network_allowed_domains"]
+                detail = key + ".tool_permissions.network_allowed_domains"
+                if not network or not isinstance(domains, list) or not 1 <= len(domains) <= MAX_NETWORK_DOMAINS:
+                    raise SupervisorError("config_role_network_domains_invalid", detail=detail)
+                for domain in domains:
+                    if not isinstance(domain, str) or len(domain) > 253 or "." not in domain or \
+                            not any("a" <= c <= "z" for c in domain.rsplit(".", 1)[-1]) or \
+                            not all(DOMAIN_LABEL_RE.fullmatch(label) for label in domain.split(".")):
+                        raise SupervisorError("config_role_network_domains_invalid", detail=detail)
+                    try:
+                        ipaddress.ip_address(domain)
+                    except ValueError:
+                        pass
+                    else:
+                        raise SupervisorError("config_role_network_domains_invalid", detail=detail)
+                paths["network_allowed_domains"] = list(dict.fromkeys(domains))
             return {"extends": extends, "network_enabled": network, **paths}
     raise SupervisorError("config_role_tool_permissions_invalid", detail=key)
 
@@ -496,6 +526,38 @@ def _reopens(path, denied, resolve=False):
         paths.add(os.path.realpath(path))
         denies.add(os.path.realpath(denied))
     return any(is_within(_path_key(p), _path_key(d)) for p in paths for d in denies)
+
+
+def _overlaps(path, other):
+    return _reopens(path, other, resolve=True) or _reopens(other, path, resolve=True)
+
+
+def _check_profile_path_conflicts(permissions, key):
+    """Refuse ambiguous grants at load and generation, including filesystem aliases."""
+    for access in ("read", "write"):
+        for path in permissions.get(access + "_paths", []):
+            if any(_reopens(path, denied, resolve=True) and _reopens(denied, path, resolve=True)
+                   for denied in permissions["deny_paths"]):
+                raise SupervisorError("config_role_" + access + "_path_equals_deny_path",
+                                      detail=key + ".tool_permissions." + access + "_paths:" + path)
+    for path in permissions["read_paths"]:
+        if any(_overlaps(path, write) for write in permissions.get("write_paths", [])):
+            raise SupervisorError("config_role_read_write_paths_overlap",
+                                  detail=key + ".tool_permissions.read_paths:" + path)
+
+
+def _write_overlaps_run_auth_home(path, runs_root):
+    """Writes may not replace a run's codex-home, its parents or any of its contents."""
+    for candidate in {str(path), os.path.realpath(path)}:
+        for root in {str(runs_root), os.path.realpath(runs_root)}:
+            key, base = _path_key(candidate), _path_key(root)
+            if is_within(base, key):
+                return True
+            if is_within(key, base):
+                parts = Path(key).relative_to(base).parts
+                if len(parts) <= 2 or parts[2] == "codex-home":
+                    return True
+    return False
 
 
 def _is_run_path(path, runs_root, parts, resolve=False):
@@ -657,19 +719,37 @@ class Config:
             raise SupervisorError("config_lease_directory_contains_runs_root")
         for name, role in self.roles.items():
             if isinstance(role["tool_permissions"], dict):
+                if role["tool_permissions"].get("network_allowed_domains"):
+                    for extra in (self.codex_config, role["codex_config"]):
+                        if extra.get("web_search", "disabled") != "disabled":
+                            raise SupervisorError("config_role_network_web_search_must_be_disabled",
+                                                  detail="roles." + name)
                 for path in role["tool_permissions"]["read_paths"]:
                     self._check_read_path(name, path)
+                for path in role["tool_permissions"].get("write_paths", []):
+                    self._check_write_path(name, path)
 
     def _check_read_path(self, role, path):
         """A role's read carve-out may open a path below one of its own denies, but
         never the canonical auth home, any run's auth link, the lease directory or
         an `extra_denied_paths` entry (equal to or inside any of them)."""
         detail = "roles." + role + ".tool_permissions.read_paths:" + path
-        if _reopens(path, self.canonical_auth_home) or _reopens(path, self.lease_path.parent) \
-                or _is_run_auth_link(path, self.runs_root):
+        if _reopens(path, self.canonical_auth_home, resolve=True) or \
+                _reopens(path, self.lease_path.parent, resolve=True) or \
+                _is_run_auth_link(path, self.runs_root, resolve=True):
             raise SupervisorError("config_role_read_path_reopens_credential", detail=detail)
-        if any(_reopens(path, denied) for denied in self.extra_denied_paths):
+        if any(_reopens(path, denied, resolve=True) for denied in self.extra_denied_paths):
             raise SupervisorError("config_role_read_path_reopens_extra_deny", detail=detail)
+
+    def _check_write_path(self, role, path):
+        detail = "roles." + role + ".tool_permissions.write_paths:" + path
+        if _path_key(path) == "/" or os.path.realpath(path) == "/":
+            raise SupervisorError("config_role_write_path_root", detail=detail)
+        if _overlaps(path, self.canonical_auth_home) or _overlaps(path, self.lease_path.parent) or \
+                _write_overlaps_run_auth_home(path, self.runs_root):
+            raise SupervisorError("config_role_write_path_overlaps_credential", detail=detail)
+        if any(_overlaps(path, denied) for denied in self.extra_denied_paths):
+            raise SupervisorError("config_role_write_path_overlaps_extra_deny", detail=detail)
 
     @classmethod
     def load(cls, path):
@@ -1630,7 +1710,7 @@ def render_toml(tree):
     def emit(prefix, table):
         scalars = [(k, v) for k, v in table.items() if not isinstance(v, dict)]
         tables = [(k, v) for k, v in table.items() if isinstance(v, dict)]
-        if prefix and scalars:
+        if prefix and (scalars or not table):
             lines.append("")
             lines.append("[" + prefix + "]")
         for key, value in scalars:
@@ -1652,28 +1732,46 @@ def permission_denials(cfg, layout):
 
 def profile_filesystem(cfg, layout, tool_permissions):
     """Filesystem table of the generated profile: the supervisor's denies, the
-    role's denies, then the role's read carve-outs. Codex 0.162.1 applies the most
+    role's denies, then explicit minimal, read and write grants. Codex 0.162.1 applies the most
     specific entry, so a carve-out can open a path below a role deny. Config load
     refuses one that reopens a supervisor deny; this re-checks against the run's
     actual link with symlinks resolved, before anything is written or launched."""
     denied = permission_denials(cfg, layout)
+    _check_profile_path_conflicts(tool_permissions, "roles." + layout.role)
     entries = {path: "deny" for path in denied + tool_permissions["deny_paths"]}
+    if tool_permissions.get("minimal_read", False):
+        entries[":minimal"] = "read"
     for path in tool_permissions["read_paths"]:
         if any(_reopens(path, item, resolve=True) for item in denied) or \
                 _is_run_auth_link(path, cfg.runs_root, resolve=True):
             raise SupervisorError("role_read_path_resolves_into_denied_path", detail=path)
         entries[path] = "read"
+    for path in tool_permissions.get("write_paths", []):
+        if any(_overlaps(path, item) for item in denied) or \
+                _write_overlaps_run_auth_home(path, cfg.runs_root):
+            raise SupervisorError("role_write_path_resolves_into_denied_path", detail=path)
+        entries[path] = "write"
     return entries
 
 
 def tool_credential_access(cfg, layout, tool_permissions):
     if isinstance(tool_permissions, dict):
         filesystem = profile_filesystem(cfg, layout, tool_permissions)
-        return {"policy": "supervisor_profile", "profile": SUPERVISOR_PERMISSION_PROFILE,
+        result = {"policy": "supervisor_profile", "profile": SUPERVISOR_PERMISSION_PROFILE,
                 "extends": tool_permissions["extends"], "network_enabled": tool_permissions["network_enabled"],
                 "denied_paths": [path for path, access in filesystem.items() if access == "deny"],
-                "read_paths": [path for path, access in filesystem.items() if access == "read"],
+                "read_paths": [path for path, access in filesystem.items()
+                               if access == "read" and path != ":minimal"],
                 "applies_to": "tool commands of consumers that do not select another permission profile"}
+        if tool_permissions.get("minimal_read", False):
+            result["minimal_read"] = True
+        if tool_permissions.get("write_paths", []):
+            result["write_paths"] = [path for path, access in filesystem.items() if access == "write"]
+        if tool_permissions.get("network_allowed_domains"):
+            result.update(network_allowed_domains=list(tool_permissions["network_allowed_domains"]),
+                          network_proxy=True, web_search="disabled",
+                          network_scope="exact domains for sandboxed tool commands; no endpoint or model restriction")
+        return result
     if tool_permissions == "consumer-managed":
         return {"policy": "consumer_managed", "verified_by_supervisor": False}
     return {"policy": "unrestricted", "tool_commands_can_read_credential": True}
@@ -1688,11 +1786,20 @@ def codex_config_tree(cfg, layout, extra, tool_permissions=None):
     root["log_dir"] = str(layout.log_dir)
     tables = {k: v for k, v in tree.items() if isinstance(v, dict)}
     if isinstance(tool_permissions, dict):
+        network = {"enabled": bool(tool_permissions["network_enabled"])}
+        if tool_permissions.get("network_allowed_domains"):
+            if merged.get("web_search", "disabled") != "disabled":
+                raise SupervisorError("config_role_network_web_search_must_be_disabled",
+                                      detail="roles." + layout.role)
+            root["web_search"] = "disabled"
+            tables["features"]["network_proxy"] = True
+            network = dict(RESTRICTED_NETWORK_CONFIG,
+                           domains={domain: "allow" for domain in tool_permissions["network_allowed_domains"]})
         root["default_permissions"] = SUPERVISOR_PERMISSION_PROFILE
         tables["permissions"] = {SUPERVISOR_PERMISSION_PROFILE: {
             "extends": tool_permissions["extends"],
             "filesystem": profile_filesystem(cfg, layout, tool_permissions),
-            "network": {"enabled": bool(tool_permissions["network_enabled"])}}}
+            "network": network}}
     result = dict(sorted(root.items()))
     result.update(tables)
     return result
@@ -1841,21 +1948,31 @@ def _codex_options(argv):
     return options
 
 
-def codex_profile_override(argv):
+def codex_profile_override(argv, restricted_network=False):
     """The first argument of a Codex command line that would replace the generated
     permission profile or undo a pinned key for model tool commands (a flag name,
     `-c KEY` or `--enable FEATURE`), or None."""
+    pinned_features = CODEX_PINNED_FEATURES | (RESTRICTED_NETWORK_FEATURES if restricted_network else frozenset())
     for name, value in _codex_options(argv):
         if name in CODEX_PROFILE_OVERRIDE_FLAGS:
+            return name
+        if restricted_network and name == "--search":
             return name
         if name in CODEX_CONFIG_FLAGS:
             segments = [part.strip().strip("\"'") for part in (value or "").partition("=")[0].split(".")]
             key = segments[0]
             if key in CODEX_PROFILE_CONFIG_KEYS or key in CODEX_PINNED_CONFIG_KEYS:
                 return name + " " + key
-            if key == "features" and (len(segments) == 1 or segments[1] in CODEX_PINNED_FEATURES):
+            if key == "features" and (len(segments) == 1 or segments[1] in pinned_features):
                 return name + " " + ".".join(segments[:2])
+            if restricted_network and key == "web_search":
+                setting = (value or "").partition("=")[2].strip()
+                if len(segments) != 1 or setting not in ('"disabled"', "'disabled'", "disabled"):
+                    return name + " " + key
         if name == "--enable" and (value or "").strip() in CODEX_PINNED_FEATURES:
+            return name + " " + value.strip()
+        if restricted_network and name in ("--enable", "--disable") and \
+                (value or "").strip() in RESTRICTED_NETWORK_FEATURES:
             return name + " " + value.strip()
         if name in CODEX_PERMISSION_PROFILE_FLAGS and value != SUPERVISOR_PERMISSION_PROFILE:
             return name
@@ -1940,7 +2057,7 @@ def consumer_argv_guard(cfg, layout, spec, argv):
         return "not_applicable"
     if not invokes_codex(cfg, argv[0], spec["path_env"] or cfg.path_env, layout.work_dir):
         return "not_a_codex_command"
-    override = codex_profile_override(argv)
+    override = codex_profile_override(argv, restricted_network=bool(tool_permissions.get("network_allowed_domains")))
     if override is not None:
         raise SupervisorError("consumer_argv_overrides_permission_profile", detail=override)
     denied = permission_denials(cfg, layout) + tool_permissions["deny_paths"]

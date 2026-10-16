@@ -64,30 +64,34 @@ An authorized experimental source branch is a collaborator handoff, not a binary
 release or a successful benchmark. Its current development limits are recorded in
 [experimental status](experimental-status.md).
 
-The Cargo workspace and the optional wrapper are version `0.1.0-alpha.1`
+The Cargo workspace and the optional wrapper are version `0.2.0-alpha.1`
 (experimental). Experimental builds keep `0.x.y-alpha.N` versions. The version
 moves to a canary `x.y.z` only after the paired same-Codex benchmark criterion in
 [SPEC](../SPEC.md) passes. A version change alone creates no tag or release. Tags
-need explicit owner authorization, and the first release tag still requires G5.
+need the applicable project authorization and independent acceptance.
 
 ## CI and publication
 
-The first experimental release is gated on a real paired PageIndex-OSS-Benchmark
-result showing a minimum verified advantage over PageIndex Flash plus GPT-5.6.
-The complete GPTgrep system must use its required Jev retrieval and local Codex
-workflow. Source delivery, CI, transport smokes and tree-only controls do not
-satisfy this gate. Preserve task denominators, actual profiles, build/search costs,
-failures, citation checks and the matching source revisions. The comparison rule
-is defined in [SPEC.md](../SPEC.md) and the project goal contract. Do not create or
-push the first release tag while G5 remains unaccepted.
+Release/canary acceptance follows the predeclared matched native Codex comparison
+on XL-DocBench in [SPEC](../SPEC.md), [evaluation](evaluation.md) and the
+[goal contract](../workspace/harness-config/goal-contract.json). Freeze the exact
+cohort, source/runtime identities and success criterion before results; preserve
+failures, unknown outcomes, citation checks and separate preparation/SEARCH/Judge
+accounting. A small live pilot, offline check or source delivery does not establish
+full-benchmark acceptance. The self-opt report cannot grant release acceptance.
+The former PageIndex/full62 gate is retired.
 
-CI runs native Rust formatting, workspace tests, Clippy with denied warnings, the offline retrieval evaluation and its oracle tests, packaging self-tests, the runtime staging regression, and complete license collection on both targets. Separate jobs test the offline PageIndex baseline adapter and the locked optional incur package. The PDFium archive is checksum-verified before use. The official runner table lists `macos-14` as ARM64 and `ubuntu-latest` as x86_64; jobs still verify native target artifacts. [GitHub runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
+CI runs Rust formatting, workspace tests, Clippy with denied warnings, packaging
+self-tests, runtime staging and complete license collection on both native targets.
+Separate jobs check the Bun benchmark/self-opt contracts, the uv-locked Harbor
+verifier and the locked optional incur wrapper. The PDFium archive is checksum-verified before use. Native platform
+acceptance requires that target's completed CI and archive smoke receipt.
 
 The release workflow runs on an existing `vVERSION` tag or a manual dispatch naming that tag. It binds the tag to the Cargo workspace version and exact source revision, runs CI against that revision, builds each native artifact, collects licenses, packages and runs relocation tests, then publishes only after both targets succeed. Only the final publish job has `contents: write`. Checkout credentials are not persisted. The workflow does not publish to crates.io or npm, create a source tag, replace existing release assets, sign binaries or notarize macOS executables. Prerelease version tags produce GitHub prereleases.
 
 Independent source review and project closeout precede the tag push. Preparing these workflow files or passing local checks does not establish that a hosted workflow or public release has run. Triggering the release workflow is a publication action; the project owner performs it after checking the concrete source and retained results.
 
-Action references were resolved from the primary GitHub tag APIs and pinned to actual commit objects on September 22, 2026. The annotated pnpm tag was dereferenced to its commit. The Rust action is pinned to the observed `stable` action commit while the compiler itself is explicitly 1.96.0.
+Existing action references were resolved from the primary GitHub tag APIs and pinned to actual commit objects on September 22, 2026. The Bun and uv actions were additionally resolved on October 16, 2026. The annotated pnpm tag was dereferenced to its commit. The Rust action is pinned to the observed `stable` action commit while the compiler itself is explicitly 1.96.0.
 
 | Action | Verified ref | Commit |
 |---|---|---|
@@ -98,3 +102,5 @@ Action references were resolved from the primary GitHub tag APIs and pinned to a
 | [download-artifact](https://github.com/actions/download-artifact/releases/tag/v8.0.1) | v8.0.1 | `3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c` |
 | [pnpm/action-setup](https://github.com/pnpm/action-setup/releases/tag/v6.1.0) | v6.1.0 | `ea17c68df8912ef543352723c149a84f56e3d413` |
 | [rust-toolchain](https://github.com/dtolnay/rust-toolchain/tree/6bed0761d98439e5a578e2877258200ad565ba87) | stable action revision | `6bed0761d98439e5a578e2877258200ad565ba87` |
+| [setup-bun](https://github.com/oven-sh/setup-bun/tree/0c5077e51419868618aeaa5fe8019c62421857d6) | v2 action revision; Bun 1.3.14 | `0c5077e51419868618aeaa5fe8019c62421857d6` |
+| [setup-uv](https://github.com/astral-sh/setup-uv/tree/37802adc94f370d6bfd71619e3f0bf239e1f3b78) | v7 action revision; uv 0.13.1 | `37802adc94f370d6bfd71619e3f0bf239e1f3b78` |

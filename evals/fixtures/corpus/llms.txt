@@ -1,7 +1,0 @@
-# GPTgrep Fixture Routes
-
-Recovery handbook: ops/recovery.md
-Replication guide: ops/replication.md
-Retention policy: architecture/storage.mdx
-Unicode notes: language/多语言.txt
-

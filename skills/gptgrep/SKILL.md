@@ -38,6 +38,18 @@ For independent work, use the corresponding installed native role if delegation 
 4. Read the evidence needed for the answer. Follow returned continuations when a relevant window is incomplete. Bind citations to fresh evidence actually delivered to the reader.
 5. Check the requested output against the source, artifact, or generation that the job returned. A successful process, a worker message, or a discovered Skill is insufficient by itself.
 
+## Source-linked working memory
+
+For a task that needs several search/read cycles, keep a task-local findings file
+and a working tree overlay using the native filesystem tools. Record each useful
+finding with its original document hash, physical page or delivered text range,
+claim, uncertainty and links to related tree nodes. Use the overlay to connect
+new findings to subsequent navigation; review relevant notes before repeating a
+search or answering. Validate conflicting findings against the original pages.
+These are working artifacts, not extra GPTgrep CLI subcommands. Keep them outside
+the corpus/index input, and do not turn an unsupported note into a citation. The
+final answer must trace material claims back to the original source evidence.
+
 ## Runtime and evidence
 
 Use shell, code execution, image viewing, and other native capabilities when they help the selected task. Respect the runtime's actual permissions and the original job deadline and resource budget. Packaged role guidance does not replace those controls. A caller may run the package inside an independently isolated sandbox with its chosen Codex permission mode; this Skill does not alter host configuration.

@@ -18,8 +18,18 @@
         ".local",
         "runs",
         "handoff",
-        "artifacts"
-      ]
+        "artifacts",
+        "docs/research",
+        "workspace/exec-plans",
+        "workspace/issues",
+        "workspace/handoff",
+        "__pycache__",
+        "evals",
+        "scripts/pageindex_baseline",
+        "workspace/harness-tooling/harbor-ablation"
+      ],
+      "manifest_base": "root",
+      "discovery": "manifest"
     }
   ],
   "skills": [],

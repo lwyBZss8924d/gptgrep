@@ -2,7 +2,7 @@
 
 This guide covers the experimental source in
 [`lwyBZss8924d/gptgrep`](https://github.com/lwyBZss8924d/gptgrep), including the
-native parse/OCR path and the full62 Harbor adapter. Read the
+native parse/OCR path and the XL-DocBench benchmark and self-opt kits. Read the
 [current status](experimental-status.md) for measured outcomes and open gaps.
 [SPEC](../SPEC.md) owns acceptance; these instructions do not change its gates.
 
@@ -53,11 +53,12 @@ gateway policy. Local IPC and provider egress are separate readiness checks.
 | --- | --- |
 | GPTgrep | Rust/Cargo with edition 2024; CI selects Rust 1.96.0, rustfmt and Clippy; use `Cargo.lock` |
 | Native parsing | Pinned LiteParse Rust source and PDFium `chromium/8058`; an existing LibreOffice installation for Office conversion |
-| Codex login and ordinary reader | Caller-selected official Codex CLI; the Harbor common base pins 0.162.1 |
+| Codex login and ordinary reader | Caller-selected official Codex CLI; pin the same native runtime revision in both comparison arms |
 | Native Document/OCR runtime | Caller-selected pinned standalone app-server; retained fixed-image profiles use the derivative described below |
-| Python tools | uv-managed Python 3.12+; the common evaluation image uses Python 3.13 |
-| Raw-document evaluation tools | Python, Pillow 12.3.0, Poppler `pdftotext`/`pdftoppm`, shell, and matching Codex/Code Mode host binaries in both arms |
-| Harbor | Exact `harbor==0.24.0` from the adapter's `uv.lock`, plus an independently managed Docker/Buildx environment |
+| Python tools | uv-managed Python 3.12+; CI uses Python 3.13 for the locked Harbor verifier |
+| Raw-document evaluation tools | The same explicitly qualified PDF extraction/rendering tools, shell and Codex/Code Mode runtime in both arms |
+| Benchmark and self-opt kits | Bun 1.3.14; synthetic contract tests need no npm dependencies |
+| Harbor verifier | `harbor-rewardkit==0.2.3` with its `benchmark/harbor/uv.lock`; a separate Harbor/container execution environment is required only for that optional route |
 | Optional wrapper | Node 24 and pnpm 11.24.0, using `packages/cli/pnpm-lock.yaml` |
 
 ```sh
@@ -66,8 +67,8 @@ export GPTGREP_BIN="$CARGO_TARGET_DIR/release/gptgrep"
 "$GPTGREP_BIN" doctor --json
 "$GPTGREP_BIN" --schema
 "$GPTGREP_BIN" --llms
-"$GPTGREP_BIN" index ./evals/fixtures/corpus --json
-"$GPTGREP_BIN" search 'retention|expiry' ./evals/fixtures/corpus --mode regex --json
+"$GPTGREP_BIN" index ./documents --json
+"$GPTGREP_BIN" search 'retention|expiry' ./documents --mode regex --json
 ```
 
 Plaintext works without loading PDFium. The first native build may download the
@@ -99,10 +100,10 @@ Complete the one-time code in the browser when prompted. Device login must be
 enabled for that ChatGPT account/workspace. `login status` checks authentication
 without printing credentials; model availability and an actual permitted turn
 remain separate checks. See [official Codex authentication](https://learn.chatgpt.com/docs/auth).
-Never put the credential cache in a build context or source commit. Harbor mounts
-the selected cached file read-only at runtime. Trials never refresh it: their
-native children point the token and revoke endpoints at loopback port 0, where
-no process can listen.
+Never put the credential cache in a build context or source commit. For matched
+native evaluation, the [runner contract](../benchmark/NATIVE-RUNNER.md) uses the
+auth supervisor below to provide a distinct per-run home and keep credentials
+out of model tool access. Trials never own credential refresh.
 
 When several roles share one login, run every consumer through
 [`workspace/harness-tooling/codex-auth`](../workspace/harness-tooling/codex-auth/README.md).
@@ -117,8 +118,8 @@ directory. A consumer argv guard refuses Codex command-line overrides, such as
 supervisor scans the run directory for credential links; a finding, or a scan
 that cannot complete, quarantines the run (1.3.1). Entry points that do not route
 through it are unmanaged and stay blocked for shared-login use. Examples are a
-workstation launcher that exports a fixed `CODEX_HOME`, or the harbor-ablation
-Rust harness run on its own; its README lists the known cases.
+workstation launcher that exports a fixed `CODEX_HOME`, or a reader launched
+without the matching lease and role profile.
 Its runbook covers the live sequence, failure recovery and the re-login procedure.
 
 GPTgrep's native roles request `gpt-6-luna`, reasoning effort `max`, service tier
@@ -140,9 +141,9 @@ admitted only when the served build has the same author and family, for example
 are independent.
 
 ```sh
-"$GPTGREP_BIN" search 'How are snapshots retained?' ./evals/fixtures/corpus \
+"$GPTGREP_BIN" search 'How are snapshots retained?' ./documents \
   --mode hybrid --json
-"$GPTGREP_BIN" ask 'How are snapshots retained?' ./evals/fixtures/corpus \
+"$GPTGREP_BIN" ask 'How are snapshots retained?' ./documents \
   --codex-home "$GPTGREP_CODEX_HOME" \
   --model gpt-6-luna --reasoning-effort max --service-tier fast --json
 ```
@@ -283,118 +284,50 @@ start OCR. See [rich batch](rich-batch.md), [native metadata](native-metadata.md
 
 ## Development checks
 
-Use the selected external environment and retain failures as well as final passes:
+Use a checked external run for the selected checkout. Retain failed attempts as
+well as the final pass, and keep the build, caches and temporary directories in
+that run's admitted locations.
 
 ```sh
 cargo fmt --all -- --check
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
-uv venv --python 3.13 "$GPTGREP_DEV_ROOT/eval-venv"
-uv pip sync --python "$GPTGREP_DEV_ROOT/eval-venv/bin/python" evals/requirements.lock
-"$GPTGREP_DEV_ROOT/eval-venv/bin/python" -B -m unittest discover -s evals -p 'test_*.py'
-"$GPTGREP_DEV_ROOT/eval-venv/bin/python" -B scripts/eval.py \
-  --binary "$GPTGREP_BIN" --output "$GPTGREP_DEV_ROOT/results/offline-eval.json"
-"$GPTGREP_DEV_ROOT/eval-venv/bin/python" -B scripts/check_runtime_staging.py \
+bun run --cwd benchmark test
+python3 -B scripts/package_release.py --self-test
+python3 -B scripts/check_runtime_staging.py \
   --script runtime/codex/stage.sh --package . \
   --output "$GPTGREP_DEV_ROOT/results/runtime-staging"
 pnpm --dir packages/cli install --frozen-lockfile --ignore-scripts
 pnpm --dir packages/cli test
 ```
 
-When changing the harbor-ablation Rust harness (its own Cargo workspace, not
-covered by `cargo test --workspace`), run its suite from
-`workspace/harness-tooling/harbor-ablation` as its
-[README](../workspace/harness-tooling/harbor-ablation/README.md) describes, with
-`GPTGREP_MOCK_PYTHON`, `GPTGREP_JUDGE_TEST_PYTHON` and
-`GPTGREP_JUDGE_TEST_PYTHON_SHA256` naming a qualified interpreter and its digest:
-`cargo test --offline --locked --manifest-path harness/Cargo.toml -- --test-threads=1`.
+Set pnpm's store to the selected external location before installation. Use the
+owner-selected uv-managed Python interpreter for the dependency-free packaging
+and staging checks. The [Harbor verifier](../benchmark/harbor/README.md) has its
+own uv-managed, pinned RewardKit dependency and synthetic tests.
+
 When changing `workspace/harness-tooling/codex-auth`, run
 `python3 -I -B tests/run_qualification.py --results-dir DIR` from that directory
-and keep its summary.
+and retain its summary. Native/profile changes also need matching actual runtime
+evidence. Do not count ignored or unrun tests as passes.
 
-Set pnpm's store to the selected external location using the local project/runtime
-configuration before installation. The offline suite does not establish native
-model behavior. A code change needs its relevant regression and the complete
-release checks before release; a native/profile change also needs matching actual
-runtime evidence. Do not count ignored or unrun tests as passes.
+## XL-DocBench and self-opt
 
-## Full62 paired SEARCH through Harbor
+The active workflow is [the evaluation protocol](evaluation.md). Read the
+[XL source contract](../benchmark/UPSTREAM.md) before enrolling verified raw
+material, and the [native runner contract](../benchmark/NATIVE-RUNNER.md) before
+launching isolated Codex readers or the independent judge. Both arms share the
+native base, common prompt, complete original PDFs and ordinary reading tools;
+GPTgrep adds its pinned generic product assets and preparation.
 
-The current adapter is
-[workspace/harness-tooling/harbor-ablation/full62](../workspace/harness-tooling/harbor-ablation/full62/README.md).
-The parent Harbor directory also retains earlier adapter work; use `full62` for
-the approved main comparison.
+`bun benchmark/src/cli.ts freeze` selects a declared development cohort from
+verified local inputs. The `reader` and `judge` commands each use one independently
+supervised child and an exact caller-owned config. `export-harbor` creates
+compatible Harbor tasks; it does not demonstrate upstream oracle parity.
+`bun self-opt/src/cli.ts compare` compares retained run manifests, while `plan-loop`
+records the next isolated product iteration. These commands never turn a small
+live check into full XL acceptance or a canary release. Exact invocation examples,
+source-group splitting, missing-result rules and accounting are in the protocol.
 
-```sh
-export GPTGREP_FULL62_SOURCE="$PWD/workspace/harness-tooling/harbor-ablation/full62"
-export UV_PROJECT_ENVIRONMENT="$GPTGREP_DEV_ROOT/full62-venv"
-uv sync --project "$GPTGREP_FULL62_SOURCE" --frozen
-# Host test extra: the hashed Pillow 12.3.0 lock.
-uv pip install --python "$UV_PROJECT_ENVIRONMENT/bin/python" --require-hashes \
-  -r "$GPTGREP_FULL62_SOURCE/base-image/requirements.lock"
-uv run --project "$GPTGREP_FULL62_SOURCE" --frozen gptgrep-harbor-full62 --help
-uv run --project "$GPTGREP_FULL62_SOURCE" --frozen python -B -m unittest discover \
-  -s "$GPTGREP_FULL62_SOURCE/tests" -v
-```
-
-`uv.lock` pins only the adapter's runtime dependencies (Harbor), while the
-base-image probe test imports Pillow 12.3.0 on the host. Install it into the same
-environment only from hashed requirements: the base image's `requirements.lock`
-above, or a local extras file in the same `pillow==12.3.0 --hash=sha256:...`
-format that lists the host wheel's hash. An exact `uv sync` removes packages
-outside the lock, so reinstall after every sync.
-
-An environment shared between checkouts has one editable install that points at
-only one of them. When reusing such an interpreter for another checkout, run the
-suite with `PYTHONPATH="$GPTGREP_FULL62_SOURCE/src"` (not with `python -I`, which
-ignores it) and record the `gptgrep_harbor.__file__` it imported;
-`tests/test_source_identity.py` fails if the suite imports any other source tree.
-
-For a real run, follow the adapter's sequence: build and verify the common
-Python/Pillow/Poppler/native-Codex foundation; add the complete Linux GPTgrep plus
-PDFium bundle to the treatment derivative; build the treatment index inside that
-Linux image at `/data/corpus` with its product binary, from the raw documents only
-and before any question is exposed (materialization rejects an index whose pinned
-manifest root is not `/data/corpus` or whose sources differ from the pinned
-documents, such as a host-built index); qualify matching reader permissions and account mounts; pin
-the owner-approved reader seccomp profile that both reader containers need for Codex's
-bubblewrap sandbox (the adapter's `seccomp/` directory); supply
-the frozen private cohort and Judge contract; select one treatment Decisions mode
-(an existing shared ledger, per-trial preparation, or invocation-bounded contexts
-with one create-new host claim per treatment trial, a pinned price and a cohort
-cost cap that is checked at admission, not enforced at runtime); prepare all 124
-tasks; build exact role images; run the generated Harbor job; aggregate all paired
-outcomes. Its `prepare`,
-`build-local-images` and `aggregate` commands require pinned manifests; `prepare`
-prints its budget preflight before writing tasks. `harbor run -c GENERATED_JOB_JSON`
-uses the same installed adapter environment and a fresh admitted output namespace,
-with one attempt and no automatic retry.
-
-Raw Codex receives only original documents and may extract/render during SEARCH.
-GPTgrep receives the same bytes plus a frozen index built before question access.
-Both readers use the same selected native binary and generic raw-document tools,
-with identical configuration bytes that disable hosted web search, the host-side
-connector, plugin and tool-suggestion features, and model-tool network access.
-Both reader containers run under the same seccomp profile, which adds only the
-namespace calls bubblewrap needs to Docker's default; the Judge keeps the default.
-GPTgrep's reader contract (base instructions, citation and abstention rules and
-answer rules) is part of the treatment; the raw-only reader receives the common
-task prompt with Codex's default base instructions. In either reader mode the
-primary raw-only prompt omits GPTgrep's answer rules and Skills. Freeze the actual
-adapter input bytes; keep effective native base-instruction hashes unknown when
-the runtime does not expose them.
-The Judge runs in a separate environment with the complete answer and frozen
-reference, not the reader's history. Task failures stay in the denominator;
-unavailable judging stays unknown. INDEX and Judge costs are separate from
-question-dependent SEARCH. See the [evaluation protocol](design/agentic-search-evaluation.md)
-for the unchanged primary metric and missing-result rules.
-
-The private 62-task cohort, accepted image/account controls, budget state and
-prebuilt index are not distributed. Synthetic adapter checks can run from source;
-they do not make a real paired run ready or prove an advantage. The full62 paired
-comparison and full34 native PTC indexing remain open live gates; see the
-[experimental status](experimental-status.md). The first paired run uses a frozen
-zero-model text index. Build it inside the Linux treatment image at the
-in-container corpus root, from raw documents only and before question exposure.
-The product binds a generation to its canonical root, so an index built on the
-host fails with `index identity mismatch; reindex at current root`.
+The old PageIndex/full62 scripts are retired. Their source remains in Git history;
+new runs do not depend on that environment or its historical release gates.

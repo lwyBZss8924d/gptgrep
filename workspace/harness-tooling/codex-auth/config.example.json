@@ -46,6 +46,30 @@
       "_comment": "Plain Codex consumers (account-probe, codex exec, app-server clients that select no permission profile): tool commands are denied the canonical auth home, the run's auth link, the lease directory, every extra_denied_paths entry and the role's deny_paths; read_paths re-open subpaths of the role's own denies only. A codex command line that selects another sandbox or permission source, or a working or added directory inside a deny, is refused before launch."
     },
     "test": {"tool_permissions": {"extends": ":workspace", "network_enabled": false}},
+    "native-task": {
+      "tool_permissions": {
+        "extends": ":read-only",
+        "network_enabled": false,
+        "deny_paths": ["/"],
+        "minimal_read": true,
+        "read_paths": ["/path/to/runtime/tools"],
+        "write_paths": ["/path/to/workloads/task"]
+      },
+      "_comment": "Requires supervisor 1.4.0 or later. Replace the write root with the exact physical task cwd and the read roots with only its declared common runtime directories; keep gold and private evaluator material outside these grants. Select gptgrep_codex_auth in the native consumer. Auth, lease and run auth-link denies remain enforced."
+    },
+    "native-network-task": {
+      "tool_permissions": {
+        "extends": ":read-only",
+        "network_enabled": true,
+        "network_allowed_domains": ["openrouter.ai"],
+        "deny_paths": ["/"],
+        "minimal_read": true,
+        "read_paths": ["/path/to/runtime/tools"],
+        "write_paths": ["/path/to/workloads/task"]
+      },
+      "codex_config": {"approval_policy": "never"},
+      "_comment": "Optional exact-domain tool network with managed proxy and web search disabled. This allows the host, not a particular endpoint or model. Use identical domains for comparison arms; allow_openrouter and OPENROUTER_API_KEY passthrough are a separate explicit treatment-role choice. Use the proxy address injected into tool commands at runtime. Replace physical runtime/task paths and qualify the native consumer's unchanged profile before use."
+    },
     "eval-baseline": {
       "tool_permissions": "consumer-managed",
       "_comment": "GPTgrep native roles select their own deny-root permission profiles; the supervisor records this as unverified."

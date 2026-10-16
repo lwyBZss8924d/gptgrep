@@ -1,7 +1,0 @@
-{
-  "adapter_id": "gptgrep-full62",
-  "status": "NOT_RUN",
-  "runs": 0,
-  "metrics": [],
-  "notes": "The adapter's synthetic contract tests and real Harbor 0.24.0 schema/interface checks have run. No original or Harbor-side benchmark experiment, Docker trial, model call or parity validation has run. Historical PageIndex results remain separate and cannot be substituted for this paired experiment."
-}

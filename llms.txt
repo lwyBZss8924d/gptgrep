@@ -1,22 +1,25 @@
 # GPTgrep project navigation
 
 - [Project authority](AGENTS.md): implementation, verification, review and delivery.
+- [Execution and delivery workflow](workspace/harness-config/workflow.txt): proportionate changes, validation, private evidence and closeout.
+- [Checkpoint template](workspace/harness-config/templates/checkpoint.json): fields for a local continuation cursor.
+- [GPTgrep agent Skill](skills/gptgrep/SKILL.md): source-linked evidence working memory and product tool composition.
 - [Product specification](SPEC.md): interfaces, initial release and long-horizon research goal.
-- [Evaluation protocol](docs/design/agentic-search-evaluation.md): main same-Codex SEARCH comparison, treatment feature profile (including GPTgrep's reader contract), cost/time boundary and Judge.
-- [Goal contract](workspace/harness-config/goal-contract.json): main same-Codex SEARCH comparison against raw-only bare Codex (`main_goal_acceptance`) and the separate PageIndex G3–G5 first-release gate (`first_release_gate`); source delivery or a preview build meets neither.
+- [Evaluation protocol](docs/evaluation.md): matched native Codex with GPTgrep versus bare on XL-DocBench, fixed denominators, separate preparation/SEARCH/Judge accounting and frozen confirmation.
+- [Goal contract](workspace/harness-config/goal-contract.json): 0.2 models, matched arms, development selection and distinct XL release acceptance; small live runs and source delivery do not establish canary readiness.
 - Local research gaps: `workspace/issues/research-gaps.json` (ignored and untracked).
 - Local execution plans: `workspace/exec-plans/` (ignored and untracked).
 - [Architecture](docs/architecture.md): parsing, trees, trigram filtering, Jev and the local Codex host.
 - [PTC multimodal design](docs/design/ptc-multimodal-retrieval.md): implemented batch retrieval, Luna Decisions, rich parsing and Agentic OCR contracts; complete live integration and release gates remain pending.
 - [Development setup](docs/development.md): external build storage, native runtime, authentication, parse/OCR controls and evaluation environment.
 - [Codex auth supervisor](workspace/harness-tooling/codex-auth/README.md): shared-login lease, per-run CODEX_HOME, single refresh owner; route every shared-login live consumer through it.
-- [Experimental status](docs/experimental-status.md): D1–D7 progress, aggregate checkpoints, retained failures and the next live experiment.
+- [Experimental status](docs/experimental-status.md): retained product baseline and current 0.2 validation/acceptance limits.
 - Local research entry: `docs/research/README.md` (ignored and untracked).
 - [Flash stage coverage](crates/gptgrep-pageindex/FLASH_STAGE_COVERAGE.md): verified port stages, LiteParse alternatives and pending parity.
-- Local paired plan: `docs/research/paired-baseline-plan.md` (ignored and untracked).
-- [Baseline runner](scripts/pageindex_baseline/README.md): reproducible controls, execution and accounting.
+- [XL benchmark source contract](benchmark/UPSTREAM.md): pinned release/scorer, raw-source verification, complete cross-document context and rights.
+- [Native benchmark runner](benchmark/NATIVE-RUNNER.md): isolated readers, independent judge, exact profiles and runtime evidence.
+- [Self-opt CLI](self-opt/src/cli.ts): compare complete retained measurements and plan isolated product iterations.
 - [Local host defaults](config/codex-host.toml): gpt-6-luna / max; account selected at runtime.
-- [Full paired evaluation](workspace/harness-tooling/harbor-ablation/full62/README.md): 62 tasks, 34 raw documents, 124 SEARCH trials, separate Judge and INDEX accounting.
 - [Release workflow](docs/release.md): source binding, native dependency notices, relocation and the experimental version policy.
 - Native parse/OCR indexing: `gptgrep parse-agent serve|run|agent|qualify` and `gptgrep index ROOT --parse-agent-config ... --document-agent-controls ...`; see the [prepared-document agent](docs/architecture.md#prepared-document-agent).
 - `search|ask --multimodal` (v2 text/visual routing and reranking) and `ask --native-ptc --codex-permissions PROFILE` (native final reader sharing the tool budget; no citation authority from native output).

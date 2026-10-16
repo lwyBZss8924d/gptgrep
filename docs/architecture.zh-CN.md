@@ -29,9 +29,13 @@ flowchart TD
   I --> K[经过验证的引用与可选摘要]
 ```
 
-当前实现与未完成的 live gate 见[实验状态](experimental-status.md)，可移植构建、独立
-Codex 登录、原生 runtime 和 full62 环境见[开发说明](development.md)。完整 34 文档
-原生流水线与 62 对 SEARCH 尚未验收；INDEX 成本单列，PageIndex G5 首发门槛独立保留。
+当前实现见[实验状态](experimental-status.md)，可移植构建、独立 Codex 登录和原生 runtime
+见[开发说明](development.md)。0.2 开发线按 [XL-DocBench 评估协议](evaluation.md)比较同一原生
+Codex 智能体使用 GPTgrep 与裸 Codex；[基准工具包](../benchmark/UPSTREAM.md)与
+[自优化工具包](../self-opt/src/evaluate.ts)分别负责评估和开发迭代选择。
+监督模型为 `gpt-6.1-sol`，worker／OCR 为 `gpt-6-luna`，辅助模型显式选择 Luna Decisions 或 Jev 1.14。
+准备、SEARCH 与判分分别计量。旧 PageIndex／full62 评估与首发门槛已退役；小规模 live／调试检查不能
+代表完整 XL 结果或 canary 验收，后者需要事先固定的完整确认集合、匹配比较优势及独立审查。
 
 ## 模块职责
 
@@ -290,14 +294,16 @@ Base64 与 JSON 封装均计入完整请求体上限。
 总时限也包括初始检索。空范围或仅包含过期源的范围不能证明重排成功。
 摘要与检索使用真实的源文档证据；模型生成的引用必须能够解析到本次运行实际返回过的证据，
 且在完成时仍保持新鲜。检索阅读器的指令（受限与原生两种）增加两条通用的回答规则：
-按问题要求的形式先给出直接答案；当已读证据按问题原意回答了该问题时，确定该答案并引用证据，
-而不是含糊其辞；当问题依赖某一具体段落时，先阅读被引用的注释或章节，解析该段落所依赖的文内引用
-（脚注或尾注标记、引文编号、“见表／见节”之类的指引）后再回答。这些规则只说明何时确定答案，
-从不放宽弃答：所有证据、引用与弃答规则保持不变，证据缺失或无法支持答案时仍须设置
-`insufficient_evidence: true`。富文本与多模态阅读器不接收这些规则。这些规则属于 GPTgrep 的
-reader 合同，主比较将其视为实验处理的一部分。full62 的主要裸 Codex 组在两种 reader 模式下
-都只接收共同问题与原始文档范围，使用 Codex 默认 base instructions，不接收 GPTgrep 的回答规则
-或 Skills。可选的裸 Codex 加规则诊断必须有独立的实验组身份。
+按问题要求的形式先给出直接答案；当问题依赖某一具体段落时，先阅读被引用的注释或章节，
+解析该段落所依赖的文内引用（脚注或尾注标记、引文编号、“见表／见节”之类的指引）后再回答。
+所有证据、引用与弃答规则保持不变；证据缺失或无法支持答案时仍须设置 `insufficient_evidence: true`。
+富文本与多模态阅读器不接收这些附加规则。这些规则属于 GPTgrep 的 reader 合同。
+
+XL 比较的两组均保留相同的原生 Codex 基础，接收相同的问题、完整原始文档上下文与输出要求。
+GPTgrep 组额外获得固定版本的通用 Skills／角色、二进制和完整预处理产物，作为声明的实验处理。
+问题、标准答案与证据标注不得进入索引准备；标准答案、证据标注和判分状态只属于独立 evaluator，不能进入 reader。
+因此，这一比较衡量整个产品配置的效果，不能单独归因为检索。具体模型、权限、工具、预算、隔离与
+确认集合要求以[评估协议](evaluation.md)为准。
 
 `HostConfig.native_ptc`（默认 false）和 `--native-ptc` 为最终检索 reader 选择原生执行。必须在
 turn 开始前确认一个已存在的命名权限 profile。原生配置继承所选运行时的 Code Mode、MCP、web 及

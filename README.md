@@ -21,28 +21,23 @@ an [incur CLI covering the native operations](packages/cli/README.md), and
 [direct Rust APIs with a runnable composition example](docs/rust-sdk.md).
 Document/OCR callers choose their native capabilities, permissions, job budgets
 and package root; GPTgrep stages the selected guidance in each actual work directory.
-The core optimization goal is the actual **GPTgrep harness versus bare Codex
-ablation study**: the same Codex reader runtime on 62 paired tasks, with INDEX
-reported separately from SEARCH reward and cost. GPTgrep's reader contract (its
-base instructions, citation and abstention rules, and answer rules) is part of the
-treatment; the bare arm receives the common task prompt with Codex's default base
-instructions. The source includes the native pipeline and full62 Harbor adapter;
-complete 34-document native indexing remains unaccepted and the 124 paired SEARCH
-trials have not run. Component qualifications and treatment-only development runs
-support that comparison; they do not replace it. Its Goal is separate from the G5
-tag gate.
+The active optimization compares **GPTgrep with bare native Codex on XL-DocBench**.
+Both arms use the same native base, question, complete raw context and shared
+reading tools; GPTgrep adds its pinned binary, generic Skills and preparation.
+Preparation, question-dependent SEARCH and independent judging have separate
+accounting. The released XL manifest has 292 documents and 1,345 questions;
+a declared development subset does not establish full-benchmark acceptance.
+See the [evaluation protocol](docs/evaluation.md), [benchmark kit](benchmark/UPSTREAM.md)
+and [self-opt CLI](self-opt/src/cli.ts).
 
-This is development source at version `0.1.0-alpha.1`, an experimental
-pre-release; [SPEC](SPEC.md) states the version policy. The first experimental
-release requires a verified minimum live advantage over PageIndex Flash plus
-GPT-5.6 on PageIndex-OSS-Benchmark.
-The original local PageIndex OSS `results.json` reports 60/62 with Luna/high;
-our separately qualified live SDK/Codex control also reports 60/62 with Luna/max.
-These runs have distinct model/backend and evidence provenance.
-See [architecture](docs/architecture.md)
-and the explicit
-[Flash stage coverage](crates/gptgrep-pageindex/FLASH_STAGE_COVERAGE.md).
-Maintainer research notes under `docs/research/` are local-only and untracked.
+This is development source at version `0.2.0-alpha.1`. The version remains
+experimental until the predeclared matched comparison and independent release
+checks in [SPEC](SPEC.md) pass. Small live runs, offline checks and source delivery
+do not establish canary readiness. The former PageIndex/full62 evaluation stack
+is retired; its history remains in Git. PageIndex's product algorithm provenance
+and [Flash stage coverage](crates/gptgrep-pageindex/FLASH_STAGE_COVERAGE.md) remain
+applicable. Maintainer research notes under `docs/research/` are local-only and
+untracked.
 
 `gptgrep enrich` is an explicit, model-assisted step after local `index`. Its
 `--plan-only` mode walks the full canonical document corpus and fixes a bounded
@@ -172,7 +167,7 @@ entry and does not source shell code, copy an env file, or echo its value.
 gptgrep search 'how can a damaged journal be recovered?' ./documents \
   --model typesafe/jev-1.13 --min-score 0.5 --json
 
-gptgrep judge --input evals/requests/decision-smoke.json \
+gptgrep judge --input ./decision-request.json \
   --model '~typesafe/jev-latest' --json
 ```
 
@@ -335,14 +330,11 @@ a summary is scoped to its selected node's document. Follow-up searches default
 to hybrid; tree reads and explicit exact refinements build on the initial result.
 Reports retain Jev coverage, actual model and usage alongside Codex usage.
 
-The text retrieval reader (restricted or native) also receives generic answer
-rules. They tell it to lead with the direct answer in the form the question asks
-for; to commit to that answer and cite it when the evidence it has read answers
-the question as asked; and to resolve in-text references (note markers, citation
-numbers, see-table or see-section pointers) by reading the referenced passage.
-The rules never relax the evidence, citation or `insufficient_evidence` rules.
-Rich text and multimodal readers do not receive them. They are part of GPTgrep's
-reader contract.
+The text retrieval reader (restricted or native) resolves in-text references
+that a passage depends on, such as note markers, citation numbers and section
+pointers, by reading the referenced passage before answering. Evidence, citation
+and `insufficient_evidence` rules remain in force. Rich text and multimodal
+readers have their own contracts.
 
 In the default restricted mode, the host creates an ephemeral stdio app-server
 thread with an empty execution environment and bounded GPTgrep
@@ -431,8 +423,7 @@ typed workflow primitive. Its input is `{instructions, state, schema}` and its
 output includes schema-validated `value`, model/effort, usage and input digests.
 The default combined input budget is 256 KiB, explicitly adjustable up to 1 MiB;
 prompts are never silently truncated. This completion mode does not claim citation
-verification. It supports the declared provider bridge used to run original
-PageIndex summary/optimization prompts during comparative evaluation.
+verification.
 
 The app-server API is experimental. Supported boundaries and configuration are
 recorded in [the host crate documentation](crates/gptgrep-host/README.md).
@@ -481,35 +472,34 @@ published registry version during this investigation.
 
 ## Verification and evidence
 
-Configure the explicit external output paths and uv environment in
-[development setup](docs/development.md) before running these checks. Python
-checks use Python 3.12 or newer and the repository lockfiles.
+Configure the checked external storage paths in [development setup](docs/development.md)
+before running builds or tests. The benchmark and self-opt contract tests use Bun
+and synthetic material; they do not call a model or require npm dependencies.
 
 ```sh
 cargo fmt --all -- --check
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
-uv venv --python 3.13 "$GPTGREP_DEV_ROOT/eval-venv"
-uv pip sync --python "$GPTGREP_DEV_ROOT/eval-venv/bin/python" evals/requirements.lock
-"$GPTGREP_DEV_ROOT/eval-venv/bin/python" -B -m unittest discover -s evals -p 'test_*.py'
-"$GPTGREP_DEV_ROOT/eval-venv/bin/python" -B scripts/eval.py \
-  --binary "$CARGO_TARGET_DIR/release/gptgrep" \
-  --output "$GPTGREP_DEV_ROOT/results/offline-eval.json"
+bun run --cwd benchmark test
+python3 -B scripts/package_release.py --self-test
+python3 -B scripts/check_runtime_staging.py \
+  --script runtime/codex/stage.sh --package . \
+  --output "$GPTGREP_DEV_ROOT/results/runtime-staging"
+pnpm --dir packages/cli test
 ```
 
-The fixture suite covers regex correctness, lexical retrieval, Unicode, exact
-source digests/byte ranges, stale replacement/deletion and reindexing. Native
-parser tests cover real generated PDFs, bookmarks, textless-document rejection and
-more than 1,000 pages. The merge-stage fixtures execute the pinned upstream pure
-functions for comparison. Mock Codex/HTTP tests establish transport invariants;
-live host/provider receipts are separate evidence.
+The Rust suites cover retrieval, source-bound evidence, parser/native runtime
+contracts and mocked provider failures. Wrapper and staging tests check the
+published integration surfaces. Ignored tests and opt-in native fixtures need
+their own qualified inputs; an offline pass does not establish live behavior.
 
-External PageIndex data is referenced by a pinned manifest and is not redistributed.
-Running GPTgrep on that subset is distinct from executing the original PageIndex
-SDK baseline. Historical upstream benchmark numbers are not GPTgrep measurements.
-See [the baseline runner](scripts/pageindex_baseline/README.md) for denominators,
-ablation boundaries, failed cases and cost accounting. Detailed local research
-and experimental interpretation remain under the ignored `docs/research/` path.
+The [XL source contract](benchmark/UPSTREAM.md) pins the released tasks and native
+scorer. Original PDFs, answers, judge inputs and exact runtime receipts remain
+private. The [native runner](benchmark/NATIVE-RUNNER.md) runs isolated readers and
+an independent judge; [self-opt](self-opt/src/cli.ts) compares complete retained
+measurements and refuses promotion from unknown outcomes. See the
+[evaluation protocol](docs/evaluation.md) for fixed denominators, source-group
+splits, cost boundaries and separate frozen confirmation.
 
 ## Limits of this release
 
@@ -526,10 +516,6 @@ and experimental interpretation remain under the ignored `docs/research/` path.
   no extractable text, such as a scanned PDF, and the previous generation stays
   current. Such corpora need explicit rich ingestion with `--ocr auto` or
   parse-agent indexing.
-- The reader's answer-commitment rule is under evaluation: in development
-  measurements of the Opt-1 change that introduced it, failed runs fell but
-  answers to unanswerable questions rose; see the
-  [experimental status](docs/experimental-status.md).
 - Semantic candidate budgets can miss relevant documents/nodes. Jev cannot rescue
   evidence excluded upstream; its scores are not a truth guarantee.
 - Corpus freshness is a snapshot contract. Rerun indexing for new files; a search

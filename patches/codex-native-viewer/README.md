@@ -61,9 +61,9 @@ account routing, reader evidence and runtime identities; operators must prepare
 their own controls from the published types and verify their exact runtime.
 
 Scoped Page and Document image components have live evidence in the maintained
-development environment. Complete-corpus OCR/indexing and the full62 paired
-comparison remain open; [experimental status](../../docs/experimental-status.md)
-records the distinction and the latest retained failure.
+development environment. Complete-corpus OCR/indexing and matched XL-DocBench
+acceptance remain separate; the [evaluation protocol](../../docs/evaluation.md)
+defines the current comparison and its limits.
 
 The GPTgrep entry points are `parse-agent serve` for an external PTC client,
 `parse-agent run` for complete deterministic parsing, `parse-agent agent` for

@@ -4,8 +4,8 @@
     {
       "source_path": "runtime/codex/AGENTS.md",
       "target_path": "AGENTS.md",
-      "bytes": 2794,
-      "sha256": "f0d64bccb38e70a907f49f2620dce1fc42a967eaf5acce708e44bb63f92c1c0b"
+      "bytes": 3525,
+      "sha256": "aedd7c59c04a2534343bf59e873ea6884a3f468fc5d0c7713e736220c3dc5a19"
     },
     {
       "source_path": "runtime/codex/agents/gptgrep-document.toml",
@@ -28,8 +28,8 @@
     {
       "source_path": "skills/gptgrep/SKILL.md",
       "target_path": ".agents/skills/gptgrep/SKILL.md",
-      "bytes": 5188,
-      "sha256": "d568706b1a1a1551bac00f961f441eb8f4c2506bbd2c3dbeffae77eba32cce9d"
+      "bytes": 5944,
+      "sha256": "c5d8b03c75eadf64cf39fb182a376a4a55f1af4256c25d03e83123b1646367cd"
     },
     {
       "source_path": "skills/gptgrep-document/SKILL.md",

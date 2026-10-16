@@ -34,8 +34,9 @@ flowchart TD
 The current implementation and pending live gates are recorded in the dated
 [experimental status](experimental-status.md). [Development setup](development.md)
 separates ordinary local retrieval, native Page/Document runtime preparation and
-the full62 paired SEARCH workflow. INDEX preparation is measured separately from
-question-dependent SEARCH; PageIndex G5 remains a separate first-release gate.
+the XL-DocBench comparison and self-opt workflow. Preparation is measured
+separately from question-dependent SEARCH and judging; see the
+[evaluation protocol](evaluation.md) for development and frozen confirmation.
 
 ## Module ownership
 
@@ -391,21 +392,15 @@ Jev coverage and usage alongside Codex usage, and the overall deadline includes
 initial retrieval. Empty or stale scopes do not establish successful reranking.
 Summary and retrieval use actual source evidence; model-produced citations must
 resolve to evidence issued during that run and remain fresh at completion.
-The retrieval reader's instructions (restricted and native) add two generic
-answer rules: lead with the direct answer in the form the question asks for, and
-commit to it, citing it, when the evidence read answers the question as asked;
-and, when the question depends on a specific passage, resolve the in-text
-references it relies on (footnote or endnote markers, citation numbers, see-table
-or see-section pointers) by reading the referenced note or section before
-answering. The rules say when to commit, never when to stop abstaining: every
-evidence, citation and abstention rule is unchanged, including
-`insufficient_evidence: true` when evidence is missing or cannot support the
-answer. Rich text and multimodal readers do not receive these rules. The rules
-are part of GPTgrep's reader contract, which the main comparison treats as part
-of the treatment. The full62 primary raw-only arm receives the common question
-and raw-document scope with Codex's default base instructions, without GPTgrep's
-answer rules or Skills, in either reader mode. An optional bare-plus-rules
-diagnostic would require a distinct arm identity.
+The retrieval reader's instructions (restricted and native) require resolving
+in-text references that a passage depends on, such as notes, citation numbers and
+section pointers, before answering. Evidence, citation and abstention requirements
+remain in force, including `insufficient_evidence: true` when source evidence
+cannot support an answer. Rich text and multimodal readers have their own
+contracts. The XL comparison keeps Codex's native base and common task prompt
+identical in both arms; the treatment adds GPTgrep's generic assets and records
+actual use. It does not replace the bare reader's native base with product
+instructions. See [evaluation](evaluation.md) for the declared treatment profile.
 
 `HostConfig.native_ptc` (default false) and `--native-ptc` select native
 execution for the final retrieval reader. An existing named permission profile

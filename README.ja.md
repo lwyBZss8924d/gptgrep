@@ -20,19 +20,22 @@ Jev によるルーティングと再ランキングを必須とします。`ask
 [直接使える Rust API と実行可能な組み合わせ例](docs/rust-sdk.md)を提供します。
 Document／OCR の呼び出し側は、ネイティブ機能、権限、ジョブ予算、パッケージのルートを選び、GPTgrep は
 選ばれたガイダンスを実際の各作業ディレクトリに配置します。
-中核となる最適化目標は、実際の **GPTgrep harness と素の Codex のアブレーション研究**です。62 組の
-タスクで同じ Codex reader ランタイムを比較し、INDEX は SEARCH の報酬・コストと分けて報告します。
-GPTgrep の reader 契約（基本指示、引用と回答保留の規則、回答規則）は処置（treatment）の一部です。
-素の Codex 側は共通のタスクプロンプトだけを受け取り、Codex の既定の基本指示を使います。ソースには
-ネイティブパイプラインと full62 Harbor adapter が含まれますが、34 文書全体のネイティブ索引は未受理で、
-124 回の対になった SEARCH 試行はまだ実行していません。コンポーネントの検証と処置側のみの開発実行は
-この比較を支えるものであり、比較の代わりにはなりません。この Goal は G5 のタグ条件とは別です。
+現在の `0.2.0-alpha.1` 開発系列は、固定した XL-DocBench のタスク集合で、**同じネイティブ Codex
+エージェントによる GPTgrep 使用時と素の Codex** を比較します。両側に同じ質問、完全な原文書の
+コンテキスト、出力指示を渡し、共通のネイティブツールを維持します。GPTgrep 側にはさらに固定版の
+バイナリ、汎用 Skills／ロール、そのコンテキスト全体の前処理成果物を渡します。
+監督モデルは `gpt-6.1-sol`、worker と OCR は `gpt-6-luna`、補助モデルは Luna Decisions または
+Jev 1.14 を明示的に選びます。比較前にモデル、ランタイム、権限、予算を固定し、設定と実測を分けて
+記録します。これらの比較設定は製品の CLI の既定値を変更しません。クエリ前の準備は別計測とし、
+質問に依存する処理はすべて SEARCH に、判定のコストは別枠に計上します。
 
-これは開発中のソースで、バージョンは実験的プレリリースの `0.1.0-alpha.1` です。バージョン方針は
-[SPEC](SPEC.md)にあります。最初の実験版を公開するには、PageIndex-OSS-Benchmark の実測で、
-PageIndex Flash と GPT-5.6 の組み合わせに対する最小限の優位性を確認する必要があります。
-元のローカル PageIndex OSS `results.json` は Luna/high で 60/62、別途検証した SDK/Codex の
-live 対照は Luna/max で 60/62 です。モデル、バックエンド、証拠の来歴は別々に記録します。
+[評価プロトコル](docs/evaluation.md)が現在の受け入れ条件を定め、[ベンチマークキット](benchmark/UPSTREAM.md)が
+ソースとタスクの契約を保持し、[自己最適化キット](self-opt/src/evaluate.ts)が開発の反復を比較します。
+既定の開発目標は、同じ登録済みタスク全体で根拠に裏付けられた成功率を高めることです。
+リリース／canary の主張には、事前に固定した確認用集合全体、条件をそろえた比較での優位性、独立レビューが必要です。
+小規模な live／デバッグ検査、オフラインテスト、ソースの提供、GPTgrep 側のみの実行は、完全な XL の結果や
+canary の受け入れを示しません。旧 PageIndex／full62 評価と初回リリース条件は廃止され、過去の測定値は
+新しい XL の結果にはなりません。バージョンと提供の規則は [SPEC](SPEC.md) を参照してください。
 [アーキテクチャ](docs/architecture.ja.md)と、
 [Flash の各段階の対応範囲](crates/gptgrep-pageindex/FLASH_STAGE_COVERAGE.md)を参照してください。
 `docs/research/` にあるメンテナーの調査ノートはローカル専用で、Git の追跡対象外です。
@@ -156,7 +159,7 @@ Rust コアは、`VisualGenerationReader` の rendition から得た PNG の切�
 gptgrep search 'how can a damaged journal be recovered?' ./documents \
   --model typesafe/jev-1.13 --min-score 0.5 --json
 
-gptgrep judge --input evals/requests/decision-smoke.json \
+gptgrep judge --input ./decision-request.json \
   --model '~typesafe/jev-latest' --json
 ```
 
@@ -298,8 +301,8 @@ gptgrep summarize DOCUMENT_ID:NODE_ID --root ./documents \
 使用量も保持します。
 
 テキスト検索の reader（制限付きとネイティブのどちらも）には汎用の回答規則も与えます。質問が求める形で
-直接の答えを先に示すこと、読んだ根拠が質問どおりの問いに答えている場合はその答えを確定させて引用すること、
-本文中の参照（注記号、引用番号、「表／節を参照」などの指示）を参照先の箇所を読んで解決することを求めます。
+直接の答えを先に示すこと、質問が依存する本文中の参照（注記号、引用番号、「表／節を参照」などの指示）を
+参照先の箇所を読んで解決することを求めます。
 これらの規則は根拠、引用、`insufficient_evidence` の規則を緩めません。リッチテキストとマルチモーダルの
 reader には与えません。これらは GPTgrep の reader 契約の一部です。
 
@@ -378,8 +381,7 @@ gptgrep ask 'How are offline exports recovered?' ./documents \
 構成要素として提供します。入力は `{instructions, state, schema}` で、出力にはスキーマ検証済みの
 `value`、モデル／推論強度、使用量、入力ダイジェストが含まれます。入力の合計上限はデフォルトで
 256 KiB であり、明示的に最大 1 MiB まで変更できます。プロンプトを通知なしに切り詰めることは
-ありません。この補完モードに引用検証の保証はありません。比較評価で元の PageIndex の要約・
-最適化プロンプトを実行するために定義された、プロバイダーブリッジに対応しています。
+ありません。この補完モードに引用検証の保証はありません。
 
 app-server API は実験段階です。対応範囲と設定については、
 [ホストクレートのドキュメント](crates/gptgrep-host/README.md)に記録されています。
@@ -463,19 +465,14 @@ GPTGREP_BIN=/absolute/path/to/gptgrep node src/cli.js search \
 
 ## 検証と根拠
 
-これらの検査の前に、[開発ガイド](docs/development.md)に従って明示的な外部出力パスと uv 環境を設定して
-ください。Python の検査には 3.12 以上とリポジトリのロックファイルを使います。
+これらの検査の前に、[開発ガイド](docs/development.md)に従ってストレージ所有者が検証した外部実行領域を
+用意してください。現在のオフラインのベンチマーク／自己最適化契約テストは Bun を使い、npm 依存のインストールは不要です。
 
 ```sh
 cargo fmt --all -- --check
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
-uv venv --python 3.13 "$GPTGREP_DEV_ROOT/eval-venv"
-uv pip sync --python "$GPTGREP_DEV_ROOT/eval-venv/bin/python" evals/requirements.lock
-"$GPTGREP_DEV_ROOT/eval-venv/bin/python" -B -m unittest discover -s evals -p 'test_*.py'
-"$GPTGREP_DEV_ROOT/eval-venv/bin/python" -B scripts/eval.py \
-  --binary "$CARGO_TARGET_DIR/release/gptgrep" \
-  --output "$GPTGREP_DEV_ROOT/results/offline-eval.json"
+bun run --cwd benchmark test
 ```
 
 フィクスチャによるテストは、正規表現の正しさ、語句検索、Unicode、ソースの正確なダイジェストと
@@ -485,11 +482,35 @@ uv pip sync --python "$GPTGREP_DEV_ROOT/eval-venv/bin/python" evals/requirements
 実行します。Codex/HTTP のモックテストが確かめるのは通信経路の不変条件であり、実際のホストや
 プロバイダーの実行記録は別の根拠として扱います。
 
-外部の PageIndex データは固定マニフェストで参照し、再配布しません。その一部に対して GPTgrep を
-実行することと、元の PageIndex SDK によるベースラインを実行することは別です。上流で過去に
-報告されたベンチマーク値は、GPTgrep の測定値ではありません。評価の分母、要素を除外した比較の
-範囲、失敗事例、コスト集計については、[ベースラインランナー](scripts/pageindex_baseline/README.md)を
-参照してください。詳しいローカル調査と実験結果の解釈は、無視対象の `docs/research/` 配下に保持します。
+[XL のソース契約](benchmark/UPSTREAM.md)は、リリース、スコアラー、文書の権利、ローカル配置を固定します。
+各タスクでは原文書のコンテキスト全体を検証します。索引準備には原文書だけを渡し、質問、正解、根拠の注釈は
+渡しません。reader はタスクの質問を受け取りますが、正解、根拠の注釈、判定状態は受け取りません。
+以下の入口は呼び出し側が選んだ外部パスを使います。取得と live プロバイダー呼び出しには
+対応する権限が必要で、各 reader と独立 judge はそれぞれ承認済みのストレージ、認証状態、権限を持ちます。
+設定項目と隔離要件は[評価プロトコル](docs/evaluation.md)を参照してください。
+
+```sh
+# 検証済みのローカル資料から開発サンプルだけを選ぶ。
+bun benchmark/src/cli.ts freeze \
+  --release "$XL_RELEASE_ROOT" --corpus "$XL_CORPUS_ROOT" \
+  --output "$XL_RUN_ROOT/cohort" --seed "$XL_SEED" \
+  --sample-size "$DEV_SAMPLE_SIZE"
+
+# 各呼び出しでは独立した子プロセスを 1 つ監督する。
+bun benchmark/src/cli.ts reader --config "$READER_CONFIG"
+bun benchmark/src/cli.ts judge --config "$JUDGE_CONFIG"
+
+# 保存済みの測定値を比較する。このコマンドは実験を実行しない。
+bun self-opt/src/cli.ts compare \
+  --incumbent "$INCUMBENT_RUN" --candidate "$CANDIDATE_RUN" \
+  --output "$XL_RUN_ROOT/opt-comparison.json"
+```
+
+`freeze` が登録するのは開発サンプルだけです。ネイティブ XL 正解率と、独立した根拠付き成功率／原子的な
+要件の充足率は別々に報告します。開始済み reader の実行失敗は根拠付き成功率でゼロ、準備や判定が利用不能な場合は不明とし、
+固定した分母に保持します。使用量、リクエスト数、費用の欠測は利用不能のまま残します。
+`self-opt` のレポートは常に `releaseAccepted: false` を保持します。
+詳しいローカル調査と実験結果の解釈は、無視対象の `docs/research/` 配下に保持します。
 
 ## このリリースの制限
 
@@ -502,9 +523,6 @@ uv pip sync --python "$GPTGREP_DEV_ROOT/eval-venv/bin/python" evals/requirements
 - 既定（v1）の索引は、対応形式の文書に抽出可能なテキストが 1 つもない場合（スキャンした PDF など）に
   構築全体を拒否し、以前の世代を現行のまま残します。そうした文書集合には `--ocr auto` による明示的な
   rich ingestion か parse-agent による索引が必要です。
-- reader の「答えを確定させる」規則は評価中です。この規則を導入した Opt-1 の変更の開発測定では、失敗した
-  実行は減りましたが、回答不能な質問に答える件数が増えました。[実験の現状](docs/experimental-status.md)を
-  参照してください。
 - 意味検索の候補数には上限があり、関連する文書やノードを取りこぼす可能性があります。Jev は前段で
   除外された根拠を取り戻せず、そのスコアも真実性の保証にはなりません。
 - 文書集合の鮮度はスナップショットの契約に基づきます。新しいファイルを追加したら、インデックスを

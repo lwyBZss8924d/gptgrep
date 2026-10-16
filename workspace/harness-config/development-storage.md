@@ -45,13 +45,14 @@ nonconsumers. Registry coverage is distinct from runtime adoption. Arbitrary
 direct shell commands are outside this cooperative launch gate; it does not
 provide host-wide filesystem confinement.
 
-The internal free-space floor is 100 GB and the target is 150 GB. Large workloads
-stop below the floor. A small governance-validation exception must be explicitly
-reviewed and bound to its command, timeout, paths, internal metadata ceiling and
-download, unpack, output, cache, migration, rollback and safety-margin estimates.
-It does not make the floor pass. Missing, wrong, read-only or insufficient
-external storage must refuse before the child starts, without creating a
-replacement mountpoint or falling back to internal storage.
+Internal free space is recorded as telemetry. Large builds, datasets, caches and
+run artifacts belong on the registered external volume; the internal disk holds
+source and small owner metadata. Admission depends on external volume identity,
+physical paths, writable status, reserved free space and the declared whole-run
+peak, including downloads, unpacking, retained copies, caches and safety margin.
+Use task-qualified adapters or an explicit bounded validation run before a new
+runtime. Missing or insufficient external storage refuses before the child starts;
+never create a replacement mountpoint or fall back to internal caches.
 
 Preserve source, uncommitted changes, Git relationships, checkpoints and
 evaluation evidence. Migration requires writer/lock/reference checks, retained

@@ -1050,7 +1050,7 @@ dependencies = [
 
 [[package]]
 name = "gptgrep-cli"
-version = "0.1.0-alpha.1"
+version = "0.2.0-alpha.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1070,7 +1070,7 @@ dependencies = [
 
 [[package]]
 name = "gptgrep-core"
-version = "0.1.0-alpha.1"
+version = "0.2.0-alpha.1"
 dependencies = [
  "anyhow",
  "fs2",
@@ -1092,7 +1092,7 @@ dependencies = [
 
 [[package]]
 name = "gptgrep-host"
-version = "0.1.0-alpha.1"
+version = "0.2.0-alpha.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1117,7 +1117,7 @@ dependencies = [
 
 [[package]]
 name = "gptgrep-index"
-version = "0.1.0-alpha.1"
+version = "0.2.0-alpha.1"
 dependencies = [
  "anyhow",
  "regex",
@@ -1130,7 +1130,7 @@ dependencies = [
 
 [[package]]
 name = "gptgrep-jev"
-version = "0.1.0-alpha.1"
+version = "0.2.0-alpha.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1147,7 +1147,7 @@ dependencies = [
 
 [[package]]
 name = "gptgrep-pageindex"
-version = "0.1.0-alpha.1"
+version = "0.2.0-alpha.1"
 dependencies = [
  "pulldown-cmark",
  "serde",
@@ -1156,7 +1156,7 @@ dependencies = [
 
 [[package]]
 name = "gptgrep-parse"
-version = "0.1.0-alpha.1"
+version = "0.2.0-alpha.1"
 dependencies = [
  "anyhow",
  "gptgrep-pageindex",

@@ -14,23 +14,20 @@ license inventory and PDFium's full native notices, not only this summary.
 | [incur](https://github.com/wevm/incur) | published `0.5.1` | Optional gptgrep-ai wrapper | MIT |
 | [PDFium native binaries](https://github.com/run-llama/pdfium-binaries/releases/tag/chromium%2F8058) | `chromium/8058` | Runtime PDFium library | Per-component licenses bundled in release |
 | [Codex](https://github.com/openai/codex) | Reader runtime selected by caller; native viewer derivative pins `rust-v0.162.1` / `092d3acd6bec3e3a14bdc7e7a2810ab628ab759d` | Local stdio app-server; derivative source patch and notices under `patches/codex-native-viewer`, no Codex binary bundled | Apache-2.0 source; hosted service terms separate |
-| [Moby default seccomp profile](https://github.com/moby/moby/blob/daa0cb7f23594cdbcce5002e370027d3fd36ffd7/vendor/github.com/moby/profiles/seccomp/default.json) | Docker Engine `docker-v29.4.0` / `daa0cb7f23594cdbcce5002e370027d3fd36ffd7` (module `github.com/moby/profiles/seccomp` v0.1.0) | Vendored data file and the derived full62 reader seccomp profile; license, derivation and provenance under `workspace/harness-tooling/harbor-ablation/full62/seccomp` | Apache-2.0 |
 
 The PageIndex and parser crate notices document their source mapping and limitations.
 The [native viewer derivative](patches/codex-native-viewer/README.md) records its
 upstream pin, source patch, notices and build/qualification boundaries.
-The full62 reader seccomp profile changes the vendored Moby profile only as its
-`provenance.json` records; the module's `LICENSE` is kept beside the vendored file,
-and the module ships no `NOTICE` file.
 JevGrep, TypeSafe SDK/skills and the example projects were studied for interface and
 workflow patterns; GPTgrep implements its own Rust Decisions client. No Jev weights
 are distributed. TypeSafe/OpenRouter are hosted providers selected explicitly by
 the caller; API credentials and provider service access are not package assets.
 
-The external PageIndex benchmark, jev-eval and open-jev reference checkouts had no
-clear repository license declaration in the reviewed snapshots. Their code/data
-are not vendored here. GPTgrep's committed eval corpus is project-authored. A local
-reference manifest identifies external benchmark inputs without redistributing PDFs.
+The [XL-DocBench source contract](benchmark/UPSTREAM.md) records the pinned
+release/scorer and benchmark licensing. Original context documents retain their
+own rights and are not redistributed here. The benchmark and self-opt tests use
+project-authored synthetic material. Reference-only code and private evaluation
+corpora are not package assets.
 
 Research reports separate source/vendor claims from GPTgrep execution evidence.
 The initial Rust layout profile does not claim the complete PageIndex Flash algorithm.

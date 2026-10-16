@@ -1,6 +1,3 @@
-# Retain upstream notice bytes and reproducible fixture digests exactly.
+# Retain upstream notice bytes exactly.
 licenses/** -text -whitespace
 crates/gptgrep-parse/licenses/** -text -whitespace
-evals/fixtures/** -text -whitespace
-workspace/harness-tooling/harbor-ablation/full62/seccomp/upstream/** -text -whitespace
-workspace/harness-tooling/harbor-ablation/full62/seccomp/gptgrep-reader-seccomp.json -text -whitespace

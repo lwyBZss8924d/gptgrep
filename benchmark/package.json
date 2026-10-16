@@ -1,0 +1,10 @@
+{
+  "name": "gptgrep-reasoning-documents-benchmark-kit",
+  "version": "0.2.0-alpha.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test tests ../self-opt/tests",
+    "cli": "bun src/cli.ts"
+  }
+}

@@ -68,8 +68,11 @@ The supervisor refuses group- or world-writable configs. Keys:
 - `roles.<name>`:
   - `tool_permissions` (**required**; see [Tool commands](#tool-commands-and-the-credential)):
     `{"extends": ":workspace"|":read-only", "network_enabled": false, "deny_paths": [],
-    "read_paths": []}` for a generated profile, `"consumer-managed"`, or `"unrestricted"`.
-    `deny_paths` and `read_paths` are optional, each up to 64 absolute, normalized paths.
+    "read_paths": [], "write_paths": [], "minimal_read": false}` for a generated profile,
+    `"consumer-managed"`, or `"unrestricted"`. Path lists are optional, each up to 64 absolute,
+    normalized paths. `minimal_read` explicitly adds the Codex `:minimal = "read"` filesystem entry.
+    With `network_enabled=true`, optional `network_allowed_domains` selects the exact-domain
+    managed proxy described below. Omitting it preserves the existing network behavior.
   - `passthrough_env`, `allow_openrouter`, `deadline_seconds` and `codex_config`.
   - `path_env`: Harbor needs the directory that holds `docker`.
   - `stop_scope` (`tree` or `root-first`) and `term_grace_seconds`. With `root-first`, cancel and
@@ -82,6 +85,21 @@ Supervisors before 1.2.0 ignore unknown top-level keys, so they silently drop
 `extra_denied_paths`, and they refuse role `deny_paths` and `read_paths`. Do not run a config that
 uses these keys with an older supervisor. The config schema stays
 `gptgrep.codex-auth.config.v1`.
+
+Compatibility of 1.4.0 with 1.3.1:
+
+- `write_paths` and `minimal_read` are opt-in. Omitted or empty writes and `minimal_read=false`
+  preserve the previous generated permissions and receipt fields. Older supervisors refuse these
+  role keys; use 1.4.0 or later for a config that includes them.
+- Read grants now resolve symlinks at config load as well as profile generation. A pre-existing
+  alias into a protected deny fails earlier with `CONFIG_ERROR` (64).
+- `network_allowed_domains` is opt-in and requires `network_enabled=true`. It pins the managed
+  proxy and disables web search for that role; a conflicting global or role `web_search` setting
+  is refused. Existing roles without this key retain their prior network configuration.
+- Read and write roots must be disjoint, including aliases and nested roots. Writes cannot cover
+  `/`, any credential or lease directory, an extra deny, or an ancestor of those protected paths.
+  Writes also cannot cover any run's `codex-home` or a directory containing it. The authentication
+  lease, lifecycle output and auth-failure exit 77 contracts are unchanged.
 
 Compatibility of 1.3.1 with 1.3.0:
 
@@ -224,13 +242,16 @@ credential through the run's link (and, before the supervisor removes it, write 
 must state who prevents that:
 
 - `{"extends": ":workspace"|":read-only", "network_enabled": false, "deny_paths": [...],
-  "read_paths": [...]}`: the supervisor generates `default_permissions = "gptgrep_codex_auth"`.
+  "read_paths": [...], "write_paths": [...], "minimal_read": false}`: the supervisor generates
+  `default_permissions = "gptgrep_codex_auth"`.
   The profile extends the chosen built-in. Its filesystem table holds:
   1. `deny` for the canonical auth home, the run's `codex-home/auth.json` and the lease directory
      (markers and ledger);
   2. `deny` for every `extra_denied_paths` entry;
   3. `deny` for the role's `deny_paths`;
-  4. `read` for the role's `read_paths`.
+  4. `:minimal = "read"` when the role explicitly enables `minimal_read`;
+  5. `read` for the role's `read_paths`;
+  6. `write` for the role's `write_paths`.
 
   The official 0.162.1 `command/exec` path was qualified with the official binary: the deny holds
   through the link, the workspace stays writable, and an `unrestricted` negative control could read
@@ -246,18 +267,81 @@ Codex 0.162.1 applies the most specific entry, and of two equally specific entri
 A read path therefore opens a directory below a deny, which is what a carve-out is for. It can
 never reopen a supervisor deny:
 
-- At config load, a read path equal to or inside the canonical auth home, any run's
+- At config load, with symlinks resolved, a read path equal to or inside the canonical auth home, any run's
   `codex-home/auth.json` or the lease directory is refused (`config_role_read_path_reopens_credential`).
   The same applies to an `extra_denied_paths` entry (`config_role_read_path_reopens_extra_deny`).
   A path listed in both `deny_paths` and `read_paths` is refused
   (`config_role_read_path_equals_deny_path`).
+- A write path equal to a role deny is refused (`config_role_write_path_equals_deny_path`).
+  Read and write roots cannot overlap (`config_role_read_write_paths_overlap`). These checks
+  include case, Unicode normalization and symlink aliases, and repeat during profile generation.
+- Writes to `/` are refused (`config_role_write_path_root`). A write root cannot equal, contain
+  or fall inside the auth home, lease directory or an extra deny, nor contain or fall inside
+  any run's `codex-home` (`config_role_write_path_overlaps_credential` or
+  `config_role_write_path_overlaps_extra_deny`). Safe sibling `work` and `results` directories
+  remain eligible. Profile generation checks again against the actual run paths and symlinks
+  (`role_write_path_resolves_into_denied_path`).
 - Before launch, read paths are checked again against the run's actual denies with symlinks
   resolved (`role_read_path_resolves_into_denied_path`). Codex resolves read roots again for every
-  sandboxed command, so keep read paths on directories that no other process can replace with a
+  sandboxed command, so keep granted paths on directories that no other process can replace with a
   symlink while a run is live.
 
 Receipts and dry runs list every deny in `tool_credential_access.denied_paths` and the carve-outs in
-`tool_credential_access.read_paths`.
+`tool_credential_access.read_paths`. Opted-in profiles also report `minimal_read=true` and their
+explicit `write_paths`; `:minimal` is not an absolute path in `read_paths`.
+
+For a task that uses the existing native deny-root validator, select `extends=":read-only"`,
+`deny_paths=["/"]`, `minimal_read=true`, the exact task working directory in `write_paths`,
+and only the declared common runtime roots in `read_paths`. The portable `native-task` role in
+`config.example.json` illustrates this layout. The caller supplies the exact physical task paths
+and selects `gptgrep_codex_auth`; the supervisor does not infer a task working directory or
+authorize a parent directory. Gold data and other private evaluator material stay outside the
+grants. Runtime acknowledgement and actual tool-sandbox qualification remain separate checks.
+
+### Exact-domain tool network
+
+An optional `network_allowed_domains` list selects a managed proxy for sandboxed tool commands.
+It requires `network_enabled=true` and 1–64 exact lowercase DNS names such as `openrouter.ai`.
+Duplicate entries are removed. URLs, ports, wildcard patterns, IP literals, single-label names,
+trailing dots and malformed names are refused (`config_role_network_domains_invalid`). The
+portable `native-network-task` role shows the opt-in; credential environment passthrough remains
+a separate, explicit role choice.
+
+For Codex 0.162.1, the supervisor sets `features.network_proxy=true` and `web_search="disabled"`.
+It generates this network table under `permissions.gptgrep_codex_auth`:
+
+```toml
+[permissions.gptgrep_codex_auth.network]
+enabled = true
+proxy_url = "http://127.0.0.1:3128"
+mode = "full"
+enable_socks5 = false
+enable_socks5_udp = false
+allow_upstream_proxy = false
+allow_local_binding = false
+dangerously_allow_non_loopback_proxy = false
+dangerously_allow_all_unix_sockets = false
+
+[permissions.gptgrep_codex_auth.network.unix_sockets]
+
+[permissions.gptgrep_codex_auth.network.domains]
+"openrouter.ai" = "allow"
+```
+
+The exact host entry does not include its subdomains. Other destinations have no allow rule.
+Full mode supports HTTPS CONNECT and POST; this is a domain restriction, with no API endpoint or
+model restriction within an allowed host. It applies to sandboxed tool commands, not Codex's host
+inference connection. Web search is disabled, and fresh run homes retain the existing disabled-app
+and absent-MCP contract. Native callers must keep `approval_policy="never"`, select this profile,
+and preserve it through any app-server or wrapper layer; their runtime acknowledgement and tests
+remain necessary.
+
+The serialized proxy address uses loopback port 3128. Codex 0.162.1 managed execution on macOS
+reserves a private ephemeral loopback listener and injects its actual address into tool-command
+proxy variables. Callers must use that runtime address rather than assume port 3128. No upstream
+application proxy is chained. The proxy's onward traffic still follows the OS-managed routing and DNS policy;
+these settings do not prove external provider connectivity. Receipts add `network_allowed_domains`,
+`network_proxy=true`, `web_search="disabled"` and the domain-only `network_scope` description.
 
 ### Consumer argv guard
 
@@ -295,6 +379,9 @@ The run is refused before anything is created (`CONFIG_ERROR`,
     feature (`use_agent_identity`, `secret_auth_storage`, `memories`, `hooks`, `plugins`,
     `apps`);
 - `--enable` with a pinned feature;
+- for an exact-domain role, `--search`, a `web_search` override other than `disabled`, any
+  `features.network_proxy` or legacy web-search feature override, and `--enable` or `--disable`
+  of `network_proxy`, `web_search`, `web_search_cached` or `web_search_request`;
 - `--profile` or `-p`, which layers `$CODEX_HOME/<name>.config.toml`;
 - `--ignore-user-config`, which skips the generated `config.toml`;
 - `--remote`, which runs threads on another app-server under its own config;

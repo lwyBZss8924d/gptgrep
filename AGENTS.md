@@ -20,13 +20,13 @@ their historical source bytes and remain nonconsumers until explicitly admitted.
 The project mandate authorizes routine development, tests, CI, releases and delivery.
 Reserve major requirement, product/domain and research changes for Human discussion.
 Use the smallest useful team; independent review is required before release.
-The first experimental release additionally requires the accepted live PageIndex
-comparison gate in SPEC.md; source delivery and CI alone do not authorize its tag.
+The 0.2 evaluation contract uses XL-DocBench through benchmark/ and self-opt/.
+A small paired live result establishes an experimental measurement; full benchmark
+acceptance and a canary tag require their declared evidence in SPEC.md.
 Read docs/architecture.md for module boundaries and SPEC.md for acceptance.
 Use docs/development.md for portable Dev/Test/Eval setup, docs/experimental-status.md
-for the dated public progress summary, and workspace/harness-tooling/harbor-ablation/full62/README.md
-for the current paired SEARCH adapter. The parent Harbor directory retains older
-adapter work; select the full62 entry for the approved main comparison.
+for the dated public progress summary, benchmark/README.md for the XL adapter,
+and self-opt/README.md for isolated development loops.
 Route every live Codex consumer that shares one login through
 workspace/harness-tooling/codex-auth/README.md (lease, per-run CODEX_HOME, single
 refresh owner); entry points it lists as unmanaged stay blocked for shared-login
@@ -59,25 +59,22 @@ valid phase results, push that round's experimental worktree branch to its
 authorized remote branch for open-source researcher review and Dev follow-up, once
 its checks, independent review and a pre-push scan finding no machine paths,
 private identities or credentials have passed. Source sharing does not
-qualify the first release tag: retain G5 and all tag checks separately. Push source
+qualify a canary or full benchmark result: retain their acceptance checks separately. Push source
 and tags only within their corresponding authorization. Do not push private PoUW
 notes or runtime evidence. No global configuration, toolchain or service
 changes are implied by project ownership.
 
-The main Opt loop uses actual current-source parse/OCR/index and retrieval runs,
-then the complete same-Codex full62 paired SEARCH comparison and independent Judge.
-INDEX preparation is excluded from primary SEARCH reward/cost and reported separately.
-Preserve failed and unknown outcomes; test/mock success alone cannot accept a live
-pipeline or advantage. Use the requested gpt-6-luna/max/fast native profile and the
-independent OpenRouter Decisions model; credentials and accepted controls are caller-owned.
-The core Opt goal is a measured win of the GPTgrep search harness over bare Codex on
-that comparison. Dev & Opt work covers tgrep regex search PTC dynamic workflows with
-agentic parsing/OCR and PageIndex reasoning-based retrieval, the System-one
-Decisions helper, and agentic parsing/OCR for reasoning-based agentic RAG.
-At each Opt→Test→Eval→Judge→Next-Opt turn, update the private SELF-PM checkpoint
-with goal objects and progress, the current cursor, the worktree branch and evidence
-links, and the latest completed Opt/Eval-run checkpoint; publish only its dated
-aggregate projection in docs/experimental-status.md.
+The main Opt loop freezes a verified 0.2 baseline, then uses a distinct experimental
+worktree for each proposed product or runtime change. Compare the same development
+cohort, raw document hashes, rubric, models, preparation policy and resource limits.
+Use gpt-6.1-sol for the supervisor, gpt-6-luna for workers and multimodal page work,
+and the declared OpenRouter Decisions model. Reader and judge sessions remain
+separate; gold answers and evidence annotations are verifier-only. Preserve every
+enrolled failure, timeout and unknown outcome. Report preparation separately from
+search, and account for repeated work instead of silently treating it as free.
+A development win selects a candidate for confirmation; it does not accept a release.
+Record each Opt -> Test -> Eval -> Judge -> Next-Opt checkpoint and exact worktree
+revision privately, and publish only a dated aggregate status.
 
 Run cargo fmt --all -- --check, cargo test --workspace, cargo clippy --workspace
 --all-targets -- -D warnings, the offline eval harness, and the applicable wrapper

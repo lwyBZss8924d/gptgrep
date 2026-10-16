@@ -545,7 +545,7 @@ class ToolPathsAndArgvGuardTests(unittest.TestCase):
                  ("config_path_not_absolute", key + "deny_paths", {"deny_paths": ["data"]}),
                  ("config_path_not_normalized", key + "read_paths", {"read_paths": [data + "/./public"]}),
                  ("config_path_not_normalized", key + "read_paths", {"read_paths": ["/" + data]}),
-                 ("config_role_tool_permissions_invalid", "roles.tools", {"write_paths": [data]}),
+                 ("config_role_tool_permissions_invalid", "roles.tools", {"unknown_paths": [data]}),
                  ("config_role_read_path_equals_deny_path", key + "read_paths:" + data,
                   {"deny_paths": [data], "read_paths": [data]}),
                  ("config_role_read_path_equals_deny_path", key + "read_paths:" + data,
@@ -592,20 +592,144 @@ class ToolPathsAndArgvGuardTests(unittest.TestCase):
         self.assertFalse(self.env.lease_path.exists())
         self.assertFalse(self.env.run_dir("dev", "load1").exists())
 
-    def test_read_path_resolving_into_a_denied_path_is_refused_before_launch(self):
+    def test_read_path_resolving_into_a_denied_path_is_refused_at_load_and_generation(self):
         alias = self.env.root / "alias"
-        os.symlink(self.env.credential.home, alias)
         self.env.reconfigure(roles=self.tools_roles(read_paths=[str(alias / "sub")]))
-        self.env.cfg()  # lexically valid, so the config loads
+        cfg = self.env.cfg()  # A physical path may change after config load.
+        os.symlink(self.env.credential.home, alias)
         for run_id, extra in (("alias1", ()), ("alias2", ("--dry-run",))):
             code, result, _ = self.env.supervisor("run", "--role", "tools", "--run-id", run_id, *extra, "--",
                                                   "/usr/bin/true")
             self.assertEqual((code, result["refusal"]),
-                             (sup.EXIT_USAGE, {"reason": "role_read_path_resolves_into_denied_path",
-                                               "detail": str(alias / "sub")}))
+                             (sup.EXIT_USAGE, {"reason": "config_role_read_path_reopens_credential",
+                                               "detail": "roles.tools.tool_permissions.read_paths:" + str(alias / "sub")}))
             self.assertFalse(self.env.run_dir("tools", run_id).exists())
+        with self.assertRaises(sup.SupervisorError) as ctx:
+            sup.profile_filesystem(cfg, sup.Layout(cfg, "tools", "alias3"), cfg.role("tools")["tool_permissions"])
+        self.assertEqual(ctx.exception.reason, "role_read_path_resolves_into_denied_path")
         self.assertFalse(self.env.lease_path.exists())
         self.assertEqual(support.run_auth_links(self.env), [])
+
+    def test_write_paths_and_minimal_read_are_explicit_and_validated(self):
+        root = self.env.root
+        data = str(root / "task")
+        permissions = self.config_with(roles=self.tools_roles(
+            extends=":read-only", minimal_read=True, deny_paths=["/"], write_paths=[data, data]))
+        self.assertEqual(permissions.role("tools")["tool_permissions"],
+                         {"extends": ":read-only", "network_enabled": False, "minimal_read": True,
+                          "deny_paths": ["/"], "read_paths": [], "write_paths": [data]})
+        plain = self.config_with(roles=self.tools_roles(minimal_read=False, write_paths=[]))
+        self.assertEqual(plain.role("tools")["tool_permissions"],
+                         {"extends": ":workspace", "network_enabled": False, "deny_paths": [], "read_paths": []})
+        most = [str(root / ("write%02d" % i)) for i in range(sup.MAX_PROFILE_PATHS)]
+        self.config_with(roles=self.tools_roles(write_paths=most))
+        key = "roles.tools.tool_permissions."
+        cases = [("config_role_tool_permissions_invalid", key + "write_paths", {"write_paths": data}),
+                 ("config_role_tool_permissions_invalid", key + "write_paths", {"write_paths": most + [data]}),
+                 ("config_path_not_absolute", key + "write_paths", {"write_paths": [":minimal"]}),
+                 ("config_path_not_normalized", key + "write_paths", {"write_paths": [data + "/../other"]}),
+                 ("config_role_write_path_root", key + "write_paths:/", {"write_paths": ["/"]}),
+                 ("config_role_write_path_equals_deny_path", key + "write_paths:" + data,
+                  {"deny_paths": [data.upper()], "write_paths": [data]})]
+        cases.extend(("config_role_tool_permissions_invalid", "roles.tools", {"minimal_read": value})
+                     for value in (None, 1, "true", []))
+        for reason, detail, change in cases:
+            with self.subTest(reason=reason, change=change):
+                self.assertEqual(self.refusal(roles=self.tools_roles(**change)), (reason, detail))
+
+    def test_write_paths_cannot_overlap_credentials_or_extra_denies(self):
+        root, home, runs = self.env.root, self.env.credential.home, self.env.runs_root
+        extra = root / "data" / "private"
+        alias = root / "alias"
+        alias.symlink_to(home)
+        paths = [home, home / "nested", home.parent, self.env.credential.path,
+                 self.env.lease_path, self.env.lease_path.parent, runs, runs / "tools",
+                 runs / "tools" / "run", runs / "other" / "run" / "codex-home",
+                 runs / "other" / "run" / "Codex-Home" / "AUTH.json", alias, alias / "nested"]
+        for path in paths:
+            with self.subTest(path=str(path)):
+                self.assertEqual(self.refusal(roles=self.tools_roles(write_paths=[str(path)])),
+                                 ("config_role_write_path_overlaps_credential",
+                                  "roles.tools.tool_permissions.write_paths:" + str(path)))
+        for path in (extra, extra / "nested", extra.parent):
+            with self.subTest(extra=str(path)):
+                self.assertEqual(self.refusal(extra_denied_paths=[str(extra)],
+                                              roles=self.tools_roles(write_paths=[str(path)])),
+                                 ("config_role_write_path_overlaps_extra_deny",
+                                  "roles.tools.tool_permissions.write_paths:" + str(path)))
+        # A run's work and result directories do not contain its auth home.
+        self.config_with(roles=self.tools_roles(write_paths=[
+            str(runs / "tools" / "run" / "work"), str(runs / "tools" / "run" / "results")]))
+
+    def test_read_write_conflicts_include_nested_paths_and_aliases(self):
+        read = self.env.root / "read"
+        read.mkdir()
+        alias = self.env.root / "alias"
+        alias.symlink_to(read)
+        for write in (read, read / "nested", read.parent, Path(str(read).upper()), alias):
+            with self.subTest(write=str(write)):
+                self.assertEqual(self.refusal(roles=self.tools_roles(read_paths=[str(read)], write_paths=[str(write)])),
+                                 ("config_role_read_write_paths_overlap",
+                                  "roles.tools.tool_permissions.read_paths:" + str(read)))
+
+    def test_write_and_conflict_checks_repeat_after_config_load(self):
+        alias = self.env.root / "alias"
+        read = self.env.root / "read"
+        read.mkdir()
+        extra = self.env.root / "private"
+        for target, permissions, reason in (
+                (self.env.credential.home, {"write_paths": [str(alias)]},
+                 "role_write_path_resolves_into_denied_path"),
+                (self.env.lease_path.parent, {"write_paths": [str(alias)]},
+                 "role_write_path_resolves_into_denied_path"),
+                (extra, {"write_paths": [str(alias)]}, "role_write_path_resolves_into_denied_path"),
+                (self.env.runs_root / "other" / "r" / "codex-home", {"write_paths": [str(alias)]},
+                 "role_write_path_resolves_into_denied_path"),
+                (read, {"read_paths": [str(read)], "write_paths": [str(alias)]},
+                 "config_role_read_write_paths_overlap"),
+                (read, {"deny_paths": [str(read)], "write_paths": [str(alias)]},
+                 "config_role_write_path_equals_deny_path")):
+            with self.subTest(target=str(target), reason=reason):
+                cfg = self.config_with(extra_denied_paths=[str(extra)], roles=self.tools_roles(**permissions))
+                alias.symlink_to(target)
+                try:
+                    with self.assertRaises(sup.SupervisorError) as ctx:
+                        sup.render_codex_config(cfg, sup.Layout(cfg, "tools", "changed"), {},
+                                                cfg.role("tools")["tool_permissions"])
+                    self.assertEqual(ctx.exception.reason, reason)
+                    with self.assertRaises(sup.SupervisorError):
+                        self.config_with(extra_denied_paths=[str(extra)], roles=self.tools_roles(**permissions))
+                finally:
+                    alias.unlink()
+        self.assertFalse(self.env.lease_path.exists())
+
+    def test_minimal_read_and_exact_write_profile_preserve_denies_and_receipts(self):
+        root = self.env.root
+        task, runtime, extra = root / "task", root / "runtime", root / "private"
+        self.env.reconfigure(extra_denied_paths=[str(extra)], roles=self.tools_roles(
+            extends=":read-only", deny_paths=["/"], minimal_read=True,
+            read_paths=[str(runtime)], write_paths=[str(task)]))
+        code, receipt, proc = self.env.supervisor("run", "--role", "tools", "--run-id", "explicit", "--",
+                                                  "/usr/bin/true")
+        self.assertEqual((code, receipt["state"]), (0, "PASS"), proc.stderr)
+        run = self.env.run_dir("tools", "explicit")
+        profile = tomllib.loads((run / "codex-home" / "config.toml").read_text())["permissions"][PROFILE]
+        self.assertEqual(profile, {"extends": ":read-only", "network": {"enabled": False}, "filesystem": {
+            str(self.env.credential.home): "deny", str(run / "codex-home" / "auth.json"): "deny",
+            str(self.env.lease_path.parent): "deny", str(extra): "deny", "/": "deny",
+            ":minimal": "read", str(runtime): "read", str(task): "write"}})
+        access = receipt["tool_credential_access"]
+        self.assertEqual(access["write_paths"], [str(task)])
+        self.assertEqual(access["read_paths"], [str(runtime)])
+        self.assertIs(access["minimal_read"], True)
+        self.assertEqual(receipt["supervisor_version"], "1.4.0")
+        self.assertTrue(receipt["auth_link_final"]["released"])
+        self.assertFalse(receipt["credential_contents_read_by_supervisor"])
+        code, plan, _ = self.env.supervisor("run", "--role", "tools", "--run-id", "explicit-plan",
+                                            "--dry-run", "--", "/usr/bin/true")
+        self.assertEqual(code, 0)
+        self.assertEqual(plan["tool_credential_access"]["write_paths"], [str(task)])
+        self.assertIs(plan["tool_credential_access"]["minimal_read"], True)
 
     def test_generated_profile_composes_supervisor_and_role_denies_with_read_carve_outs(self):
         root, home = self.env.root, self.env.credential.home
@@ -655,6 +779,107 @@ class ToolPathsAndArgvGuardTests(unittest.TestCase):
         for args in ARGV_ALLOWED:
             with self.subTest(args=args):
                 self.assertIsNone(sup.codex_profile_override(["/x/codex", *args]))
+
+    def test_exact_network_domains_require_explicit_enable_and_valid_dns_names(self):
+        valid = {"network_enabled": True, "network_allowed_domains": ["openrouter.ai", "api.example.invalid",
+                                                                    "openrouter.ai"]}
+        cfg = self.config_with(roles=self.tools_roles(**valid))
+        self.assertEqual(cfg.role("tools")["tool_permissions"]["network_allowed_domains"],
+                         ["openrouter.ai", "api.example.invalid"])
+        self.config_with(roles=self.tools_roles(network_enabled=True,
+                                               network_allowed_domains=["h%d.example.invalid" % i for i in range(64)]))
+        invalid = [[], "openrouter.ai", [None], ["*"], ["*.openrouter.ai"], ["https://openrouter.ai"],
+                   ["openrouter.ai:443"], ["openrouter.ai/"], ["OPENROUTER.AI"], ["openrouter.ai."],
+                   ["localhost"], ["127.0.0.1"], ["127.1"], ["::1"], ["[::1]"], ["openrouter..ai"],
+                   ["-bad.example"], ["bad-.example"], ["under_score.example"], ["例.example"],
+                   ["a" * 64 + ".example"], ["openrouter.ai"] * 65]
+        for domains in invalid:
+            with self.subTest(domains=domains):
+                self.assertEqual(self.refusal(roles=self.tools_roles(network_enabled=True,
+                                                                    network_allowed_domains=domains)),
+                                 ("config_role_network_domains_invalid",
+                                  "roles.tools.tool_permissions.network_allowed_domains"))
+        self.assertEqual(self.refusal(roles=self.tools_roles(network_allowed_domains=["openrouter.ai"])),
+                         ("config_role_network_domains_invalid", "roles.tools.tool_permissions.network_allowed_domains"))
+        plain = self.config_with(roles=self.tools_roles(network_enabled=True))
+        layout = sup.Layout(plain, "tools", "plainnet")
+        tree = sup.codex_config_tree(plain, layout, {}, plain.role("tools")["tool_permissions"])
+        self.assertEqual(tree["permissions"][PROFILE]["network"], {"enabled": True})
+        self.assertNotIn("network_proxy", tree["features"])
+        self.assertNotIn("web_search", tree)
+
+    def test_exact_network_profile_pins_proxy_search_and_preserves_credential_denies(self):
+        roles = self.tools_roles(network_enabled=True, network_allowed_domains=["openrouter.ai"])
+        self.env.reconfigure(roles=roles)
+        code, receipt, proc = self.env.supervisor("run", "--role", "tools", "--run-id", "domainnet", "--",
+                                                  PY, "-I", "-B", PROBE, "env-report",
+                                                  str(self.env.root / "domainnet.json"), str(self.env.lease_path))
+        self.assertEqual((code, receipt["state"]), (0, "PASS"), proc.stderr)
+        run = self.env.run_dir("tools", "domainnet")
+        tree = tomllib.loads((run / "codex-home" / "config.toml").read_text())
+        self.assertEqual(tree["web_search"], "disabled")
+        self.assertIs(tree["features"]["network_proxy"], True)
+        self.assertIs(tree["features"]["apps"], False)
+        self.assertNotIn("mcp_servers", tree)
+        self.assertEqual(tree["permissions"][PROFILE]["network"], {
+            "enabled": True, "proxy_url": "http://127.0.0.1:3128", "mode": "full",
+            "enable_socks5": False, "enable_socks5_udp": False, "allow_upstream_proxy": False,
+            "allow_local_binding": False, "dangerously_allow_non_loopback_proxy": False,
+            "dangerously_allow_all_unix_sockets": False, "unix_sockets": {},
+            "domains": {"openrouter.ai": "allow"}})
+        filesystem = tree["permissions"][PROFILE]["filesystem"]
+        for path in (self.env.credential.home, self.env.lease_path.parent, run / "codex-home" / "auth.json"):
+            self.assertEqual(filesystem[str(path)], "deny")
+        access = receipt["tool_credential_access"]
+        self.assertEqual(access["network_allowed_domains"], ["openrouter.ai"])
+        self.assertIs(access["network_proxy"], True)
+        self.assertEqual(access["web_search"], "disabled")
+        self.assertIn("no endpoint or model restriction", access["network_scope"])
+        self.assertTrue(receipt["auth_link_final"]["released"])
+
+    def test_exact_network_profile_rejects_search_config_conflicts(self):
+        for level in ("global", "role"):
+            for setting in ("live", "cached", "DISABLED", 1):
+                roles = self.tools_roles(network_enabled=True, network_allowed_domains=["openrouter.ai"])
+                extra = {"codex_config": {"web_search": setting}} if level == "global" else {}
+                if level == "role":
+                    roles["tools"]["codex_config"] = {"web_search": setting}
+                with self.subTest(level=level, setting=setting):
+                    self.assertEqual(self.refusal(roles=roles, **extra),
+                                     ("config_role_network_web_search_must_be_disabled", "roles.tools"))
+        roles = self.tools_roles(network_enabled=True, network_allowed_domains=["openrouter.ai"])
+        cfg = self.config_with(roles=roles, codex_config={"web_search": "disabled"})
+        with self.assertRaises(sup.SupervisorError) as ctx:
+            sup.codex_config_tree(cfg, sup.Layout(cfg, "tools", "search"), {"web_search": "live"},
+                                  cfg.role("tools")["tool_permissions"])
+        self.assertEqual(ctx.exception.reason, "config_role_network_web_search_must_be_disabled")
+
+    def test_exact_network_profile_argv_guard_pins_proxy_and_disabled_search(self):
+        denied = [(["exec", "--search", "hello"], "--search"),
+                  (["exec", "-c", 'web_search="live"', "hello"], "-c web_search"),
+                  (["exec", "--config", 'web_search="cached"'], "--config web_search"),
+                  (["exec", "-c", 'web_search.enabled=false'], "-c web_search")]
+        for feature in ("network_proxy", "web_search", "web_search_cached", "web_search_request"):
+            denied.extend([(["exec", "-c", "features.%s=false" % feature], "-c features." + feature),
+                           (["exec", "-c", "features.%s.enabled=true" % feature], "-c features." + feature),
+                           (["exec", "--enable", feature], "--enable " + feature),
+                           (["exec", "--disable=" + feature], "--disable " + feature)])
+        cfg = self.config_with(roles=self.tools_roles(network_enabled=True,
+                                                     network_allowed_domains=["openrouter.ai"]))
+        layout = sup.Layout(cfg, "tools", "netargv")
+        for args, detail in denied:
+            with self.subTest(args=args):
+                argv = ["/x/codex", *args]
+                self.assertEqual(sup.codex_profile_override(argv, restricted_network=True), detail)
+                with self.assertRaises(sup.SupervisorError) as ctx:
+                    sup.consumer_argv_guard(cfg, layout, cfg.role("tools"), argv)
+                self.assertEqual((ctx.exception.reason, ctx.exception.detail),
+                                 ("consumer_argv_overrides_permission_profile", detail))
+                self.assertIsNone(sup.codex_profile_override(argv), "legacy roles keep their existing contract")
+        for args in (["exec", "-c", 'web_search="disabled"'], ["exec", "-c", "web_search='disabled'"],
+                     ["exec", "-c", "web_search=disabled"], ["exec", "--disable", "memories"],
+                     ["exec", "--", "--search"]):
+            self.assertIsNone(sup.codex_profile_override(["/x/codex", *args], restricted_network=True))
 
     def test_consumer_argv_guard_refuses_before_anything_is_created(self):
         fake = self.install_fake_codex()
