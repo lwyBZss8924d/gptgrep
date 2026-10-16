@@ -231,6 +231,29 @@ describe("native protocol lifecycle", () => {
 });
 
 describe("native experiment boundary", () => {
+  test("accepts the null filesystem metadata returned by app-server config/read", async () => {
+    // The pinned app-server adds this null field to its serialized filesystem map.
+    const server = new FakeServer();
+    server.effectiveConfig = { permissions: { test_reader: { ...profile.permissions.test_reader,
+      filesystem: { ...profile.permissions.test_reader.filesystem, glob_scan_max_depth: null } } } };
+    const result = await runNativeForTest(options, server);
+    expect(result.status).toBe("completed");
+    expect(result.validStart).toBe(true);
+    expect(server.requests.some(request => request.method === "turn/start")).toBe(true);
+  });
+
+  test("rejects non-null filesystem metadata without relaxing path grants", () => {
+    const check = (filesystem: Message) => validatePermissionProfile({ permissions: { test_reader: {
+      ...profile.permissions.test_reader, filesystem: { ...profile.permissions.test_reader.filesystem, ...filesystem },
+    } } }, options);
+    for (const value of [0, 1, -1, false, "read", "deny", {}, []]) {
+      expect(() => check({ glob_scan_max_depth: value })).toThrow("Unexpected filesystem glob_scan_max_depth metadata");
+    }
+    for (const mutation of [{ unknown_metadata: null }, { "/whole-corpus": "read" }, { "/private/judge": "write" }]) {
+      expect(() => check({ glob_scan_max_depth: null, ...mutation })).toThrow();
+    }
+  });
+
   test("accepts only the declared managed Decisions domain and rejects wider proxy access", () => {
     const network = { enabled: true, proxy_url: "http://127.0.0.1:3128", mode: "full", domains: { "openrouter.ai": "allow" },
       enable_socks5: false, enable_socks5_udp: false, allow_upstream_proxy: false, allow_local_binding: false,

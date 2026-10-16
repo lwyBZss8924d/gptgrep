@@ -120,6 +120,10 @@ export function validatePermissionProfile(config: Message, options: NativeRunOpt
   const fs = profile.filesystem;
   if (!fs || fs["/"] !== "deny") throw new Error("Owner profile must deny / and explicitly grant the selected workspace/runtime roots");
   for (const [path, access] of Object.entries(fs)) {
+    if (path === "glob_scan_max_depth") {
+      if (access !== null) throw new Error("Unexpected filesystem glob_scan_max_depth metadata in owner permission profile");
+      continue;
+    }
     if (access === "deny") continue;
     if (path === ":minimal" && access === "read") continue;
     if (!["read", "write"].includes(String(access)) || !isAbsolute(path) || /[*?\[\]{}]/.test(path)) throw new Error("Unbounded filesystem grant in owner permission profile");
