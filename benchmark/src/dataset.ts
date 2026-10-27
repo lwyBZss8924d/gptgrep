@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { resolve, relative, isAbsolute } from "node:path";
+import { canonical } from "./io";
 
 export const XL_RELEASE_REVISION = "72954bd70ffffe230f08b57c57fa9274ec14d7ea";
 export const XL_RELEASE_VERSION = "xldocbench_strict_1345_v1";
@@ -74,6 +75,52 @@ export interface GroupingOptions {
   sourceFamilies?: Record<string, string>;
   /** SHA-256 of acquired raw files, used to unite identical content. */
   rawSha256?: Record<string, string>;
+}
+
+export function parseSourceFamilies(value: unknown): Record<string, string> {
+  const row = object(value, "source families");
+  const wrapped = Object.hasOwn(row, "families");
+  if (wrapped && (row.schema !== "gptgrep.source-families.v1" ||
+      Object.keys(row).some(key => !["schema", "recorded_at", "policy", "families"].includes(key)))) throw new Error("Unknown source-family schema or fields");
+  const families = wrapped ? object(row.families, "families") : row;
+  return Object.fromEntries(Object.entries(families).map(([id, family]) => [string(id, "family document ID"), string(family, "family ID")]));
+}
+
+/** Events are the source; the summary must be their exact union, never a substitute. */
+export function parseExposureLedger(value: unknown): string[] {
+  const row = object(value, "exposure ledger");
+  if (row.schema !== "gptgrep.dev-exposure-ledger.v1" ||
+      Object.keys(row).some(key => !["schema", "recorded_at", "policy", "exposure_events", "exposed_document_ids"].includes(key)) ||
+      !Array.isArray(row.exposure_events) || !Array.isArray(row.exposed_document_ids)) throw new Error("Expected a complete exposure event ledger");
+  const eventIds: string[] = [], documentIds: string[] = [];
+  for (const raw of row.exposure_events) {
+    const event = object(raw, "exposure event");
+    if (Object.keys(event).some(key => !["event_id", "description", "document_ids", "observed_document_ids", "task_ids"].includes(key)) ||
+        !Array.isArray(event.document_ids) || !event.document_ids.length) throw new Error("Exposure event requires complete document IDs");
+    eventIds.push(string(event.event_id, "exposure event ID")); string(event.description, "exposure description");
+    const ids = event.document_ids.map(id => string(id, "exposure document ID")); unique(ids, "event document IDs");
+    for (const field of ["observed_document_ids", "task_ids"] as const) if (event[field] !== undefined) {
+      if (!Array.isArray(event[field])) throw new Error("Exposure ID list required");
+      const values = event[field].map(id => string(id, "exposure ID")); unique(values, "exposure IDs");
+      if (field === "observed_document_ids" && values.some(id => !ids.includes(id))) throw new Error("Observed exposure omitted from event context");
+    }
+    documentIds.push(...ids);
+  }
+  unique(eventIds, "exposure event IDs");
+  const summary = row.exposed_document_ids.map(id => string(id, "exposure summary ID")); unique(summary, "exposure summary IDs");
+  const union = [...new Set(documentIds)].sort();
+  if (canonical([...summary].sort()) !== canonical(union)) throw new Error("Exposure summary differs from actual event union");
+  return union;
+}
+
+/** Check the entire release, including unselected tasks, before a cohort is frozen. */
+export function assertDependencyReleaseMatches(expected: DependencyRelease, current: DependencyRelease | XlRelease): void {
+  const projection = (release: DependencyRelease | XlRelease) => ({ revision: release.revision,
+    documents: [...release.documents].sort((a, b) => a.documentId.localeCompare(b.documentId)), fileHashes: release.fileHashes,
+    tasks: ("tasks" in release ? release.tasks : release.readerTasks).map(task => ({ id: task.id, taskType: task.taskType,
+      contextDocumentIds: [...task.contextDocumentIds], contextId: task.contextId, groupId: task.groupId })).sort((a, b) => a.id.localeCompare(b.id)),
+    groups: [...release.groups].sort((a, b) => a.id.localeCompare(b.id)) });
+  if (canonical(projection(expected)) !== canonical(projection(current))) throw new Error("Complete release dependencies or source grouping differ from assessment");
 }
 
 export interface XlRelease {
@@ -377,7 +424,7 @@ export interface SplitManifest {
   groupingRule: string;
 }
 
-export function splitBySourceGroups(release: XlRelease, options: {
+export function splitBySourceGroups(release: Pick<DependencyRelease, "revision" | "documents" | "groups">, options: {
   seed: string; devGroupCount?: number; devFraction?: number; exposedDocumentIds?: string[];
 }): SplitManifest {
   if (!options.seed) throw new Error("A deterministic split seed is required");

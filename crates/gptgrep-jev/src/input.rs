@@ -64,43 +64,7 @@ pub struct ImageEvidence {
 impl ImageEvidence {
     pub fn from_bytes(source: SourceBinding, bytes: Vec<u8>) -> Result<Self> {
         source.validate()?;
-        ensure!(
-            !bytes.is_empty() && bytes.len() <= MAX_IMAGE_BYTES,
-            "Decisions image exceeded the file byte limit"
-        );
-        ensure!(
-            bytes.len().div_ceil(3) * 4 <= MAX_IMAGE_BASE64_BYTES,
-            "Decisions image exceeded the base64 byte limit"
-        );
-        let format =
-            image::guess_format(&bytes).map_err(|_| anyhow!("Invalid Decisions image encoding"))?;
-        let media_type = match format {
-            ImageFormat::Png => "image/png",
-            ImageFormat::Jpeg => "image/jpeg",
-            _ => return Err(anyhow!("Decisions images require PNG or JPEG")),
-        };
-        let (width, height) = ImageReader::with_format(Cursor::new(&bytes), format)
-            .into_dimensions()
-            .map_err(|_| anyhow!("Invalid Decisions image dimensions"))?;
-        let pixels = u64::from(width) * u64::from(height);
-        ensure!(
-            pixels > 0 && pixels <= MAX_IMAGE_PIXELS,
-            "Decisions image exceeded the pixel limit"
-        );
-        let mut limits = Limits::default();
-        limits.max_image_width = Some(width);
-        limits.max_image_height = Some(height);
-        limits.max_alloc = Some(MAX_IMAGE_PIXEL_BUFFER_BYTES);
-        let mut reader = ImageReader::with_format(Cursor::new(&bytes), format);
-        reader.limits(limits);
-        let decoded = reader
-            .decode()
-            .map_err(|_| anyhow!("Invalid Decisions image or decoded allocation limit exceeded"))?;
-        ensure!(
-            decoded.as_bytes().len() as u64 <= MAX_IMAGE_PIXEL_BUFFER_BYTES,
-            "Decisions image exceeded the pixel buffer limit"
-        );
-        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let (width, height, media_type, sha256) = validate_image_bytes(&bytes)?;
         Ok(Self {
             source,
             bytes,
@@ -154,6 +118,48 @@ impl ImageEvidence {
         self.media_type
     }
 }
+// The helper reuses this raw-image admission without inventing source provenance.
+fn validate_image_bytes(bytes: &[u8]) -> Result<(u32, u32, &'static str, String)> {
+    ensure!(
+        !bytes.is_empty() && bytes.len() <= MAX_IMAGE_BYTES,
+        "Decisions image exceeded the file byte limit"
+    );
+    ensure!(
+        bytes.len().div_ceil(3) * 4 <= MAX_IMAGE_BASE64_BYTES,
+        "Decisions image exceeded the base64 byte limit"
+    );
+    let format =
+        image::guess_format(bytes).map_err(|_| anyhow!("Invalid Decisions image encoding"))?;
+    let media_type = match format {
+        ImageFormat::Png => "image/png",
+        ImageFormat::Jpeg => "image/jpeg",
+        _ => return Err(anyhow!("Decisions images require PNG or JPEG")),
+    };
+    let (width, height) = ImageReader::with_format(Cursor::new(bytes), format)
+        .into_dimensions()
+        .map_err(|_| anyhow!("Invalid Decisions image dimensions"))?;
+    let pixels = u64::from(width) * u64::from(height);
+    ensure!(
+        pixels > 0 && pixels <= MAX_IMAGE_PIXELS,
+        "Decisions image exceeded the pixel limit"
+    );
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(width);
+    limits.max_image_height = Some(height);
+    limits.max_alloc = Some(MAX_IMAGE_PIXEL_BUFFER_BYTES);
+    let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
+    reader.limits(limits);
+    let decoded = reader
+        .decode()
+        .map_err(|_| anyhow!("Invalid Decisions image or decoded allocation limit exceeded"))?;
+    ensure!(
+        decoded.as_bytes().len() as u64 <= MAX_IMAGE_PIXEL_BUFFER_BYTES,
+        "Decisions image exceeded the pixel buffer limit"
+    );
+    let sha256 = format!("{:x}", Sha256::digest(bytes));
+    Ok((width, height, media_type, sha256))
+}
+
 #[derive(Clone, Default)]
 pub struct DecisionInput {
     pub text: Vec<TextEvidence>,
@@ -354,7 +360,7 @@ impl JevClient {
         serialize_qualification(self, input, &questions, true, &mut body)
             .map_err(|_| anyhow!("Could not serialize the bounded Decisions request"))?;
         self.execution.remaining()?;
-        Ok(self.bind_prepared_body(body.bytes, questions))
+        Ok(self.bind_prepared_mode(body.bytes, questions, crate::PreparedBodyMode::TypedInput))
     }
 }
 
@@ -456,6 +462,116 @@ fn serialize_qualification(
             },
         },
     )
+}
+
+/// Revalidate the existing flat typed codec at the helper boundary. Source
+/// bindings remain local to the preparing caller; they are not wire authority.
+#[cfg(target_os = "linux")]
+pub(crate) fn validate_helper_flat_body(client: &JevClient, bytes: &[u8]) -> Result<Value> {
+    ensure!(
+        crate::luna_decisions_model(&client.model) && bytes.len() <= MAX_MULTIMODAL_REQUEST_BYTES,
+        "Helper typed input requires the bounded Luna Decisions codec"
+    );
+    let body = crate::parse_unique_json(bytes)
+        .map_err(|_| anyhow!("Invalid helper typed request JSON"))?;
+    let fields = body
+        .as_object()
+        .ok_or_else(|| anyhow!("Invalid helper typed body"))?;
+    ensure!(
+        fields.len() == 4
+            && fields
+                .keys()
+                .all(|key| ["model", "provider", "questions", "state"].contains(&key.as_str()))
+            && body["model"].as_str() == Some(client.model.as_str())
+            && body["provider"] == json!({"allow_fallbacks": false}),
+        "Helper typed request model or provider policy differs"
+    );
+    let questions = body["questions"].clone();
+    crate::validation::request(&json!("typed evidence"), &questions)?;
+    let state = body["state"]
+        .as_array()
+        .ok_or_else(|| anyhow!("Invalid helper typed state"))?;
+    ensure!(!state.is_empty(), "Decisions evidence input is empty");
+    let mut text = Vec::new();
+    let mut images = 0usize;
+    let mut pixels = 0u64;
+    let mut text_bytes = 0usize;
+    for part in state {
+        if let Some(value) = part.as_str() {
+            ensure!(
+                images == 0 && !value.trim().is_empty(),
+                "Invalid helper typed text order"
+            );
+            text_bytes = text_bytes.saturating_add(value.len());
+            ensure!(
+                text_bytes <= MAX_REQUEST_BYTES,
+                "Decisions text exceeded the byte limit"
+            );
+            text.push(Value::String(value.to_owned()));
+            continue;
+        }
+        let image = part
+            .as_object()
+            .ok_or_else(|| anyhow!("Invalid helper image part"))?;
+        let url_object = image
+            .get("image_url")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow!("Invalid helper image URL"))?;
+        ensure!(
+            image.len() == 2
+                && image.get("type").and_then(Value::as_str) == Some("image_url")
+                && url_object.len() == 1,
+            "Invalid helper image part shape"
+        );
+        let url = url_object
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("Invalid helper image URL"))?;
+        let (media, encoded) = if let Some(value) = url.strip_prefix("data:image/png;base64,") {
+            ("image/png", value)
+        } else if let Some(value) = url.strip_prefix("data:image/jpeg;base64,") {
+            ("image/jpeg", value)
+        } else {
+            return Err(anyhow!("Decisions images require PNG or JPEG data URLs"));
+        };
+        images += 1;
+        ensure!(
+            images <= MAX_IMAGES,
+            "Decisions image count exceeded the limit"
+        );
+        ensure!(
+            encoded.len() <= MAX_IMAGE_BASE64_BYTES,
+            "Decisions image exceeded the base64 byte limit"
+        );
+        let decoded = STANDARD
+            .decode(encoded)
+            .map_err(|_| anyhow!("Invalid helper image base64"))?;
+        ensure!(
+            STANDARD.encode(&decoded) == encoded,
+            "Noncanonical helper image base64"
+        );
+        let (width, height, observed_media, _) = validate_image_bytes(&decoded)?;
+        ensure!(
+            media == observed_media,
+            "Helper image media differs from its bytes"
+        );
+        pixels = pixels.saturating_add(u64::from(width) * u64::from(height));
+        ensure!(
+            pixels <= MAX_TOTAL_IMAGE_PIXELS,
+            "Decisions images exceeded the aggregate pixel limit"
+        );
+    }
+    let envelope = json!({"model": client.model, "provider": {"allow_fallbacks": false},
+                          "questions": questions, "state": text});
+    ensure!(
+        serde_json::to_vec(&envelope)?.len() <= MAX_REQUEST_BYTES,
+        "Decisions escaped text/questions envelope exceeded the byte limit"
+    );
+    ensure!(
+        serde_json::to_vec(&body)? == bytes,
+        "Helper typed request is not canonical"
+    );
+    Ok(questions)
 }
 
 /// Count or retain serialized bytes, rejecting before a write can cross the cap.

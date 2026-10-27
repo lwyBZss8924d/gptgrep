@@ -96,6 +96,13 @@
       "kind": "document",
       "path": "workspace/harness-config/goal-contract.json",
       "when": "Select the 0.2 XL development endpoint and separate frozen release acceptance"
+    },
+    {
+      "id": "gptgrep-remote-devbox",
+      "kind": "skill",
+      "path": "skills/gptgrep-remote-devbox/SKILL.md",
+      "when": "Operate, selfcheck, configure, or administer the remote GCE DevBox harness and AI Engineer CLI clients"
     }
   ]
 }
+

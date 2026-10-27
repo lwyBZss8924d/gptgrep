@@ -65,12 +65,56 @@ optional writes confined to the task workspace, optional `:minimal` system read
 access, and disabled tool network by default. A declared Decisions provider can
 use the exact `openrouter.ai` managed-proxy allowlist with all wider network
 channels disabled; both arms must use the same declared network policy. The
-provider key is a separate treatment-only capability. It verifies effective config and profile
+Linux treatment helper instead uses the keyless Unix boundary described below. The runner
+rejects inherited provider keys, including `OPENROUTER_API_KEY`. It verifies effective config and profile
 readback; a legacy `sandbox` override is never sent. The current auth owner must
 support the selected writable-workspace profile itself. A shared profile that
 opens both arms, all tasks or evaluator files is refused. System executable and
 library roots may be declared as common runtime reads when necessary; a home,
 corpus, owner run root or controller output root is not a runtime read root.
+
+The optional `NativeRunOptions.decisionsHelper` has the exact shape
+`{socketPath: "/run/gptgrep-decisions/decisions.sock", scope: "linux-container-fs-netns-v1"}`.
+An optional `attestationSha256` adds a readback equality check against the actual current owner
+proof. Immutable jobs omit that future hash: the namespace plan pins their template and job bytes,
+while the ready attestation later pins that namespace plan. Declare `/run/gptgrep-decisions` as its own read-only
+root. It cannot accompany `allowedToolNetworkHosts`, a wider ancestor read root or a writable
+helper path. Its effective profile must use `:read-only`, `/ = "deny"`, `:minimal = "read"`,
+Boolean `features.network_proxy=true`, `features.use_legacy_landlock=false`, approvals never and
+disabled web search. The fixed full-mode managed proxy has empty domain and Unix-socket maps,
+all wider IP/proxy features disabled and `dangerously_allow_all_unix_sockets=true`.
+
+This Linux syscall flag relies on the owner's qualified read-only mount and fresh
+`ProxyRouted`/`ProxyOnly` tool network namespace. The network table is not a raw Unix allowlist.
+The current owner `ContainerCommandBinding` must return a verified
+`StorageAdmission.container.decisionsHelper` with the selected ready-attestation hash,
+namespace-plan hash, native binary/profile, client control and closed
+`linuxRawUnixBoundary` evidence. The runner matches it to the actual treatment `reader`
+command, requested binary/profile and read roots, and the exact paired
+`GPTGREP_DECISIONS_IPC_CONTROL` / `GPTGREP_DECISIONS_IPC_SHA256` environment. The native binary's
+actual bytes must match. Owner `modelReadRoots` contains the common read-only roots; the reader
+adds its exact task cwd separately when constructing the native run. Host commands,
+preflight/qualification commands, baselines, judges and
+C4 actors cannot consume this capability. Native app-server model/auth/API proxy state remains
+in its inherited supervisor environment; Codex injects the managed proxy into tool environments.
+Omitting the expected hash never omits current ready authority. The runner records the actual
+consumed attestation, command-binding, namespace-plan and client-control hashes in the private
+`owner_helper` trace entry before launching app-server and in `decisionsHelperEvidence` on its result.
+
+Create actual route evidence with a separate no-model qualification intent and a keyless,
+provider-disabled Generation A. Exercise the shipped CLI Probe through the actual native sandbox,
+prove endpoint, peer and container identity, foreign socket/abstract namespace denial, direct IP
+and proxy denial, and parent API-proxy separation. Finish A and prove terminal process/endpoint
+cleanup. Then start a fresh enabled Generation B using only a public synthetic stdin sentinel;
+inspect privacy and absence of ledger/HTTP traffic without Probe, Submit, provider or model work.
+B is an independently owned no-model lifecycle outside reader admission with no Codex
+authentication. Its completed terminal chain proves enabled initialization only. A live treatment
+reader later needs a fresh helper generation and current owner ready attestation under its real
+outer authentication lease; B's readiness, client, server and socket cannot be reused. Only A's
+immutable binary/profile/policy proof can be reused within the frozen route scope. The live
+ready-dependent runner is not the entrypoint that bootstraps A's qualification. These steps retain
+the separate auth, storage, actual model/tool, provider and independent evaluation acceptance
+requirements.
 
 The inherited auth supervisor must provide its run/source identities, isolated
 Codex state, loopback refresh/revoke blockers, remote-control exclusion and

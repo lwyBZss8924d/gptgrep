@@ -1,0 +1,212 @@
+This quickstart shows you how to answer queries and search and retrieve
+developer documentation with the Developer Knowledge API by using the Google Cloud CLI.
+
+## Before you begin
+
+Before you start using the Developer Knowledge API with the gcloud CLI,
+complete the following steps.
+
+### Install and configure the gcloud CLI
+
+To install and configure the gcloud CLI, complete the following
+steps:
+
+1. If you haven't installed the gcloud CLI, then
+   [install the gcloud CLI](https://docs.cloud.google.com/sdk/docs/install).
+
+2. Run the [`gcloud components update` command](https://docs.cloud.google.com/sdk/gcloud/reference/components/update) to
+   make sure that you have the latest version:
+
+   ```
+   gcloud components update
+   ```
+3. Sign in to your Google Cloud account by running the
+   [`gcloud auth login` command](https://docs.cloud.google.com/sdk/gcloud/reference/auth/login):
+
+   ```
+   gcloud auth login
+   ```
+4. Set your active Google Cloud project by running the
+   [`gcloud config set` command](https://docs.cloud.google.com/sdk/gcloud/reference/config/set):
+
+   ```
+   gcloud config set project PROJECT_ID
+   ```
+
+   Replace `PROJECT_ID` with the ID of your
+   Google Cloud project.
+
+### Enable the API
+
+To enable the Developer Knowledge API, complete the following steps:
+
+1. Enable the Developer Knowledge API in your Google Cloud project by running the
+   [`gcloud services enable` command](https://docs.cloud.google.com/sdk/gcloud/reference/services/enable):
+
+   ```
+   gcloud services enable developerknowledge.googleapis.com
+   ```
+
+   You don't need specific Identity and Access Management (IAM) roles to enable
+   or use the API.
+2. Verify that the API is enabled for your project by running the
+   [`gcloud services list` command](https://docs.cloud.google.com/sdk/gcloud/reference/services/list):
+
+   ```
+   gcloud services list --enabled \
+       --filter="name:developerknowledge.googleapis.com"
+   ```
+
+   The output lists the API name and title:
+
+   ```
+   NAME                                     TITLE
+   developerknowledge.googleapis.com  Developer Knowledge API
+   ```
+
+## Generate answers from documentation
+
+The [`gcloud developer-knowledge answer-query` command](https://docs.cloud.google.com/sdk/gcloud/reference/developer-knowledge/answer-query)
+lets you ask questions about Google products and receive direct,
+natural-language answers. The command pulls information from official
+documentation sources and provides citations to the referenced pages.
+
+To ask a question and generate an answer, complete the following steps:
+
+1. Run the following command to ask how to create a Cloud Storage bucket:
+
+   ```
+   gcloud developer-knowledge answer-query \
+       --query="How do I create a Cloud Storage bucket?"
+   ```
+2. Confirm that the command returns a generated answer and source references
+   in YAML format:
+
+       answer:
+         answerText: |-
+           To create a Cloud Storage bucket, you can use the Google Cloud console,
+           the gcloud CLI (`gcloud storage buckets create`), client libraries, or
+           the REST API...
+         citations:
+         - endIndex: 158
+           sources:
+           - referenceIndex: 0
+           startIndex: 0
+         references:
+         - documentReference:
+             documentChunk:
+               content: |-
+                 This document shows you how to create a Cloud Storage
+                 [bucket](https://docs.cloud.google.com/storage/docs/buckets)...
+               document:
+                 dataSource: docs.cloud.google.com
+                 name: documents/docs.cloud.google.com/storage/docs/creating-buckets
+                 title: Create a bucket
+                 uri: https://docs.cloud.google.com/storage/docs/creating-buckets
+               parent: documents/docs.cloud.google.com/storage/docs/creating-buckets
+
+   The `answer` object in the output includes the following fields:
+   - `answerText`: the generated natural-language answer to your query.
+   - `citations`: byte-offset ranges, `startIndex` and `endIndex`, in `answerText` that map to supporting entries in `references` by `referenceIndex`.
+   - `references`: the source documentation chunks and metadata, including `document` and `parent`, used to generate the answer.
+
+## Search for document chunks
+
+To find specific text excerpts in Google's developer documentation rather than
+a generated answer, use the
+[`gcloud developer-knowledge documents search-chunks` command](https://docs.cloud.google.com/sdk/gcloud/reference/developer-knowledge/documents/search-chunks).
+This command scans the documentation corpus and returns matching content chunks
+alongside the resource names of their parent documents.
+
+To search for document chunks, complete the following steps:
+
+1. Run the following command to search for documentation about creating
+   Cloud Storage buckets:
+
+   ```
+   gcloud developer-knowledge documents search-chunks \
+       --query="How do I create a Cloud Storage bucket?"
+   ```
+2. Confirm that the command returns a list of matching document chunks in YAML
+   format:
+
+       ---
+       content: |-
+         This document shows you how to create a Cloud Storage
+         [bucket](https://docs.cloud.google.com/storage/docs/buckets). If not otherwise
+         specified in your request, buckets are created in the
+         [US multi-region](https://docs.cloud.google.com/storage/docs/locations)...
+       document:
+         contentLengthBytes: 31842
+         dataSource: docs.cloud.google.com
+         description: World-wide storage and retrieval of data in Google Cloud.
+         name: documents/docs.cloud.google.com/storage/docs/creating-buckets
+         title: Create a bucket
+         updateTime: '2026-09-10T20:05:41Z'
+         uri: https://docs.cloud.google.com/storage/docs/creating-buckets
+         view: DOCUMENT_VIEW_BASIC
+       id: c1
+       parent: documents/docs.cloud.google.com/storage/docs/creating-buckets
+       relevanceScore: 0.856608
+
+   Each chunk in the output includes the following fields:
+   - `content`: the matched text snippet from the documentation.
+   - `document`: metadata about the source document, including its `title`, `description`, `uri`, `dataSource`, and `updateTime`.
+   - `id`: the identifier of the chunk within the document.
+   - `parent`: the resource name of the parent document. You can pass this value to the [`describe` command](https://docs.cloud.google.com/sdk/gcloud/reference/developer-knowledge/documents/describe) to retrieve the full document.
+   - `relevanceScore`: the relevance score of the chunk to the search query.
+
+## Retrieve a document
+
+After you find a relevant document chunk, use the `parent` field from those
+search results to fetch the complete Markdown content of the document.
+
+Run the [`gcloud developer-knowledge documents describe` command](https://docs.cloud.google.com/sdk/gcloud/reference/developer-knowledge/documents/describe)
+with the resource name of the document. For example, to retrieve the document on
+creating Cloud Storage buckets, complete the following steps:
+
+1. Run the following command:
+
+   ```
+   gcloud developer-knowledge documents describe \
+     documents/docs.cloud.google.com/storage/docs/creating-buckets
+   ```
+2. Confirm that the command returns the metadata and full Markdown content of
+   the document:
+
+       content: |
+         This document shows you how to create a Cloud Storage [bucket](https://docs.cloud.google.com/storage/docs/buckets). If not otherwise specified in your request, buckets are
+         created in the [`US` multi-region](https://docs.cloud.google.com/storage/docs/locations)
+         with a default storage class of [Standard storage](https://docs.cloud.google.com/storage/docs/storage-classes)
+         and have a seven-day [soft delete](https://docs.cloud.google.com/storage/docs/soft-delete)
+         retention duration...
+       contentLengthBytes: 31842
+       dataSource: docs.cloud.google.com
+       description: World-wide storage and retrieval of data in Google Cloud.
+       name: documents/docs.cloud.google.com/storage/docs/creating-buckets
+       title: Create a bucket
+       updateTime: '2026-09-10T20:05:41Z'
+       uri: https://docs.cloud.google.com/storage/docs/creating-buckets
+       view: DOCUMENT_VIEW_CONTENT
+
+   The output includes the following fields:
+   - `content`: the full Markdown text of the document.
+   - `contentLengthBytes`: the total size of the document content in bytes.
+   - `dataSource`: the documentation domain hosting the document.
+   - `description`: a brief summary of the document.
+   - `name`: the unique resource name of the document.
+   - `title`: the title of the document.
+   - `updateTime`: the timestamp when the document was last updated.
+   - `uri`: the public URL of the documentation page.
+   - `view`: the document view returned (`DOCUMENT_VIEW_CONTENT`, `DOCUMENT_VIEW_BASIC`, or `DOCUMENT_VIEW_FULL`).
+
+## What's next
+
+- Learn how to [generate answers from documentation](https://developers.google.com/knowledge/answer-query).
+- Learn how to [filter search results, paginate, and specify document
+  views](https://developers.google.com/knowledge/search-retrieve).
+- Explore the [corpus reference](https://developers.google.com/knowledge/reference/corpus-reference) to view the full list of included documentation.
+- Refer to the [`gcloud developer-knowledge` reference](https://docs.cloud.google.com/sdk/gcloud/reference/developer-knowledge) for details on all available commands and flags.
+- Review the [REST API reference](https://developers.google.com/knowledge/reference/rest) for complete specifications for API methods.
+- Learn how to [set up the Model Context Protocol (MCP) server in Google
+  Antigravity](https://codelabs.developers.google.com/developer-knowledge-mcp-antigravity).

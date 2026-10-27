@@ -487,6 +487,8 @@ class ProxyTrap(Trap):
     def verify_live(self, timeout=5):
         """True when a loopback connection to the trap is accepted and recorded as this trap's
         own self-check."""
+        if not self.running:
+            return False
         before = self.self_checks
         try:
             with socket.create_connection(("127.0.0.1", self.port), timeout=timeout) as conn:

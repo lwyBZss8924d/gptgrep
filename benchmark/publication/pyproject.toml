@@ -1,0 +1,9 @@
+[project]
+name = "gptgrep-reader-publication"
+version = "0.1.0"
+description = "Pinned Parquet writer and decoder for closed public reader projections"
+requires-python = ">=3.13,<3.14"
+dependencies = ["pyarrow==26.0.0"]
+
+[tool.uv]
+package = false

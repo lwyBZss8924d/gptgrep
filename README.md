@@ -14,6 +14,17 @@ errors. `semantic` and `judge` also use remote Jev inference. Explicit `regex` a
 `lexical` commands are local retrieval primitives. The reasoning agent can compose
 searches, inspect trees and read bounded nodes before answering.
 
+Linux callers can explicitly select a foreground Decisions helper when model
+tools must remain keyless. A trusted owner starts `gptgrep decisions-helper serve`
+with a pinned private control, an existing Decisions budget and a private umask;
+live credentials arrive through bounded stdin followed by EOF. Clients inherit
+only `GPTGREP_DECISIONS_IPC_CONTROL` and `GPTGREP_DECISIONS_IPC_SHA256`. The helper
+owns provider submission, retries and the original budget; it preserves typed
+text/image requests and accounting callbacks. It never starts automatically or
+falls back to HTTP after a channel failure. `decisions-helper probe` is limited
+to provider-disabled engineering endpoints. Actual native socket permissions and
+selected container generations need their own qualification before adoption.
+
 Experimental collaborators: start with [development and evaluation setup](docs/development.md)
 and the dated [implementation and live-run status](docs/experimental-status.md).
 The unified runtime supplies [four Skills and three native roles](runtime/codex/STAGING.md),

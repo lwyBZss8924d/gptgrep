@@ -55,7 +55,7 @@ import time
 import unicodedata
 import urllib.parse
 
-SUPERVISOR_VERSION = "1.4.0"
+SUPERVISOR_VERSION = "1.5.0"
 CONFIG_SCHEMA = "gptgrep.codex-auth.config.v1"
 RUN_SCHEMA = "gptgrep.codex-auth.run.v1"
 LEDGER_SCHEMA = "gptgrep.codex-auth.ledger.v1"
@@ -100,6 +100,11 @@ DEFAULT_BLOCKER_URL = "http://127.0.0.1:0/oauth/token"
 # ExceptionsList; NO_PROXY is honoured. Without this a request to the loopback
 # blocker can be forwarded, body included, through a local or remote proxy.
 LOOPBACK_NO_PROXY = "127.0.0.1,localhost,::1"
+LOCAL_NO_PROXY_NETWORKS = tuple(ipaddress.ip_network(value) for value in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8",
+    "fc00::/7", "fe80::/10", "::1/128"))
+LOCAL_NO_PROXY_SUFFIXES = ("local", "lan", "test", "localhost", "internal", "home.arpa")
+PROXY_ENV_NAMES = frozenset({"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"})
 DEFAULT_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 STRIPPED_ALWAYS = ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OP_SERVICE_ACCOUNT_TOKEN")
 # The owner's failure classification needs Codex's WARN-level refresh lines
@@ -145,12 +150,19 @@ SUPERVISOR_PERMISSION_PROFILE = "gptgrep_codex_auth"
 TOOL_PERMISSION_BASES = (":workspace", ":read-only")
 TOOL_PERMISSION_MODES = ("consumer-managed", "unrestricted")
 TOOL_PERMISSION_KEYS = frozenset({"extends", "network_enabled", "deny_paths", "read_paths",
-                                  "write_paths", "minimal_read", "network_allowed_domains"})
+                                  "write_paths", "minimal_read", "network_allowed_domains",
+                                  "network_allowed_unix_sockets", "network_unix_socket_scope"})
+DECISIONS_UNIX_PARENT = "/run/gptgrep-decisions"
+DECISIONS_UNIX_SOCKET = DECISIONS_UNIX_PARENT + "/decisions.sock"
+DECISIONS_UNIX_CONTROL = DECISIONS_UNIX_PARENT + "/client.json"
+DECISIONS_UNIX_SCOPE = "linux-container-fs-netns-v1"
+DECISIONS_UNIX_ENV = ("GPTGREP_DECISIONS_IPC_CONTROL", "GPTGREP_DECISIONS_IPC_SHA256")
 MAX_PROFILE_PATHS = 64
 MAX_NETWORK_DOMAINS = 64
 DOMAIN_LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 # These apply only to roles that explicitly select an exact-domain proxy policy.
 RESTRICTED_NETWORK_FEATURES = frozenset({"network_proxy", "web_search", "web_search_cached", "web_search_request"})
+UNIX_NETWORK_FEATURES = RESTRICTED_NETWORK_FEATURES | {"use_legacy_landlock"}
 RESTRICTED_NETWORK_CONFIG = {
     "enabled": True, "proxy_url": "http://127.0.0.1:3128", "mode": "full",
     "enable_socks5": False, "enable_socks5_udp": False, "allow_upstream_proxy": False,
@@ -192,7 +204,7 @@ CODEX_PINNED_FEATURES = frozenset(PINNED_CODEX_CONFIG["features"])
 # A root inside a denied path is the more specific entry, so it reopens that path.
 CODEX_WORKSPACE_ROOT_FLAGS = frozenset({"-C", "--cd", "--add-dir"})
 CODEX_INSPECTED_VALUE_FLAGS = (CODEX_CONFIG_FLAGS | CODEX_PERMISSION_PROFILE_FLAGS | CODEX_WORKSPACE_ROOT_FLAGS |
-                               {"--enable", "--disable"})
+                               {"--enable", "--disable", "-a", "--ask-for-approval"})
 CODEX_BOOLEAN_SHORT_FLAGS = frozenset("hVy")
 # Codex executables: `codex`, release binaries (`codex-aarch64-apple-darwin`) and
 # shims (`codex.js`), in any letter case; not `codex_auth_supervisor.py`.
@@ -439,6 +451,66 @@ def _env_names(values, key, allow_openrouter):
     return names
 
 
+def _no_proxy_additions(values):
+    """Accept explicit local destinations without accepting an inherited bypass-all value."""
+    if not isinstance(values, list) or len(values) > 128:
+        raise SupervisorError("config_no_proxy_additions_invalid")
+    result = []
+    for value in values:
+        if (not isinstance(value, str) or not 1 <= len(value) <= 253
+                or not value.isascii() or any(char.isspace() for char in value)
+                or any(char in value for char in (",", "\x00", "@", "\\", "%"))):
+            raise SupervisorError("config_no_proxy_entry_invalid")
+        try:
+            network = ipaddress.ip_network(value, strict=True)
+        except ValueError:
+            # CIDRs and colon-containing values must parse as IPs, never as hostnames.
+            if "/" in value or ":" in value:
+                raise SupervisorError("config_no_proxy_entry_invalid") from None
+            prefix = "*." if value.startswith("*.") else "." if value.startswith(".") else ""
+            host = value[len(prefix):].lower()
+            labels = host.split(".")
+            local_host = any(host == suffix or host.endswith("." + suffix)
+                             for suffix in LOCAL_NO_PROXY_SUFFIXES)
+            if "." not in host and not prefix:
+                # Plain alphabetic names can be public suffixes (for example "com").
+                local_host = local_host or (("-" in host or any(char.isdigit() for char in host))
+                                            and not host.startswith("xn--"))
+            if (not all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                        for label in labels)
+                    or host.isdecimal() or not local_host):
+                raise SupervisorError("config_no_proxy_entry_not_local") from None
+            entry = prefix + host
+        else:
+            if not any(network.version == local.version and network.subnet_of(local)
+                       for local in LOCAL_NO_PROXY_NETWORKS):
+                raise SupervisorError("config_no_proxy_entry_not_local")
+            entry = str(network) if "/" in value else str(network.network_address)
+        if entry not in result:
+            result.append(entry)
+    return result
+
+
+def _passthrough_value(name, value):
+    if name not in PROXY_ENV_NAMES:
+        return value
+    # Keep proxy credentials and ambiguous URL syntax out of the inherited auth route.
+    if (not isinstance(value, str) or not 1 <= len(value) <= 2048 or not value.isascii()
+            or any(char.isspace() for char in value) or "\x00" in value):
+        raise SupervisorError("config_proxy_env_invalid", detail=name)
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        valid = (parsed.scheme in {"http", "https", "socks4", "socks4a", "socks5", "socks5h"}
+                 and parsed.hostname and parsed.username is None and parsed.password is None
+                 and parsed.path in {"", "/"} and not parsed.query and not parsed.fragment
+                 and (parsed.port is None or 1 <= parsed.port <= 65535))
+    except ValueError:
+        valid = False
+    if not valid:
+        raise SupervisorError("config_proxy_env_invalid", detail=name)
+    return value
+
+
 def _codex_config_extra(value, key):
     if value is None:
         return {}
@@ -500,6 +572,19 @@ def _tool_permissions(value, key):
                     else:
                         raise SupervisorError("config_role_network_domains_invalid", detail=detail)
                 paths["network_allowed_domains"] = list(dict.fromkeys(domains))
+            if {"network_allowed_unix_sockets", "network_unix_socket_scope"} & set(value):
+                detail = key + ".tool_permissions.network_allowed_unix_sockets"
+                if (not network or extends != ":read-only" or not minimal_read or
+                        value.get("network_allowed_unix_sockets") != [DECISIONS_UNIX_SOCKET] or
+                        value.get("network_unix_socket_scope") != DECISIONS_UNIX_SCOPE or
+                        "network_allowed_domains" in value or "/" not in paths["deny_paths"] or
+                        DECISIONS_UNIX_PARENT not in paths["read_paths"] or
+                        any(path != DECISIONS_UNIX_PARENT and _overlaps(path, DECISIONS_UNIX_PARENT)
+                            for path in paths["read_paths"]) or
+                        any(_overlaps(path, DECISIONS_UNIX_PARENT) for path in paths.get("write_paths", []))):
+                    raise SupervisorError("config_role_network_unix_scope_invalid", detail=detail)
+                paths["network_allowed_unix_sockets"] = [DECISIONS_UNIX_SOCKET]
+                paths["network_unix_socket_scope"] = DECISIONS_UNIX_SCOPE
             return {"extends": extends, "network_enabled": network, **paths}
     raise SupervisorError("config_role_tool_permissions_invalid", detail=key)
 
@@ -530,6 +615,46 @@ def _reopens(path, denied, resolve=False):
 
 def _overlaps(path, other):
     return _reopens(path, other, resolve=True) or _reopens(other, path, resolve=True)
+
+
+def is_descendant_path(child, parent, resolve=True):
+    """True when `child` is a strict descendant of `parent` (lexically, or once
+    symlinks are resolved), but not the same path."""
+    ckey, pkey = _path_key(child), _path_key(parent)
+    if ckey != pkey and is_within(ckey, pkey):
+        return True
+    if resolve:
+        try:
+            rchild = _path_key(os.path.realpath(child))
+            rparent = _path_key(os.path.realpath(parent))
+            if rchild != rparent and is_within(rchild, rparent):
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def prune_descendant_paths(paths, resolve=True):
+    """Sort and prune redundant descendant deny paths when an ancestor directory
+    is already in the list, preventing Bubblewrap EROFS mount collisions on Linux.
+    Preserves original relative order for retained non-redundant paths."""
+    unique = []
+    seen = set()
+    for p in paths:
+        s = str(p)
+        k = _path_key(s)
+        if k not in seen:
+            seen.add(k)
+            unique.append(s)
+
+    redundant = set()
+    for candidate in unique:
+        for other in unique:
+            if candidate != other and is_descendant_path(candidate, other, resolve=resolve):
+                redundant.add(candidate)
+                break
+
+    return [p for p in unique if p not in redundant]
 
 
 def _check_profile_path_conflicts(permissions, key):
@@ -589,6 +714,8 @@ class Config:
             raise SupervisorError("config_schema")
         self.source_path = source_path
         self.raw = raw
+        self.no_proxy_additions = _no_proxy_additions(raw.get("no_proxy_additions", []))
+        self.no_proxy = ",".join(dict.fromkeys(LOOPBACK_NO_PROXY.split(",") + self.no_proxy_additions))
         self.auth_source_id = raw.get("auth_source_id")
         if not isinstance(self.auth_source_id, str) or not NAME_RE.fullmatch(self.auth_source_id):
             raise SupervisorError("config_auth_source_id")
@@ -638,7 +765,8 @@ class Config:
         if not isinstance(self.locale, str) or not re.fullmatch(r"[A-Za-z0-9_.@-]{1,40}", self.locale):
             raise SupervisorError("config_locale")
         self.ps_bin = _abs(raw.get("ps_bin", "/bin/ps"), "ps_bin")
-        self.lsof_bin = _abs(raw.get("lsof_bin", "/usr/sbin/lsof"), "lsof_bin")
+        default_lsof = "/usr/sbin/lsof" if os.path.exists("/usr/sbin/lsof") else (shutil.which("lsof") or "/usr/bin/lsof")
+        self.lsof_bin = _abs(raw.get("lsof_bin", default_lsof), "lsof_bin")
         policy = raw.get("refresh_policy", {})
         if not isinstance(policy, dict):
             raise SupervisorError("config_refresh_policy")
@@ -718,11 +846,20 @@ class Config:
         if is_within(self.runs_root, self.lease_path.parent):
             raise SupervisorError("config_lease_directory_contains_runs_root")
         for name, role in self.roles.items():
+            helper_env = set(role["passthrough_env"]) & set(DECISIONS_UNIX_ENV)
+            helper_policy = isinstance(role["tool_permissions"], dict) and \
+                bool(role["tool_permissions"].get("network_allowed_unix_sockets"))
+            if helper_policy and (role["allow_openrouter"] or helper_env != set(DECISIONS_UNIX_ENV)) or \
+                    helper_env and not helper_policy:
+                raise SupervisorError("config_role_network_unix_keyless_pair_required", detail="roles." + name)
             if isinstance(role["tool_permissions"], dict):
-                if role["tool_permissions"].get("network_allowed_domains"):
+                if role["tool_permissions"].get("network_allowed_domains") or helper_policy:
                     for extra in (self.codex_config, role["codex_config"]):
                         if extra.get("web_search", "disabled") != "disabled":
                             raise SupervisorError("config_role_network_web_search_must_be_disabled",
+                                                  detail="roles." + name)
+                        if helper_policy and extra.get("approval_policy", "never") != "never":
+                            raise SupervisorError("config_role_network_unix_approval_must_be_never",
                                                   detail="roles." + name)
                 for path in role["tool_permissions"]["read_paths"]:
                     self._check_read_path(name, path)
@@ -1371,27 +1508,37 @@ class Lease:
 
 def probe_lease(cfg):
     """Report whether the lease is free without keeping any lock."""
+    fd = parent_fd = None
     try:
-        info = os.lstat(cfg.lease_path)
-    except FileNotFoundError:
-        return "absent"
-    if not stat.S_ISREG(info.st_mode):
-        return "unsafe"
-    fd = os.open(cfg.lease_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    try:
+        fd, parent_fd, before = _status_open_record(cfg, cfg.lease_path)
         try:
             fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except BlockingIOError:
+            _status_recheck(fd, parent_fd, cfg.lease_path, before)
             return "held_exclusive"
+        os.close(fd)
+        fd = None
+        os.close(parent_fd)
+        parent_fd = None
+        fd, parent_fd, current = _status_open_record(cfg, cfg.lease_path)
+        if _status_identity(current) != _status_identity(before):
+            return "unsafe"
         try:
-            os.close(fd)
-            fd = os.open(cfg.lease_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            _status_recheck(fd, parent_fd, cfg.lease_path, current)
             return "held_shared"
+        _status_recheck(fd, parent_fd, cfg.lease_path, current)
         return "free"
+    except FileNotFoundError:
+        return "absent"
+    except (OSError, SupervisorError):
+        return "unsafe"
     finally:
-        os.close(fd)
+        if fd is not None:
+            os.close(fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
 
 
 # --------------------------------------------------------------------------- lease binding
@@ -1541,19 +1688,150 @@ def ledger(cfg, entry):
     append_jsonl(cfg.ledger_path, entry)
 
 
-def last_ledger_entries(cfg, count=5):
+STATUS_RECORD_LIMIT = 65536
+STATUS_LEDGER_LIMIT = 1048576
+STATUS_HOLDER_LIMIT = 4096
+STATUS_RESERVED_ROLES = frozenset({"_owner", "_relogin", "_maintenance"})
+STATUS_HOLDER_NAME_RE = re.compile(
+    r"(?:[a-z][a-z0-9_-]{0,31}|_(?:owner|relogin|maintenance))--[A-Za-z0-9][A-Za-z0-9_-]{0,95}\.json")
+
+
+def _status_identity(info):
+    return tuple(getattr(info, key) for key in (
+        "st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_nlink",
+        "st_size", "st_mtime_ns", "st_ctime_ns"))
+
+
+def _status_parent(path):
+    """Open a physical private parent component by component, without symlinks."""
+    path = Path(path)
+    if not path.is_absolute() or str(path) != os.path.normpath(path):
+        raise SupervisorError("status_metadata_path_unsafe")
+    fd = os.open("/", _search_dir_flags())
     try:
-        with open(cfg.ledger_path, "rb") as handle:
-            lines = handle.read().splitlines()[-count:]
-    except OSError:
-        return []
+        components = path.parent.parts[1:]
+        for index, component in enumerate(components):
+            flags = _LIST_DIR_FLAGS if index == len(components) - 1 else _search_dir_flags()
+            next_fd = os.open(component, flags, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        info = os.fstat(fd)
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            raise SupervisorError("status_metadata_parent_unsafe")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _status_open_record(cfg, path, *, limit=None):
+    """Validate opened metadata before any content read; exclude credential inode."""
+    path = Path(path)
+    parent_fd = _status_parent(path)
+    fd = None
+    try:
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                     dir_fd=parent_fd)
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1
+                or limit is not None and info.st_size > limit):
+            raise SupervisorError("status_metadata_file_unsafe")
+        canonical = canonical_metadata(cfg)
+        if canonical.get("exists") is None:
+            raise SupervisorError("status_canonical_identity_unavailable")
+        if (canonical.get("exists") is True
+                and (canonical.get("symlink") is not False or canonical.get("regular") is not True)):
+            raise SupervisorError("status_canonical_identity_unsafe")
+        if (canonical.get("exists") is True
+                and (info.st_dev, info.st_ino) == (canonical.get("dev"), canonical.get("ino"))):
+            raise SupervisorError("status_metadata_is_credential")
+        if sys.platform == "linux" and os.readlink(f"/proc/self/fd/{fd}") != str(path):
+            raise SupervisorError("status_metadata_path_changed")
+        return fd, parent_fd, info
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        os.close(parent_fd)
+        raise
+
+
+def _status_recheck(fd, parent_fd, path, before):
+    after = os.fstat(fd)
+    current = os.stat(Path(path).name, dir_fd=parent_fd, follow_symlinks=False)
+    parent_now = os.lstat(Path(path).parent)
+    parent_opened = os.fstat(parent_fd)
+    if (_status_identity(before) != _status_identity(after)
+            or _status_identity(before) != _status_identity(current)
+            or (parent_now.st_dev, parent_now.st_ino) != (parent_opened.st_dev, parent_opened.st_ino)
+            or os.path.realpath(Path(path).parent) != str(Path(path).parent)):
+        raise SupervisorError("status_metadata_changed")
+
+
+def _status_read_bytes(cfg, path, *, limit=STATUS_RECORD_LIMIT):
+    fd, parent_fd, before = _status_open_record(cfg, path, limit=limit)
+    try:
+        raw = bytearray()
+        while len(raw) <= limit:
+            block = os.read(fd, min(65536, limit + 1 - len(raw)))
+            if not block:
+                break
+            raw.extend(block)
+        if len(raw) > limit or len(raw) != before.st_size:
+            raise SupervisorError("status_metadata_size_changed")
+        _status_recheck(fd, parent_fd, path, before)
+        return bytes(raw)
+    finally:
+        os.close(fd)
+        os.close(parent_fd)
+
+
+def _status_json(raw):
+    def pairs(values):
+        record = {}
+        for key, value in values:
+            if key in record:
+                raise ValueError("duplicate metadata key")
+            record[key] = value
+        return record
+    def nonfinite(_value):
+        raise ValueError("nonfinite metadata value")
+    value = json.loads(raw, object_pairs_hook=pairs, parse_constant=nonfinite)
+    if not isinstance(value, dict):
+        raise ValueError("metadata must be an object")
+    return value
+
+
+def _status_error(exc):
+    return {"reason": exc.reason if isinstance(exc, SupervisorError) else
+            errno_name(exc) if isinstance(exc, OSError) else "status_metadata_malformed"}
+
+
+def status_ledger(cfg, count=5):
+    scan = {"complete": False, "errors": [], "present": None, "bytes": 0,
+            "max_bytes": STATUS_LEDGER_LIMIT}
+    try:
+        raw = _status_read_bytes(cfg, cfg.ledger_path, limit=STATUS_LEDGER_LIMIT)
+    except FileNotFoundError:
+        return [], dict(scan, complete=True, present=False)
+    except (OSError, SupervisorError) as exc:
+        return [], dict(scan, errors=[_status_error(exc)])
+    scan.update(present=True, bytes=len(raw))
+    if type(count) is not int or not 1 <= count <= 5:
+        raise ValueError("status ledger count must be between one and five")
     result = []
-    for line in lines:
+    for line in raw.splitlines()[-count:]:
         try:
-            result.append(json.loads(line))
-        except ValueError:
-            pass
-    return result
+            if len(line) > STATUS_RECORD_LIMIT:
+                raise ValueError("ledger record bound")
+            entry = _status_json(line)
+            if entry.get("schema") != LEDGER_SCHEMA or entry.get("auth_source_id") != cfg.auth_source_id:
+                raise ValueError("ledger identity")
+            result.append(entry)
+        except (ValueError, RecursionError) as exc:
+            scan["errors"].append(_status_error(exc))
+    scan["complete"] = not scan["errors"]
+    return result, scan
 
 
 # --------------------------------------------------------------------------- layout, config, environment
@@ -1725,9 +2003,12 @@ def render_toml(tree):
 def permission_denials(cfg, layout):
     """Paths model tool commands are always denied in the supervisor permission
     profile: the canonical auth home, this run's auth link, the lease directory
-    (lock, markers, ledger) and the configured `extra_denied_paths`."""
+    (lock, markers, ledger) and the configured `extra_denied_paths`. Redundant
+    descendant paths are pruned so Bubblewrap does not fail with EROFS trying to
+    create mount points inside a read-only parent."""
     base = [str(cfg.canonical_auth_home), str(layout.auth_link), str(cfg.lease_path.parent)]
-    return base + [path for path in cfg.extra_denied_paths if path not in base]
+    raw = base + [path for path in cfg.extra_denied_paths if path not in base]
+    return prune_descendant_paths(raw)
 
 
 def profile_filesystem(cfg, layout, tool_permissions):
@@ -1771,6 +2052,11 @@ def tool_credential_access(cfg, layout, tool_permissions):
             result.update(network_allowed_domains=list(tool_permissions["network_allowed_domains"]),
                           network_proxy=True, web_search="disabled",
                           network_scope="exact domains for sandboxed tool commands; no endpoint or model restriction")
+        if tool_permissions.get("network_allowed_unix_sockets"):
+            result.update(network_allowed_unix_sockets=list(tool_permissions["network_allowed_unix_sockets"]),
+                          network_unix_socket_scope=DECISIONS_UNIX_SCOPE, network_proxy=True,
+                          web_search="disabled", approval_policy="never",
+                          network_scope="Linux raw Unix syscalls; exact external helper authority requires owner-qualified filesystem and ProxyOnly namespaces")
         return result
     if tool_permissions == "consumer-managed":
         return {"policy": "consumer_managed", "verified_by_supervisor": False}
@@ -1795,6 +2081,18 @@ def codex_config_tree(cfg, layout, extra, tool_permissions=None):
             tables["features"]["network_proxy"] = True
             network = dict(RESTRICTED_NETWORK_CONFIG,
                            domains={domain: "allow" for domain in tool_permissions["network_allowed_domains"]})
+        if tool_permissions.get("network_allowed_unix_sockets"):
+            if merged.get("web_search", "disabled") != "disabled":
+                raise SupervisorError("config_role_network_web_search_must_be_disabled",
+                                      detail="roles." + layout.role)
+            if merged.get("approval_policy", "never") != "never":
+                raise SupervisorError("config_role_network_unix_approval_must_be_never",
+                                      detail="roles." + layout.role)
+            root.update(web_search="disabled", approval_policy="never")
+            tables["features"].update(network_proxy=True, use_legacy_landlock=False)
+            # On Linux the map does not restrict raw AF_UNIX syscalls. The owner
+            # qualifies the exact read-only mount view and ProxyOnly child netns.
+            network = dict(RESTRICTED_NETWORK_CONFIG, dangerously_allow_all_unix_sockets=True, domains={})
         root["default_permissions"] = SUPERVISOR_PERMISSION_PROFILE
         tables["permissions"] = {SUPERVISOR_PERMISSION_PROFILE: {
             "extends": tool_permissions["extends"],
@@ -1816,7 +2114,7 @@ def base_env(cfg, layout, run_id):
            "HOME": str(layout.home), "TMPDIR": str(layout.tmp),
            "CODEX_SQLITE_HOME": str(layout.state_dir),
            "CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED": "1",
-           "NO_PROXY": LOOPBACK_NO_PROXY, "no_proxy": LOOPBACK_NO_PROXY,
+           "NO_PROXY": cfg.no_proxy, "no_proxy": cfg.no_proxy,
            "GPTGREP_AUTH_RUN_ID": run_id, "GPTGREP_AUTH_SOURCE_ID": cfg.auth_source_id}
     env.update({k: str(v) for k, v in layout.xdg().items()})
     return env
@@ -1838,12 +2136,16 @@ def build_consumer_env(cfg, role, layout, parent_env):
     passed = []
     for name in spec["passthrough_env"]:
         if name in parent_env:
-            env[name] = parent_env[name]
+            env[name] = _passthrough_value(name, parent_env[name])
             passed.append(name)
     for name in STRIPPED_ALWAYS:
         env.pop(name, None)
     if not spec["allow_openrouter"]:
         env.pop("OPENROUTER_API_KEY", None)
+    if isinstance(spec["tool_permissions"], dict) and spec["tool_permissions"].get("network_allowed_unix_sockets"):
+        if env.get(DECISIONS_UNIX_ENV[0]) != DECISIONS_UNIX_CONTROL or \
+                not re.fullmatch(r"[a-f0-9]{64}", env.get(DECISIONS_UNIX_ENV[1], "")):
+            raise SupervisorError("consumer_network_unix_keyless_pair_invalid", detail=role)
     return env, passed
 
 
@@ -1852,7 +2154,7 @@ def build_owner_env(cfg, layout, parent_env, codex_home):
     env["CODEX_HOME"] = str(codex_home)
     for name in cfg.owner_passthrough_env:
         if name in parent_env:
-            env[name] = parent_env[name]
+            env[name] = _passthrough_value(name, parent_env[name])
     if cfg.owner_refresh_token_url:
         env["CODEX_REFRESH_TOKEN_URL_OVERRIDE"] = cfg.owner_refresh_token_url
     # The owner never logs out; any revoke must fail instead of reaching the authority.
@@ -1863,12 +2165,15 @@ def build_owner_env(cfg, layout, parent_env, codex_home):
     return env
 
 
-def build_relogin_env(cfg, layout, codex_home):
+def build_relogin_env(cfg, layout, codex_home, parent_env):
     """The device login reaches only the issuer; refresh and revoke hit the blocker."""
     env = base_env(cfg, layout, layout.run_id)
     env["CODEX_HOME"] = str(codex_home)
     env["CODEX_REFRESH_TOKEN_URL_OVERRIDE"] = cfg.blocker_url
     env["CODEX_REVOKE_TOKEN_URL_OVERRIDE"] = cfg.revoke_blocker_url
+    for name in cfg.owner_passthrough_env:
+        if name in PROXY_ENV_NAMES and name in parent_env:
+            env[name] = _passthrough_value(name, parent_env[name])
     return env
 
 
@@ -1948,15 +2253,19 @@ def _codex_options(argv):
     return options
 
 
-def codex_profile_override(argv, restricted_network=False):
+def codex_profile_override(argv, restricted_network=False, restricted_unix=False):
     """The first argument of a Codex command line that would replace the generated
     permission profile or undo a pinned key for model tool commands (a flag name,
     `-c KEY` or `--enable FEATURE`), or None."""
-    pinned_features = CODEX_PINNED_FEATURES | (RESTRICTED_NETWORK_FEATURES if restricted_network else frozenset())
+    restricted_network = restricted_network or restricted_unix
+    network_features = UNIX_NETWORK_FEATURES if restricted_unix else RESTRICTED_NETWORK_FEATURES
+    pinned_features = CODEX_PINNED_FEATURES | (network_features if restricted_network else frozenset())
     for name, value in _codex_options(argv):
         if name in CODEX_PROFILE_OVERRIDE_FLAGS:
             return name
         if restricted_network and name == "--search":
+            return name
+        if restricted_unix and name in ("-a", "--ask-for-approval") and value != "never":
             return name
         if name in CODEX_CONFIG_FLAGS:
             segments = [part.strip().strip("\"'") for part in (value or "").partition("=")[0].split(".")]
@@ -1969,10 +2278,14 @@ def codex_profile_override(argv, restricted_network=False):
                 setting = (value or "").partition("=")[2].strip()
                 if len(segments) != 1 or setting not in ('"disabled"', "'disabled'", "disabled"):
                     return name + " " + key
+            if restricted_unix and key == "approval_policy":
+                setting = (value or "").partition("=")[2].strip()
+                if len(segments) != 1 or setting not in ('"never"', "'never'", "never"):
+                    return name + " " + key
         if name == "--enable" and (value or "").strip() in CODEX_PINNED_FEATURES:
             return name + " " + value.strip()
         if restricted_network and name in ("--enable", "--disable") and \
-                (value or "").strip() in RESTRICTED_NETWORK_FEATURES:
+                (value or "").strip() in network_features:
             return name + " " + value.strip()
         if name in CODEX_PERMISSION_PROFILE_FLAGS and value != SUPERVISOR_PERMISSION_PROFILE:
             return name
@@ -2057,7 +2370,8 @@ def consumer_argv_guard(cfg, layout, spec, argv):
         return "not_applicable"
     if not invokes_codex(cfg, argv[0], spec["path_env"] or cfg.path_env, layout.work_dir):
         return "not_a_codex_command"
-    override = codex_profile_override(argv, restricted_network=bool(tool_permissions.get("network_allowed_domains")))
+    override = codex_profile_override(argv, restricted_network=bool(tool_permissions.get("network_allowed_domains")),
+                                     restricted_unix=bool(tool_permissions.get("network_allowed_unix_sockets")))
     if override is not None:
         raise SupervisorError("consumer_argv_overrides_permission_profile", detail=override)
     denied = permission_denials(cfg, layout) + tool_permissions["deny_paths"]
@@ -3556,7 +3870,7 @@ def relogin_gate(cfg, layout):
     link = verify_home / "auth.json"
     os.symlink(str(cfg.canonical_auth_file), link)
     try:
-        env = build_relogin_env(cfg, layout, verify_home)
+        env = build_relogin_env(cfg, layout, verify_home, dict(os.environ))
         status = subprocess.run(_pinned_cli(cfg, layout) + ["login", "status"], env=env, cwd=str(layout.work_dir),
                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                 timeout=120)
@@ -3610,7 +3924,7 @@ def command_relogin(cfg, args):
             if lease.sidecar:
                 lease.update_sidecar(released_at=utc_iso())
             return _finish(layout, receipt, "RELOGIN_NOT_REQUIRED", EXIT_USAGE)
-        env = build_relogin_env(cfg, layout, layout.codex_home)
+        env = build_relogin_env(cfg, layout, layout.codex_home, dict(os.environ))
         login_argv = _pinned_cli(cfg, layout) + ["login", "--device-auth"]
         if cfg.relogin_issuer:
             login_argv += ["--experimental_issuer", cfg.relogin_issuer]
@@ -3730,6 +4044,106 @@ def live_holders(cfg):
     return holders
 
 
+def status_holders(cfg):
+    """Keep incomplete scans distinct from an observed empty holder directory."""
+    scan = {"complete": False, "errors": [], "scanned_entries": 0, "max_entries": STATUS_HOLDER_LIMIT}
+    holders = []
+    directory_fd = None
+    try:
+        directory_fd = _status_parent(cfg.holders_dir / "selected-record")
+        before = os.fstat(directory_fd)
+        with os.scandir(directory_fd) as entries:
+            for entry in entries:
+                scan["scanned_entries"] += 1
+                if scan["scanned_entries"] > STATUS_HOLDER_LIMIT:
+                    scan["errors"].append({"reason": "status_holder_count_exceeded"})
+                    break
+                if not STATUS_HOLDER_NAME_RE.fullmatch(entry.name):
+                    scan["errors"].append({"reason": "status_holder_name_invalid"})
+                    continue
+                try:
+                    raw = _status_read_bytes(cfg, cfg.holders_dir / entry.name, limit=16384)
+                    record = _status_json(raw)
+                    required = {"pid", "host_id", "process_start_time", "run_id", "role", "operation", "mode",
+                                "acquired_at", "released_at"}
+                    if (not required <= set(record) or set(record) - required - {"guardian_pid", "released_by"}
+                            or type(record["pid"]) is not int or not 1 < record["pid"] <= 4194304
+                            or not isinstance(record["role"], str)
+                            or not (NAME_RE.fullmatch(record["role"]) or record["role"] in STATUS_RESERVED_ROLES)
+                            or not isinstance(record["run_id"], str) or not RUN_ID_RE.fullmatch(record["run_id"])
+                            or entry.name != record["role"] + "--" + record["run_id"] + ".json"
+                            or any(not isinstance(record[key], str) or not 1 <= len(record[key]) <= 256
+                                   for key in ("host_id", "process_start_time", "operation", "acquired_at"))
+                            or record["mode"] not in {"shared", "exclusive"}
+                            or record["released_at"] is not None and not isinstance(record["released_at"], str)
+                            or "guardian_pid" in record and (type(record["guardian_pid"]) is not int or record["guardian_pid"] <= 1)
+                            or "released_by" in record and (not isinstance(record["released_by"], str) or len(record["released_by"]) > 256)):
+                        raise ValueError("holder metadata schema")
+                    if record["released_at"] is None:
+                        record["alive"] = process_alive(record["pid"], record["process_start_time"], cfg.ps_bin)
+                        holders.append(record)
+                except (OSError, ValueError, RecursionError, SupervisorError) as exc:
+                    scan["errors"].append(_status_error(exc))
+        after = os.fstat(directory_fd)
+        current = os.lstat(cfg.holders_dir)
+        if (_status_identity(before) != _status_identity(after)
+                or (before.st_dev, before.st_ino) != (current.st_dev, current.st_ino)
+                or os.path.realpath(cfg.holders_dir) != str(cfg.holders_dir)):
+            scan["errors"].append({"reason": "status_holder_directory_changed"})
+    except (OSError, SupervisorError) as exc:
+        scan["errors"].append(_status_error(exc))
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+    scan["complete"] = not scan["errors"]
+    return holders, scan
+
+
+def status_binding(cfg):
+    state = {"present": None, "matches_config": False, "full_identity_matches_config": False}
+    try:
+        raw = _status_read_bytes(cfg, cfg.binding_path)
+    except FileNotFoundError:
+        return dict(state, present=False, matches_config=None, full_identity_matches_config=None)
+    except (OSError, SupervisorError) as exc:
+        return dict(state, error=_status_error(exc)["reason"])
+    state["present"] = True
+    fd = parent_fd = None
+    try:
+        binding = _status_json(raw)
+        if (binding.get("schema") != BINDING_SCHEMA
+                or not {"auth_source_id", "lease_path", "lease_dev", "lease_ino"} <= set(binding)
+                or type(binding["lease_dev"]) is not int or type(binding["lease_ino"]) is not int):
+            raise ValueError("binding metadata schema")
+        fd, parent_fd, info = _status_open_record(cfg, cfg.lease_path)
+        verify_binding_identity(cfg, binding)
+        if (binding["lease_dev"], binding["lease_ino"]) != (info.st_dev, info.st_ino):
+            raise SupervisorError("lease_file_replaced")
+        _status_recheck(fd, parent_fd, cfg.lease_path, info)
+        if _status_read_bytes(cfg, cfg.binding_path) != raw:
+            raise SupervisorError("status_metadata_changed")
+        return dict(state, matches_config=True, full_identity_matches_config=True)
+    except (OSError, ValueError, RecursionError, SupervisorError) as exc:
+        return dict(state, error=_status_error(exc)["reason"])
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+
+
+def status_marker(cfg, path, schema):
+    try:
+        record = _status_json(_status_read_bytes(cfg, path))
+        if record.get("schema") != schema:
+            raise ValueError("marker metadata schema")
+        return dict(record, present=True)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, RecursionError, SupervisorError) as exc:
+        return {"present": True, "unreadable": True, "error": _status_error(exc)["reason"]}
+
+
 def command_rebind_lease(cfg, args):
     """Human-confirmed rebinding of the auth source to the configured lease file
     (after the lock file was deleted, or a deliberate lease move)."""
@@ -3773,7 +4187,8 @@ def command_rebind_lease(cfg, args):
 
 
 def command_status(cfg, _args):
-    holders = [h for h in live_holders(cfg)]
+    holders, holder_scan = status_holders(cfg)
+    ledger_tail, ledger_scan = status_ledger(cfg)
     try:
         meta = canonical_preflight(cfg)
         canonical = dict(meta, preflight="ok")
@@ -3782,19 +4197,19 @@ def command_status(cfg, _args):
     age = None
     if canonical.get("mtime_ns"):
         age = round(max(0.0, time.time() - canonical["mtime_ns"] / 1e9), 3)
-    try:
-        binding = read_binding(cfg)
-        binding_state = {"present": binding is not None,
-                         "matches_config": None if binding is None else binding["lease_path"] == str(cfg.lease_path)}
-    except SupervisorError as exc:
-        binding_state = {"present": True, "error": exc.reason}
+    binding_state = status_binding(cfg)
+    quarantine = status_marker(cfg, cfg.quarantine_path, "gptgrep.codex-auth.quarantine.v1")
+    auth_block = status_marker(cfg, cfg.auth_block_path, "gptgrep.codex-auth.auth-block.v1")
+    metadata_complete = (holder_scan["complete"] and ledger_scan["complete"] and "error" not in binding_state
+                         and not (quarantine or {}).get("unreadable") and not (auth_block or {}).get("unreadable"))
     return {"schema": "gptgrep.codex-auth.status.v1", "auth_source_id": cfg.auth_source_id,
             "lease": {"path": str(cfg.lease_path), "probe": probe_lease(cfg), "binding": binding_state},
-            "unreleased_holder_records": holders, "quarantine": quarantine_state(cfg),
-            "auth_block": auth_block_state(cfg), "canonical": canonical,
+            "unreleased_holder_records": holders, "holder_scan": holder_scan, "quarantine": quarantine,
+            "auth_block": auth_block, "canonical": canonical,
             "refresh_policy": {"max_age_seconds": cfg.refresh_max_age_seconds, "canonical_age_seconds": age,
                                "refresh_due": None if age is None else age > cfg.refresh_max_age_seconds},
-            "ledger_tail": last_ledger_entries(cfg), "blocker": {"url": cfg.blocker_url,
+            "ledger_tail": ledger_tail, "ledger_scan": ledger_scan,
+            "metadata_observation_complete": metadata_complete, "blocker": {"url": cfg.blocker_url,
                                                                  "probe": blocker_probe(cfg)},
             "credential_contents_read_by_supervisor": False}, EXIT_PASS
 

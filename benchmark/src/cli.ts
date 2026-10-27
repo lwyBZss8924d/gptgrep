@@ -1,7 +1,7 @@
 import { mkdir, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { corpusDigest, writeHarborTasks, type RawDocument } from "./adapter";
-import { loadDependencyRelease, loadXlRelease, splitBySourceGroups, XL_RELEASE_REVISION } from "./dataset";
+import { assertDependencyReleaseMatches, loadDependencyRelease, loadXlRelease, parseExposureLedger, parseSourceFamilies, splitBySourceGroups, XL_RELEASE_REVISION } from "./dataset";
 import { digest, fileHash, physicalPath, readJson, requireStorage, sha256, within, writeJson } from "./io";
 import { judgeAnswer, type JudgeOptions } from "./judge";
 import { runReaderArm, type ReaderArmOptions } from "./runner";
@@ -44,21 +44,22 @@ async function acquiredInputs(releaseRoot: string, corpusRoot: string) {
   if (new Set(raw.documents.map((d: any) => d.documentId)).size !== raw.documents.length || raw.documents.some((d: any) => !known.has(d.documentId))) throw new Error("RAW manifest has duplicate or foreign documents");
   return { acquisition, rawSha256, raw, documents };
 }
-async function sourceInputs(releaseRoot: string, corpusRoot: string) {
+
+async function sourceInputs(releaseRoot: string, corpusRoot: string, sourceFamilies?: Record<string, string>) {
   const inputs = await acquiredInputs(releaseRoot, corpusRoot);
-  return { ...inputs, release: await loadXlRelease({ releaseRoot, revision: inputs.acquisition.revision, rawSha256: inputs.rawSha256 }) };
+  return { ...inputs, release: await loadXlRelease({ releaseRoot, revision: inputs.acquisition.revision, rawSha256: inputs.rawSha256, sourceFamilies }) };
 }
 
 const [command, ...args] = process.argv.slice(2);
 if (!command || command === "help" || command === "--help") {
-  console.log("GPTgrep XL Benchmark Kit\nassess-availability --release ROOT --corpus ROOT --states JSON --output JSON\nfreeze --release ROOT --corpus ROOT --output DIR --seed VALUE --profile ID --acceptance JSON --acceptance-sha256 SHA [--sample-size N] [--dev-groups N]\nexport-harbor --release ROOT --corpus ROOT --cohort JSON --arm bare|gptgrep --output DIR --profile ID --acceptance JSON --acceptance-sha256 SHA [--runtime-artifacts JSON]\nreader --config JSON --acceptance JSON --acceptance-sha256 SHA\nharbor-preflight|harbor-run --config JSON --acceptance JSON --acceptance-sha256 SHA\njudge --config JSON\nAcceptance must be selected by the exact owner-admitted command or its pinned child closure. Raw/OCR acquisition remains a separate workflow.");
+  console.log("GPTgrep XL Benchmark Kit\nassess-availability --release ROOT --corpus ROOT --states JSON --output JSON\nfreeze --release ROOT --corpus ROOT --output DIR --seed VALUE --profile ID --acceptance JSON --acceptance-sha256 SHA [--sample-size N] [--dev-groups N] [--source-families JSON] [--exposed-ledger JSON]\nexport-harbor --release ROOT --corpus ROOT --cohort JSON --arm bare|gptgrep --output DIR --profile ID --acceptance JSON --acceptance-sha256 SHA [--runtime-artifacts JSON] [--source-families JSON]\nreader --config JSON --acceptance JSON --acceptance-sha256 SHA\nharbor-preflight|harbor-run --config JSON --acceptance JSON --acceptance-sha256 SHA\njudge --config JSON\nAcceptance must be selected by the exact owner-admitted command or its pinned child closure. Raw/OCR acquisition remains a separate workflow.");
 } else {
   const { values, get } = options(args);
   const reference = (): AdmissionReference => ({ acceptance: { path: resolve(get("acceptance")), sha256: get("acceptance-sha256") }, profileId: get("profile") });
   const allowed: Record<string, string[]> = {
-    "assess-availability": ["release", "corpus", "states", "output"],
-    freeze: ["release", "corpus", "output", "seed", "profile", "acceptance", "acceptance-sha256", "sample-size", "dev-groups"],
-    "export-harbor": ["release", "corpus", "cohort", "arm", "output", "runtime-artifacts", "profile", "acceptance", "acceptance-sha256"],
+    "assess-availability": ["release", "corpus", "states", "output", "source-families"],
+    freeze: ["release", "corpus", "output", "seed", "profile", "acceptance", "acceptance-sha256", "sample-size", "dev-groups", "source-families", "exposed-ledger"],
+    "export-harbor": ["release", "corpus", "cohort", "arm", "output", "runtime-artifacts", "profile", "acceptance", "acceptance-sha256", "source-families"],
     reader: ["config", "acceptance", "acceptance-sha256"], judge: ["config"],
     "harbor-preflight": ["config", "acceptance", "acceptance-sha256"], "harbor-run": ["config", "acceptance", "acceptance-sha256"],
   };
@@ -66,7 +67,8 @@ if (!command || command === "help" || command === "--help") {
   if (command === "assess-availability") {
     const output = resolve(get("output")); await requireStorage(output);
     const releaseRoot = resolve(get("release")), inputs = await acquiredInputs(releaseRoot, resolve(get("corpus")));
-    const release = await loadDependencyRelease({ releaseRoot, revision: inputs.acquisition.revision, rawSha256: inputs.rawSha256 });
+    const sourceFamilies = values.has("source-families") ? parseSourceFamilies(await readExactJson(get("source-families"))) : undefined;
+    const release = await loadDependencyRelease({ releaseRoot, revision: inputs.acquisition.revision, rawSha256: inputs.rawSha256, sourceFamilies });
     const state = await readExactJson(get("states"));
     if (Object.keys(state).sort().join("\0") !== ["revision", "generation", "recordedAt", "supersedes", "documents", "profiles", "preprocessing"].sort().join("\0")) throw new Error("Unknown or missing assessment input fields");
     const input = { ...state, release };
@@ -77,11 +79,17 @@ if (!command || command === "help" || command === "--help") {
   } else if (command === "freeze") {
     const output = resolve(get("output")); await requireStorage(output);
     const admission = await loadAdmission(reference(), output);
-    const { release, raw, documents } = await sourceInputs(resolve(get("release")), resolve(get("corpus")));
+    const sourceFamilies = values.has("source-families") ? parseSourceFamilies(await readExactJson(get("source-families"))) : undefined;
+    const exposedDocumentIds = values.has("exposed-ledger") ? parseExposureLedger(await readExactJson(get("exposed-ledger"))) : undefined;
+    const { release, raw, documents } = await sourceInputs(resolve(get("release")), resolve(get("corpus")), sourceFamilies);
     const seed = get("seed"), count = Number(values.get("sample-size") ?? 4);
     if (!Number.isSafeInteger(count) || count < 1) throw new Error("Sample size must be a positive integer");
-    const split = splitBySourceGroups(release, { seed, ...(values.has("dev-groups") ? { devGroupCount: Number(get("dev-groups")) } : {}) });
-    if (digest(release.fileHashes) !== digest(admission.assessment.release.fileHashes)) throw new Error("Freeze release differs from assessment");
+    const split = splitBySourceGroups(release, {
+      seed,
+      ...(values.has("dev-groups") ? { devGroupCount: Number(get("dev-groups")) } : {}),
+      ...(exposedDocumentIds ? { exposedDocumentIds } : {}),
+    });
+    assertDependencyReleaseMatches(admission.assessment.release, release);
     const dev = new Set(split.dev.taskIds), eligibleIds = new Set(admission.assessment.tasks.filter(t => t.armAvailability[reference().profileId]?.admitted).map(t => t.taskId));
     const eligible = release.readerTasks.filter(t => dev.has(t.id) && eligibleIds.has(t.id) && admission.acceptance.taskIds.includes(t.id))
       .sort((a, b) => sha256(`${seed}\0${a.id}`).localeCompare(sha256(`${seed}\0${b.id}`)));
@@ -103,13 +111,18 @@ if (!command || command === "help" || command === "--help") {
         acquired: raw.documents.filter((d: any) => d.status === "ready").length,
         held: raw.documents.filter((d: any) => d.status === "held").length, failed: raw.failed, pending: raw.pending },
       enrolledTasksNeverDropped: true, fullBenchmarkAccepted: false, sourceFileHashes: release.fileHashes,
+      groupingInputs: {
+        sourceFamilies: values.has("source-families") ? { path: resolve(get("source-families")), sha256: await fileHash(get("source-families")) } : null,
+        exposureLedger: values.has("exposed-ledger") ? { path: resolve(get("exposed-ledger")), sha256: await fileHash(get("exposed-ledger")) } : null,
+      },
       availabilityAtEnrollment: { assessmentSha256: admission.acceptance.assessment.sha256, revision: admission.assessment.revision,
         generation: admission.assessment.generation, profileId: reference().profileId },
       splitSha256: await fileHash(join(output, "split.json")) });
     console.log(JSON.stringify({ tasks: tasks.length, documents: selected.length, cohort: join(output, "cohort.json"), cohortSha256: await fileHash(join(output, "cohort.json")) }));
   } else if (command === "export-harbor") {
     const output = resolve(get("output")); await requireStorage(output);
-    const { release, documents } = await sourceInputs(resolve(get("release")), resolve(get("corpus")));
+    const sourceFamilies = values.has("source-families") ? parseSourceFamilies(await readExactJson(get("source-families"))) : undefined;
+    const { release, documents } = await sourceInputs(resolve(get("release")), resolve(get("corpus")), sourceFamilies);
     const cohort = validateFrozenCohort(await readJson(get("cohort")), release, documents);
     const arm = get("arm"); if (arm !== "bare" && arm !== "gptgrep") throw new Error("Unsupported initial benchmark arm");
     const rubricPath = resolve(import.meta.dir, "../rubric.json");

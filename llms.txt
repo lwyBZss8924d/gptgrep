@@ -4,6 +4,8 @@
 - [Execution and delivery workflow](workspace/harness-config/workflow.txt): proportionate changes, validation, private evidence and closeout.
 - [Checkpoint template](workspace/harness-config/templates/checkpoint.json): fields for a local continuation cursor.
 - [GPTgrep agent Skill](skills/gptgrep/SKILL.md): source-linked evidence working memory and product tool composition.
+- [Remote DevBox DevOps Skill](skills/gptgrep-remote-devbox/SKILL.md): operate, selfcheck, configure, and administer the remote GCE DevBox harness and AI Engineer CLI clients (Claude Code, Codex, Antigravity).
+- [Remote DevBox Skill Catalog](skills/gptgrep-remote-devbox/llms.txt): index of bundled upstream Google Developer skills (gcloud, retrieving-developer-knowledge, gws, colab-operator) and AI Engineer client skills (claude-code-operator, openai-docs, antigravity-guide, 1password-self).
 - [Product specification](SPEC.md): interfaces, initial release and long-horizon research goal.
 - [Evaluation protocol](docs/evaluation.md): matched native Codex with GPTgrep versus bare on XL-DocBench, fixed denominators, separate preparation/SEARCH/Judge accounting and frozen confirmation.
 - [Goal contract](workspace/harness-config/goal-contract.json): 0.2 models, matched arms, development selection and distinct XL release acceptance; small live runs and source delivery do not establish canary readiness.

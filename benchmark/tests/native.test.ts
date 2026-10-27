@@ -2,9 +2,9 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { runNativeForTest, validatePermissionProfile, type NativeRunOptions, type NativeTestTransport } from "../src/native";
+import { boundNativeResult, runNativeForTest, validateNativeHelperAdmission, validatePermissionProfile, type NativeRunOptions, type NativeTestTransport } from "../src/native";
 import { parseReaderAnswer, readerOrder, readerPrompt, runReaderArm, runReaderPair, stagePreparedWorkspace, verifyReaderWorkspace, type ReaderWorkspace } from "../src/runner";
-import { canonical, sha256 } from "../src/io";
+import { canonical, digest, sha256, type StorageAdmission } from "../src/io";
 
 type Message = Record<string, any>;
 const options: NativeRunOptions = {
@@ -15,6 +15,35 @@ const options: NativeRunOptions = {
 const profile = { permissions: { test_reader: { extends: ":read-only", network: { enabled: false }, filesystem: { "/": "deny", "/task": "read" } } } };
 const tokenUsage = { total: { totalTokens: 99, inputTokens: 70, cachedInputTokens: 10, cacheWriteInputTokens: 0, outputTokens: 29, reasoningOutputTokens: 17 } };
 
+function unixHelperFixture() {
+  const parent = "/run/gptgrep-decisions", socket = `${parent}/decisions.sock` as const;
+  const pin = (path: string) => ({ path, sha256: "a".repeat(64) });
+  const selected: NativeRunOptions = { ...options, readableRoots: [...options.readableRoots, parent],
+    decisionsHelper: { socketPath: socket, scope: "linux-container-fs-netns-v1", attestationSha256: "b".repeat(64) } };
+  const environment = { CODEX_HOME: "/private/native-home", GPTGREP_DECISIONS_IPC_CONTROL: `${parent}/client.json`, GPTGREP_DECISIONS_IPC_SHA256: "a".repeat(64) };
+  const nativeProfile = pin(`${environment.CODEX_HOME}/config.toml`);
+  const helper = { attestation: { ...pin("/private/helper-ready.json"), sha256: selected.decisionsHelper!.attestationSha256! },
+    namespacePlanSha256: "c".repeat(64), nativeProfile, nativeProfileId: selected.permissionProfile,
+    nativeBinary: pin(selected.codexBinary), clientControl: pin(environment.GPTGREP_DECISIONS_IPC_CONTROL),
+    allowedUnixSocket: socket, unixSocketScope: "linux-container-fs-netns-v1" as const,
+    linuxRawUnixBoundary: { schema: "environments-harness.linux-native-unix-boundary.v1" as const,
+      native_mode: "ProxyRouted-ProxyOnly" as const, allow_all_unix_syscalls: true as const,
+      filesystem_socket_authority: "one-selected-external-helper-endpoint" as const, selected_socket: socket,
+      tool_namespace_observation: pin("/private/tool-namespace.json"), filesystem_socket_inventory: pin("/private/socket-inventory.json"),
+      network_denial_evidence: pin("/private/network-denial.json"), parent_api_proxy_separation: pin("/private/api-separation.json") } };
+  const admission: StorageAdmission = { binding: "/private/command.json", sha256: "d".repeat(64), container: {
+    commandId: "reader", admissionClass: "reader", containerBindingSha256: "e".repeat(64),
+    parentHostBindingSha256: "f".repeat(64), ownerTemplateSha256: "a".repeat(64), acceptance: pin("/private/acceptance.json"),
+    immutableJob: pin("/private/job.json"), experimentArm: "treatment", modelProfile: nativeProfile,
+    modelReadRoots: selected.readableRoots.filter(root => root !== selected.cwd), decisionsHelper: helper } };
+  const network = { enabled: true, proxy_url: "http://127.0.0.1:3128", mode: "full", domains: {}, unix_sockets: {},
+    enable_socks5: false, enable_socks5_udp: false, allow_upstream_proxy: false, allow_local_binding: false,
+    dangerously_allow_non_loopback_proxy: false, dangerously_allow_all_unix_sockets: true };
+  const config = { features: { network_proxy: true, use_legacy_landlock: false }, approval_policy: "never", web_search: "disabled",
+    permissions: { test_reader: { extends: ":read-only", network, filesystem: { "/": "deny", ":minimal": "read", "/task": "read", [parent]: "read" } } } };
+  return { selected, environment, admission, helper, config, parent, network };
+}
+
 class FakeServer implements NativeTestTransport {
   requests: Message[] = [];
   messages: (message: Message) => void = () => {};
@@ -23,6 +52,8 @@ class FakeServer implements NativeTestTransport {
   effectiveConfig: any = profile;
   threadModel = "gpt-6.1-sol";
   activeProfile = "test_reader";
+  threadEphemeral = true;
+  threadReads = new Map<string, any>();
   turnBody: (server: FakeServer, request: Message) => void = (server, request) => {
     server.reply(request.id, { turn: { id: "turn-1", status: "inProgress" } });
     server.finish();
@@ -45,8 +76,9 @@ class FakeServer implements NativeTestTransport {
         case "model/list": this.reply(request.id, { data: this.models, nextCursor: null }); break;
         case "config/read": this.reply(request.id, { config: this.effectiveConfig }); break;
         case "permissionProfile/list": this.reply(request.id, { data: [{ id: "test_reader", allowed: true }], nextCursor: null }); break;
-        case "thread/start": this.reply(request.id, { thread: { id: "thread-1", sessionId: "session-distinct" }, model: this.threadModel,
+        case "thread/start": this.reply(request.id, { thread: { id: "thread-1", sessionId: "session-distinct", ephemeral: this.threadEphemeral }, model: this.threadModel,
           cwd: "/task", activePermissionProfile: { id: this.activeProfile }, instructionSources: [] }); break;
+        case "thread/read": this.reply(request.id, { thread: this.threadReads.get(request.params.threadId) }); break;
         case "turn/start": this.turnBody(this, request); break;
       }
     });
@@ -102,6 +134,90 @@ async function preparedWorkspaceFixture() {
 }
 
 describe("native protocol lifecycle", () => {
+  test("oversized started native results retain identity and exact media bindings as bounded failures", async () => {
+    const result = await runNativeForTest(options, new FakeServer());
+    const media = [{ sourcePath: "/task/view.png", sourceCallId: "view", sourceThreadId: "thread-1", mediaType: "image/png" as const,
+      artifact: { path: "/private/media/view.png", sha256: sha256("image bytes") } }];
+    for (const original of [
+      { ...result, answerText: "a".repeat(2 * 1024 * 1024), mediaBindings: media },
+      { ...result, activities: Array.from({ length: 400 }, (_, i) => ({ id: String(i), type: "commandExecution", status: "completed", command: "x".repeat(8192) })), mediaBindings: media },
+    ]) {
+      const compact = boundNativeResult(original);
+      expect(compact.validStart).toBe(true); expect(compact.status).toBe("failed");
+      expect(compact.threadId).toBe(result.threadId); expect(compact.sessionId).toBe(result.sessionId); expect(compact.turnId).toBe(result.turnId);
+      expect(compact.cleanup).toEqual(result.cleanup); expect(compact.traceTruncated).toBe(result.traceTruncated);
+      expect(compact.permissionEvidence).toEqual(result.permissionEvidence);
+      expect(compact.mediaBindings).toEqual(media); expect(compact.captureGaps).toContain("native_result_omitted_size");
+      expect(compact.resultOmission?.sha256).toBe(sha256(JSON.stringify(original)));
+      expect(compact.resultOmission?.originalStatus).toBe("completed"); expect(compact.resultOmission?.omittedBytesRetained).toBe(false);
+      expect(Buffer.byteLength(JSON.stringify(compact, null, 2))).toBeLessThan(4 * 1024 * 1024);
+    }
+  });
+  test("response-row capture failure settles RPC and preserves acknowledged turn start", async () => {
+    const server = new FakeServer();
+    const result = await runNativeForTest(options, server, row => { if (row.direction === "response" && row.id === 6) throw new Error("response capture failed"); });
+    expect(result.status).toBe("failed"); expect(result.validStart).toBe(true); expect(result.turnId).toBe("turn-1"); expect(result.cleanup.completed).toBe(true);
+    expect(result.latencyMs).toBeLessThan(options.timeoutMs);
+  });
+  test("multiple deferred child notifications replay once in a detached nonreentrant drain", async () => {
+    const server = new FakeServer();
+    server.turnBody = (server, request) => { server.reply(request.id, { turn: { id: "turn-1", status: "inProgress" } });
+      for (let i = 0; i < 2; i++) server.emit({ method: "thread/tokenUsage/updated", params: { threadId: "child", turnId: "child-turn", tokenUsage } });
+      server.emit({ method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item: { id: "spawn", type: "collabAgentToolCall", tool: "spawnAgent", receiverThreadIds: ["child"] } } }); server.finish(); };
+    expect((await runNativeForTest(options, server)).status).toBe("completed");
+  });
+  test("a final capture failure preserves the started identity instead of becoming setup unknown", async () => {
+    const result = await runNativeForTest(options, new FakeServer(), row => { if (row.direction === "result") throw new Error("capture ceiling"); });
+    expect(result.status).toBe("failed"); expect(result.validStart).toBe(true); expect(result.threadId).toBe("thread-1"); expect(result.traceTruncated).toBe(true);
+  });
+  test("late-drain budget and child reroute errors cannot leave a completed result", async () => {
+    const late = new FakeServer();
+    late.turnBody = (server, request) => { server.reply(request.id, { turn: { id: "turn-1", status: "inProgress" } }); server.finish();
+      setTimeout(() => server.emit({ method: "item/started", params: { threadId: "thread-1", turnId: "turn-1", item: { id: "late", type: "commandExecution", command: "read" } } }), 0); };
+    expect((await runNativeForTest({ ...options, observationLimits: { toolCalls: 0, childThreads: 0, retryEvents: 0 } }, late)).status).toBe("failed");
+    const child = new FakeServer();
+    child.turnBody = (server, request) => { server.reply(request.id, { turn: { id: "turn-1", status: "inProgress" } });
+      server.emit({ method: "model/rerouted", params: { threadId: "child", turnId: "child-turn", fromModel: "gpt-6-luna", toModel: "foreign-model" } });
+      server.emit({ method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item: { id: "spawn", type: "collabAgentToolCall", tool: "spawnAgent", receiverThreadIds: ["child"] } } }); server.finish(); };
+    const result = await runNativeForTest(options, child); expect(result.status).toBe("failed"); expect(result.modelBoundaryValid).toBe(false);
+  });
+  test("finite notification guards interrupt excess work and retain unavailable provider request count", async () => {
+    const server = new FakeServer();
+    server.turnBody = (server, request) => {
+      server.reply(request.id, { turn: { id: "turn-1", status: "inProgress" } });
+      for (const id of ["tool-a", "tool-b"]) server.emit({ method: "item/started", params: { threadId: "thread-1", turnId: "turn-1", item: { id, type: "commandExecution", command: "read source" } } });
+    };
+    const result = await runNativeForTest({ ...options, observationLimits: { toolCalls: 1, childThreads: 0, retryEvents: 0 } }, server);
+    expect(result.status).toBe("failed"); expect(result.validStart).toBe(true);
+    expect(result.observations).toEqual({ toolCalls: 2, childThreads: 0, retryEvents: 0, enforcement: "post_notification_interrupt", exceeded: "toolCalls" });
+    expect(result.requestCount).toBeNull(); expect(server.requests.some(request => request.method === "turn/interrupt")).toBe(true);
+  });
+  test("retained child readback binds actual lineage and never resumes a child", async () => {
+    const server = new FakeServer(); server.threadEphemeral = false;
+    const spawn = { id: "spawn", type: "collabAgentToolCall", tool: "spawnAgent", receiverThreadIds: ["child"], prompt: "Read a source", model: "gpt-6-luna" };
+    const root = { id: "thread-1", sessionId: "session-distinct", parentThreadId: null, ephemeral: false, model: "gpt-6.1-sol",
+      turns: [{ id: "turn-1", itemsView: "full", status: "completed", items: [spawn] }] };
+    const child = { id: "child", sessionId: "child-session", parentThreadId: "thread-1", ephemeral: false, model: "gpt-6-luna",
+      turns: [{ id: "child-turn", itemsView: "full", status: "completed", items: [{ id: "message", type: "agentMessage", text: "Source evidence" }] }] };
+    server.threadReads.set("thread-1", root); server.threadReads.set("child", child);
+    server.turnBody = (server, request) => {
+      server.reply(request.id, { turn: { id: "turn-1", status: "inProgress" } });
+      server.emit({ method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item: spawn } }); server.finish();
+    };
+    const capture: any[] = [];
+    const result = await runNativeForTest({ ...options, retainedChildCapture: true, observationLimits: { toolCalls: 5, childThreads: 1, retryEvents: 0 } }, server, row => capture.push(row));
+    expect(result.status).toBe("completed"); expect(result.childSnapshots?.[0]?.parentThreadId).toBe("thread-1");
+    expect(capture.some(row => row.source === "supported_thread_read" && row.sourceThreadId === "child")).toBe(true);
+    expect(server.requests.some(request => request.method === "thread/resume")).toBe(false);
+    expect(server.requests.find(request => request.method === "thread/start")?.params.ephemeral).toBe(false);
+    const foreign = new FakeServer(); foreign.threadEphemeral = false; foreign.turnBody = server.turnBody;
+    foreign.threadReads.set("thread-1", root); foreign.threadReads.set("child", { ...child, parentThreadId: "foreign" });
+    expect((await runNativeForTest({ ...options, retainedChildCapture: true, observationLimits: { toolCalls: 5, childThreads: 1, retryEvents: 0 } }, foreign)).status).toBe("failed");
+    const unauthorized = new FakeServer(); unauthorized.threadEphemeral = false; unauthorized.turnBody = server.turnBody;
+    unauthorized.threadReads.set("thread-1", root); unauthorized.threadReads.set("child", { ...child, turns: [{ ...child.turns[0], status: "failed", error: { message: "Unauthorized" } }] });
+    const auth = await runNativeForTest({ ...options, retainedChildCapture: true, observationLimits: { toolCalls: 5, childThreads: 1, retryEvents: 0 } }, unauthorized);
+    expect(auth.authFailure).toBe("AUTH_UNAUTHORIZED"); expect(auth.status).toBe("failed");
+  });
   test("direct reader and paired APIs deny absent admission before staging or model callbacks", async () => {
     const fixture = await preparedWorkspaceFixture();
     const outputDir = join(dirname(fixture.bare.cwd), "denied-reader");
@@ -112,12 +228,14 @@ describe("native protocol lifecycle", () => {
         native: options, bare: fixture.bare, gptgrep: fixture.workspace, runtime, helperModel: "openai/gpt-6-luna-decisions",
         launchArm: async () => { launches++; throw new Error("must not run"); } } as any)).rejects.toThrow("admission reference");
       expect(launches).toBe(0);
+      const retainedDenial = await readFile(join(outputDir, "prelaunch-denial.json"), "utf8");
       await expect(runReaderArm({ admission: undefined, task: fixture.task, arm: "bare", order: 0, workspace: fixture.bare,
-        outputDir, native: options, runtime, helperModel: "openai/gpt-6-luna-decisions" } as any)).rejects.toThrow("admission reference");
+        outputDir, native: options, runtime, helperModel: "openai/gpt-6-luna-decisions" } as any)).rejects.toThrow("EEXIST");
       await expect(stat(join(outputDir, "attempt-start.json"))).rejects.toThrow();
       await expect(stat(join(outputDir, "pair.json"))).rejects.toThrow();
-      const denials = (await readdir(outputDir)).filter(name => name.startsWith("prelaunch-denial-"));
-      expect(denials).toHaveLength(2);
+      const denials = (await readdir(outputDir)).filter(name => name === "prelaunch-denial.json");
+      expect(denials).toHaveLength(1);
+      expect(await readFile(join(outputDir, "prelaunch-denial.json"), "utf8")).toBe(retainedDenial);
       for (const file of denials) {
         const denial = JSON.parse(await readFile(join(outputDir, file), "utf8"));
         expect(denial.readerStarted).toBe(false); expect(denial.measurement).toBeNull();
@@ -228,12 +346,15 @@ describe("native protocol lifecycle", () => {
           exitCode: 0, durationMs: 21, aggregatedOutput: "PRIVATE_TOOL_OUTPUT" } } });
         server.finish();
       };
-      const result = await runNativeForTest(options, server);
+      const capture: Message[] = [];
+      const result = await runNativeForTest(options, server, row => capture.push(row));
       expect(result.activities).toHaveLength(1);
       expect(result.activities[0]!.command).toBe("gptgrep search [redacted] documents");
       expect(result.activities[0]!.exitCode).toBe(0);
       expect(JSON.stringify(result)).not.toContain("synthetic-secret-for-redaction");
       expect(JSON.stringify(result)).not.toContain("PRIVATE_TOOL_OUTPUT");
+      expect(JSON.stringify(capture)).toContain("PRIVATE_TOOL_OUTPUT");
+      expect(JSON.stringify(capture)).not.toContain("synthetic-secret-for-redaction");
     } finally { if (old === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = old; }
   });
 
@@ -324,6 +445,32 @@ describe("native experiment boundary", () => {
     }
   });
 
+  test("exact read-only source files bind the effective profile and cannot inherit broader roots", async () => {
+    const source = "/raw/source.pdf", candidate = "/task/candidate.json";
+    const selected = { ...options, readableRoots: [...options.readableRoots, source], requiredReadOnlyFiles: [source, candidate] };
+    const filesystem = { ...profile.permissions.test_reader.filesystem, "/task": "write", [source]: "read", [candidate]: "read" };
+    const effective = { permissions: { test_reader: { ...profile.permissions.test_reader, filesystem } } };
+    const server = new FakeServer(); server.effectiveConfig = effective;
+    const result = await runNativeForTest(selected, server);
+    expect(result.status).toBe("completed"); expect(result.executionMode).toBe("test");
+    expect(result.permissionEvidence).toEqual({ profileId: "test_reader", extends: ":read-only",
+      filesystemSha256: digest({ name: "test_reader", extends: ":read-only", filesystem }), exactReadOnlyFiles: [source, candidate] });
+    for (const mutation of [
+      { ...selected, readableRoots: ["/task", "/raw", source] },
+      { ...selected, readableRoots: ["/task", source], requiredReadOnlyFiles: ["/task/source.pdf"] },
+      { ...selected, requiredReadOnlyFiles: ["/task"] },
+      { ...selected, requiredReadOnlyFiles: [source, source] },
+    ]) expect(() => validatePermissionProfile(effective, mutation)).toThrow();
+    for (const replacement of [{ "/": "deny", "/task": "read", "/raw": "read" }, { ...filesystem, [source]: "write" }, { ...filesystem, [candidate]: "write" }]) {
+      const rejected = new FakeServer(); rejected.effectiveConfig = { permissions: { test_reader: { ...profile.permissions.test_reader, filesystem: replacement } } };
+      expect(() => validatePermissionProfile(rejected.effectiveConfig, selected)).toThrow();
+      const denied = await runNativeForTest(selected, rejected);
+      expect(denied.validStart).toBe(false); expect(denied.status).toBe("setup_failed");
+      expect(rejected.requests.some(request => request.method === "turn/start")).toBe(false);
+    }
+    expect(() => validatePermissionProfile({ permissions: { test_reader: { ...effective.permissions.test_reader, extends: ":workspace" } } }, selected)).toThrow();
+  });
+
   test("accepts only the declared managed Decisions domain and rejects wider proxy access", () => {
     const network = { enabled: true, proxy_url: "http://127.0.0.1:3128", mode: "full", domains: { "openrouter.ai": "allow" },
       enable_socks5: false, enable_socks5_udp: false, allow_upstream_proxy: false, allow_local_binding: false,
@@ -335,6 +482,83 @@ describe("native experiment boundary", () => {
     expect(() => validatePermissionProfile(config, options)).toThrow();
     for (const change of [{ domains: { "*": "allow" } }, { allow_upstream_proxy: true }, { mode: "read-only" }, { enable_socks5: true }, { unix_sockets: { "/run/service": "allow" } }]) {
       expect(() => validatePermissionProfile({ ...config, permissions: { test_reader: { ...config.permissions.test_reader, network: { ...network, ...change } } } }, selected)).toThrow();
+    }
+  });
+  test("Linux helper profile admits the declared filesystem and ProxyOnly scope only", async () => {
+    const fixture = unixHelperFixture(), { selected, config, parent } = fixture;
+    expect(() => validatePermissionProfile(config, selected)).not.toThrow();
+    expect(() => validatePermissionProfile(config, options)).toThrow();
+    const server = new FakeServer(); server.effectiveConfig = config;
+    const result = await runNativeForTest(selected, server);
+    expect(result.status).toBe("completed"); expect(result.executionMode).toBe("test");
+    expect(result.decisionsHelperEvidence).toBeUndefined();
+    for (const change of [{ domains: { "*": "allow" } }, { domains: { "openrouter.ai": "allow" } }, { domains: [] }, { unix_sockets: [] },
+      { unix_sockets: { [selected.decisionsHelper!.socketPath]: "allow" } }, { dangerously_allow_all_unix_sockets: false },
+      { allow_upstream_proxy: true }, { enable_socks5_udp: true }, { allow_local_binding: true }]) {
+      expect(() => validatePermissionProfile({ ...config, permissions: { test_reader: { ...config.permissions.test_reader,
+        network: { ...fixture.network, ...change } } } }, selected)).toThrow();
+    }
+    for (const change of [{ features: { network_proxy: true, use_legacy_landlock: true } },
+      { features: { network_proxy: { enabled: true, credential_broker: true }, use_legacy_landlock: false } },
+      { approval_policy: "on-request" }, { web_search: "live" }]) {
+      expect(() => validatePermissionProfile({ ...config, ...change }, selected)).toThrow();
+    }
+    expect(() => validatePermissionProfile({ ...config, permissions: { test_reader: { ...config.permissions.test_reader,
+      filesystem: { ...config.permissions.test_reader.filesystem, [parent]: "write" } } } }, selected)).toThrow();
+    for (const change of [{ allowedToolNetworkHosts: ["openrouter.ai"] }, { readableRoots: ["/task", "/run", parent] },
+      { decisionsHelper: { ...selected.decisionsHelper!, attestationSha256: "" } },
+      { decisionsHelper: { ...selected.decisionsHelper!, scope: "macos-proxy" } }]) {
+      expect(() => validatePermissionProfile(config, { ...selected, ...change } as NativeRunOptions)).toThrow();
+    }
+  });
+
+  test("helper authority requires the current treatment reader command and exact ready bindings", () => {
+    const { selected, environment, admission } = unixHelperFixture();
+    const helper = admission.container!.decisionsHelper!;
+    expect(() => validateNativeHelperAdmission(selected, admission, environment)).not.toThrow();
+    expect(() => validateNativeHelperAdmission(options, { binding: "/private/binding", sha256: "a".repeat(64) }, {})).not.toThrow();
+    expect(() => validateNativeHelperAdmission(selected, { binding: "/private/host", sha256: "a".repeat(64) }, environment)).toThrow();
+    expect(() => validateNativeHelperAdmission(options, admission, environment)).toThrow();
+    for (const mutation of [{ commandId: "preflight" }, { commandId: "qualification", admissionClass: "bounded-qualification" },
+      { commandId: "c4-engineer", admissionClass: "c4-actor" }, { experimentArm: "baseline" },
+      { decisionsHelper: undefined }, { modelProfile: { ...helper.nativeProfile, sha256: "b".repeat(64) } },
+      { modelReadRoots: ["/task"] }, { modelReadRoots: [...selected.readableRoots] }]) {
+      expect(() => validateNativeHelperAdmission(selected, { ...admission, container: { ...admission.container, ...mutation } } as StorageAdmission, environment)).toThrow();
+    }
+    for (const mutation of [{ attestation: { ...helper.attestation, sha256: "a".repeat(64) } },
+      { namespacePlanSha256: "" }, { nativeProfileId: "judge" }, { nativeBinary: { ...helper.nativeBinary, path: "/runtime/other-codex" } },
+      { clientControl: { ...helper.clientControl, path: "/run/foreign/client.json" } }, { allowedUnixSocket: "/run/foreign.sock" },
+      { linuxRawUnixBoundary: { ...helper.linuxRawUnixBoundary, native_mode: "Restricted" } },
+      { linuxRawUnixBoundary: { ...helper.linuxRawUnixBoundary, parent_api_proxy_separation: { path: "/private/unqualified", sha256: "" } } }]) {
+      expect(() => validateNativeHelperAdmission(selected, { ...admission, container: { ...admission.container, decisionsHelper: { ...helper, ...mutation } } } as StorageAdmission, environment)).toThrow();
+    }
+    for (const change of [{ GPTGREP_DECISIONS_IPC_CONTROL: "" }, { GPTGREP_DECISIONS_IPC_SHA256: "b".repeat(64) },
+      { CODEX_HOME: "/private/other-home" }, { OPENROUTER_API_KEY: "public-synthetic-privacy-sentinel" }, { OPENROUTER_API_KEY: "" }]) {
+      expect(() => validateNativeHelperAdmission(selected, admission, { ...environment, ...change })).toThrow();
+    }
+    for (const name of ["GPTGREP_DECISIONS_IPC_CONTROL", "GPTGREP_DECISIONS_IPC_SHA256"]) {
+      expect(() => validateNativeHelperAdmission(options, { binding: "/private/binding", sha256: "a".repeat(64) }, { [name]: "undeclared" })).toThrow();
+    }
+  });
+  test("cycle-free static helper intent consumes current owner proof and exposes the actual ready identity", () => {
+    const { selected, environment, admission, config } = unixHelperFixture();
+    const intent: NativeRunOptions = { ...selected, decisionsHelper: {
+      socketPath: selected.decisionsHelper!.socketPath, scope: selected.decisionsHelper!.scope } };
+    // These immutable job options carry no future hash. Only the later owner command supplies it.
+    expect(Object.keys(intent.decisionsHelper!).sort()).toEqual(["scope", "socketPath"]);
+    expect(() => validatePermissionProfile(config, intent)).not.toThrow();
+    const helper = admission.container!.decisionsHelper!;
+    const current = { ...admission, container: { ...admission.container!, decisionsHelper: {
+      ...helper, attestation: { ...helper.attestation, sha256: "e".repeat(64) } } } };
+    expect(validateNativeHelperAdmission(intent, current, environment)).toEqual({
+      attestationSha256: "e".repeat(64), commandBindingSha256: current.sha256,
+      namespacePlanSha256: helper.namespacePlanSha256, clientControlSha256: helper.clientControl.sha256 });
+    expect(() => validateNativeHelperAdmission(selected, current, environment)).toThrow();
+    for (const missing of [{ binding: admission.binding, sha256: admission.sha256 },
+      { ...admission, container: { ...admission.container!, decisionsHelper: undefined } },
+      ...[undefined, {}, { ...helper.attestation, sha256: "" }, { ...helper.attestation, sha256: "B".repeat(64) }].map(attestation => ({
+        ...admission, container: { ...admission.container!, decisionsHelper: { ...helper, attestation } } }))]) {
+      expect(() => validateNativeHelperAdmission(intent, missing as StorageAdmission, environment)).toThrow();
     }
   });
   test("rejects broad or network-enabled profiles", () => {

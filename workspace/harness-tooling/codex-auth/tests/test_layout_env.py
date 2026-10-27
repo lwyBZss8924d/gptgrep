@@ -188,6 +188,99 @@ class LayoutEnvTests(unittest.TestCase):
         self.assertTrue(report["openrouter_present"])
         self.assertNotIn("CODEX_API_KEY", report["names"])
 
+    def test_explicit_lan_bypass_reaches_child_without_inheriting_parent_bypass(self):
+        additions = ["192.168.50.0/24", "192.168.50.23", ".local", "*.local", "NAS.Local",
+                     ".example.test", "fd42::/64", "fe80::/64", "127.0.0.1", "NAS.Local"]
+        self.env.reconfigure(no_proxy_additions=additions, roles={
+            "dev": {"tool_permissions": "unrestricted", "passthrough_env": ["HTTPS_PROXY"]}})
+        report, receipt = self.report("dev", "lan-bypass", dict(
+            CANARY_ENV, NO_PROXY="*", no_proxy="*", HTTPS_PROXY="http://proxy.example.test:6152"))
+        expected = ("127.0.0.1,localhost,::1,192.168.50.0/24,192.168.50.23,.local,*.local,"
+                    "nas.local,.example.test,fd42::/64,fe80::/64")
+        self.assertEqual(report["values"]["NO_PROXY"], expected)
+        self.assertEqual(report["values"]["no_proxy"], expected)
+        self.assertEqual(receipt["passthrough_env"], ["HTTPS_PROXY"])
+        self.assertFalse(report["openrouter_present"])
+        for name in sup.STRIPPED_ALWAYS:
+            self.assertNotIn(name, report["names"])
+        self.assertEqual(report["values"]["CODEX_REFRESH_TOKEN_URL_OVERRIDE"], sup.DEFAULT_BLOCKER_URL)
+        self.assertTrue(receipt["auth_link_final"]["released"])
+        self.assertFalse(receipt["credential_contents_read_by_supervisor"])
+
+    def test_lan_bypass_is_shared_by_owner_and_relogin_env_and_defaults_are_unchanged(self):
+        cfg = self.env.cfg()
+        layout = sup.Layout(cfg, "dev", "lan-builders")
+        self.assertEqual(sup.base_env(cfg, layout, layout.run_id)["NO_PROXY"], sup.LOOPBACK_NO_PROXY)
+        self.env.reconfigure(no_proxy_additions=[])
+        self.assertEqual(self.env.cfg().no_proxy, sup.LOOPBACK_NO_PROXY)
+        self.env.reconfigure(no_proxy_additions=["172.20.0.0/16", ".lan", "storage-1"])
+        cfg = self.env.cfg()
+        expected = sup.LOOPBACK_NO_PROXY + ",172.20.0.0/16,.lan,storage-1"
+        owner = sup.build_owner_env(cfg, layout, CANARY_ENV, layout.codex_home)
+        relogin = sup.build_relogin_env(cfg, layout, layout.codex_home, CANARY_ENV)
+        for env in (owner, relogin):
+            self.assertEqual(env["NO_PROXY"], expected)
+            self.assertEqual(env["no_proxy"], expected)
+            for name in sup.STRIPPED_ALWAYS + ("OPENROUTER_API_KEY",):
+                self.assertNotIn(name, env)
+            self.assertEqual(env["CODEX_REVOKE_TOKEN_URL_OVERRIDE"], cfg.revoke_blocker_url)
+        self.assertEqual(relogin["CODEX_REFRESH_TOKEN_URL_OVERRIDE"], cfg.blocker_url)
+
+    def test_relogin_uses_only_owner_selected_valid_proxy_variables(self):
+        proxies = {name: "http://proxy.example.test:6152" for name in sup.PROXY_ENV_NAMES}
+        proxies.update(ALL_PROXY="socks5://proxy.example.test:6153", all_proxy="socks5h://proxy.example.test:6153")
+        self.env.reconfigure(owner={"passthrough_env": [*sorted(sup.PROXY_ENV_NAMES), "CUSTOM_OWNER_SETTING"]})
+        cfg = self.env.cfg()
+        layout = sup.Layout(cfg, "_relogin", "login-proxies")
+        parent = dict(CANARY_ENV, CUSTOM_OWNER_SETTING="owner-only", **proxies)
+        relogin = sup.build_relogin_env(cfg, layout, layout.codex_home, parent)
+        for name, value in proxies.items():
+            self.assertEqual(relogin[name], value)
+        self.assertNotIn("CUSTOM_OWNER_SETTING", relogin)
+        self.assertNotIn("OPENROUTER_API_KEY", relogin)
+        self.env.reconfigure(owner={"passthrough_env": ["HTTPS_PROXY"]})
+        relogin = sup.build_relogin_env(self.env.cfg(), layout, layout.codex_home, parent)
+        self.assertEqual(set(relogin) & sup.PROXY_ENV_NAMES, {"HTTPS_PROXY"})
+
+    def test_proxy_values_reject_userinfo_and_ambiguous_urls_for_all_auth_routes(self):
+        self.env.reconfigure(owner={"passthrough_env": ["HTTPS_PROXY"]}, roles={
+            "dev": {"tool_permissions": "unrestricted", "passthrough_env": ["HTTPS_PROXY"]}})
+        cfg = self.env.cfg()
+        layout = sup.Layout(cfg, "dev", "proxy-validation")
+        builders = [lambda env: sup.build_consumer_env(cfg, "dev", layout, env),
+                    lambda env: sup.build_owner_env(cfg, layout, env, layout.codex_home),
+                    lambda env: sup.build_relogin_env(cfg, layout, layout.codex_home, env)]
+        for value in ("http://example-user@proxy.example.test:6152", "http://proxy.example.test:0",
+                      "http://proxy.example.test:65536", "proxy.example.test:6152", "file:///proxy",
+                      "http://proxy.example.test/path", "http://proxy.example.test?x=1",
+                      "http://proxy.example.test#fragment", "http://proxy.example.test\n"):
+            for build in builders:
+                with self.subTest(value=value, build=build):
+                    with self.assertRaises(sup.SupervisorError) as caught:
+                        build({"HTTPS_PROXY": value})
+                    self.assertEqual(caught.exception.reason, "config_proxy_env_invalid")
+                    self.assertEqual(caught.exception.detail, "HTTPS_PROXY")
+
+    def test_lan_bypass_rejects_global_public_ambiguous_or_ambient_values(self):
+        invalid = [None, "192.168.50.23", ["nas.local"] * 129, [None], [True], [""], ["*"],
+                   ["0.0.0.0/0"], ["::/0"], ["8.8.8.8"], ["203.0.113.0/24"],
+                   ["169.254.169.254"], ["192.168.50.23/24"], ["fe80::1%en0"],
+                   ["com"], ["dev"], ["storage"], ["xn--p1ai"], [".com"], ["*.com"],
+                   ["example.com"], ["nas.local:6152"],
+                   ["https://nas.local"], ["user@nas.local"], ["nas*.local"],
+                   ["nas.local,localhost"], [" nas.local"], ["nas.local\n"], ["nas\x00.local"]]
+        for values in invalid:
+            with self.subTest(values=values):
+                with self.assertRaises(sup.SupervisorError):
+                    sup.Config(dict(self.env.values, schema=sup.CONFIG_SCHEMA, no_proxy_additions=values), "inline")
+        for name in ("NO_PROXY", "no_proxy"):
+            for change in ({"owner": {"passthrough_env": [name]}},
+                           {"roles": {"dev": {"tool_permissions": "unrestricted", "passthrough_env": [name]}}}):
+                with self.subTest(name=name, change=change):
+                    with self.assertRaises(sup.SupervisorError) as caught:
+                        sup.Config(dict(self.env.values, schema=sup.CONFIG_SCHEMA, **change), "inline")
+                    self.assertEqual(caught.exception.reason, "config_env_name_forbidden")
+
     def test_config_rejects_forbidden_passthrough_and_unknown_codex_keys(self):
         cases = [
             {"roles": {"dev": {"passthrough_env": ["CODEX_API_KEY"], "tool_permissions": "unrestricted"}}},
@@ -526,6 +619,26 @@ class ToolPathsAndArgvGuardTests(unittest.TestCase):
             with self.subTest(reason=reason, value=str(value)[-32:]):
                 self.assertEqual(self.refusal(extra_denied_paths=value), (reason, "extra_denied_paths"))
 
+    def test_redundant_descendant_deny_paths_are_pruned(self):
+        """Redundant descendant deny paths must be pruned when an ancestor directory
+        is already in the denied list, preventing Bubblewrap EROFS collisions on Linux."""
+        root = self.env.root
+        parent = str(root / "private-ancestor")
+        child1 = str(root / "private-ancestor" / "nested-child")
+        child2 = str(root / "private-ancestor" / "deep" / "nested" / "child")
+        other = str(root / "other-dir")
+        raw = [child1, other, parent, child2]
+        pruned = sup.prune_descendant_paths(raw)
+        self.assertEqual(pruned, [other, parent])
+
+        cfg = self.config_with(extra_denied_paths=[str(self.env.credential.home.parent)])
+        layout = sup.Layout(cfg, "tools", "prune-test")
+        denied = sup.permission_denials(cfg, layout)
+        self.assertIn(str(self.env.credential.home.parent), denied)
+        if sup.is_within(str(cfg.canonical_auth_home), str(self.env.credential.home.parent)):
+            self.assertNotIn(str(cfg.canonical_auth_home), denied)
+        self.assertIn(str(layout.auth_link), denied)
+
     def test_role_deny_and_read_paths_are_validated(self):
         root = self.env.root
         data = str(root / "data")
@@ -722,7 +835,7 @@ class ToolPathsAndArgvGuardTests(unittest.TestCase):
         self.assertEqual(access["write_paths"], [str(task)])
         self.assertEqual(access["read_paths"], [str(runtime)])
         self.assertIs(access["minimal_read"], True)
-        self.assertEqual(receipt["supervisor_version"], "1.4.0")
+        self.assertEqual(receipt["supervisor_version"], "1.5.0")
         self.assertTrue(receipt["auth_link_final"]["released"])
         self.assertFalse(receipt["credential_contents_read_by_supervisor"])
         code, plan, _ = self.env.supervisor("run", "--role", "tools", "--run-id", "explicit-plan",
@@ -807,6 +920,94 @@ class ToolPathsAndArgvGuardTests(unittest.TestCase):
         self.assertEqual(tree["permissions"][PROFILE]["network"], {"enabled": True})
         self.assertNotIn("network_proxy", tree["features"])
         self.assertNotIn("web_search", tree)
+
+    def helper_roles(self, **changes):
+        permissions = {"extends": ":read-only", "network_enabled": True, "minimal_read": True,
+                       "deny_paths": ["/"], "read_paths": [sup.DECISIONS_UNIX_PARENT],
+                       "network_allowed_unix_sockets": [sup.DECISIONS_UNIX_SOCKET],
+                       "network_unix_socket_scope": sup.DECISIONS_UNIX_SCOPE}
+        permissions.update(changes)
+        roles = self.tools_roles(**permissions)
+        roles["tools"]["passthrough_env"] = list(sup.DECISIONS_UNIX_ENV)
+        return roles
+
+    def test_linux_helper_profile_requires_the_exact_pair_and_filesystem_scope(self):
+        cfg = self.config_with(roles=self.helper_roles())
+        selected = cfg.role("tools")["tool_permissions"]
+        layout = sup.Layout(cfg, "tools", "helper-profile")
+        tree = sup.codex_config_tree(cfg, layout, {}, selected)
+        self.assertEqual(tree["permissions"][PROFILE]["network"], dict(
+            sup.RESTRICTED_NETWORK_CONFIG, dangerously_allow_all_unix_sockets=True, domains={}))
+        self.assertIs(tree["features"]["network_proxy"], True)
+        self.assertIs(tree["features"]["use_legacy_landlock"], False)
+        self.assertEqual((tree["approval_policy"], tree["web_search"]), ("never", "disabled"))
+        self.assertEqual(tree["permissions"][PROFILE]["filesystem"][sup.DECISIONS_UNIX_PARENT], "read")
+        access = sup.tool_credential_access(cfg, layout, selected)
+        self.assertEqual(access["network_allowed_unix_sockets"], [sup.DECISIONS_UNIX_SOCKET])
+        self.assertEqual(access["network_unix_socket_scope"], sup.DECISIONS_UNIX_SCOPE)
+        self.assertIn("owner-qualified", access["network_scope"])
+        for change in [{"extends": ":workspace"}, {"network_enabled": False}, {"minimal_read": False},
+                       {"deny_paths": []}, {"network_unix_socket_scope": "macos-proxy"},
+                       {"network_allowed_unix_sockets": []}, {"network_allowed_unix_sockets": [sup.DECISIONS_UNIX_SOCKET] * 2},
+                       {"network_allowed_unix_sockets": ["/run/other.sock"]}, {"network_allowed_unix_sockets": ["/run/gptgrep-decisions/../other.sock"]},
+                       {"network_allowed_domains": ["openrouter.ai"]}, {"read_paths": ["/run"]},
+                       {"read_paths": [sup.DECISIONS_UNIX_PARENT, "/run"]},
+                       {"read_paths": [sup.DECISIONS_UNIX_PARENT, sup.DECISIONS_UNIX_CONTROL]}]:
+            with self.subTest(change=change):
+                self.assertEqual(self.refusal(roles=self.helper_roles(**change))[0], "config_role_network_unix_scope_invalid")
+        for missing in ("network_allowed_unix_sockets", "network_unix_socket_scope"):
+            roles = self.helper_roles()
+            del roles["tools"]["tool_permissions"][missing]
+            self.assertEqual(self.refusal(roles=roles)[0], "config_role_network_unix_scope_invalid")
+        for names, allow in [(list(sup.DECISIONS_UNIX_ENV[:1]), False), ([], False),
+                             (list(sup.DECISIONS_UNIX_ENV), True)]:
+            roles = self.helper_roles()
+            roles["tools"].update(passthrough_env=names, allow_openrouter=allow)
+            self.assertEqual(self.refusal(roles=roles)[0], "config_role_network_unix_keyless_pair_required")
+        roles = self.tools_roles()
+        roles["tools"]["passthrough_env"] = list(sup.DECISIONS_UNIX_ENV)
+        self.assertEqual(self.refusal(roles=roles)[0], "config_role_network_unix_keyless_pair_required")
+
+    def test_linux_helper_environment_passes_only_complete_keyless_metadata(self):
+        cfg = self.config_with(roles=self.helper_roles())
+        layout = sup.Layout(cfg, "tools", "helper-env")
+        supplied = dict(CANARY_ENV, **{sup.DECISIONS_UNIX_ENV[0]: sup.DECISIONS_UNIX_CONTROL,
+                                     sup.DECISIONS_UNIX_ENV[1]: "b" * 64})
+        env, passed = sup.build_consumer_env(cfg, "tools", layout, supplied)
+        self.assertEqual(passed, list(sup.DECISIONS_UNIX_ENV))
+        self.assertEqual([env[name] for name in passed], [sup.DECISIONS_UNIX_CONTROL, "b" * 64])
+        for name in sup.STRIPPED_ALWAYS + ("OPENROUTER_API_KEY",):
+            self.assertNotIn(name, env)
+        for change in [{sup.DECISIONS_UNIX_ENV[0]: "/run/foreign/client.json"},
+                       {sup.DECISIONS_UNIX_ENV[1]: "B" * 64}, {sup.DECISIONS_UNIX_ENV[1]: ""}]:
+            with self.assertRaises(sup.SupervisorError) as ctx:
+                sup.build_consumer_env(cfg, "tools", layout, dict(supplied, **change))
+            self.assertEqual(ctx.exception.reason, "consumer_network_unix_keyless_pair_invalid")
+        for name in sup.DECISIONS_UNIX_ENV:
+            incomplete = dict(supplied)
+            del incomplete[name]
+            with self.assertRaises(sup.SupervisorError):
+                sup.build_consumer_env(cfg, "tools", layout, incomplete)
+        plain = self.config_with(roles=self.tools_roles())
+        plain_env, _ = sup.build_consumer_env(plain, "tools", sup.Layout(plain, "tools", "plain"), supplied)
+        for name in sup.DECISIONS_UNIX_ENV:
+            self.assertNotIn(name, plain_env)
+
+    def test_linux_helper_config_refuses_search_and_approval_widening(self):
+        for setting, reason in [("live", "config_role_network_web_search_must_be_disabled"),
+                                ("on-request", "config_role_network_unix_approval_must_be_never")]:
+            key = "web_search" if setting == "live" else "approval_policy"
+            for level in ("global", "role"):
+                roles = self.helper_roles()
+                extra = {"codex_config": {key: setting}} if level == "global" else {}
+                if level == "role":
+                    roles["tools"]["codex_config"] = {key: setting}
+                self.assertEqual(self.refusal(roles=roles, **extra)[0], reason)
+            cfg = self.config_with(roles=self.helper_roles())
+            with self.assertRaises(sup.SupervisorError) as ctx:
+                sup.codex_config_tree(cfg, sup.Layout(cfg, "tools", "override"), {key: setting},
+                                      cfg.role("tools")["tool_permissions"])
+            self.assertEqual(ctx.exception.reason, reason)
 
     def test_exact_network_profile_pins_proxy_search_and_preserves_credential_denies(self):
         roles = self.tools_roles(network_enabled=True, network_allowed_domains=["openrouter.ai"])

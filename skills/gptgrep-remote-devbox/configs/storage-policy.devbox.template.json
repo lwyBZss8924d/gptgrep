@@ -1,0 +1,136 @@
+{
+  "schema": "environments-harness.storage-policy.v1",
+  "owner": "environments-harness-self",
+  "volume": {
+    "mount_point": "/mnt/gptgrep-dev",
+    "volume_uuid": "REPLACE_WITH_EXT4_BLKID_UUID_ON_DEVBOX",
+    "physical_store_uuids": [
+      "REPLACE_WITH_GOOGLE_PD_SERIAL_gptgrep-dev-vol-01"
+    ],
+    "filesystem": "ext4"
+  },
+  "artifact_root": "/mnt/gptgrep-dev/development-artifacts",
+  "state_root": "/mnt/gptgrep-dev/development-artifacts/owner-private/storage",
+  "temporary_root": "t/runtime",
+  "external_reserve_bytes": 40000000000,
+  "internal": {
+    "probe_path": "/",
+    "small_workload_max_peak_bytes": 2147483648,
+    "max_metadata_bytes": 10000000
+  },
+  "internal_capacity_policy": {
+    "role": "telemetry_only"
+  },
+  "projects": {
+    "gptgrep": {
+      "repository_id": "lwyBZss8924d/gptgrep",
+      "common_dirs": [
+        {
+          "path": "/home/arthur/ai-self-library/gptgrep/.git",
+          "identity": {
+            "device": 0,
+            "inode": 0
+          }
+        }
+      ],
+      "workspaces": {
+        "main": {
+          "path": "/home/arthur/ai-self-library/gptgrep",
+          "common_dir": "/home/arthur/ai-self-library/gptgrep/.git",
+          "identity": {
+            "device": 0,
+            "inode": 0
+          },
+          "disposition": "active"
+        },
+        "xl-docbench-dev": {
+          "path": "/mnt/gptgrep-dev/development-artifacts/owners/gptgrep/worktrees/xl-docbench-dev",
+          "common_dir": "/home/arthur/ai-self-library/gptgrep/.git",
+          "identity": {
+            "device": 0,
+            "inode": 0
+          },
+          "disposition": "active"
+        }
+      }
+    }
+  },
+  "toolchains": {
+    "selected": {
+      "rustup_home": "toolchains/selected/rustup",
+      "uv_python_install_dir": "toolchains/selected/python",
+      "uv_tool_dir": "toolchains/selected/uv-tools",
+      "uv_tool_bin_dir": "toolchains/selected/uv-bin"
+    }
+  },
+  "shared_caches": {
+    "cargo_packages": {
+      "path": "caches/gptgrep/cargo",
+      "manager": "cargo"
+    },
+    "npm_cache": {
+      "path": "caches/gptgrep/npm",
+      "manager": "npm"
+    },
+    "pnpm_store": {
+      "path": "caches/gptgrep/pnpm",
+      "manager": "pnpm"
+    },
+    "uv_cache": {
+      "path": "caches/gptgrep/uv",
+      "manager": "uv"
+    }
+  },
+  "fallbacks": {
+    "home": "isolated",
+    "preserved_home": null,
+    "xdg": "isolated"
+  },
+  "exceptions": [],
+  "adapters": {
+    "cargo": {
+      "status": "validation_only",
+      "receipt": null
+    },
+    "compiler": {
+      "status": "validation_only",
+      "receipt": null
+    },
+    "npm": {
+      "status": "validation_only",
+      "receipt": null
+    },
+    "pnpm": {
+      "status": "validation_only",
+      "receipt": null
+    },
+    "uv": {
+      "status": "validation_only",
+      "receipt": null
+    },
+    "python": {
+      "status": "validation_only",
+      "receipt": null
+    },
+    "node": {
+      "status": "validation_only",
+      "receipt": null
+    },
+    "model": {
+      "status": "validation_only",
+      "receipt": null
+    },
+    "temporary": {
+      "status": "validation_only",
+      "receipt": null
+    },
+    "source": {
+      "status": "validation_only",
+      "receipt": null
+    },
+    "container": {
+      "status": "held",
+      "receipt": null
+    }
+  }
+}

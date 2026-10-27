@@ -20,6 +20,7 @@
   "keeper_poll_seconds": 2,
   "path_env": "/usr/bin:/bin:/usr/sbin:/sbin",
   "locale": "en_US.UTF-8",
+  "no_proxy_additions": [],
   "refresh_policy": {
     "max_age_seconds": 43200,
     "pre_run": "never"

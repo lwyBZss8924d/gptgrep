@@ -23,7 +23,7 @@ acceptance items stay `BLOCKED` until each is qualified.
 | Per-run isolation | `RUNS_ROOT/<role>/<run-id>/{codex-home,state,state/logs,home,tmp,work,results}`, all 0700. Run ids are never reused. `codex-home/config.toml` is generated. The canonical `config.toml`, skills and state are never copied. |
 | Auth link lifetime | `codex-home/auth.json`, an absolute symlink to the canonical file, is created only after the quarantine check, the lease and the blocker and canonical preflights. It is removed on every exit path once the sweep is clean; after `UNKNOWN`, the guardian removes it at release. Refusals (`AUTH_BUSY`, `QUARANTINED`, `BLOCKED_AUTH`, configuration errors) never create it. The `_relogin` and `_maintenance` layouts never have one. A link a consumer *replaced* with a regular file or a different symlink (a per-run login or copy) is `RUN_AUTH_LINK_REPLACED`: the run is `QUARANTINED` and the file is left for review, not deleted. |
 | Pinned Codex config | `cli_auth_credentials_store="file"`, `forced_login_method="chatgpt"`, `features.use_agent_identity=false`, `features.{secret_auth_storage,memories,hooks,plugins,apps}=false`, `memories.{generate_memories,use_memories}=false`, `cloud.skills.enabled=false`, `notify=[]`, `analytics/feedback` off, `history.persistence="none"`, `check_for_update_on_startup=false`, `log_dir=<run>/state/logs`. Every key is checked against the 0.162.1 schema; the qualification starts app-servers with `--strict-config`. |
-| Allowlisted environment | The child environment is built from scratch: fixed `PATH` (or the role's `path_env`), `LANG`/`LC_ALL`, per-run `HOME`, `TMPDIR` and `XDG_*`, `CODEX_HOME`, `CODEX_SQLITE_HOME`, `CODEX_REFRESH_TOKEN_URL_OVERRIDE` and `CODEX_REVOKE_TOKEN_URL_OVERRIDE` (the blocker), `CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED=1`, loopback `NO_PROXY`/`no_proxy`, `GPTGREP_AUTH_RUN_ID`, `GPTGREP_AUTH_SOURCE_ID` and `GPTGREP_AUTH_FAILURE_RECORD` (`{results}/auth-failure.json`), plus any names a role lists. `OPENAI_API_KEY`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN` and `OP_SERVICE_ACCOUNT_TOKEN` can never pass. `OPENROUTER_API_KEY` passes only for roles with `allow_openrouter=true`. |
+| Allowlisted environment | The child environment is built from scratch: fixed `PATH` (or the role's `path_env`), `LANG`/`LC_ALL`, per-run `HOME`, `TMPDIR` and `XDG_*`, `CODEX_HOME`, `CODEX_SQLITE_HOME`, `CODEX_REFRESH_TOKEN_URL_OVERRIDE` and `CODEX_REVOKE_TOKEN_URL_OVERRIDE` (the blocker), `CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED=1`, pinned `NO_PROXY`/`no_proxy` (always loopback, plus explicit local additions), `GPTGREP_AUTH_RUN_ID`, `GPTGREP_AUTH_SOURCE_ID` and `GPTGREP_AUTH_FAILURE_RECORD` (`{results}/auth-failure.json`), plus any names a role lists. `OPENAI_API_KEY`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN` and `OP_SERVICE_ACCOUNT_TOKEN` can never pass. `OPENROUTER_API_KEY` passes only for roles with `allow_openrouter=true`. |
 | Consumers cannot refresh or revoke | Codex reads both override variables on every call. The default blocker is `http://127.0.0.1:0/oauth/token` (revoke: `/oauth/revoke` on the same address). **Port 0 can never have a listener**: binding port 0 assigns an ephemeral port, and a connect to it fails before a byte is sent (`EADDRNOTAVAIL` on macOS, `ECONNREFUSED` on Linux). A fixed low port such as 9 is not safe, because any local process, a consumer's own tool commands included, can bind it on macOS and would receive the refresh token. Proactive refresh (token within 5 minutes of expiry), 401 recovery step 2, and explicit `account/read {refreshToken:true}` all fail transiently. A guarded reload still adopts an owner's rewrite. For a configured non-zero blocker port, the port is probed at launch, every 2 seconds while the child runs, and after it exits. A listener stops the child and gives `QUARANTINED` (`BLOCKER_LISTENER_APPEARED`), because the token may have been harvested. |
 | Proxy safety | reqwest/hyper-util read the macOS system HTTP(S) proxy but **ignore its ExceptionsList**, while honouring `NO_PROXY`. Without the loopback `NO_PROXY`, a request to the blocker (body included) can be relayed through a local or remote proxy. The supervisor always sets it. |
 | Single refresh owner | `refresh` holds the **exclusive** lease, so no consumer is alive during Codex's non-atomic in-place save. It drives the official `codex app-server --listen stdio:// --strict-config` in its own per-run home without the consumer blocker: `initialize`, `initialized`, `account/read {refreshToken:true}`, then `account/read {}`, which must report a `chatgpt` account. Success (`REFRESHED`) requires the canonical `mtime_ns`/`size` to change while the inode, regular-file type, mode 0600 and the run's symlink stay intact. |
@@ -54,11 +54,28 @@ The supervisor refuses group- or world-writable configs. Keys:
 - `expected_user` (optional): refuse unless the effective user has this name.
 - `blocker_url` (loopback only; keep the default port 0) and `blocker_must_be_closed`.
 - `allow_shared_consumers`: Phase 2 only (see below). Default `false`.
+- `no_proxy_additions` (optional, supervisor 1.4.1+): up to 128 explicit local destinations added to
+  both `NO_PROXY` and `no_proxy` for consumers, the refresh owner and device login. The fixed
+  `127.0.0.1,localhost,::1` prefix cannot be removed. Entries may be private IPv4 addresses/CIDRs,
+  loopback, IPv6 unique-local/link-local addresses/CIDRs, single-label LAN hostnames containing a
+  digit or hyphen (excluding bare `xn--` names), or hosts and
+  suffixes under `.local`, `.lan`, `.test`, `.localhost`, `.internal` and `.home.arpa`. Leading `.`
+  and `*.` suffix forms are accepted; clients differ in their interpretation, so private deployment
+  configs should list explicit host IPs alongside CIDRs and suffixes. Public addresses/domains,
+  alphabetic single-label names outside those LAN suffixes, noncanonical CIDRs,
+  URI/port/userinfo syntax, comma lists, whitespace and a universal `*` are
+  refused. Ambient `NO_PROXY`/`no_proxy` remain forbidden passthrough variables. This setting selects
+  application proxy exceptions; actual routing and each consumer's proxy handling require separate
+  deployment verification.
 - `refresh_policy.max_age_seconds` (default 43200) and `refresh_policy.pre_run`
   (`never`, `if-stale` or `always`). With `if-stale`, a shared consumer upgrades to the exclusive
   lease only when a refresh is actually due.
 - `owner.*`: RPC timeout, exit wait, SIGTERM grace, `passthrough_env`, and the test-only
-  `refresh_token_url_override` (loopback only).
+  `refresh_token_url_override` (loopback only). Its explicitly listed `HTTP_PROXY`, `HTTPS_PROXY`,
+  `ALL_PROXY` and lowercase equivalents also reach device login and login-status verification.
+  Other owner passthrough variables do not reach those login commands. Proxy URL passthrough
+  accepts HTTP(S) and SOCKS4/4a/5/5h URLs with a hostname and optional port, but refuses userinfo,
+  non-root paths, queries, fragments and whitespace. Consumer proxy variables remain role-selected.
 - `relogin.experimental_issuer`: test-only loopback device-code issuer for qualification.
 - `codex_config`: extra allowlisted Codex keys, such as `chatgpt_base_url`, `openai_base_url`
   or `model`. The pinned auth keys and the permission keys cannot be overridden.
@@ -72,7 +89,9 @@ The supervisor refuses group- or world-writable configs. Keys:
     `"consumer-managed"`, or `"unrestricted"`. Path lists are optional, each up to 64 absolute,
     normalized paths. `minimal_read` explicitly adds the Codex `:minimal = "read"` filesystem entry.
     With `network_enabled=true`, optional `network_allowed_domains` selects the exact-domain
-    managed proxy described below. Omitting it preserves the existing network behavior.
+    managed proxy described below. The paired `network_allowed_unix_sockets` and
+    `network_unix_socket_scope` fields select the qualified Linux helper boundary below.
+    Omitting these fields preserves the existing network behavior.
   - `passthrough_env`, `allow_openrouter`, `deadline_seconds` and `codex_config`.
   - `path_env`: Harbor needs the directory that holds `docker`.
   - `stop_scope` (`tree` or `root-first`) and `term_grace_seconds`. With `root-first`, cancel and
@@ -85,6 +104,24 @@ Supervisors before 1.2.0 ignore unknown top-level keys, so they silently drop
 `extra_denied_paths`, and they refuse role `deny_paths` and `read_paths`. Do not run a config that
 uses these keys with an older supervisor. The config schema stays
 `gptgrep.codex-auth.config.v1`.
+
+Compatibility of 1.5.0 with 1.4.1:
+
+- The Linux helper fields are opt-in and require the exact paired keyless environment names,
+  root-deny filesystem, read-only helper parent, `:read-only` base, `minimal_read=true` and
+  `network_enabled=true`. Older supervisors refuse these role keys; use 1.5.0 or later.
+- Helper roles forbid provider-key passthrough, web search, approval widening and legacy
+  Landlock overrides. Source configuration does not establish Linux runtime qualification.
+- Roles without helper fields retain their existing profile and environment behavior.
+
+Compatibility of 1.4.1 with 1.4.0:
+
+- Omitted or empty `no_proxy_additions` preserves the loopback-only environment. Use 1.4.1 or
+  later when setting it: older supervisors ignore this top-level key and would omit LAN bypasses.
+- Device login and its status check now use the owner's explicit proxy environment selection.
+  Selected proxy values are validated for consumers and owners as well as login; ambiguous or
+  credential-bearing proxy URLs are refused before their command starts.
+- No credential, lease, refresh, permission-profile or secret-passthrough rule changes.
 
 Compatibility of 1.4.0 with 1.3.1:
 
@@ -342,6 +379,76 @@ proxy variables. Callers must use that runtime address rather than assume port 3
 application proxy is chained. The proxy's onward traffic still follows the OS-managed routing and DNS policy;
 these settings do not prove external provider connectivity. Receipts add `network_allowed_domains`,
 `network_proxy=true`, `web_search="disabled"` and the domain-only `network_scope` description.
+
+### Qualified Linux Decisions helper
+
+A treatment reader can opt into this exact role fragment, together with its existing exact
+task/runtime reads, task-only writes and private-path denies:
+
+```json
+{
+  "passthrough_env": ["GPTGREP_DECISIONS_IPC_CONTROL", "GPTGREP_DECISIONS_IPC_SHA256"],
+  "allow_openrouter": false,
+  "tool_permissions": {
+    "extends": ":read-only",
+    "network_enabled": true,
+    "minimal_read": true,
+    "deny_paths": ["/"],
+    "read_paths": ["/run/gptgrep-decisions"],
+    "network_allowed_unix_sockets": ["/run/gptgrep-decisions/decisions.sock"],
+    "network_unix_socket_scope": "linux-container-fs-netns-v1"
+  }
+}
+```
+
+Both Unix fields are required together. The only supported scope and socket are those shown.
+Domain rules, wider helper-parent read grants, helper-parent writes and provider-key passthrough
+are refused. The explicit environment pair carries `/run/gptgrep-decisions/client.json` and its
+lowercase SHA-256; missing, partial or differently addressed controls fail before consumer launch.
+Other roles do not inherit these names from the parent environment.
+
+For the pinned Codex 0.164.0 Linux route, the supervisor sets Boolean
+`features.network_proxy=true`, `features.use_legacy_landlock=false`, `approval_policy="never"`
+and `web_search="disabled"`. Its network table matches the fixed table above with
+`dangerously_allow_all_unix_sockets=true` and empty `domains` and `unix_sockets` tables.
+The Boolean feature leaves credential brokerage disabled. Feature objects, credential providers,
+approval widening and proxy-policy overrides are outside this contract.
+
+The Linux `unix_sockets` map does not enforce an allowlist on raw Unix syscalls. The syscall
+permission therefore requires the owner's verified root-deny mount view: one read-only external
+helper directory containing only `client.json` and `decisions.sock`, exact other roots and private
+denies. The active native `ProxyRouted`/`ProxyOnly` route creates a child network namespace distinct
+from the container and host; the empty managed-proxy domain policy denies external TCP/HTTP/CONNECT
+egress. Model-owned workspace IPC remains possible. Receipts describe this scope without claiming
+that the network table alone restricts all Unix sockets. Parent app-server API/auth/proxy settings
+remain separate from the proxy variables Codex injects into tool commands.
+
+The live runner additionally requires the current owner reader command's verified ready
+attestation and its native binary/profile/control pins, namespace-plan binding and qualified
+`linux_raw_unix_boundary` evidence. A role file or arbitrary attestation hash cannot admit a host
+command, baseline, judge or C4 actor. The owner retains manual review of this selected boundary;
+source tests do not establish runtime adoption.
+
+Actual route qualification uses two fresh helper generations. Generation A is a distinct
+no-model qualification intent with `provider_disabled=true` and no key. Start the shipped
+`gptgrep decisions-helper serve --control ... --expected-control-sha256 ...`, then run the shipped
+`gptgrep decisions-helper probe --control ... --expected-control-sha256 ...` through the actual
+native sandbox. Record O_PATH connection and peer/container identity, effective filesystem/socket
+inventory, foreign filesystem and abstract-socket denials, direct IP/proxy denial and parent API
+proxy separation. A does not require an already-qualified live ready attestation. Retain A's full
+terminal receipt, actual process absence and exact endpoint cleanup before starting B.
+
+Generation B uses a fresh server/socket/control generation with `provider_disabled=false` and
+`--key-stdin`, supplying only a public synthetic privacy sentinel through bounded stdin followed
+by EOF. This independently owned no-model lifecycle stays outside reader admission and uses no
+Codex authentication. Inspect actual environment, argv, descriptor, proc and file-write absence,
+plus private ledger/HTTP absence; send no Probe, Submit, provider or model operation. The disabled
+server cannot accept a key, and the enabled server cannot accept Probe. Complete B's terminal
+chain; its result proves enabled initialization only. Do not reuse B's readiness, client, socket
+or server generation for a live reader. The live treatment reader later starts a fresh helper
+under its real outer authentication lease and seals its own current ready attestation and command
+admission. Only A's immutable binary/profile/policy route qualification can be reused within the
+same frozen scope; no sentinel admission class is introduced.
 
 ### Consumer argv guard
 

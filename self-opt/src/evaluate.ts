@@ -1,3 +1,5 @@
+import { validateMutationPaths } from "./mutation-paths";
+export { validateMutationPaths } from "./mutation-paths";
 import { digest } from "../../benchmark/src/io";
 
 export type OutcomeStatus = "complete" | "operational_failure" | "judge_unknown" | "setup_failed" | "pending";
@@ -5,15 +7,19 @@ export interface Outcome {
   taskId: string;
   status: OutcomeStatus;
   groundedSuccess: 0 | 1 | null;
+  groundedAccuracy?: 0 | 1 | null;
   nativeAccuracy: number | null;
+  accuracy?: number | null;
   atomicCoverage: number | null;
   latencyMs: number | null;
   costUsd: number | null;
   errorCategory?: string;
+  documentIds?: string[];
 }
 export interface EvaluationRun {
   schema: "gptgrep.opt-evaluation.v1";
   runId: string;
+  arm?: "bare" | "gptgrep";
   /** Immutable product revision. Changed products are compared under the same scenario. */
   revision: string;
   parentRevision: string | null;
@@ -44,6 +50,95 @@ export function scenarioFingerprint(run: EvaluationRun): string {
   return digest({ scenario: run.scenario, split: run.split, cohort: [...run.cohort].sort() });
 }
 
+export interface RawOutcome {
+  taskId: string;
+  status?: OutcomeStatus | "denied_before_dispatch" | "denied_before_reader" | "prelaunch_denial" | "timeout" | "crashed" | "reader_failed" | "failed" | "answer_invalid" | "completed";
+  validStart?: boolean;
+  groundedSuccess?: 0 | 1 | null;
+  groundedAccuracy?: 0 | 1 | null;
+  nativeAccuracy?: number | null;
+  accuracy?: number | null;
+  atomicCoverage?: number | null;
+  latencyMs?: number | null;
+  costUsd?: number | null;
+  errorCategory?: string;
+  documentIds?: string[];
+}
+export function normalizeOutcome(outcome: RawOutcome): Outcome {
+  if (outcome.status !== undefined && !["complete", "operational_failure", "judge_unknown", "setup_failed", "pending", "denied_before_dispatch", "denied_before_reader", "prelaunch_denial", "timeout", "crashed", "reader_failed", "failed", "answer_invalid", "completed"].includes(outcome.status)) throw new Error("Unknown raw outcome status");
+  const isPrelaunchDenial =
+    outcome.validStart === false ||
+    outcome.status === "setup_failed" ||
+    outcome.status === "denied_before_dispatch" ||
+    outcome.status === "denied_before_reader" ||
+    outcome.status === "prelaunch_denial" ||
+    outcome.errorCategory === "prelaunch_denial" ||
+    outcome.errorCategory === "setup_failed";
+
+  const isOperationalFailure =
+    outcome.status === "operational_failure" ||
+    outcome.status === "timeout" ||
+    outcome.status === "crashed" ||
+    outcome.status === "reader_failed" ||
+    outcome.status === "failed" ||
+    outcome.status === "answer_invalid" ||
+    outcome.errorCategory === "timeout" ||
+    outcome.errorCategory === "crashed" ||
+    outcome.errorCategory === "operational_failure";
+
+  let status: OutcomeStatus = "complete";
+  let groundedSuccess: 0 | 1 | null = outcome.groundedSuccess ?? outcome.groundedAccuracy ?? null;
+  const nativeAccuracy: number | null = outcome.nativeAccuracy ?? outcome.accuracy ?? null;
+  const atomicCoverage: number | null = outcome.atomicCoverage ?? null;
+
+  if (isPrelaunchDenial) {
+    status = "setup_failed";
+    groundedSuccess = null;
+  } else if (outcome.status === "judge_unknown") {
+    status = "judge_unknown";
+    groundedSuccess = null;
+  } else if (outcome.status === "pending") {
+    status = "pending";
+    groundedSuccess = null;
+  } else if (isOperationalFailure) {
+    status = "operational_failure";
+    groundedSuccess = 0;
+  } else if (outcome.status === "complete" || outcome.status === "completed") {
+    status = "complete";
+    if (groundedSuccess !== 0 && groundedSuccess !== 1) {
+      throw new Error(`Completed outcome requires binary grounded success: ${outcome.taskId}`);
+    }
+  } else if (groundedSuccess === null) {
+    status = "judge_unknown";
+  } else if (groundedSuccess === 0 || groundedSuccess === 1) {
+    status = "complete";
+  }
+
+  return {
+    taskId: outcome.taskId,
+    status,
+    groundedSuccess,
+    groundedAccuracy: groundedSuccess,
+    nativeAccuracy,
+    accuracy: nativeAccuracy,
+    atomicCoverage,
+    latencyMs: outcome.latencyMs ?? null,
+    costUsd: outcome.costUsd ?? null,
+    errorCategory: outcome.errorCategory,
+    ...(outcome.documentIds ? { documentIds: outcome.documentIds } : {}),
+  };
+}
+
+export function normalizeRun(run: Omit<EvaluationRun, "outcomes"> & { outcomes: RawOutcome[] }): EvaluationRun {
+  if (!Array.isArray(run.outcomes)) throw new Error("Evaluation outcomes must be an array");
+  const normalized: EvaluationRun = {
+    ...run,
+    outcomes: run.outcomes.map(normalizeOutcome),
+  };
+  validateRun(normalized);
+  return normalized;
+}
+
 function score(value: number | null, label: string): void {
   if (value !== null && (!Number.isFinite(value) || value < 0 || value > 1)) throw new Error(`Invalid ${label}`);
 }
@@ -66,6 +161,8 @@ export function validateRun(run: EvaluationRun): void {
     if (!ids.has(result.taskId) || observed.has(result.taskId)) throw new Error("Outcome is duplicated or outside the frozen cohort");
     observed.add(result.taskId);
     if (!["complete", "operational_failure", "judge_unknown", "setup_failed", "pending"].includes(result.status)) throw new Error("Unknown outcome status");
+    if (result.groundedAccuracy !== undefined && result.groundedAccuracy !== result.groundedSuccess) throw new Error("groundedAccuracy and groundedSuccess must match when both present");
+    if (result.accuracy !== undefined && result.accuracy !== result.nativeAccuracy) throw new Error("accuracy and nativeAccuracy must match when both present");
     score(result.nativeAccuracy, "native accuracy"); score(result.atomicCoverage, "atomic coverage");
     nonnegative(result.latencyMs, "latency"); nonnegative(result.costUsd, "cost");
     if (result.status === "complete" && ![0, 1].includes(result.groundedSuccess as number)) throw new Error("Completed grounding requires a binary result");
@@ -83,6 +180,9 @@ export function summarize(run: EvaluationRun) {
   const complete = run.outcomes.filter(o => o.status === "complete").length;
   const failures = run.outcomes.filter(o => o.status === "operational_failure").length;
   const successes = run.outcomes.reduce((n, o) => n + (o.groundedSuccess === 1 ? 1 : 0), 0);
+  const lowerBound = successes / enrolled;
+  const upperBound = (successes + unknown + pending) / enrolled;
+  const final = unknown === 0 && pending === 0 ? successes / enrolled : null;
   const numeric = (key: "nativeAccuracy" | "atomicCoverage") => {
     const values = run.outcomes.map(o => o[key]).filter((v): v is number => v !== null);
     return { observed: values.length, unavailable: enrolled - values.length,
@@ -96,9 +196,12 @@ export function summarize(run: EvaluationRun) {
   return {
     schema: "gptgrep.opt-summary.v1", runId: run.runId, revision: run.revision,
     fingerprint: scenarioFingerprint(run), split: run.split, enrolled, complete, failures, unknown, pending, successes,
-    groundedSuccess: { lowerBound: successes / enrolled, upperBound: (successes + unknown + pending) / enrolled,
-      final: unknown === 0 && pending === 0 ? successes / enrolled : null },
-    nativeAccuracy: numeric("nativeAccuracy"), atomicCoverage: numeric("atomicCoverage"),
+    bounds: [lowerBound, upperBound] as [number, number],
+    groundedSuccess: { lowerBound, upperBound, final },
+    groundedAccuracy: { lowerBound, upperBound, final },
+    nativeAccuracy: numeric("nativeAccuracy"),
+    accuracy: numeric("nativeAccuracy"),
+    atomicCoverage: numeric("atomicCoverage"),
     latencyMs: telemetry("latencyMs"), costUsd: telemetry("costUsd"),
     comparable: unknown === 0 && pending === 0,
   };
@@ -114,6 +217,10 @@ export function compare(incumbent: EvaluationRun, candidate: EvaluationRun, opti
   if (candidate.parentRevision !== incumbent.revision) reasons.push("candidate_parent_is_not_current_incumbent");
   if (candidate.revision === incumbent.revision) reasons.push("candidate_has_no_source_change");
   if (!before.comparable || !after.comparable) reasons.push("incomplete_or_unknown_outcomes");
+  if (before.unknown !== after.unknown) reasons.push("unknown_count_differs");
+  if ((before.unknown > 0 || after.unknown > 0) && after.groundedSuccess.lowerBound <= before.groundedSuccess.upperBound) {
+    reasons.push("delta_within_uncertainty_bounds");
+  }
   // Repeated Opt search only uses development material; frozen runs are confirmation evidence.
   if (candidate.split !== "dev" || incumbent.split !== "dev") reasons.push("frozen_split_cannot_select_next_opt_parent");
   const improvement = before.groundedSuccess.final !== null && after.groundedSuccess.final !== null
@@ -128,14 +235,6 @@ export function compare(incumbent: EvaluationRun, candidate: EvaluationRun, opti
     releaseAccepted: false, acceptanceScope: "development_candidate_selection_only" };
 }
 
-const ALLOWED_SURFACES = ["crates/", "skills/", "runtime/", "prompts/"];
-export function validateMutationPaths(paths: string[]): void {
-  if (!paths.length || new Set(paths).size !== paths.length) throw new Error("Explicit unique mutation paths are required");
-  for (const path of paths) {
-    if (path.startsWith("/") || path.includes("\\") || path.split("/").some(p => !p || p === "." || p === "..") ||
-        !ALLOWED_SURFACES.some(prefix => path.startsWith(prefix))) throw new Error(`Mutation outside product/harness surfaces: ${path}`);
-  }
-}
 
 /** A loop plan is a request to the checked worktree/storage launcher, never execution authority. */
 export function planLoop(options: { baselineRevision: string; parent: EvaluationRun; iteration: number; mutationPaths: string[] }) {

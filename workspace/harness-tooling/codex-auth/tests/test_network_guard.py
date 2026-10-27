@@ -99,5 +99,43 @@ class DeclaredGuardTests(unittest.TestCase):
         support.observe("declared_proxy_trap_refused", exit_code=proc.returncode, binary_started=False)
 
 
+class UnixProfileOverrideTests(unittest.TestCase):
+    """Argument policy only; actual Linux namespace/socket qualification is a separate run."""
+
+    def test_unix_profile_cannot_widen_approval_or_proxy_features(self):
+        sup = support.sup
+        env = support.Env("unix-argv")
+        permissions = {"extends": ":read-only", "network_enabled": True, "minimal_read": True,
+                       "deny_paths": ["/"], "read_paths": [sup.DECISIONS_UNIX_PARENT],
+                       "network_allowed_unix_sockets": [sup.DECISIONS_UNIX_SOCKET],
+                       "network_unix_socket_scope": sup.DECISIONS_UNIX_SCOPE}
+        roles = dict(env.values["roles"], tools={"tool_permissions": permissions,
+                                               "passthrough_env": list(sup.DECISIONS_UNIX_ENV)})
+        cfg = sup.Config(dict(env.values, schema=sup.CONFIG_SCHEMA, roles=roles), "inline")
+        layout = sup.Layout(cfg, "tools", "unix-argv")
+        denied = [["exec", "--search"], ["exec", "-a", "on-request"],
+                  ["exec", "--ask-for-approval=untrusted"], ["exec", "-c", 'approval_policy="on-failure"'],
+                  ["exec", "-c", "approval_policy.enabled=false"],
+                  ["exec", "-c", "features.network_proxy={enabled=true,credential_broker=true}"],
+                  ["exec", "-c", "features={network_proxy=true}"],
+                  ["exec", "-c", 'permissions.gptgrep_codex_auth.network.domains={"*"="allow"}']]
+        for feature in sup.UNIX_NETWORK_FEATURES:
+            denied.extend([["exec", "--enable", feature], ["exec", "--disable=" + feature],
+                           ["exec", "-c", "features.%s=false" % feature]])
+        for args in denied:
+            with self.subTest(args=args):
+                argv = ["/runtime/codex", *args]
+                self.assertIsNotNone(sup.codex_profile_override(argv, restricted_unix=True))
+                with self.assertRaises(sup.SupervisorError) as ctx:
+                    sup.consumer_argv_guard(cfg, layout, cfg.role("tools"), argv)
+                self.assertEqual(ctx.exception.reason, "consumer_argv_overrides_permission_profile")
+        for args in [["app-server", "--listen", "stdio://", "--strict-config"],
+                     ["exec", "-a", "never", "-c", 'approval_policy="never"', "-c", 'web_search="disabled"'],
+                     ["sandbox", "--permission-profile", sup.SUPERVISOR_PERMISSION_PROFILE, "--", "/bin/true"]]:
+            self.assertEqual(sup.consumer_argv_guard(cfg, layout, cfg.role("tools"), ["/runtime/codex", *args]), "checked")
+        self.assertIsNone(sup.codex_profile_override(["/runtime/codex", "exec", "--enable", "use_legacy_landlock"]))
+        self.assertIsNone(sup.codex_profile_override(["/runtime/codex", "exec", "-a", "on-request"]))
+
+
 if __name__ == "__main__":
     unittest.main()
