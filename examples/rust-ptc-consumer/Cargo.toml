@@ -1,0 +1,22 @@
+[package]
+name = "gptgrep-rust-ptc-consumer"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+# An independent consumer workspace; it imports the actual public core crate.
+[workspace]
+
+[[bin]]
+name = "gptgrep-rust-ptc-consumer"
+path = "../../crates/gptgrep-host/examples/rust_ptc_sdk.rs"
+
+[dependencies]
+anyhow = "1"
+gptgrep-core = { path = "../../crates/gptgrep-core" }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[patch."https://github.com/run-llama/liteparse"]
+liteparse-pdfium = { path = "../../vendor/liteparse-pdfium" }

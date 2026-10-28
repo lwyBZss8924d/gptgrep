@@ -234,7 +234,7 @@ pub(crate) async fn mock_roles(count: usize) -> (JevClient, tokio::task::JoinHan
                 (id.clone(), answer)
             }).collect();
             requests.push(request);
-            let body = json!({"model":"fixture-role-model","provider":"fixture","id":format!("reply-{ordinal}"),"answers":answers,
+            let body = json!({"model":"openai/gpt-6-luna-decisions-20261006","provider":"fixture","id":format!("reply-{ordinal}"),"answers":answers,
                 "usage":{"input_tokens":19,"output_tokens":7,"cost":0.001}}).to_string();
             socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
         }

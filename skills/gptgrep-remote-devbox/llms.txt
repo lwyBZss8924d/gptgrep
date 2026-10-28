@@ -1,0 +1,46 @@
+# GPTgrep Remote DevBox Skill Navigation
+
+- [Remote DevBox Skill Specification](SKILL.md): Authoritative skill contract, workflows for waking, selfchecking, administering, and suspending gptgrep-devbox-01.
+- [Agent Governance & Operational Rules](AGENTS.md): Strict privacy, storage, security, and cost protection constraints for devbox agents.
+- [DevBox Selfcheck CLI](bin/gptgrep-devbox-selfcheck): Bun launcher for current-host observations; canonical owner payload and private config required. No implicit SSH or workload admission.
+- [Current Selfcheck Contract](SKILL.md#3-selfcheck-observations-and-live-qualification-gptgrep-devbox-selfcheck): v2 evidence, UNKNOWN/nonzero behavior, explicit local qualification and source-closure installation.
+- [DevBox Architecture](references/devbox-architecture.md): Dedicated GCE VM, 250 GB SSD mount, and 3-tier storage architecture.
+- [Historical Verification Checklist](references/verification-gates.md): Dated deployment targets; current owner evidence is required for qualification.
+- [Codex Auth Lease Broker](references/codex-auth-lease.md): flock exclusivity, canonical token home, and port 0 loopback blocker.
+- [Harbor Container Isolation](references/harbor-isolation.md): Harbor v0.24.0 verifier container sandbox (--network=none --read-only).
+- [REEF Mutation Validator](references/reef-validator.md): Allowed mutation surfaces (crates/, skills/, runtime/, prompts/).
+- [Three-Tier Corpus Accounting](references/corpus-accounting.md): Invariants for 291 RAW PDFs, 82,121 MinerU pages, 1,345-task denominator, and split.json.
+- [Google Cloud Attribution](references/attribution.md): Metric attribution standards for Google Cloud SDK calls.
+
+## Bundled Upstream Google Skills (`skills/google/`)
+- [Retrieving Developer Knowledge](skills/google/retrieving-developer-knowledge/SKILL.md): Synthesize official Google developer docs across Cloud, AI, and Android via MCP or REST fallback.
+- [Finding Google Skills](skills/google/finding-google-skills/SKILL.md): Discover published Google skills dynamically from the official catalog index.
+- [Google Cloud SDK (gcloud)](skills/google/gcloud/SKILL.md): Leaf-level command syntax validation, attribution, and safety guardrails for GCP operations.
+- [Google Cloud Recipe: Auth](skills/google/google-cloud-recipe-auth/SKILL.md): IAM, ADC, service accounts, and workload identity setup.
+- [Google Cloud Recipe: Onboarding](skills/google/google-cloud-recipe-onboarding/SKILL.md): Singleton developer onboarding, project creation, and billing attachment.
+- [Google Drive Skill](skills/google/gdrive/SKILL.md): Drive file management with separate read-only and mutation scripts.
+- [Google Workspace CLI (gws)](skills/google/gws/SKILL.md): Dynamic discovery CLI for Google Workspace APIs (Drive, Gmail, Calendar, Docs, Sheets, Tasks).
+- [Google Colab Operator](skills/google/colab-operator/SKILL.md): Colab GPU/TPU VM management, execution, and persistent notebook kernels.
+
+## Bundled AI Engineer CLI Clients Skills (`skills/`)
+- [OpenAI Docs & Codex](skills/openai-docs/SKILL.md): Authoritative guidance from OpenAI developer documentation and Codex manual.
+- [Claude Code Operator](skills/claude-code-operator/SKILL.md): Autonomous operation of Anthropic Claude Code CLI (`claude --dangerously-skip-permissions --resume`).
+- [Antigravity Guide](skills/antigravity-guide/SKILL.md): Builtin guidance for Google Antigravity CLI and IDE features.
+- [Antigravity Customizations](skills/agy-customizations/SKILL.md): Rules, hooks, MCP servers, and JSON configurations for Antigravity.
+- [1Password Self Bridge](skills/1password-self/SKILL.md): Secret-reference injection (`op://AGENTS/...`) with zero token exposure.
+
+## Bundled Reference Documentation Snapshots (`references/`)
+- [Google Knowledge Docs](references/google-docs/): 7 official reference documents from `developers.google.com/knowledge/`.
+- [Claude Code Documentation](references/claude-code-docs/): 26 official chapters from `code.claude.com/docs/en/`.
+- [Codex Documentation](references/codex-docs/): Configuration schema, `llms.txt`, and developer guides from `learn.chatgpt.com`.
+- [Antigravity Documentation](references/agy-docs/): Official documentation and CLI manuals from `antigravity.google/docs/`.
+
+## Configuration Templates & Scripts
+- [Configuration Templates](configs/):
+  - [DevBox Inventory Template](configs/devbox-inventory.template.json)
+  - [Storage Policy Template](configs/storage-policy.devbox.template.json)
+  - [Codex Auth Template](configs/codex-auth.devbox.template.json)
+  - [1Password Secret Reference Template](configs/.env.op.template)
+- [Scripts](scripts/):
+  - [DevBox Bootstrap](scripts/devbox-bootstrap.sh): Remote initialization and environment setup.
+  - [DevBox Auth Helper](scripts/devbox-auth-helper.sh): Non-interactive & interactive authentication helper.

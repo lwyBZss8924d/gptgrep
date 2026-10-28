@@ -101,7 +101,7 @@ impl Backend for Mock {
             return Err(crate::HostProtocolError { kind: crate::HostProtocolErrorKind::TerminalError,
                 codex_error_info: Some(crate::CodexErrorInfo::ServerOverloaded), will_retry: Some(false), http_status_code: Some(503),
                 server_retry_notifications: 1, usage: Some(json!({"total":{"inputTokens":12,"outputTokens":5,"totalTokens":17},"PRIVATE":"not-retained"})),
-                accounting_complete: false, tool_budget: None }.into());
+                accounting_complete: false, diagnostics: None, tool_budget: None }.into());
         }
         if let Some(path) = &self.mutate_source {
             fs::write(path, "Changed source after planning.")?;
@@ -206,6 +206,7 @@ impl Backend for Mock {
             usage: json!({"prompt_tokens":11,"completion_tokens":2,"total_tokens":13,"private":"not-retained"}),
             id: Some(format!("synthetic-jev-{ordinal}")),
             provider: Some("synthetic-provider".into()),
+            retried_attempts: Vec::new(),
         })
     }
 }
@@ -622,12 +623,18 @@ async fn enrich_all_documents_share_one_invocation_deadline_and_source_bound_pla
     )?;
     gptgrep_core::index(directory.path(), 8).await?;
     config.window_bytes = 8;
-    config.timeout_secs = 1;
+    // The invocation deadline also covers planning and every durable ledger
+    // write, so it must not expire during this complete run. It only has to stay
+    // below the per-call host timeout, which makes it the bound every call gets.
+    config.timeout_secs = 60;
+    assert!(config.timeout_secs < config.host.timeout_secs);
     let plan = plan_enrichment(directory.path(), &config)?;
     assert_eq!(plan.documents.len(), 2);
     assert_eq!(plan.binding.source.documents_total, 2);
     let backend = Mock::new(Mode::Empty, &config);
+    let invoked = tokio::time::Instant::now();
     let report = enrich_with(directory.path(), &config, &backend).await?;
+    let returned = tokio::time::Instant::now();
     assert_eq!(report.status, "complete");
     assert_eq!(report.documents_completed, 2);
     assert_eq!(report.windows_completed, plan.unit_count);
@@ -639,6 +646,9 @@ async fn enrich_all_documents_share_one_invocation_deadline_and_source_bound_pla
             .iter()
             .all(|deadline| *deadline == calls.deadlines[0])
     );
+    // The shared bound is the invocation deadline itself, captured once.
+    let timeout = Duration::from_secs(config.timeout_secs);
+    assert!(invoked + timeout <= calls.deadlines[0] && calls.deadlines[0] <= returned + timeout);
     assert_eq!(calls.jev, 0);
     Ok(())
 }
@@ -910,6 +920,7 @@ fn enrich_failure_taxonomy_uses_safe_owner_metadata_without_provider_text() {
             server_retry_notifications: 2,
             usage: None,
             accounting_complete: false,
+            diagnostics: None,
             tool_budget: None,
         };
         let failure = failure_info(&error.into(), CallKind::Builder);

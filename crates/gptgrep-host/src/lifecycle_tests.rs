@@ -109,6 +109,7 @@ async fn protocol_attempt(
         protocol::RunOptions {
             observer: Some(attempt.observer()),
             max_output_bytes: output_limit,
+            ..Default::default()
         },
     )
     .await;
@@ -144,19 +145,36 @@ async fn planner_tool_call_is_denied_and_preserves_prior_usage() {
         "threadId":"thread-native","turnId":"turn-native","callId":"call-1",
         "namespace":"gptgrep","tool":"gptgrep_search","arguments":{"query":"x"}}});
     let (result, attempts, _) = protocol_attempt(vec![usage(), tool], None, true).await;
-    assert!(
-        result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("Pure completion")
+    assert_eq!(
+        result.err().unwrap().to_string(),
+        "host_codex_completion_tool_request"
     );
     assert_eq!(attempts[0].status, "failed");
+    assert_eq!(
+        attempts[0].error.as_ref().unwrap()["code"],
+        "host_codex_completion_tool_request"
+    );
     assert_eq!(
         attempts[0].usage.as_ref().unwrap()["total"]["totalTokens"],
         10
     );
     assert!(!attempts[0].accounting_complete);
+}
+
+#[tokio::test]
+async fn planner_tool_item_reports_its_stable_code() {
+    let item = json!({"method":"item/completed","params":{
+        "threadId":"thread-native","turnId":"turn-native",
+        "item":{"type":"dynamicToolCall","namespace":"gptgrep","tool":"gptgrep_search"}}});
+    let (result, attempts, _) = protocol_attempt(vec![usage(), item], None, false).await;
+    assert_eq!(
+        result.err().unwrap().to_string(),
+        "host_codex_completion_tool_item"
+    );
+    assert_eq!(
+        attempts[0].error.as_ref().unwrap()["code"],
+        "host_codex_completion_tool_item"
+    );
 }
 
 #[tokio::test]
@@ -424,6 +442,7 @@ async fn schema_failure_keeps_process_metadata_usage_and_retry_events() {
         protocol::RunOptions {
             observer: Some(planner.observer()),
             max_output_bytes: Some(4096),
+            ..Default::default()
         },
     )
     .await;
@@ -474,6 +493,7 @@ async fn supplied_absolute_deadline_is_not_refreshed_by_completion_or_retry() {
         protocol::RunOptions {
             observer: Some(planner.observer()),
             max_output_bytes: Some(4096),
+            ..Default::default()
         },
     )
     .await;
@@ -510,6 +530,7 @@ async fn cancelling_completion_retains_observed_attempt_and_stops_owned_process(
             protocol::RunOptions {
                 observer: Some(planner.observer()),
                 max_output_bytes: Some(4096),
+                ..Default::default()
             },
         )
         .await;
@@ -608,6 +629,13 @@ async fn terminal_model_error_retains_only_sanitized_failure_and_trusted_usage()
 fn two_process_mock(directory: &Path, reader_answer: &Value) -> HostConfig {
     two_process_mock_with_budget(directory, reader_answer, None)
 }
+
+/// Token count reported for a foreign turn. Tests search the whole attempt
+/// ledger for it as text, and that ledger also holds run-dependent SHA-256
+/// digests and timestamps, so it must be long enough not to occur there by
+/// chance. The former 99999 did, inside a tool-output digest.
+#[cfg(unix)]
+const FOREIGN_TOTAL_TOKENS: u64 = 987_654_321;
 
 #[cfg(unix)]
 fn two_process_mock_with_budget(
@@ -724,7 +752,7 @@ fn two_process_mock_with_budget(
                 "foreign" => emit(
                     &mut script,
                     json!({"method":"thread/tokenUsage/updated","params":{
-                    "threadId":thread_id,"turnId":"foreign-budget-turn","tokenUsage":{"total":{"totalTokens":99999}}}}),
+                    "threadId":thread_id,"turnId":"foreign-budget-turn","tokenUsage":{"total":{"totalTokens":FOREIGN_TOTAL_TOKENS}}}}),
                 ),
                 "stall" => {}
                 _ => panic!("unknown synthetic ending"),
@@ -806,12 +834,12 @@ async fn planned_ask_runs_two_distinct_turns_with_original_question_and_summed_u
         &json!({"answer":"It uses a ceramic chamber.",
         "citations":[citation],"insufficient_evidence":false}),
     );
-    let (client, jev_server) = crate::query_plan::tests::mock_jev(vec![200; 4]).await;
+    let (client, jev_server) = crate::query_plan::tests::mock_jev(vec![200]).await;
     let question = "  Explain ember storage.\n";
     let report = execute_with_client(root.path(), question, None, &config, Some(client))
         .await
         .unwrap();
-    assert_eq!(jev_server.await.unwrap().len(), 4);
+    assert_eq!(jev_server.await.unwrap().len(), 1);
     assert_eq!(report.status, "completed");
     assert_eq!(report.query_plan.as_ref().unwrap().status, "completed");
     assert_eq!(
@@ -904,14 +932,22 @@ async fn planned_ask_runs_two_distinct_turns_with_original_question_and_summed_u
 #[cfg(unix)]
 #[tokio::test]
 async fn reader_validation_failures_preserve_completed_planner_and_both_turn_usages() {
-    for answer in [
-        json!({"answer":12,"citations":[],"insufficient_evidence":false}),
-        json!({"answer":"An unsupported claim.","citations":["never-issued"],"insufficient_evidence":false}),
+    for (answer, code, cause) in [
+        (
+            json!({"answer":12,"citations":[],"insufficient_evidence":false}),
+            "host_answer_schema_mismatch",
+            "final_response_schema",
+        ),
+        (
+            json!({"answer":"An unsupported claim.","citations":["never-issued"],"insufficient_evidence":false}),
+            "host_answer_citation_unissued",
+            "unissued_citation",
+        ),
     ] {
         let (root, _) = planner_corpus().await;
         let home = tempfile::tempdir().unwrap();
         let config = two_process_mock(home.path(), &answer);
-        let (client, jev_server) = crate::query_plan::tests::mock_jev(vec![200; 4]).await;
+        let (client, jev_server) = crate::query_plan::tests::mock_jev(vec![200]).await;
         let error = execute_with_client(
             root.path(),
             "Explain ember storage.",
@@ -921,13 +957,16 @@ async fn reader_validation_failures_preserve_completed_planner_and_both_turn_usa
         )
         .await
         .unwrap_err();
-        assert_eq!(jev_server.await.unwrap().len(), 4);
+        assert_eq!(jev_server.await.unwrap().len(), 1);
         let error = error.downcast_ref::<HostRetrievalError>().unwrap();
         assert_eq!(error.stage, "citation_validation");
+        assert_eq!(error.code, code);
+        assert_eq!(error.cause, Some(json!({"code":cause})));
         assert_eq!(error.query_plan.as_ref().unwrap().status, "completed");
         assert_eq!(error.model_attempts.len(), 2);
         assert_eq!(error.model_attempts[0].status, "completed");
         assert_eq!(error.model_attempts[1].status, "failed");
+        assert_eq!(error.model_attempts[1].error, Some(json!({"code":code})));
         assert_eq!(error.model_usage.known_totals.total_tokens, Some(38));
         assert_eq!(error.model_usage.observed_turns, 2);
         assert!(!error.model_usage.accounting_complete);
@@ -948,6 +987,28 @@ async fn reader_validation_failures_preserve_completed_planner_and_both_turn_usa
         assert_two_processes_stopped(home.path());
     }
 }
+
+/// Original deadline for integrated budget runs that must reach a stalled
+/// reader. The planner turn, four durably accounted Jev calls and both process
+/// startups take about 1.5 s on an idle host and under 7 s inside a fully
+/// loaded parallel suite, so only the deliberately stalled reader reaches it.
+#[cfg(unix)]
+const INTEGRATED_DEADLINE_SECS: u64 = 30;
+
+/// Original deadline for the integrated run that only a timeout can end. Its
+/// last Decisions reply is held until [`STALLED_READER_WINDOW`] before this
+/// deadline. That leaves the planner turn and the earlier Decisions calls
+/// (under 7 s even in a loaded parallel suite) 15 s and keeps the hold below
+/// the 20 s Decisions request timeout.
+#[cfg(unix)]
+const STALLED_READER_DEADLINE_SECS: u64 = 20;
+
+/// The stalled reader starts with at most this much of the original deadline
+/// left, on any host. Its startup, handshake and both tool calls need well under
+/// that, while a reader deadline refreshed at its start, or set more than 8 s
+/// after its start, would end the stall after the 3 s finalization allowance.
+#[cfg(unix)]
+const STALLED_READER_WINDOW: Duration = Duration::from_secs(5);
 
 #[cfg(unix)]
 fn budget_answer(citation: &str) -> Value {
@@ -989,7 +1050,7 @@ async fn integrated_budget_finalization_counts_latest_reader_usage_once_and_pres
     let mut config =
         two_process_mock_with_budget(home.path(), &budget_answer(&citation), Some("completed"));
     config.max_tool_calls = 1;
-    let (client, server) = crate::query_plan::tests::mock_jev(vec![200; 4]).await;
+    let (client, server) = crate::query_plan::tests::mock_jev(vec![200]).await;
     let report = execute_with_client(
         root.path(),
         "Explain ember storage.",
@@ -1001,7 +1062,7 @@ async fn integrated_budget_finalization_counts_latest_reader_usage_once_and_pres
     .unwrap();
     assert_eq!(
         server.await.unwrap().len(),
-        4,
+        1,
         "Denied search must not invoke Jev"
     );
     assert_eq!(
@@ -1021,7 +1082,7 @@ async fn integrated_budget_finalization_counts_latest_reader_usage_once_and_pres
         report.model_attempts[1].usage.as_ref().unwrap()["total"]["totalTokens"],
         40
     );
-    assert_eq!(report.jev.requests, 4);
+    assert_eq!(report.jev.requests, 1);
     assert!(
         report
             .tool_calls
@@ -1056,9 +1117,19 @@ async fn integrated_budget_failures_keep_identity_usage_and_original_deadline() 
         let mut config =
             two_process_mock_with_budget(home.path(), &budget_answer(&citation), Some(ending));
         config.max_tool_calls = 1;
-        config.timeout_secs = 2;
-        let (client, server) = crate::query_plan::tests::mock_jev(vec![200; 4]).await;
+        config.timeout_secs = INTEGRATED_DEADLINE_SECS;
         let started = Instant::now();
+        let (client, server) = if ending == "stall" {
+            // The reader starts only after the held last Decisions reply, i.e. with
+            // at most STALLED_READER_WINDOW of the original deadline left.
+            config.timeout_secs = STALLED_READER_DEADLINE_SECS;
+            let release = tokio::time::Instant::from_std(started)
+                + Duration::from_secs(config.timeout_secs)
+                - STALLED_READER_WINDOW;
+            crate::query_plan::tests::mock_jev_with_last_reply_at(vec![200], release).await
+        } else {
+            crate::query_plan::tests::mock_jev(vec![200]).await
+        };
         let error = execute_with_client(
             root.path(),
             "Explain ember storage.",
@@ -1068,7 +1139,7 @@ async fn integrated_budget_failures_keep_identity_usage_and_original_deadline() 
         )
         .await
         .unwrap_err();
-        assert_eq!(server.await.unwrap().len(), 4);
+        assert_eq!(server.await.unwrap().len(), 1);
         let failure = error.downcast_ref::<HostRetrievalError>().unwrap();
         assert_eq!(failure.model_attempts.len(), 2);
         assert_eq!(failure.model_attempts[0].status, "completed");
@@ -1086,7 +1157,10 @@ async fn integrated_budget_failures_keep_identity_usage_and_original_deadline() 
                 .any(|receipt| receipt.tool_budget.is_some())
         );
         let ledger = std::fs::read_to_string(&failure.ledger_path).unwrap();
-        assert!(!ledger.contains("foreign-budget-turn") && !ledger.contains("99999"));
+        assert!(
+            !ledger.contains("foreign-budget-turn")
+                && !ledger.contains(&FOREIGN_TOTAL_TOKENS.to_string())
+        );
         if ending == "failed" {
             assert_eq!(
                 failure.cause.as_ref().unwrap()["tool_budget"]["denied_tool_calls"],
@@ -1094,8 +1168,13 @@ async fn integrated_budget_failures_keep_identity_usage_and_original_deadline() 
             );
         }
         if ending == "stall" {
+            // Only the original deadline ends the stalled reader; finalization keeps
+            // the same three-second allowance beyond it (formerly 2 s + 3 s = 5 s).
+            let deadline = Duration::from_secs(config.timeout_secs);
+            assert_eq!(failure.code, "host_model_attempt_timeout");
+            assert!(started.elapsed() >= deadline);
             assert!(
-                started.elapsed() < Duration::from_secs(5),
+                started.elapsed() < deadline + Duration::from_secs(3),
                 "Finalization refreshed the original deadline"
             );
         }
@@ -1111,7 +1190,8 @@ async fn integrated_budget_cancellation_retains_bound_partial_observations() {
     let mut config =
         two_process_mock_with_budget(home.path(), &budget_answer(&citation), Some("stall"));
     config.max_tool_calls = 1;
-    let (client, server) = crate::query_plan::tests::mock_jev(vec![200; 4]).await;
+    config.timeout_secs = INTEGRATED_DEADLINE_SECS;
+    let (client, server) = crate::query_plan::tests::mock_jev(vec![200]).await;
     let mut running = Box::pin(execute_with_client(
         root.path(),
         "Explain ember storage.",
@@ -1119,32 +1199,32 @@ async fn integrated_budget_cancellation_retains_bound_partial_observations() {
         &config,
         Some(client),
     ));
-    let observed = async {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Ok(files) = std::fs::read_dir(root.path().join(".gptgrep/host-attempts")) {
-                    for file in files.flatten() {
-                        let raw = std::fs::read_to_string(file.path()).unwrap();
-                        for line in raw.lines() {
-                            let event: Value = serde_json::from_str(line).unwrap();
-                            if event["model_attempts"][1]["usage"]["total"]["totalTokens"] == 40 {
-                                return file.path();
-                            }
-                        }
-                    }
+    // The attempt ledger is appended synchronously while the invocation is
+    // polled, so checking the newly appended lines after every poll observes the
+    // reader's usage as soon as it is durable. Only a run that never records it
+    // reaches the original deadline and fails below.
+    let attempts = root.path().join(".gptgrep/host-attempts");
+    let mut scanned = std::collections::BTreeMap::<PathBuf, usize>::new();
+    let ledger_path = std::future::poll_fn(|context| {
+        if let std::task::Poll::Ready(result) = running.as_mut().poll(context) {
+            panic!("Expected pending finalization: {result:?}");
+        }
+        for file in std::fs::read_dir(&attempts).into_iter().flatten().flatten() {
+            let raw = std::fs::read_to_string(file.path()).unwrap();
+            let seen = scanned.entry(file.path()).or_default();
+            for line in raw.lines().skip(*seen) {
+                *seen += 1;
+                let event: Value = serde_json::from_str(line).unwrap();
+                if event["model_attempts"][1]["usage"]["total"]["totalTokens"] == 40 {
+                    return std::task::Poll::Ready(file.path());
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        })
-        .await
-        .unwrap()
-    };
-    let ledger_path = tokio::select! {
-        result = &mut running => panic!("Expected pending finalization: {result:?}"),
-        ledger = observed => ledger,
-    };
+        }
+        std::task::Poll::Pending
+    })
+    .await;
     drop(running);
-    assert_eq!(server.await.unwrap().len(), 4);
+    assert_eq!(server.await.unwrap().len(), 1);
     tokio::time::sleep(Duration::from_millis(200)).await;
     let raw = std::fs::read_to_string(ledger_path).unwrap();
     let last: Value = serde_json::from_str(raw.lines().last().unwrap()).unwrap();
@@ -1174,7 +1254,7 @@ async fn evidence_roles_preserve_two_turns_budget_finalization_and_treatment_onl
         two_process_mock_with_budget(home.path(), &budget_answer(&citation), Some("completed"));
     config.query_plan.as_mut().unwrap().evidence_roles = true;
     config.max_tool_calls = 1;
-    let (client, server) = crate::evidence_roles::tests::mock_roles(4).await;
+    let (client, server) = crate::evidence_roles::tests::mock_roles(1).await;
     let report = execute_with_client(
         root.path(),
         "Explain ember storage.",
@@ -1185,7 +1265,7 @@ async fn evidence_roles_preserve_two_turns_budget_finalization_and_treatment_onl
     .await
     .unwrap();
     let requests = server.await.unwrap();
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 1);
     assert_eq!(
         (
             report.model_usage.attempted_calls,
@@ -1194,7 +1274,7 @@ async fn evidence_roles_preserve_two_turns_budget_finalization_and_treatment_onl
         (2, 2)
     );
     assert_eq!(report.model_usage.known_totals.total_tokens, Some(54));
-    assert_eq!(report.jev.requests, 4);
+    assert_eq!(report.jev.requests, 1);
     let roles = report.jev.searches[0]
         .plan
         .as_ref()

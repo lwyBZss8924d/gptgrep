@@ -1,0 +1,13 @@
+[package]
+name = "liteparse-pdfium"
+version = "1.11.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/run-llama/liteparse"
+description = "Pinned LiteParse PDFium wrapper with bounded GPTgrep admission helpers"
+
+[dependencies]
+pdfium-sys = { package = "liteparse-pdfium-sys", git = "https://github.com/run-llama/liteparse", rev = "ab8879623ee45a0b7a775d12b42a9a7ae9dab16b" }
+
+[dev-dependencies]
+blake3 = "1"

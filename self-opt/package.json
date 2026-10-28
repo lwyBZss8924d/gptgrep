@@ -1,0 +1,7 @@
+{
+  "name": "gptgrep-harness-opt-evaluation-kit",
+  "private": true,
+  "version": "0.2.0-alpha.1",
+  "type": "module",
+  "scripts": {"test": "bun test tests", "report": "bun src/cli.ts"}
+}

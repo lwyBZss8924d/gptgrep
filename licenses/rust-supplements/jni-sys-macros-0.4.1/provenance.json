@@ -1,0 +1,24 @@
+{
+  "binding": "same source revision",
+  "files": [
+    {
+      "file": "LICENSE-MIT",
+      "git_blob": "2008402b8a1299cf118ea38e02116bfcc72e53c3",
+      "sha256": "1d85bd754b04ceec93e98e890edd1fa3c6a22e81bcb32135806beeccefa51cd1",
+      "url": "https://raw.githubusercontent.com/jni-rs/jni-sys/64d77b7a5f119d7b55b4e2c169a4668067ff59e6/LICENSE-MIT"
+    },
+    {
+      "file": "LICENSE-APACHE",
+      "git_blob": "8f71f43fee3f78649d238238cbde51e6d7055c82",
+      "sha256": "c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08",
+      "url": "https://raw.githubusercontent.com/jni-rs/jni-sys/64d77b7a5f119d7b55b4e2c169a4668067ff59e6/LICENSE-APACHE"
+    }
+  ],
+  "license_revision": "64d77b7a5f119d7b55b4e2c169a4668067ff59e6",
+  "package": "jni-sys-macros",
+  "package_archive_sha256": "38c0b942f458fe50cdac086d2f946512305e5631e720728f2a61aabcd47a6264",
+  "package_vcs_revision": "64d77b7a5f119d7b55b4e2c169a4668067ff59e6",
+  "repository": "https://github.com/jni-rs/jni-sys",
+  "schema_version": "gptgrep.license-supplement.v1",
+  "version": "0.4.1"
+}

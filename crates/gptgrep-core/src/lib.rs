@@ -1,16 +1,48 @@
 //! Source-bound document snapshots and vectorless retrieval orchestration.
 use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
-use gptgrep_jev::{Candidate, JevClient, RerankResponse};
+use gptgrep_jev::{
+    Candidate, DecisionFailure, DecisionFailureKind, DecisionRetriedAttempt, FailedResponseUsage,
+    JevClient, RerankResponse, TransientRetry, UsageObservation, UsagePresence,
+};
 
+pub mod batch;
+mod custody;
+mod derived_visual;
 mod evidence_roles;
+pub mod parse_agent;
+pub mod rich_batch;
+pub use gptgrep_index::{IndexContentLimits, IndexContentReport};
+mod rich_decisions;
+mod rich_multimodal;
+pub use derived_visual::{
+    DerivedCacheBudget, DerivedCacheStatus, DerivedRecipeToken, DerivedVisualCache,
+    DerivedVisualPin, DerivedVisualReceipt, VisualSource,
+};
 pub use evidence_roles::{
     CandidateDisposition, CandidateEligibility, DeliveredSetSufficiency, EvidenceRole,
     EvidenceRoleCandidateDecision, EvidenceRoleDiagnostics, EvidenceRoleHint, EvidenceRoleSource,
     EvidenceRoleSpan, MAX_EVIDENCE_ROLE_METADATA_BYTES,
 };
+pub use rich_decisions::{
+    PreparedRichTextSearch, RichTextAttempt, RichTextCoverage, RichTextHit, RichTextInitialPass,
+    RichTextSearchError, RichTextSearchOptions, RichTextSearchReport, RichTextUsageProjection,
+    prepare_rich_text_search,
+};
+pub use rich_multimodal::{
+    PreparedRichMultimodalSearch, PreparedRichRerank, RichMultimodalAttempt, RichMultimodalContent,
+    RichMultimodalCoverage, RichMultimodalHit, RichMultimodalInitialPass,
+    RichMultimodalSearchError, RichMultimodalSearchOptions, RichMultimodalSearchReport,
+    RichRankedCandidate, RichRerankBudget, RichRerankCandidate, RichRerankCoverage,
+    RichRerankFailure, RichRerankReport, RichRerankRequest, open_rich_rerank_reader,
+    parse_rich_rerank_request, prepare_rich_multimodal_search, prepare_rich_rerank,
+    rich_rerank_context_failure, rich_rerank_input_io_failure,
+};
 mod navigation_overlay;
 mod planned;
+mod read_cache;
+mod rich_generation;
+mod rich_ingest;
 use gptgrep_pageindex::TreeNode;
 pub use navigation_overlay::{
     BoundNavigationOverlay, MAX_NAVIGATION_HINT_BYTES, MAX_NAVIGATION_OVERLAY_BYTES,
@@ -26,6 +58,22 @@ pub use planned::{
     PlannedSearchObserver, PlannedSearchReport, PlannedSpanProvenance, PlannedViewCoverage,
     search_planned_with_client_and_observer, search_planned_with_policy_and_observer,
 };
+use read_cache::{CacheError, CacheKey, ReadCache, ReadMeter, ReadMetrics, ReadOrigin, ReadPin};
+pub use rich_generation::{
+    ArtifactSearchReport, ArtifactTextWindow, EvidenceRef, MAX_NATIVE_METADATA_BYTES,
+    MAX_NATIVE_METADATA_WORKING_BYTES, MAX_VISUAL_OUTPUT_BYTES, NATIVE_CHARACTER_FIELDS,
+    NATIVE_IMAGE_FIELDS, NATIVE_METADATA_SCALAR_FIELDS, NATIVE_OBJECT_FIELDS,
+    NATIVE_SEGMENT_FIELDS, NATIVE_WORD_FIELDS, NativeMetadataBinding, NativeMetadataCollection,
+    NativeMetadataLease, NativeMetadataReadBudget, NativeMetadataSelection,
+    NativePageMetadataSnapshot, RICH_MANIFEST_SCHEMA, RichDocument, RichGenerationReader,
+    RichGenerationWriter, RichManifest, StoredArtifact, TextEvidenceBinding, VerifiedRenditionFile,
+    VerifiedVisualPayload, VisualCandidate, VisualCandidateReport, VisualCandidateRequest,
+    VisualCoverage, VisualGenerationReader, VisualScope,
+};
+pub use rich_ingest::{
+    MAX_RICH_OCR_PAGES, PreparedRichIngest, RichIngestDocumentPlan, RichIngestOptions,
+    RichIngestPagePlan, RichIngestReport, prepare_rich_ingest, read_rich_runtime_descriptor,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -33,6 +81,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const SCHEMA: &str = "gptgrep.v1";
@@ -40,6 +89,96 @@ const STATE: &str = ".gptgrep";
 const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_TEXT_BYTES: u64 = 256 * 1024 * 1024;
+
+pub const MAX_READER_CACHE_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_READER_CACHE_ENTRIES: usize = 1024;
+
+/// Cache admission is separate from the historical text/type size limits.
+/// Default readers use a bounded uncached load when cache capacity is unavailable.
+/// Byte capacity charges immutable payloads retained by cache entries or pins;
+/// it does not bound uncached copies, manifests, native allocations or process RSS.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReaderCacheBudget {
+    pub max_bytes: usize,
+    pub max_entries: usize,
+    pub strict_cache_only: bool,
+}
+impl Default for ReaderCacheBudget {
+    fn default() -> Self {
+        Self {
+            max_bytes: 16 * 1024 * 1024,
+            max_entries: 128,
+            strict_cache_only: false,
+        }
+    }
+}
+impl ReaderCacheBudget {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.max_bytes > 0
+                && self.max_bytes <= MAX_READER_CACHE_BYTES
+                && self.max_entries > 0
+                && self.max_entries <= MAX_READER_CACHE_ENTRIES,
+            "invalid reader cache budget"
+        );
+        Ok(())
+    }
+}
+
+/// Observed byte counts, never kernel disk traffic or native index IO. Logical
+/// bytes are text windows returned by reader APIs, not final wire/provider bytes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReaderReadMetrics {
+    pub logical_reader_bytes: u64,
+    pub cached_logical_bytes: u64,
+    pub uncached_logical_bytes: u64,
+    pub observed_rust_read_bytes: u64,
+    pub observed_hash_bytes: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub cache_fallbacks: u64,
+    pub uncached_load_bytes: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub coverage: String,
+}
+impl From<ReadMetrics> for ReaderReadMetrics {
+    fn from(metrics: ReadMetrics) -> Self {
+        Self {
+            logical_reader_bytes: metrics.logical_delivered_bytes,
+            cached_logical_bytes: metrics.cached_logical_bytes,
+            uncached_logical_bytes: metrics.uncached_logical_bytes,
+            observed_rust_read_bytes: metrics.physical_read_bytes,
+            observed_hash_bytes: metrics.physical_hash_bytes,
+            cache_hits: metrics.cache_hits, cache_misses: metrics.cache_misses,
+            cache_fallbacks: metrics.cache_fallbacks, uncached_load_bytes: metrics.uncached_load_bytes,
+            coverage: "partial: Rust reader read/hash paths and node/artifact text-window delivery; excludes search/navigation logical delivery, native index/mmap, kernel disk traffic, parser and full-generation verification helpers; counters shared across reader clones".into(),
+        }
+    }
+}
+impl ReaderReadMetrics {
+    pub(crate) fn since(&self, before: &Self) -> Result<Self> {
+        macro_rules! delta {
+            ($field:ident) => {
+                self.$field
+                    .checked_sub(before.$field)
+                    .context("reader meter counter decreased")?
+            };
+        }
+        Ok(Self {
+            logical_reader_bytes: delta!(logical_reader_bytes),
+            cached_logical_bytes: delta!(cached_logical_bytes),
+            uncached_logical_bytes: delta!(uncached_logical_bytes),
+            observed_rust_read_bytes: delta!(observed_rust_read_bytes),
+            observed_hash_bytes: delta!(observed_hash_bytes),
+            cache_hits: delta!(cache_hits),
+            cache_misses: delta!(cache_misses),
+            cache_fallbacks: delta!(cache_fallbacks),
+            uncached_load_bytes: delta!(uncached_load_bytes),
+            coverage: self.coverage.clone(),
+        })
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PageSpan {
@@ -134,9 +273,24 @@ pub struct Hit {
     pub confidence: Option<f64>,
     /// A verified exact token query match retained by the hybrid lexical lane.
     pub literal_anchor: bool,
+    /// The model relevance score is below the search's `minimum_relevance_score`.
+    /// Such a hit is delivered only as a retained literal anchor or, when no
+    /// reranked candidate met the floor, as one of at most three flagged
+    /// low-confidence fallback candidates; it never passed the floor. Local
+    /// regex/lexical hits apply no floor and are never flagged.
+    #[serde(default)]
+    pub below_threshold: bool,
     pub source_sha256: String,
     pub source_fresh: bool,
     pub citation: String,
+}
+
+impl Hit {
+    /// A delivered low-confidence fallback candidate: below the relevance floor
+    /// and not a retained literal anchor. It never counts as a passing match.
+    pub fn is_below_threshold_fallback(&self) -> bool {
+        self.below_threshold && !self.literal_anchor
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -150,22 +304,260 @@ pub struct Coverage {
     pub reranked_candidates: usize,
     pub filtered_candidates: usize,
     pub retained_literal_anchors: usize,
+    /// Below-floor candidates delivered, flagged `below_threshold`, because no
+    /// reranked candidate met the relevance floor (at most three; otherwise 0).
+    /// Counted after the result limit and the final freshness check, so it
+    /// equals the flagged hits actually returned. They are also counted in
+    /// `filtered_candidates`.
+    #[serde(default)]
+    pub below_threshold_fallback: usize,
     pub stale_files: Vec<String>,
     pub truncated: bool,
     pub semantic_scope_complete: bool,
+    /// Model-assisted document routing: `routed` (one Decisions call),
+    /// `skipped_single_document` (exactly one routing candidate is selected
+    /// without a call; tree candidates are unchanged) or `no_candidates`.
+    /// Absent for local regex/lexical searches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_status: Option<String>,
+}
+
+/// One failed Jev submission that the bounded transient retry repeated. The
+/// failed attempt keeps its HTTP status; its usage stays unknown unless the
+/// provider reported it, and is never counted as zero.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JevRetriedAttempt {
+    /// `document_routing` or `evidence_reranking`.
+    pub stage: String,
+    #[serde(flatten)]
+    pub attempt: DecisionRetriedAttempt,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Metrics {
     pub elapsed_ms: u128,
     /// Logical Jev call attempts, including a pre-call observer that may stop
-    /// before network I/O. Never a claim of physical provider requests.
+    /// before network I/O. An admitted bounded transient retry counts as its own
+    /// attempt from its `before_retry` receipt, before its backoff and send, so
+    /// it too may stop before network I/O. Never a claim of physical provider
+    /// requests.
     pub jev_calls_attempted: usize,
-    /// Successful validated Jev responses observed by this search.
+    /// Successful validated Jev responses observed by this search, including a
+    /// reply that validated before a later local accounting or observer step
+    /// failed (`retry_post_send` or a validated initial `observer_callback`).
     pub jev_requests: usize,
+    /// Served (provider-returned) model of each validated response.
     pub jev_models: Vec<String>,
+    /// Requested Decisions selector of each logical call attempt, in attempt
+    /// order. It differs from the served build for canonical mappings and
+    /// `~` aliases; both are reported so neither is inferred from the other.
+    #[serde(default)]
+    pub jev_requested_models: Vec<String>,
+    /// Provider usage of each validated response, parallel to `jev_models`;
+    /// null when none was reported, never zero-filled. A reply followed by a
+    /// local failure keeps only its checked numeric fields.
     pub jev_usage: Vec<Value>,
     pub jev_candidate_bytes: usize,
+    /// Failed submissions repeated by the bounded transient retry, in attempt
+    /// order. They are counted in `jev_calls_attempted` but have no `jev_usage`
+    /// entry: their usage and cost remain unknown, so accounting is incomplete.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jev_retried_attempts: Vec<JevRetriedAttempt>,
+}
+
+/// Count each failed submission that a logical Jev call retried as its own
+/// attempt with the same requested selector. No usage entry is invented.
+fn record_retried_attempts(
+    metrics: &mut Metrics,
+    stage: &str,
+    requested_model: &str,
+    attempts: &[DecisionRetriedAttempt],
+) {
+    for attempt in attempts {
+        metrics.jev_calls_attempted += 1;
+        metrics
+            .jev_requested_models
+            .push(requested_model.to_owned());
+        metrics.jev_retried_attempts.push(JevRetriedAttempt {
+            stage: stage.into(),
+            attempt: attempt.clone(),
+        });
+    }
+}
+
+/// Earlier failed submissions carried by a failure after a bounded retry.
+fn retried_attempts_of(error: &anyhow::Error) -> &[DecisionRetriedAttempt] {
+    error
+        .downcast_ref::<DecisionFailure>()
+        .map_or(&[], |failure| &failure.diagnostic().prior_attempts)
+}
+
+/// A reply that validated before a later local failure keeps its served model
+/// and checked usage. An initial observer failure additionally requires typed
+/// send/validation observations and matching requested/served identity.
+fn record_validated_retry_reply(metrics: &mut Metrics, error: &anyhow::Error) {
+    let Some(diagnostic) = error
+        .downcast_ref::<DecisionFailure>()
+        .map(DecisionFailure::diagnostic)
+    else {
+        return;
+    };
+    let served = diagnostic
+        .response_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.model.value.as_ref());
+    let validated_initial = diagnostic.kind == DecisionFailureKind::ObserverCallback
+        && diagnostic
+            .observer_failure
+            .as_ref()
+            .is_some_and(|observer| {
+                observer.send_started
+                    && observer.response_validated
+                    && served.is_some_and(|served| {
+                        gptgrep_jev::response_model_matches(&observer.requested_model, served)
+                    })
+            });
+    if !matches!(
+        diagnostic.kind,
+        DecisionFailureKind::LocalPostSend | DecisionFailureKind::RetryPostSend
+    ) && !validated_initial
+    {
+        return;
+    }
+    if let (Some(usage), Some(served)) = (&diagnostic.reported_usage, served) {
+        metrics.jev_requests += 1;
+        metrics.jev_models.push(served.clone());
+        metrics.jev_usage.push(checked_usage(usage));
+    }
+}
+
+/// Checked numeric usage of a validated reply as a Decisions `usage` value:
+/// reported numbers, explicit nulls, absent fields omitted, and `null` when the
+/// reply reported no usage at all. Nothing unknown becomes zero.
+fn checked_usage(usage: &FailedResponseUsage) -> Value {
+    fn field<T: Serialize>(
+        object: &mut serde_json::Map<String, Value>,
+        name: &str,
+        observation: &UsageObservation<T>,
+    ) {
+        match (observation.presence, &observation.value) {
+            (UsagePresence::Absent, _) => {}
+            (UsagePresence::Reported, Some(value)) => {
+                object.insert(name.into(), json!(value));
+            }
+            _ => {
+                object.insert(name.into(), Value::Null);
+            }
+        }
+    }
+    if [
+        usage.input_tokens.presence,
+        usage.output_tokens.presence,
+        usage.cost.presence,
+    ]
+    .iter()
+    .all(|presence| *presence == UsagePresence::Null)
+    {
+        return Value::Null;
+    }
+    let mut object = serde_json::Map::new();
+    field(&mut object, "input_tokens", &usage.input_tokens);
+    field(&mut object, "output_tokens", &usage.output_tokens);
+    field(&mut object, "cost", &usage.cost);
+    Value::Object(object)
+}
+
+/// Submit one logical relevance call for `stage`. When the client's bounded
+/// transient retry is admitted, the retry is counted as its own logical attempt
+/// and its failed predecessor is recorded in `metrics` before the retry's
+/// backoff, reservation and send, and a `before_retry` progress receipt makes
+/// both durable first; a failed receipt stops the retry. A failure returns a
+/// typed [`JevSearchError`] whose metrics include every attempt.
+#[allow(clippy::too_many_arguments)]
+async fn rerank_call(
+    client: &JevClient,
+    query: &str,
+    candidates: &[Candidate],
+    stage: &str,
+    observer: Option<&JevSearchObserver<'_>>,
+    metrics: &mut Metrics,
+    coverage: &Coverage,
+    options: &SearchOptions,
+    generation: &str,
+    started: Instant,
+) -> Result<RerankResponse> {
+    let base = metrics.clone();
+    let noticed = std::sync::Mutex::new(None::<Metrics>);
+    let notice = |failed: &DecisionRetriedAttempt| -> Result<()> {
+        let mut retried = base.clone();
+        record_retried_attempts(
+            &mut retried,
+            stage,
+            client.requested_model(),
+            std::slice::from_ref(failed),
+        );
+        *noticed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(retried.clone());
+        observe_jev(
+            observer,
+            stage,
+            "before_retry",
+            &retried,
+            coverage,
+            options,
+            generation,
+            started,
+            None,
+        )
+    };
+    let result = client
+        .rerank_with_retry_notice(query, candidates, &notice)
+        .await;
+    let noticed = noticed
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match noticed {
+        Some(retried) => *metrics = retried,
+        // Defensive: a retry reported without its notice is still counted.
+        None => {
+            let attempts = match &result {
+                Ok(ranked) => ranked.retried_attempts.as_slice(),
+                Err(error) => retried_attempts_of(error),
+            };
+            record_retried_attempts(metrics, stage, client.requested_model(), attempts);
+        }
+    }
+    result.map_err(|error| {
+        if error.is::<JevSearchError>() {
+            // The `before_retry` receipt failed; its typed error already
+            // carries these metrics and a fixed cause.
+            error
+        } else {
+            // A reply that validated before a local step failed keeps its usage.
+            record_validated_retry_reply(metrics, &error);
+            jev_search_error(
+                stage,
+                error,
+                metrics,
+                coverage,
+                options.document.as_deref(),
+                Some(generation),
+                started,
+            )
+            .into()
+        }
+    })
+}
+
+/// The default retrieval client: one bounded retry of transient provider
+/// statuses. Callers that supply their own client keep its configuration.
+fn default_retrieval_client(client: JevClient) -> JevClient {
+    if client.transient_retry().is_some() {
+        client
+    } else {
+        client.with_transient_retry(TransientRetry::standard())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,14 +638,16 @@ impl std::fmt::Display for JevSearchError {
 
 impl std::error::Error for JevSearchError {}
 
-/// Nonterminal metadata receipt emitted before a logical call attempt and after
-/// each validated reply. A caller can persist these before the next await so
-/// cancellation does not discard already observed usage. No source text, request
-/// payload, credential or raw provider body is included.
+/// Nonterminal metadata receipt emitted before a logical call attempt, before
+/// an admitted bounded transient retry, and after each validated reply. A caller
+/// can persist these before the next await so cancellation does not discard
+/// already observed usage or an attempt that may have been sent. No source text,
+/// request payload, credential or raw provider body is included.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JevSearchProgress {
     pub stage: String,
-    /// `before_call` or `after_reply`.
+    /// `before_call`, `before_retry` (the retry already counts as an attempt
+    /// and its failed predecessor is in `jev_retried_attempts`) or `after_reply`.
     pub event: String,
     pub metrics: Metrics,
     pub coverage: Coverage,
@@ -279,8 +673,25 @@ fn jev_search_error(
     started: Instant,
 ) -> JevSearchError {
     let message = error.to_string();
-    let cause = if message == "OPENROUTER_API_KEY is not available" {
+    // Retry outcomes, retry refusals and observer failures keep the client's
+    // fixed, redacted diagnostic rendering.
+    let typed_diagnostic = error.downcast_ref::<DecisionFailure>().filter(|failure| {
+        let diagnostic = failure.diagnostic();
+        !diagnostic.prior_attempts.is_empty()
+            || diagnostic.retry_after_refusal.is_some()
+            || diagnostic.observer_failure.is_some()
+            || diagnostic.kind == DecisionFailureKind::LocalPostSend
+    });
+    let cause = if let Some(failure) = typed_diagnostic {
+        // Fixed wording plus numeric statuses, validation codes and fixed
+        // refusal reasons only.
+        failure.to_string()
+    } else if message == "OPENROUTER_API_KEY is not available" {
         message
+    } else if message == "Decisions submission budget exhausted" {
+        // The shared submission budget refused this call at reservation,
+        // before anything was sent.
+        "Decisions submission budget exhausted; the call was not sent; no local fallback".into()
     } else if message.contains("API key") {
         "Jev credentials are missing or invalid".into()
     } else if let Some(status) = message
@@ -344,11 +755,18 @@ fn observe_jev(
     };
     observer(&progress).map_err(|error| {
         let mut failure = jev_search_error(stage, error, metrics, coverage, options.document.as_deref(), Some(generation), started);
-        failure.cause = if event == "before_call" {
-            "Jev progress observer failed before the call; no provider call was started".into()
-        } else {
-            "Jev progress observer failed after a validated reply; no further provider call was started".into()
-        };
+        failure.cause = match event {
+            "before_call" => {
+                "Jev progress observer failed before the call; no provider call was started"
+            }
+            "before_retry" => {
+                "Jev progress observer failed before the bounded retry; the retry was not sent"
+            }
+            _ => {
+                "Jev progress observer failed after a validated reply; no further provider call was started"
+            }
+        }
+        .into();
         anyhow::Error::new(failure)
     })
 }
@@ -395,6 +813,152 @@ fn bounded_read(path: &Path, max: u64) -> Result<Vec<u8>> {
     f.take(max + 1).read_to_end(&mut bytes)?;
     ensure!(bytes.len() as u64 <= max, "file grew beyond read limit");
     Ok(bytes)
+}
+
+fn fill_reader_buffer(path: &Path, buffer: &mut [u8], meter: &ReadMeter) -> Result<usize> {
+    use std::io::Read;
+    let mut file = File::open(path)?;
+    ensure!(
+        file.metadata()?.len() == buffer.len() as u64,
+        "file length changed before reader load"
+    );
+    let mut filled = 0;
+    while filled < buffer.len() {
+        let count = file.read(&mut buffer[filled..])?;
+        meter.record_physical_read(count)?;
+        ensure!(count > 0, "file shortened during reader load");
+        filled += count;
+    }
+    let mut extra = [0u8; 1];
+    let count = file.read(&mut extra)?;
+    meter.record_physical_read(count)?;
+    ensure!(count == 0, "file grew during reader load");
+    Ok(filled)
+}
+
+fn bounded_read_metered(path: &Path, max: u64, meter: &ReadMeter) -> Result<Vec<u8>> {
+    let size = fs::metadata(path)?.len();
+    ensure!(
+        size <= max,
+        "file exceeds {max} byte limit: {}",
+        path.display()
+    );
+    let size = usize::try_from(size)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(size)
+        .context("reader allocation failed")?;
+    bytes.resize(size, 0);
+    fill_reader_buffer(path, &mut bytes, meter)?;
+    Ok(bytes)
+}
+
+fn digest_metered(bytes: &[u8], meter: &ReadMeter) -> Result<String> {
+    let digest = digest(bytes);
+    meter.record_physical_hash(bytes.len())?;
+    Ok(digest)
+}
+
+fn hash_reader_file(path: &Path, max: u64, meter: &ReadMeter) -> Result<(u64, String)> {
+    use std::io::Read;
+    let meta = fs::symlink_metadata(path)?;
+    ensure!(
+        meta.is_file() && !meta.file_type().is_symlink() && meta.len() <= max,
+        "reader file type/size rejected"
+    );
+    let mut file = File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut bytes = 0u64;
+    let mut buffer = [0u8; 65_536];
+    loop {
+        let admitted = usize::try_from((max - bytes).saturating_add(1).min(buffer.len() as u64))?;
+        let count = file.read(&mut buffer[..admitted])?;
+        meter.record_physical_read(count)?;
+        if count == 0 {
+            break;
+        }
+        bytes += count as u64;
+        ensure!(bytes <= max, "reader file grew beyond admission");
+        hash.update(&buffer[..count]);
+        meter.record_physical_hash(count)?;
+    }
+    Ok((bytes, format!("{:x}", hash.finalize())))
+}
+
+enum ReaderBuffer {
+    Cached(ReadPin),
+    Uncached(Vec<u8>),
+}
+struct ReaderText {
+    bytes: ReaderBuffer,
+    origin: ReadOrigin,
+}
+impl ReaderText {
+    fn into_string(self) -> Result<String> {
+        match self.bytes {
+            ReaderBuffer::Uncached(bytes) => Ok(String::from_utf8(bytes)?),
+            ReaderBuffer::Cached(pin) => {
+                let mut text = String::new();
+                text.try_reserve_exact(pin.len())
+                    .context("reader navigation text allocation failed")?;
+                text.push_str(std::str::from_utf8(&pin)?);
+                Ok(text)
+            }
+        }
+    }
+}
+impl std::ops::Deref for ReaderText {
+    type Target = str;
+    fn deref(&self) -> &str {
+        let bytes: &[u8] = match &self.bytes {
+            ReaderBuffer::Cached(pin) => pin,
+            ReaderBuffer::Uncached(bytes) => bytes,
+        };
+        std::str::from_utf8(bytes).expect("reader text validated before construction")
+    }
+}
+
+fn load_reader_text(
+    cache: &ReadCache,
+    budget: &ReaderCacheBudget,
+    meter: &ReadMeter,
+    key: &CacheKey,
+    path: &Path,
+    known_bytes: u64,
+    type_limit: u64,
+) -> Result<ReaderText> {
+    ensure!(
+        known_bytes <= type_limit,
+        "text exceeds historical reader type limit"
+    );
+    let known = usize::try_from(known_bytes)?;
+    let loaded = cache.get_or_load(key, known, meter, |buffer, meter| {
+        fill_reader_buffer(path, buffer, meter)
+    });
+    let (bytes, origin) = match loaded {
+        Ok(read) => (ReaderBuffer::Cached(read.bytes), read.origin),
+        Err(error @ (CacheError::Oversized { .. } | CacheError::CapacityRetained))
+            if !budget.strict_cache_only =>
+        {
+            meter.record_fallback()?;
+            let _ = error; // Explicit fallback is reported by the shared meter.
+            let bytes = bounded_read_metered(path, known_bytes, meter)?;
+            ensure!(bytes.len() == known, "uncached text length changed");
+            meter.record_uncached_load(bytes.len())?;
+            ensure!(
+                digest_metered(&bytes, meter)? == key.content_sha256(),
+                "uncached indexed text digest mismatch"
+            );
+            (ReaderBuffer::Uncached(bytes), ReadOrigin::Uncached)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let raw: &[u8] = match &bytes {
+        ReaderBuffer::Cached(pin) => pin,
+        ReaderBuffer::Uncached(bytes) => bytes,
+    };
+    std::str::from_utf8(raw).context("indexed text is not UTF-8")?;
+    Ok(ReaderText { bytes, origin })
 }
 
 fn source_path(root: &Path, relative: &str) -> Result<PathBuf> {
@@ -695,13 +1259,45 @@ pub async fn index_with_options(
     })
 }
 
-struct Snapshot {
-    manifest: Manifest,
-    dir: PathBuf,
+/// Exact retained generation identity. Passing a pin never follows CURRENT.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationPin {
+    pub generation: String,
+    pub manifest_sha256: String,
 }
 
-impl Snapshot {
-    fn open(root: &Path) -> Result<Self> {
+/// Reusable reader of a retained, immutable generation.
+///
+/// Opening resolves CURRENT once. Source freshness and candidate text digests
+/// are checked for each operation; retained generations must not be removed or
+/// edited while readers use them. No source discovery or publication occurs.
+#[derive(Clone)]
+pub struct GenerationReader {
+    manifest: Arc<Manifest>,
+    dir: PathBuf,
+    pin: GenerationPin,
+    index: Arc<OnceLock<std::result::Result<gptgrep_index::IndexSession, String>>>,
+    cache: ReadCache,
+    cache_budget: ReaderCacheBudget,
+    read_meter: ReadMeter,
+}
+
+type Snapshot = GenerationReader;
+
+impl GenerationReader {
+    pub fn open(root: &Path) -> Result<Self> {
+        Self::open_with_cache_budget(root, &ReaderCacheBudget::default())
+    }
+    pub fn open_with_cache_budget(root: &Path, budget: &ReaderCacheBudget) -> Result<Self> {
+        Self::open_with_read_meter(root, budget, ReadMeter::default())
+    }
+    fn open_with_read_meter(
+        root: &Path,
+        budget: &ReaderCacheBudget,
+        meter: ReadMeter,
+    ) -> Result<Self> {
+        budget.validate()?;
         let root = root.canonicalize()?;
         let state = root.join(STATE);
         ensure!(
@@ -712,35 +1308,75 @@ impl Snapshot {
             "index directory cannot be a symlink"
         );
         no_symlink(&state.join("CURRENT.json"))?;
-        let pointer: Pointer =
-            serde_json::from_slice(&bounded_read(&state.join("CURRENT.json"), 4096)?)?;
+        let pointer: Pointer = serde_json::from_slice(&bounded_read_metered(
+            &state.join("CURRENT.json"),
+            4096,
+            &meter,
+        )?)?;
         ensure!(
             pointer.schema_version == SCHEMA,
             "unsupported index schema; reindex required"
         );
+        Self::open_pinned_with_read_meter(
+            &root,
+            &GenerationPin {
+                generation: pointer.generation,
+                manifest_sha256: pointer.manifest_sha256,
+            },
+            budget,
+            meter,
+        )
+    }
+
+    /// Open exactly a retained generation without reading CURRENT.
+    pub fn open_pinned(root: &Path, pin: &GenerationPin) -> Result<Self> {
+        Self::open_pinned_with_cache_budget(root, pin, &ReaderCacheBudget::default())
+    }
+    pub fn open_pinned_with_cache_budget(
+        root: &Path,
+        pin: &GenerationPin,
+        budget: &ReaderCacheBudget,
+    ) -> Result<Self> {
+        Self::open_pinned_with_read_meter(root, pin, budget, ReadMeter::default())
+    }
+    fn open_pinned_with_read_meter(
+        root: &Path,
+        pin: &GenerationPin,
+        budget: &ReaderCacheBudget,
+        meter: ReadMeter,
+    ) -> Result<Self> {
+        budget.validate()?;
+        let root = root.canonicalize()?;
+        let state = root.join(STATE);
+        no_symlink(&state)?;
         ensure!(
-            !pointer.generation.is_empty()
-                && pointer
+            pin.manifest_sha256.len() == 64
+                && pin.manifest_sha256.bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid manifest digest"
+        );
+        ensure!(
+            !pin.generation.is_empty()
+                && pin
                     .generation
                     .bytes()
                     .all(|x| x.is_ascii_alphanumeric() || x == b'-'),
             "invalid generation ID"
         );
-        let dir = state.join("generations").join(&pointer.generation);
+        let dir = state.join("generations").join(&pin.generation);
         no_symlink(&state.join("generations"))?;
         no_symlink(&dir)?;
         no_symlink(&dir.join("manifest.json"))?;
         no_symlink(&dir.join("trigram"))?;
-        let bytes = bounded_read(&dir.join("manifest.json"), MAX_MANIFEST_BYTES)?;
+        let bytes = bounded_read_metered(&dir.join("manifest.json"), MAX_MANIFEST_BYTES, &meter)?;
         ensure!(
-            digest(&bytes) == pointer.manifest_sha256,
+            digest_metered(&bytes, &meter)? == pin.manifest_sha256,
             "index manifest digest mismatch; reindex required"
         );
         let manifest: Manifest = serde_json::from_slice(&bytes)?;
         ensure!(
             manifest.schema_version == SCHEMA
                 && manifest.root == root
-                && manifest.generation == pointer.generation,
+                && manifest.generation == pin.generation,
             "index identity mismatch; reindex at current root"
         );
         ensure!(
@@ -751,21 +1387,136 @@ impl Snapshot {
             "invalid document IDs"
         );
         validate_manifest(&manifest)?;
-        Ok(Self { manifest, dir })
+        Ok(Self {
+            manifest: Arc::new(manifest),
+            dir,
+            pin: pin.clone(),
+            index: Arc::new(OnceLock::new()),
+            cache: ReadCache::new(budget.max_bytes, budget.max_entries)?,
+            cache_budget: budget.clone(),
+            read_meter: meter,
+        })
     }
+    pub fn pin(&self) -> GenerationPin {
+        self.pin.clone()
+    }
+    pub fn read_metrics(&self) -> Result<ReaderReadMetrics> {
+        Ok(self.read_meter.snapshot()?.into())
+    }
+    pub fn clear_cache(&self) -> Result<()> {
+        Ok(self.cache.clear()?)
+    }
+    pub fn cache_status(&self) -> Result<Value> {
+        let status = self.cache.stats()?;
+        Ok(
+            json!({"capacity_bytes":status.capacity_bytes,"capacity_entries":status.capacity_entries,
+            "retained_bytes":status.retained_bytes,"retained_entries":status.retained_entries,
+            "resident_bytes":status.resident_bytes,"resident_entries":status.resident_entries,
+            "strict_cache_only":self.cache_budget.strict_cache_only}),
+        )
+    }
+
+    fn validate(&self) -> Result<()> {
+        let state = self.manifest.root.join(STATE);
+        no_symlink(&state)?;
+        no_symlink(&state.join("generations"))?;
+        no_symlink(&self.dir)?;
+        no_symlink(&self.dir.join("manifest.json"))?;
+        no_symlink(&self.dir.join("trigram"))?;
+        ensure!(
+            digest_metered(
+                &bounded_read_metered(
+                    &self.dir.join("manifest.json"),
+                    MAX_MANIFEST_BYTES,
+                    &self.read_meter
+                )?,
+                &self.read_meter
+            )? == self.pin.manifest_sha256,
+            "retained generation manifest changed; reindex required"
+        );
+        if let Some(Ok(index)) = self.index.get() {
+            index.validate()?;
+        }
+        Ok(())
+    }
+
+    fn index_session(&self) -> Result<&gptgrep_index::IndexSession> {
+        match self.index.get_or_init(|| {
+            gptgrep_index::IndexSession::open(&self.dir.join("trigram"))
+                .map_err(|error| format!("{error:#}"))
+        }) {
+            Ok(index) => Ok(index),
+            Err(error) => bail!("retained generation index is invalid: {error}"),
+        }
+    }
+
+    pub fn status(&self) -> Result<Value> {
+        reader_status(self)
+    }
+    pub fn catalog(&self) -> Result<Value> {
+        reader_catalog(self)
+    }
+    pub fn tree(&self, path: &Path) -> Result<Value> {
+        reader_tree(self, path)
+    }
+    pub fn read_node(&self, node_id: &str, max_bytes: usize) -> Result<Hit> {
+        self.read_node_window(node_id, max_bytes, 0)
+    }
+    pub fn read_node_window(
+        &self,
+        node_id: &str,
+        max_bytes: usize,
+        offset_bytes: usize,
+    ) -> Result<Hit> {
+        reader_read_node_window(self, node_id, max_bytes, offset_bytes)
+    }
+    pub async fn search(&self, query: &str, options: &SearchOptions) -> Result<SearchReport> {
+        search_reader_using_client(self, query, options, None, None).await
+    }
+    pub async fn search_with_client(
+        &self,
+        query: &str,
+        options: &SearchOptions,
+        client: &JevClient,
+    ) -> Result<SearchReport> {
+        search_reader_using_client(self, query, options, Some(client), None).await
+    }
+    pub async fn search_with_client_and_observer(
+        &self,
+        query: &str,
+        options: &SearchOptions,
+        client: &JevClient,
+        observer: &JevSearchObserver<'_>,
+    ) -> Result<SearchReport> {
+        search_reader_using_client(self, query, options, Some(client), Some(observer)).await
+    }
+
     fn text(&self, doc: &Document) -> Result<String> {
+        self.text_cached(doc)?.into_string()
+    }
+    fn text_cached(&self, doc: &Document) -> Result<ReaderText> {
         no_symlink(&self.dir.join("text"))?;
         no_symlink(&self.dir.join("text").join(format!("{}.txt", doc.id)))?;
-        let bytes = bounded_read(
-            &self.dir.join("text").join(format!("{}.txt", doc.id)),
+        let path = self.dir.join("text").join(format!("{}.txt", doc.id));
+        let size = fs::metadata(&path)?.len();
+        let key = CacheKey::new(&self.pin.generation, &doc.id, &doc.text_sha256)?;
+        let text = load_reader_text(
+            &self.cache,
+            &self.cache_budget,
+            &self.read_meter,
+            &key,
+            &path,
+            size,
             MAX_TEXT_BYTES,
         )?;
-        ensure!(
-            digest(&bytes) == doc.text_sha256,
-            "indexed text digest mismatch for {}; reindex",
-            doc.path
-        );
-        let text = String::from_utf8(bytes).context("indexed text is not UTF-8")?;
+        if text.origin == ReadOrigin::Cache {
+            ensure!(
+                hash_reader_file(&path, MAX_TEXT_BYTES, &self.read_meter)?
+                    == (size, doc.text_sha256.clone()),
+                "indexed text digest mismatch for {}; reindex",
+                doc.path
+            );
+        }
         ensure!(
             (text.is_empty() && doc.pages.is_empty())
                 || doc
@@ -778,13 +1529,17 @@ impl Snapshot {
     }
     fn fresh(&self, doc: &Document) -> bool {
         source_path(&self.manifest.root, &doc.path)
-            .and_then(|p| bounded_read(&p, MAX_SOURCE_BYTES))
-            .is_ok_and(|bytes| digest(&bytes) == doc.source_sha256)
+            .and_then(|p| hash_reader_file(&p, MAX_SOURCE_BYTES, &self.read_meter))
+            .is_ok_and(|(_, digest)| digest == doc.source_sha256)
     }
 }
 
 pub fn status(root: &Path) -> Result<Value> {
-    let snapshot = Snapshot::open(root)?;
+    GenerationReader::open(root)?.status()
+}
+
+fn reader_status(snapshot: &GenerationReader) -> Result<Value> {
+    snapshot.validate()?;
     let stale: Vec<_> = snapshot
         .manifest
         .documents
@@ -801,7 +1556,11 @@ pub fn status(root: &Path) -> Result<Value> {
 }
 
 pub fn tree(root: &Path, path: &Path) -> Result<Value> {
-    let snapshot = Snapshot::open(root)?;
+    GenerationReader::open(root)?.tree(path)
+}
+
+fn reader_tree(snapshot: &GenerationReader, path: &Path) -> Result<Value> {
+    snapshot.validate()?;
     let input = if path.is_absolute() {
         path.strip_prefix(&snapshot.manifest.root)?.to_path_buf()
     } else {
@@ -843,10 +1602,40 @@ pub fn read_node_window(
         (1..=65536).contains(&max_bytes),
         "max-bytes must be 1..65536"
     );
+    node_id
+        .split_once(':')
+        .context("node ID must be document_id:node_id from search/tree")?;
+    GenerationReader::open(root)?.read_node_window(node_id, max_bytes, offset_bytes)
+}
+
+fn reader_read_node_window(
+    snapshot: &GenerationReader,
+    node_id: &str,
+    max_bytes: usize,
+    offset_bytes: usize,
+) -> Result<Hit> {
+    let (hit, origin) =
+        reader_node_window_unmetered_delivery(snapshot, node_id, max_bytes, offset_bytes)?;
+    snapshot
+        .read_meter
+        .record_delivery(hit.text.len(), origin)?;
+    Ok(hit)
+}
+
+fn reader_node_window_unmetered_delivery(
+    snapshot: &GenerationReader,
+    node_id: &str,
+    max_bytes: usize,
+    offset_bytes: usize,
+) -> Result<(Hit, ReadOrigin)> {
+    ensure!(
+        (1..=65536).contains(&max_bytes),
+        "max-bytes must be 1..65536"
+    );
     let (doc_id, local_id) = node_id
         .split_once(':')
         .context("node ID must be document_id:node_id from search/tree")?;
-    let snapshot = Snapshot::open(root)?;
+    snapshot.validate()?;
     let doc = snapshot
         .manifest
         .documents
@@ -862,7 +1651,7 @@ pub fn read_node_window(
         snapshot.fresh(doc),
         "source changed or disappeared; reindex before reading evidence"
     );
-    let view = TextView::new(snapshot.text(doc)?);
+    let view = TextView::new(snapshot.text_cached(doc)?);
     let (node_start, node_end) = view
         .node_bytes(node)
         .context("tree node range lies outside canonical text")?;
@@ -901,7 +1690,8 @@ pub fn read_node_window(
         snapshot.fresh(doc),
         "source changed or disappeared; reindex before reading evidence"
     );
-    Ok(result)
+    snapshot.validate()?;
+    Ok((result, view.text.origin()))
 }
 
 fn truncate(text: &str, max: usize) -> (&str, bool) {
@@ -915,13 +1705,45 @@ fn truncate(text: &str, max: usize) -> (&str, bool) {
     (&text[..end], true)
 }
 
+enum TextStorage {
+    Owned(String),
+    Reader(ReaderText),
+}
+impl From<String> for TextStorage {
+    fn from(text: String) -> Self {
+        Self::Owned(text)
+    }
+}
+impl From<ReaderText> for TextStorage {
+    fn from(text: ReaderText) -> Self {
+        Self::Reader(text)
+    }
+}
+impl std::ops::Deref for TextStorage {
+    type Target = str;
+    fn deref(&self) -> &str {
+        match self {
+            Self::Owned(text) => text,
+            Self::Reader(text) => text,
+        }
+    }
+}
+impl TextStorage {
+    fn origin(&self) -> ReadOrigin {
+        match self {
+            Self::Owned(_) => ReadOrigin::Loaded,
+            Self::Reader(text) => text.origin,
+        }
+    }
+}
 struct TextView {
-    text: String,
+    text: TextStorage,
     lines: Vec<(usize, usize)>,
 }
 
 impl TextView {
-    fn new(text: String) -> Self {
+    fn new(text: impl Into<TextStorage>) -> Self {
+        let text = text.into();
         let mut offset = 0;
         let mut lines = Vec::new();
         for line in text.split_inclusive('\n') {
@@ -1091,6 +1913,7 @@ fn hit_from_bytes(
         score,
         confidence: None,
         literal_anchor: false,
+        below_threshold: false,
         source_sha256: doc.source_sha256.clone(),
         source_fresh: true,
         citation,
@@ -1109,15 +1932,90 @@ fn node_at(doc: &Document, line: usize) -> Option<&TreeNode> {
         })
 }
 
-fn tokens(query: &str) -> Vec<String> {
+/// Maximum lexical query terms used by one lexical/hybrid search.
+const MAX_LEXICAL_TERMS: usize = 16;
+/// Candidate terms ranked by scoped document frequency, in first-occurrence
+/// order; later candidates are not considered. Bounds the frequency pass.
+const MAX_RANKED_LEXICAL_TERMS: usize = 64;
+/// A small fixed list of English function words. Each has at least three
+/// letters; shorter ASCII-letter tokens are dropped by length instead.
+const LEXICAL_STOPWORDS: &[&str] = &[
+    "about", "above", "across", "after", "against", "all", "also", "although", "among", "and",
+    "any", "are", "because", "been", "before", "being", "below", "between", "both", "but", "can",
+    "could", "did", "does", "doing", "done", "during", "each", "either", "else", "every", "for",
+    "from", "had", "has", "have", "having", "her", "here", "hers", "him", "his", "how", "into",
+    "its", "itself", "may", "might", "mine", "must", "neither", "nor", "not", "off", "onto", "our",
+    "ours", "out", "over", "per", "shall", "she", "should", "some", "such", "than", "that", "the",
+    "their", "theirs", "them", "then", "there", "these", "they", "this", "those", "though",
+    "through", "too", "toward", "towards", "under", "upon", "very", "via", "was", "were", "what",
+    "when", "where", "whether", "which", "while", "who", "whom", "whose", "why", "will", "with",
+    "within", "without", "would", "yet", "you", "your", "yours",
+];
+
+/// Lowercase alphanumeric/underscore tokens, deduplicated in first-occurrence order.
+fn query_tokens(query: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     query
         .split(|c: char| !c.is_alphanumeric() && c != '_')
         .map(str::to_lowercase)
         .filter(|s| !s.is_empty() && seen.insert(s.clone()))
-        .take(16)
         .collect()
 }
+
+/// Candidate lexical terms before the 16-term cap. Fixed English function
+/// words and ASCII-letter tokens shorter than three characters are dropped;
+/// tokens containing a digit and non-ASCII tokens (for example CJK words) are
+/// kept. A query made only of dropped tokens keeps all of its tokens.
+fn candidate_terms(query: &str) -> Vec<String> {
+    let tokens = query_tokens(query);
+    let kept: Vec<String> = tokens
+        .iter()
+        .filter(|token| {
+            token.chars().any(|c| c.is_ascii_digit())
+                || !token.is_ascii()
+                || (token.chars().count() >= 3 && !LEXICAL_STOPWORDS.contains(&token.as_str()))
+        })
+        .cloned()
+        .collect();
+    if kept.is_empty() { tokens } else { kept }
+}
+
+/// Order candidate terms for the cap: lower document frequency in the scoped
+/// index first, terms absent from the scope last, ties by first occurrence.
+/// `frequencies` is parallel to `terms`. Deterministic for a fixed snapshot.
+fn rank_terms(terms: Vec<String>, frequencies: &[usize]) -> Vec<String> {
+    let mut ranked: Vec<(usize, String)> = terms.into_iter().enumerate().collect();
+    ranked.sort_by_key(|(index, _)| {
+        let frequency = frequencies[*index];
+        (frequency == 0, frequency, *index)
+    });
+    ranked
+        .into_iter()
+        .take(MAX_LEXICAL_TERMS)
+        .map(|(_, term)| term)
+        .collect()
+}
+
+/// Seed lexical terms for one search scope. At most 16 terms are kept; when
+/// more candidates remain, the rarest in the scoped index are kept.
+fn lexical_terms(
+    snapshot: &Snapshot,
+    query: &str,
+    indexed_document: Option<&Path>,
+) -> Result<Vec<String>> {
+    let mut terms = candidate_terms(query);
+    if terms.len() <= MAX_LEXICAL_TERMS {
+        return Ok(terms);
+    }
+    terms.truncate(MAX_RANKED_LEXICAL_TERMS);
+    let frequencies = snapshot
+        .index_session()?
+        .document_frequencies(&terms, indexed_document)?;
+    Ok(rank_terms(terms, &frequencies))
+}
+
+/// Below-floor candidates delivered when no reranked candidate meets the floor.
+const BELOW_THRESHOLD_FALLBACK: usize = 3;
 
 fn lexical_score(text: &str, terms: &[String]) -> f64 {
     if terms.is_empty() {
@@ -1207,10 +2105,22 @@ async fn search_using_client(
     supplied_client: Option<&JevClient>,
     observer: Option<&JevSearchObserver<'_>>,
 ) -> Result<SearchReport> {
+    validate_search_options(query, options)?;
+    let reader = GenerationReader::open(root)?;
+    search_reader_using_client(&reader, query, options, supplied_client, observer).await
+}
+
+async fn search_reader_using_client(
+    snapshot: &GenerationReader,
+    query: &str,
+    options: &SearchOptions,
+    supplied_client: Option<&JevClient>,
+    observer: Option<&JevSearchObserver<'_>>,
+) -> Result<SearchReport> {
     let started = Instant::now();
     validate_search_options(query, options)?;
     let model_assisted = matches!(options.mode.as_str(), "hybrid" | "semantic");
-    let snapshot = Snapshot::open(root)?;
+    snapshot.validate()?;
     let scoped = scoped_documents(&snapshot.manifest.documents, options.document.as_deref())?;
     let coverage = Coverage {
         indexed_files: snapshot.manifest.documents.len(),
@@ -1221,23 +2131,25 @@ async fn search_using_client(
     let client = if model_assisted {
         Some(match supplied_client {
             Some(client) => client.clone(),
-            None => JevClient::from_env(options.model.as_deref()).map_err(|error| {
-                jev_search_error(
-                    "initialization",
-                    error,
-                    &metrics,
-                    &coverage,
-                    options.document.as_deref(),
-                    Some(&snapshot.manifest.generation),
-                    started,
-                )
-            })?,
+            None => JevClient::from_env(options.model.as_deref())
+                .map(default_retrieval_client)
+                .map_err(|error| {
+                    jev_search_error(
+                        "initialization",
+                        error,
+                        &metrics,
+                        &coverage,
+                        options.document.as_deref(),
+                        Some(&snapshot.manifest.generation),
+                        started,
+                    )
+                })?,
         })
     } else {
         None
     };
     let mut batch = collect_candidate_view(
-        &snapshot,
+        snapshot,
         query,
         options,
         client.as_ref(),
@@ -1248,7 +2160,7 @@ async fn search_using_client(
     .await?;
     if let Some(client) = client.as_ref() {
         score_candidates(
-            &snapshot,
+            snapshot,
             query,
             options,
             client,
@@ -1259,20 +2171,21 @@ async fn search_using_client(
         )
         .await?;
     }
-    finish_candidate_batch(&snapshot, options, &mut batch);
+    finish_candidate_batch(snapshot, options, &mut batch);
     let CandidateBatch {
         hits,
         coverage,
         warnings,
     } = batch;
+    snapshot.validate()?;
     metrics.elapsed_ms = started.elapsed().as_millis();
     Ok(SearchReport {
         schema_version: SCHEMA.into(),
         query: query.into(),
         mode: options.mode.clone(),
         document_scope: options.document.clone(),
-        root: snapshot.manifest.root,
-        generation: snapshot.manifest.generation,
+        root: snapshot.manifest.root.clone(),
+        generation: snapshot.manifest.generation.clone(),
         index_used: true,
         source_fresh: if hits.is_empty() { None } else { Some(true) },
         minimum_relevance_score: model_assisted.then_some(options.min_score),
@@ -1311,7 +2224,11 @@ async fn collect_candidate_view(
     let mut freshness = HashMap::new();
     let mut texts = HashMap::new();
     let mut hits = Vec::new();
-    let terms = tokens(query);
+    let terms = if options.mode == "regex" || options.mode == "semantic" {
+        Vec::new()
+    } else {
+        lexical_terms(snapshot, query, indexed_document.as_deref())?
+    };
     if options.mode != "semantic" {
         let pattern = if options.mode == "regex" {
             query.to_owned()
@@ -1334,30 +2251,31 @@ async fn collect_candidate_view(
         let verifier = regex::RegexBuilder::new(&verification_pattern)
             .case_insensitive(options.case_insensitive || options.mode != "regex")
             .build()?;
-        let matches = gptgrep_index::search_with_document_and_predicate(
-            &snapshot.dir.join("trigram"),
-            &pattern,
-            options.case_insensitive || options.mode != "regex",
-            options.literal && options.mode == "regex",
-            if options.mode == "regex" {
-                options.limit + 1
-            } else {
-                10_000
-            },
-            indexed_document.as_deref(),
-            |relative| {
-                let id = relative
-                    .file_stem()
-                    .and_then(|value| value.to_str())
-                    .context("invalid trigram document path")?;
-                let document = docs
-                    .get(id)
-                    .context("trigram document missing from manifest")?;
-                Ok(*freshness
-                    .entry(document.id.clone())
-                    .or_insert_with(|| snapshot.fresh(document)))
-            },
-        )?;
+        let matches = snapshot
+            .index_session()?
+            .search_with_document_and_predicate(
+                &pattern,
+                options.case_insensitive || options.mode != "regex",
+                options.literal && options.mode == "regex",
+                if options.mode == "regex" {
+                    options.limit + 1
+                } else {
+                    10_000
+                },
+                indexed_document.as_deref(),
+                |relative| {
+                    let id = relative
+                        .file_stem()
+                        .and_then(|value| value.to_str())
+                        .context("invalid trigram document path")?;
+                    let document = docs
+                        .get(id)
+                        .context("trigram document missing from manifest")?;
+                    Ok(*freshness
+                        .entry(document.id.clone())
+                        .or_insert_with(|| snapshot.fresh(document)))
+                },
+            )?;
         coverage.candidate_files = matches.candidate_files;
         coverage.verified_files = matches.verified_files;
         coverage.truncated = matches.truncated;
@@ -1382,7 +2300,7 @@ async fn collect_candidate_view(
                 break;
             }
             if !texts.contains_key(&doc.id) {
-                texts.insert(doc.id.clone(), TextView::new(snapshot.text(doc)?));
+                texts.insert(doc.id.clone(), TextView::new(snapshot.text_cached(doc)?));
             }
             let text = &texts[&doc.id];
             let Some(node) = node_at(doc, m.line_number) else {
@@ -1451,7 +2369,7 @@ async fn collect_candidate_view(
                 continue;
             }
             if !texts.contains_key(&doc.id) {
-                texts.insert(doc.id.clone(), TextView::new(snapshot.text(doc)?));
+                texts.insert(doc.id.clone(), TextView::new(snapshot.text_cached(doc)?));
             }
             let headings = doc
                 .nodes
@@ -1480,9 +2398,32 @@ async fn collect_candidate_view(
         if !coverage.semantic_scope_complete {
             warnings.push("Semantic routing covers a bounded document prefix; increase --routing-docs up to 32, select --document, or search narrower roots. Lexical retrieval uses the same explicit document scope.".into());
         }
-        if !routing.is_empty() {
+        let skip_single = routing.len() == 1 && skip_single_document_routing();
+        coverage.routing_status = Some(
+            match routing.len() {
+                0 => "no_candidates",
+                _ if skip_single => "skipped_single_document",
+                _ => "routed",
+            }
+            .into(),
+        );
+        if skip_single {
+            // Routing selects the top-ranked documents regardless of score, so
+            // one candidate is always selected. Its tree candidates, and thus
+            // the rerank request, are identical without a Decisions call.
+            let only = routing.pop().expect("one routing candidate");
+            hits.truncate(options.max_candidates / 2);
+            let document = docs
+                .get(only.id.as_str())
+                .copied()
+                .context("routing document missing from scope")?;
+            add_tree_candidates(&mut hits, &[document], &texts, options, &mut coverage);
+        } else if !routing.is_empty() {
             metrics.jev_candidate_bytes += routing.iter().map(|c| c.text.len()).sum::<usize>();
             metrics.jev_calls_attempted += 1;
+            metrics
+                .jev_requested_models
+                .push(client.requested_model().to_owned());
             observe_jev(
                 observer,
                 "document_routing",
@@ -1494,17 +2435,19 @@ async fn collect_candidate_view(
                 started,
                 None,
             )?;
-            let ranked = client.rerank(query, &routing).await.map_err(|error| {
-                jev_search_error(
-                    "document_routing",
-                    error,
-                    metrics,
-                    &coverage,
-                    options.document.as_deref(),
-                    Some(&snapshot.manifest.generation),
-                    started,
-                )
-            })?;
+            let ranked = rerank_call(
+                client,
+                query,
+                &routing,
+                "document_routing",
+                observer,
+                metrics,
+                &coverage,
+                options,
+                &snapshot.manifest.generation,
+                started,
+            )
+            .await?;
             metrics.jev_requests += 1;
             metrics.jev_models.push(ranked.model.clone());
             metrics.jev_usage.push(ranked.usage.clone());
@@ -1523,48 +2466,12 @@ async fn collect_candidate_view(
             ranks.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
             // Reserve half the final budget for tree candidates, protecting no-keyword recall.
             hits.truncate(options.max_candidates / 2);
-            let mut seen: HashSet<_> = hits.iter().map(|h| h.node_id.clone()).collect();
             let selected: Vec<_> = ranks
                 .iter()
                 .take(8)
                 .filter_map(|r| docs.get(r.id.as_str()).copied())
-                .map(|document| (document, leaf_nodes(&document.nodes)))
                 .collect();
-            let max_depth = selected
-                .iter()
-                .map(|(_, leaves)| leaves.len())
-                .max()
-                .unwrap_or(0);
-            for offset in 0..max_depth {
-                for (doc, leaves) in &selected {
-                    if let Some(node) = leaves.get(offset) {
-                        let h = hit(
-                            doc,
-                            node,
-                            &texts[&doc.id],
-                            node.line_start,
-                            node.line_end,
-                            None,
-                            0.0,
-                            1400,
-                        );
-                        if seen.insert(h.node_id.clone()) {
-                            hits.push(h);
-                        }
-                    }
-                    if hits.len() >= options.max_candidates {
-                        break;
-                    }
-                }
-                if hits.len() >= options.max_candidates {
-                    break;
-                }
-            }
-            coverage.truncated |= selected
-                .iter()
-                .map(|(doc, _)| doc.nodes.len())
-                .sum::<usize>()
-                > hits.len();
+            add_tree_candidates(&mut hits, &selected, &texts, options, &mut coverage);
         }
         coverage.truncated |= hits.len() > options.max_candidates;
         hits.truncate(options.max_candidates);
@@ -1606,6 +2513,9 @@ async fn score_candidates(
             .collect();
         metrics.jev_candidate_bytes += candidates.iter().map(|c| c.text.len()).sum::<usize>();
         metrics.jev_calls_attempted += 1;
+        metrics
+            .jev_requested_models
+            .push(client.requested_model().to_owned());
         observe_jev(
             observer,
             "evidence_reranking",
@@ -1617,17 +2527,19 @@ async fn score_candidates(
             started,
             None,
         )?;
-        let ranked = client.rerank(query, &candidates).await.map_err(|error| {
-            jev_search_error(
-                "evidence_reranking",
-                error,
-                metrics,
-                coverage,
-                options.document.as_deref(),
-                Some(&snapshot.manifest.generation),
-                started,
-            )
-        })?;
+        let ranked = rerank_call(
+            client,
+            query,
+            &candidates,
+            "evidence_reranking",
+            observer,
+            metrics,
+            coverage,
+            options,
+            &snapshot.manifest.generation,
+            started,
+        )
+        .await?;
         metrics.jev_requests += 1;
         metrics.jev_models.push(ranked.model.clone());
         metrics.jev_usage.push(ranked.usage.clone());
@@ -1664,12 +2576,34 @@ async fn score_candidates(
             h.confidence = rank.confidence;
         }
         let before_filter = hits.len();
+        for h in hits.iter_mut() {
+            h.below_threshold = h.score < options.min_score;
+        }
         coverage.retained_literal_anchors = hits
             .iter()
-            .filter(|h| h.literal_anchor && h.score < options.min_score)
+            .filter(|h| h.literal_anchor && h.below_threshold)
             .count();
-        hits.retain(|h| h.literal_anchor || h.score >= options.min_score);
-        coverage.filtered_candidates = before_filter - hits.len();
+        let passing = hits
+            .iter()
+            .filter(|h| h.literal_anchor || !h.below_threshold)
+            .count();
+        coverage.filtered_candidates = before_filter - passing;
+        if passing == 0 {
+            // Never deliver an empty seed when candidates exist: keep the best
+            // few by score, each flagged as below the floor. They never count
+            // as passing. finish_candidate_batch counts the ones actually
+            // delivered and tells the reader they are low confidence.
+            hits.sort_by(|a, b| {
+                b.score
+                    .total_cmp(&a.score)
+                    .then(a.path.cmp(&b.path))
+                    .then(a.line_start.cmp(&b.line_start))
+            });
+            hits.truncate(BELOW_THRESHOLD_FALLBACK);
+            coverage.below_threshold_fallback = hits.len();
+        } else {
+            hits.retain(|h| h.literal_anchor || !h.below_threshold);
+        }
         hits.sort_by(|a, b| {
             b.literal_anchor.cmp(&a.literal_anchor).then_with(|| {
                 b.score
@@ -1687,7 +2621,11 @@ fn finish_candidate_batch(
     options: &SearchOptions,
     batch: &mut CandidateBatch,
 ) {
-    let CandidateBatch { hits, coverage, .. } = batch;
+    let CandidateBatch {
+        hits,
+        coverage,
+        warnings,
+    } = batch;
     coverage.truncated |= hits.len() > options.limit;
     hits.truncate(options.limit);
     // Recheck selected originals after potentially slow remote inference.
@@ -1711,6 +2649,109 @@ fn finish_candidate_batch(
             false
         }
     });
+    if coverage.below_threshold_fallback > 0 {
+        // Report the fallback candidates actually delivered after the result
+        // limit and the final freshness check, not those first selected.
+        coverage.below_threshold_fallback = hits
+            .iter()
+            .filter(|hit| hit.is_below_threshold_fallback())
+            .count();
+        if coverage.below_threshold_fallback > 0 {
+            warnings.push(format!(
+                "No reranked candidate met the relevance floor {}; the hits flagged below_threshold=true are the highest-scoring low-confidence candidates (at most {BELOW_THRESHOLD_FALLBACK}), counted in coverage.below_threshold_fallback. They did not pass the floor; verify them before relying on them.",
+                options.min_score
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override that still sends the single-candidate routing call,
+    /// so tests can compare the skipped path with the routed one and keep
+    /// exercising routing-call mechanics with one-document fixtures.
+    static ROUTE_SINGLE_DOCUMENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only guard: while alive on this thread, a single routing candidate is
+/// still sent to Decisions (the former behavior).
+#[cfg(test)]
+pub(crate) struct RouteSingleDocument;
+#[cfg(test)]
+impl RouteSingleDocument {
+    pub(crate) fn enable() -> Self {
+        ROUTE_SINGLE_DOCUMENT.with(|flag| flag.set(true));
+        Self
+    }
+}
+#[cfg(test)]
+impl Drop for RouteSingleDocument {
+    fn drop(&mut self) {
+        ROUTE_SINGLE_DOCUMENT.with(|flag| flag.set(false));
+    }
+}
+
+/// Exactly one routing candidate is selected without a Decisions call.
+fn skip_single_document_routing() -> bool {
+    #[cfg(test)]
+    {
+        !ROUTE_SINGLE_DOCUMENT.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
+/// Add selected documents' leaf nodes round-robin in their routed order until
+/// the candidate budget is full. Shared by routed and single-document scopes.
+fn add_tree_candidates(
+    hits: &mut Vec<Hit>,
+    selected: &[&Document],
+    texts: &HashMap<String, TextView>,
+    options: &SearchOptions,
+    coverage: &mut Coverage,
+) {
+    let mut seen: HashSet<_> = hits.iter().map(|h| h.node_id.clone()).collect();
+    let selected: Vec<_> = selected
+        .iter()
+        .map(|document| (*document, leaf_nodes(&document.nodes)))
+        .collect();
+    let max_depth = selected
+        .iter()
+        .map(|(_, leaves)| leaves.len())
+        .max()
+        .unwrap_or(0);
+    for offset in 0..max_depth {
+        for (doc, leaves) in &selected {
+            if let Some(node) = leaves.get(offset) {
+                let h = hit(
+                    doc,
+                    node,
+                    &texts[&doc.id],
+                    node.line_start,
+                    node.line_end,
+                    None,
+                    0.0,
+                    1400,
+                );
+                if seen.insert(h.node_id.clone()) {
+                    hits.push(h);
+                }
+            }
+            if hits.len() >= options.max_candidates {
+                break;
+            }
+        }
+        if hits.len() >= options.max_candidates {
+            break;
+        }
+    }
+    coverage.truncated |= selected
+        .iter()
+        .map(|(doc, _)| doc.nodes.len())
+        .sum::<usize>()
+        > hits.len();
 }
 
 /// Two linear passes preserve source/preorder while removing parents. Compute
@@ -1745,7 +2786,11 @@ fn known_stale_paths(
 
 /// Inspect all indexed documents without loading their body text.
 pub fn catalog(root: &Path) -> Result<Value> {
-    let snapshot = Snapshot::open(root)?;
+    GenerationReader::open(root)?.catalog()
+}
+
+fn reader_catalog(snapshot: &GenerationReader) -> Result<Value> {
+    snapshot.validate()?;
     let docs: Vec<_> = snapshot.manifest.documents.iter().map(|d| json!({"id":d.id,"path":d.path,"title":d.title,
         "pages":d.pages.len(),"nodes":d.nodes.len(),"parser":d.parser,"source_sha256":d.source_sha256})).collect();
     Ok(json!({"schema_version":SCHEMA,"generation":snapshot.manifest.generation,"documents":docs}))
@@ -1765,15 +2810,515 @@ mod tests {
         }
     }
 
-    async fn mock_jev(
+    fn comparable_report(report: SearchReport) -> Result<Value> {
+        let mut value = serde_json::to_value(report)?;
+        value["metrics"]
+            .as_object_mut()
+            .unwrap()
+            .remove("elapsed_ms");
+        Ok(value)
+    }
+
+    #[test]
+    fn reader_meter_size_admission_precedes_owned_io_and_failed_hashes_keep_counts() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("ordinary.txt");
+        fs::write(&path, "12345")?;
+        let meter = ReadMeter::default();
+        assert!(bounded_read_metered(&path, 4, &meter).is_err());
+        assert_eq!(meter.snapshot()?, ReadMetrics::default());
+        let bytes = bounded_read_metered(&path, 5, &meter)?;
+        assert_eq!(bytes, b"12345");
+        assert_eq!(meter.snapshot()?.physical_read_bytes, 5);
+        assert_eq!(meter.snapshot()?.physical_hash_bytes, 0);
+        assert_eq!(digest_metered(&bytes, &meter)?, digest(b"12345"));
+        assert_eq!(meter.snapshot()?.physical_hash_bytes, 5);
+        fs::remove_file(&path)?;
+        assert!(hash_reader_file(&path, 5, &meter).is_err());
+        assert_eq!(meter.snapshot()?.physical_read_bytes, 5);
+        assert_eq!(meter.snapshot()?.physical_hash_bytes, 5);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reader_cache_warm_clone_counts_windows_and_revalidation_reads_exactly() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = "alpha β gamma\n";
+        fs::write(dir.path().join("a.txt"), source)?;
+        index(dir.path(), 10).await?;
+        let reader = GenerationReader::open(dir.path())?;
+        let doc = &reader.manifest.documents[0];
+        let node = format!("{}:{}", doc.id, doc.nodes[0].id);
+        let manifest_bytes = fs::metadata(reader.dir.join("manifest.json"))?.len();
+        let text_bytes =
+            fs::metadata(reader.dir.join("text").join(format!("{}.txt", doc.id)))?.len();
+        let before = reader.read_metrics()?;
+        let first = reader.read_node_window(&node, 5, 0)?;
+        let cold = reader.read_metrics()?.since(&before)?;
+        assert_eq!(first.text, "alpha");
+        assert_eq!(cold.logical_reader_bytes, 5);
+        assert_eq!(cold.cached_logical_bytes, 0);
+        assert_eq!(cold.cache_misses, 1);
+        let expected = 2 * manifest_bytes + 2 * source.len() as u64 + text_bytes;
+        assert_eq!(cold.observed_rust_read_bytes, expected);
+        assert_eq!(cold.observed_hash_bytes, expected);
+        let clone = reader.clone();
+        assert!(Arc::ptr_eq(&reader.manifest, &clone.manifest));
+        assert!(Arc::ptr_eq(&reader.index, &clone.index));
+        let before = clone.read_metrics()?;
+        let second = clone.read_node_window(&node, 5, 0)?;
+        let warm = reader.read_metrics()?.since(&before)?;
+        assert_eq!(serde_json::to_value(first)?, serde_json::to_value(second)?);
+        assert_eq!(warm.logical_reader_bytes, 5);
+        assert_eq!(warm.cached_logical_bytes, 5);
+        assert_eq!(warm.cache_hits, 1);
+        // Full current-file digest validation deliberately preserves IO, even
+        // when an immutable cached payload avoids a second owned allocation.
+        assert_eq!(warm.observed_rust_read_bytes, expected);
+        assert_eq!(warm.observed_hash_bytes, expected);
+        assert_eq!(reader.cache_status()?["retained_entries"], 1);
+        assert!(warm.coverage.contains("kernel"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reader_cache_pins_keep_capacity_across_clear_clone_and_thread() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join("a.txt"), "alpha needle\n")?;
+        fs::write(dir.path().join("b.txt"), "bravo needle\n")?;
+        index(dir.path(), 10).await?;
+        let budget = ReaderCacheBudget {
+            max_bytes: 13,
+            max_entries: 1,
+            strict_cache_only: false,
+        };
+        let reader = GenerationReader::open_with_cache_budget(dir.path(), &budget)?;
+        let a = reader
+            .manifest
+            .documents
+            .iter()
+            .find(|d| d.path == "a.txt")
+            .unwrap();
+        let b = reader
+            .manifest
+            .documents
+            .iter()
+            .find(|d| d.path == "b.txt")
+            .unwrap();
+        let pin = reader.text_cached(a)?;
+        let clone = reader.clone();
+        clone.clear_cache()?;
+        assert_eq!(reader.cache_status()?["resident_entries"], 0);
+        assert_eq!(reader.cache_status()?["retained_bytes"], 13);
+        let before = reader.read_metrics()?;
+        let fallback =
+            std::thread::scope(|scope| scope.spawn(|| clone.text_cached(b)).join().unwrap())?;
+        assert_eq!(&*fallback, "bravo needle\n");
+        assert_eq!(fallback.origin, ReadOrigin::Uncached);
+        let delta = reader.read_metrics()?.since(&before)?;
+        assert_eq!(delta.cache_fallbacks, 1);
+        assert_eq!(delta.uncached_load_bytes, 13);
+        assert_eq!(delta.observed_rust_read_bytes, 13);
+        assert_eq!(delta.observed_hash_bytes, 13);
+        assert_eq!(reader.cache_status()?["retained_entries"], 1);
+        drop(pin);
+        let refill = reader.text_cached(b)?;
+        assert_eq!(refill.origin, ReadOrigin::Loaded);
+        assert_eq!(reader.cache_status()?["retained_bytes"], 13);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reader_cache_tight_caps_preserve_default_fallback_and_strict_preallocation_failure()
+    -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join("a.txt"), "alpha needle\n")?;
+        fs::write(dir.path().join("b.txt"), "bravo needle\n")?;
+        index(dir.path(), 10).await?;
+        let budget = ReaderCacheBudget {
+            max_bytes: 4,
+            max_entries: 1,
+            strict_cache_only: false,
+        };
+        let reader = GenerationReader::open_with_cache_budget(dir.path(), &budget)?;
+        let a = &reader.manifest.documents[0];
+        let node = format!("{}:{}", a.id, a.nodes[0].id);
+        let before = reader.read_metrics()?;
+        assert_eq!(reader.read_node_window(&node, 5, 0)?.text, "alpha");
+        let fallback = reader.read_metrics()?.since(&before)?;
+        assert_eq!(fallback.logical_reader_bytes, 5);
+        assert_eq!(fallback.uncached_logical_bytes, 5);
+        assert_eq!(fallback.cache_fallbacks, 1);
+        assert_eq!(fallback.uncached_load_bytes, 13);
+        assert_eq!(reader.cache_status()?["retained_bytes"], 0);
+        let strict = GenerationReader::open_with_cache_budget(
+            dir.path(),
+            &ReaderCacheBudget {
+                strict_cache_only: true,
+                ..budget
+            },
+        )?;
+        let before = strict.read_metrics()?;
+        assert!(strict.text_cached(&strict.manifest.documents[0]).is_err());
+        let failed = strict.read_metrics()?.since(&before)?;
+        assert_eq!(failed.observed_rust_read_bytes, 0);
+        assert_eq!(failed.observed_hash_bytes, 0);
+        assert_eq!(failed.cache_fallbacks, 0);
+        let strict = GenerationReader::open_with_cache_budget(
+            dir.path(),
+            &ReaderCacheBudget {
+                max_bytes: 13,
+                max_entries: 1,
+                strict_cache_only: true,
+            },
+        )?;
+        let pin = strict.text_cached(&strict.manifest.documents[0])?;
+        let before = strict.read_metrics()?;
+        assert!(
+            strict
+                .clone()
+                .text_cached(&strict.manifest.documents[1])
+                .is_err()
+        );
+        assert_eq!(
+            strict
+                .read_metrics()?
+                .since(&before)?
+                .observed_rust_read_bytes,
+            0
+        );
+        drop(pin);
+        strict.text_cached(&strict.manifest.documents[1])?;
+        assert!(
+            GenerationReader::open_with_cache_budget(
+                dir.path(),
+                &ReaderCacheBudget {
+                    max_bytes: 0,
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reader_cache_warm_pin_stays_fixed_and_failed_mutations_keep_observed_bytes()
+    -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join("a.txt"), "needle original\n")?;
+        index(dir.path(), 10).await?;
+        let reader = GenerationReader::open(dir.path())?;
+        let a = &reader.manifest.documents[0];
+        let node = format!("{}:{}", a.id, a.nodes[0].id);
+        reader.read_node(&node, 100)?;
+        fs::write(dir.path().join("b.txt"), "new generation\n")?;
+        index(dir.path(), 10).await?;
+        assert_ne!(GenerationReader::open(dir.path())?.pin(), reader.pin());
+        let before = reader.read_metrics()?;
+        assert_eq!(
+            reader.clone().read_node(&node, 100)?.text,
+            "needle original\n"
+        );
+        assert_eq!(reader.clone().pin(), reader.pin());
+        assert_eq!(reader.read_metrics()?.since(&before)?.cache_hits, 1);
+        let text_path = reader.dir.join("text").join(format!("{}.txt", a.id));
+        fs::write(&text_path, "needle tampered\n")?;
+        let before = reader.read_metrics()?;
+        assert!(reader.read_node(&node, 100).is_err());
+        let failed = reader.read_metrics()?.since(&before)?;
+        assert_eq!(failed.logical_reader_bytes, 0);
+        assert_eq!(failed.cache_hits, 1);
+        assert!(failed.observed_rust_read_bytes >= 16);
+        assert!(failed.observed_hash_bytes >= 16);
+        fs::write(&text_path, "needle original\n")?;
+        fs::write(dir.path().join("a.txt"), "source changed!\n")?;
+        let before = reader.read_metrics()?;
+        assert!(reader.read_node(&node, 100).is_err());
+        let failed = reader.read_metrics()?.since(&before)?;
+        assert_eq!(failed.logical_reader_bytes, 0);
+        assert_eq!(failed.cache_hits, 0);
+        assert!(failed.observed_rust_read_bytes >= 16);
+        fs::write(reader.dir.join("manifest.json"), "{}")?;
+        let before = reader.read_metrics()?;
+        assert!(reader.catalog().is_err());
+        let failed = reader.read_metrics()?.since(&before)?;
+        assert_eq!(failed.observed_rust_read_bytes, 2);
+        assert_eq!(failed.observed_hash_bytes, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn generation_reader_reuses_index_and_matches_single_operations() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(
+            dir.path().join("a.md"),
+            "# Heading\nalpha.beta\nKEY\n中国文档\n",
+        )?;
+        fs::write(dir.path().join("b.txt"), "alphaXbeta\nKEY\n")?;
+        index(dir.path(), 10).await?;
+        let reader = GenerationReader::open(dir.path())?;
+        assert!(reader.index.get().is_none());
+        assert_eq!(reader.catalog()?, catalog(dir.path())?);
+        assert_eq!(
+            reader.tree(Path::new("a.md"))?,
+            tree(dir.path(), Path::new("a.md"))?
+        );
+        assert_eq!(reader.status()?, status(dir.path())?);
+        for (query, literal, insensitive, limit, scope) in [
+            ("alpha.beta", true, false, 10, None),
+            ("^alpha.beta$", false, false, 1, None),
+            ("key", true, true, 10, Some("a.md")),
+            ("中国", true, false, 10, None),
+            ("missing-token", true, false, 10, None),
+        ] {
+            let options = SearchOptions {
+                literal,
+                case_insensitive: insensitive,
+                limit,
+                document: scope.map(str::to_owned),
+                ..regex_options()
+            };
+            let reused = reader.search(query, &options).await?;
+            let single = search(dir.path(), query, &options).await?;
+            assert_eq!(comparable_report(reused)?, comparable_report(single)?);
+        }
+        let first_index = reader.index_session()? as *const _;
+        assert_eq!(first_index, reader.index_session()? as *const _);
+        let id = format!(
+            "{}:{}",
+            reader.manifest.documents[0].id, reader.manifest.documents[0].nodes[0].id
+        );
+        assert_eq!(
+            serde_json::to_value(reader.read_node_window(&id, 5, 0)?)?,
+            serde_json::to_value(read_node_window(dir.path(), &id, 5, 0)?)?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn generation_reader_stays_pinned_during_publication_and_retained_reopen() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join("a.txt"), "old needle\n")?;
+        index(dir.path(), 10).await?;
+        let reader = GenerationReader::open(dir.path())?;
+        let pin = reader.pin();
+        fs::write(dir.path().join("b.txt"), "new needle\n")?;
+        let options = regex_options();
+        let (published, observed) =
+            tokio::join!(index(dir.path(), 10), reader.search("needle", &options));
+        let published = published?;
+        let observed = observed?;
+        assert_ne!(published.generation, pin.generation);
+        assert_eq!(observed.generation, pin.generation);
+        assert_eq!(observed.hits.len(), 1);
+        assert_eq!(observed.hits[0].path, "a.txt");
+        assert_eq!(reader.catalog()?["documents"].as_array().unwrap().len(), 1);
+        let reopened = GenerationReader::open_pinned(dir.path(), &pin)?;
+        assert_eq!(reopened.pin(), pin);
+        assert_eq!(
+            reopened
+                .search("needle", &regex_options())
+                .await?
+                .hits
+                .len(),
+            1
+        );
+        assert_eq!(
+            search(dir.path(), "needle", &regex_options())
+                .await?
+                .hits
+                .len(),
+            2
+        );
+        fs::write(
+            dir.path().join(STATE).join("CURRENT.json"),
+            b"broken current pointer",
+        )?;
+        assert!(GenerationReader::open(dir.path()).is_err());
+        assert_eq!(
+            GenerationReader::open_pinned(dir.path(), &pin)?.catalog()?,
+            reader.catalog()?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn generation_reader_rechecks_sources_text_and_shared_manifest() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join("a.txt"), "needle original\n")?;
+        index(dir.path(), 10).await?;
+        let reader = GenerationReader::open(dir.path())?;
+        let doc = &reader.manifest.documents[0];
+        let id = format!("{}:{}", doc.id, doc.nodes[0].id);
+        reader.search("needle", &regex_options()).await?;
+        fs::write(
+            reader.dir.join("text").join(format!("{}.txt", doc.id)),
+            "needle tampered\n",
+        )?;
+        assert!(reader.search("needle", &regex_options()).await.is_err());
+        assert!(reader.read_node(&id, 100).is_err());
+        fs::write(
+            reader.dir.join("text").join(format!("{}.txt", doc.id)),
+            "needle original\n",
+        )?;
+        fs::write(dir.path().join("a.txt"), "changed source\n")?;
+        assert!(reader.read_node(&id, 100).is_err());
+        assert!(reader.tree(Path::new("a.txt")).is_err());
+        let stale = reader.search("needle", &regex_options()).await?;
+        assert!(stale.hits.is_empty());
+        assert_eq!(stale.coverage.stale_files, ["a.txt"]);
+        fs::write(reader.dir.join("manifest.json"), "{}")?;
+        assert!(reader.catalog().is_err());
+        assert!(reader.status().is_err());
+        assert!(reader.search("needle", &regex_options()).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn generation_pin_rejects_invalid_identity_and_allows_legacy_metadata_reads() -> Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join("a.txt"), "needle\n")?;
+        index(dir.path(), 10).await?;
+        let reader = GenerationReader::open(dir.path())?;
+        let pin = reader.pin();
+        for bad in [
+            GenerationPin {
+                generation: "../escape".into(),
+                ..pin.clone()
+            },
+            GenerationPin {
+                manifest_sha256: "0".repeat(64),
+                ..pin.clone()
+            },
+            GenerationPin {
+                manifest_sha256: "invalid".into(),
+                ..pin.clone()
+            },
+        ] {
+            assert!(GenerationReader::open_pinned(dir.path(), &bad).is_err());
+        }
+        let index_manifest = reader.dir.join("trigram/gptgrep-index.json");
+        let mut value: Value = serde_json::from_slice(&fs::read(&index_manifest)?)?;
+        value["engine_revision"] = json!("legacy-engine");
+        fs::write(index_manifest, serde_json::to_vec(&value)?)?;
+        assert_eq!(reader.catalog()?["documents"].as_array().unwrap().len(), 1);
+        assert!(
+            format!(
+                "{:#}",
+                reader.search("needle", &regex_options()).await.unwrap_err()
+            )
+            .contains("rebuild_required")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn generation_reader_propagates_shared_index_corruption_after_reuse() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join("a.txt"), "needle\n")?;
+        index(dir.path(), 10).await?;
+        let reader = GenerationReader::open(dir.path())?;
+        reader.search("needle", &regex_options()).await?;
+        fs::remove_file(reader.dir.join("trigram/gptgrep-index.json"))?;
+        assert!(reader.search("needle", &regex_options()).await.is_err());
+        assert!(reader.catalog().is_err());
+        assert!(reader.tree(Path::new("a.txt")).is_err());
+        assert!(reader.status().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_node_id_is_rejected_before_opening_a_missing_root() {
+        let error =
+            read_node_window(Path::new("/missing-gptgrep-root"), "bad-id", 100, 0).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("node ID must be document_id:node_id")
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_reader_is_shared_across_threads_while_new_generation_publishes()
+    -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join("a.txt"), "old needle\n")?;
+        index(dir.path(), 10).await?;
+        let reader = Arc::new(GenerationReader::open(dir.path())?);
+        let pin = reader.pin();
+        fs::write(dir.path().join("b.txt"), "new needle\n")?;
+        let barrier = Arc::new(std::sync::Barrier::new(5));
+        let mut threads = Vec::new();
+        for _ in 0..3 {
+            let reader = Arc::clone(&reader);
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || -> Result<Vec<SearchReport>> {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                barrier.wait();
+                runtime.block_on(async {
+                    let mut reports = Vec::new();
+                    for _ in 0..8 {
+                        reports.push(reader.search("needle", &regex_options()).await?);
+                    }
+                    Ok(reports)
+                })
+            }));
+        }
+        let publish_root = dir.path().to_owned();
+        let publish_barrier = Arc::clone(&barrier);
+        let publisher = std::thread::spawn(move || -> Result<IndexReport> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            publish_barrier.wait();
+            runtime.block_on(index(&publish_root, 10))
+        });
+        barrier.wait();
+        assert_ne!(publisher.join().unwrap()?.generation, pin.generation);
+        for thread in threads {
+            for report in thread.join().unwrap()? {
+                assert_eq!(report.generation, pin.generation);
+                assert_eq!(report.hits.len(), 1);
+                assert_eq!(report.hits[0].path, "a.txt");
+            }
+        }
+        assert_eq!(
+            GenerationReader::open(dir.path())?.manifest.documents.len(),
+            2
+        );
+        Ok(())
+    }
+
+    pub(crate) async fn mock_jev(
         statuses: Vec<u16>,
+    ) -> Result<(JevClient, tokio::task::JoinHandle<Vec<Value>>)> {
+        mock_jev_scored(statuses, Arc::new(|_| 3.0)).await
+    }
+
+    /// Like `mock_jev`, with a rubric score (0..3) chosen from each candidate's text.
+    async fn mock_jev_scored(
+        statuses: Vec<u16>,
+        scorer: Arc<dyn Fn(&str) -> f64 + Send + Sync>,
+    ) -> Result<(JevClient, tokio::task::JoinHandle<Vec<Value>>)> {
+        let replies = statuses.into_iter().map(|status| (status, "")).collect();
+        mock_jev_replies(replies, scorer).await
+    }
+
+    /// Scripted statuses, each with extra raw response header lines (CRLF-terminated).
+    async fn mock_jev_replies(
+        replies: Vec<(u16, &'static str)>,
+        scorer: Arc<dyn Fn(&str) -> f64 + Send + Sync>,
     ) -> Result<(JevClient, tokio::task::JoinHandle<Vec<Value>>)> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("http://{}/api/alpha/decisions", listener.local_addr()?);
         let client = JevClient::with_endpoint("synthetic-core-test-key", None, &endpoint)?;
         let server = tokio::spawn(async move {
             let mut bodies = Vec::new();
-            for (ordinal, status) in statuses.into_iter().enumerate() {
+            for (ordinal, (status, headers)) in replies.into_iter().enumerate() {
                 let (mut socket, _) =
                     tokio::time::timeout(Duration::from_secs(5), listener.accept())
                         .await
@@ -1817,15 +3362,18 @@ mod tests {
                     let answers: serde_json::Map<String, Value> = body["questions"]
                         .as_object()
                         .unwrap()
-                        .keys()
-                        .map(|id| {
+                        .iter()
+                        .map(|(id, question)| {
+                            let text = question["instructions"]["candidate"]["text"]
+                                .as_str()
+                                .unwrap_or_default();
                             (
                                 id.clone(),
-                                json!({"type":"score","score":3.0,"confidence":0.9}),
+                                json!({"type":"score","score":scorer(text),"confidence":0.9}),
                             )
                         })
                         .collect();
-                    json!({"model":format!("typesafe/jev-fixture-{ordinal}"),"answers":answers,
+                    json!({"model":"openai/gpt-6-luna-decisions-20261006","answers":answers,
                         "usage":{"input_tokens":100+ordinal,"output_tokens":2,"cost":0.001*(ordinal+1) as f64}}).to_string()
                 } else {
                     "secret-provider-body-sentinel".into()
@@ -1836,7 +3384,7 @@ mod tests {
                     "Service Unavailable"
                 };
                 let wire = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{headers}Connection: close\r\n\r\n{response}",
                     response.len()
                 );
                 socket.write_all(wire.as_bytes()).await.unwrap();
@@ -1844,6 +3392,26 @@ mod tests {
             bodies
         });
         Ok((client, server))
+    }
+
+    /// Rejects every validated reply, as a failed local ledger record or
+    /// caller observer would after the provider completed the submission.
+    pub(crate) struct RejectValidated;
+
+    impl gptgrep_jev::DecisionObserver for RejectValidated {
+        fn send_started(&self, _: &gptgrep_jev::DecisionRequestObservation<'_>) -> Result<()> {
+            Ok(())
+        }
+        fn validated_response(
+            &self,
+            _: &gptgrep_jev::DecisionRequestObservation<'_>,
+            _: &gptgrep_jev::DecisionResponse,
+        ) -> Result<()> {
+            bail!("synthetic-local-ledger-failure")
+        }
+        fn failed(&self, _: &gptgrep_jev::DecisionRequestObservation<'_>) -> Result<()> {
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -2188,7 +3756,7 @@ mod tests {
             "# Scope\nDistinct source evidence.\n",
         )?;
         let indexed = index(directory.path(), unrelated_count + 1).await?;
-        let (client, server) = mock_jev(vec![200, 200]).await?;
+        let (client, server) = mock_jev(vec![200]).await?;
         let events: Arc<Mutex<Vec<JevSearchProgress>>> = Arc::new(Mutex::new(Vec::new()));
         let recorded = events.clone();
         let observer = move |progress: &JevSearchProgress| {
@@ -2206,19 +3774,28 @@ mod tests {
             &observer,
         )
         .await?;
+        // The scope leaves one routing candidate: it is selected without a
+        // routing call, and only the scoped evidence is reranked.
         let requests = server.await?;
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0]["questions"].as_object().unwrap().len(), 1);
-        let route = requests[0]["questions"]["candidate_0"]["instructions"]["candidate"]["text"]
-            .as_str()
-            .unwrap();
-        assert!(route.contains(selected));
-        assert!(!route.contains("unrelated-"));
+        assert_eq!(requests.len(), 1);
+        let candidates = requests[0]["questions"].as_object().unwrap();
+        assert!(!candidates.is_empty());
+        for question in candidates.values() {
+            let text = question["instructions"]["candidate"]["text"]
+                .as_str()
+                .unwrap();
+            assert!(text.starts_with(&format!("Document: {selected}\n")));
+            assert!(!text.contains("unrelated-"));
+        }
         assert!(report.hits.iter().all(|hit| hit.path == selected));
         assert_eq!(report.hits.len(), 1);
         assert_eq!(report.coverage.indexed_files, unrelated_count + 1);
         assert_eq!(report.coverage.scoped_files, 1);
         assert_eq!(report.coverage.routed_documents, 1);
+        assert_eq!(
+            report.coverage.routing_status.as_deref(),
+            Some("skipped_single_document")
+        );
         assert!(report.coverage.semantic_scope_complete);
         assert_eq!(report.document_scope.as_deref(), Some(selected));
         assert_eq!(
@@ -2226,37 +3803,208 @@ mod tests {
                 report.metrics.jev_calls_attempted,
                 report.metrics.jev_requests
             ),
-            (2, 2)
+            (1, 1)
         );
         assert_eq!(
             report.metrics.jev_models,
-            ["typesafe/jev-fixture-0", "typesafe/jev-fixture-1"]
+            ["openai/gpt-6-luna-decisions-20261006"]
+        );
+        // The requested selector and the served canonical build stay separate.
+        assert_eq!(
+            report.metrics.jev_requested_models,
+            [gptgrep_jev::DEFAULT_MODEL]
         );
         let events = events.lock().unwrap();
-        assert_eq!(events.len(), 4);
         assert_eq!(
             events
                 .iter()
                 .map(|event| (event.stage.as_str(), event.event.as_str()))
                 .collect::<Vec<_>>(),
             [
-                ("document_routing", "before_call"),
-                ("document_routing", "after_reply"),
                 ("evidence_reranking", "before_call"),
                 ("evidence_reranking", "after_reply")
             ]
         );
         assert_eq!(
             (
-                events[2].metrics.jev_calls_attempted,
-                events[2].metrics.jev_requests
+                events[1].metrics.jev_calls_attempted,
+                events[1].metrics.jev_requests
             ),
-            (2, 1)
+            (1, 1)
         );
-        assert_eq!(events[2].metrics.jev_usage[0]["cost"], json!(0.001));
+        assert_eq!(events[1].metrics.jev_usage[0]["cost"], json!(0.001));
         assert!(events.iter().all(|event| event.generation.as_deref()
             == Some(indexed.generation.as_str())
             && !event.accounting_complete));
+        Ok(())
+    }
+
+    /// Two indexed documents; `first.md` is the scoped one.
+    async fn two_document_corpus() -> Result<tempfile::TempDir> {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("first.md"),
+            "# Intake\nneedle intake evidence\n# Storage\nshelf storage notes\n# Review\nreview cadence notes\n",
+        )?;
+        fs::write(
+            directory.path().join("second.md"),
+            "# Other\nneedle other evidence\n",
+        )?;
+        index(directory.path(), 10).await?;
+        Ok(directory)
+    }
+
+    #[tokio::test]
+    async fn single_document_routing_is_skipped_with_identical_rerank_input() -> Result<()> {
+        let directory = two_document_corpus().await?;
+        for mode in ["hybrid", "semantic"] {
+            let options = SearchOptions {
+                mode: mode.into(),
+                document: Some("first.md".into()),
+                ..Default::default()
+            };
+            // Reference: the former path, which sent the one-candidate routing call.
+            let route = RouteSingleDocument::enable();
+            let (client, server) = mock_jev(vec![200, 200]).await?;
+            let routed = search_with_client(directory.path(), "needle", &options, &client).await;
+            drop(route);
+            let routed = routed?;
+            let routed_requests = server.await?;
+            assert_eq!(routed_requests.len(), 2, "{mode}");
+            assert_eq!(
+                routed.coverage.routing_status.as_deref(),
+                Some("routed"),
+                "{mode}"
+            );
+            // Default: no routing call; one request fewer.
+            let (client, server) = mock_jev(vec![200]).await?;
+            let skipped = search_with_client(directory.path(), "needle", &options, &client).await?;
+            let skipped_requests = server.await?;
+            assert_eq!(skipped_requests.len(), 1, "{mode}");
+            // The rerank request is identical to the routed path's second request.
+            assert_eq!(
+                serde_json::to_vec(&skipped_requests[0])?,
+                serde_json::to_vec(&routed_requests[1])?,
+                "{mode}"
+            );
+            assert_eq!(
+                skipped.coverage.routing_status.as_deref(),
+                Some("skipped_single_document")
+            );
+            assert_eq!(
+                (
+                    skipped.metrics.jev_calls_attempted,
+                    skipped.metrics.jev_requests
+                ),
+                (1, 1)
+            );
+            assert_eq!(
+                (
+                    routed.metrics.jev_calls_attempted,
+                    routed.metrics.jev_requests
+                ),
+                (2, 2)
+            );
+            // Outputs are otherwise unchanged.
+            let mut skipped_coverage = serde_json::to_value(&skipped.coverage)?;
+            let mut routed_coverage = serde_json::to_value(&routed.coverage)?;
+            skipped_coverage
+                .as_object_mut()
+                .unwrap()
+                .remove("routing_status");
+            routed_coverage
+                .as_object_mut()
+                .unwrap()
+                .remove("routing_status");
+            assert_eq!(skipped_coverage, routed_coverage, "{mode}");
+            assert_eq!(
+                serde_json::to_value(&skipped.hits)?,
+                serde_json::to_value(&routed.hits)?,
+                "{mode}"
+            );
+            assert!(!skipped.hits.is_empty());
+            assert_eq!(skipped.warnings, routed.warnings);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn two_document_scope_still_routes() -> Result<()> {
+        let directory = two_document_corpus().await?;
+        let (client, server) = mock_jev(vec![200, 200]).await?;
+        let report = search_with_client(
+            directory.path(),
+            "needle",
+            &SearchOptions::default(),
+            &client,
+        )
+        .await?;
+        let requests = server.await?;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["questions"].as_object().unwrap().len(), 2);
+        assert_eq!(report.coverage.routed_documents, 2);
+        assert_eq!(report.coverage.routing_status.as_deref(), Some("routed"));
+        assert_eq!(
+            (
+                report.metrics.jev_calls_attempted,
+                report.metrics.jev_requests
+            ),
+            (2, 2)
+        );
+        // Local primitives carry no routing status.
+        let lexical = search(
+            directory.path(),
+            "needle",
+            &SearchOptions {
+                mode: "lexical".into(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(lexical.coverage.routing_status, None);
+        assert!(!serde_json::to_string(&lexical.coverage)?.contains("routing_status"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shared_decisions_context_spans_routing_reranking_and_later_searches() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("subject.txt"),
+            "needle source evidence",
+        )?;
+        fs::write(directory.path().join("other.txt"), "other background")?;
+        index(directory.path(), 10).await?;
+        let (client, server) = mock_jev(vec![200, 200]).await?;
+        let context = gptgrep_jev::ExecutionContext::new(
+            "ordinary-shared-search-test",
+            &"a".repeat(64),
+            std::time::SystemTime::now() + Duration::from_secs(10),
+            2,
+        )?;
+        let client = client.with_execution_context(context.clone());
+        let options = SearchOptions::default();
+        let report =
+            search_with_client(directory.path(), "needle", &options, &client.clone()).await?;
+        assert_eq!(report.metrics.jev_requests, 2);
+        assert_eq!(
+            report.metrics.jev_models,
+            [
+                "openai/gpt-6-luna-decisions-20261006",
+                "openai/gpt-6-luna-decisions-20261006"
+            ]
+        );
+        assert_eq!(server.await?.len(), 2);
+        let snapshot = context.snapshot()?;
+        assert_eq!(snapshot.logical_reservations, 2);
+        assert_eq!(snapshot.send_start_observations, 2);
+        assert_eq!(snapshot.terminal_submissions, 2);
+        assert!(
+            search_with_client(directory.path(), "needle", &options, &client)
+                .await
+                .is_err()
+        );
+        assert_eq!(context.snapshot()?.logical_reservations, 2);
         Ok(())
     }
 
@@ -2267,15 +4015,13 @@ mod tests {
             directory.path().join("subject.txt"),
             "needle source evidence",
         )?;
+        fs::write(directory.path().join("other.txt"), "other background")?;
         let indexed = index(directory.path(), 10).await?;
         let (client, server) = mock_jev(vec![200, 503]).await?;
         let error = search_with_client(
             directory.path(),
             "needle",
-            &SearchOptions {
-                document: Some("subject.txt".into()),
-                ..Default::default()
-            },
+            &SearchOptions::default(),
             &client,
         )
         .await
@@ -2293,10 +4039,18 @@ mod tests {
             ),
             (2, 1)
         );
-        assert_eq!(failure.metrics.jev_models, ["typesafe/jev-fixture-0"]);
+        assert_eq!(
+            failure.metrics.jev_models,
+            ["openai/gpt-6-luna-decisions-20261006"]
+        );
+        // Both attempts, including the failed one, retain their requested selector.
+        assert_eq!(
+            failure.metrics.jev_requested_models,
+            [gptgrep_jev::DEFAULT_MODEL, gptgrep_jev::DEFAULT_MODEL]
+        );
         assert_eq!(failure.metrics.jev_usage[0]["cost"], json!(0.001));
-        assert_eq!(failure.coverage.scoped_files, 1);
-        assert_eq!(failure.document_scope.as_deref(), Some("subject.txt"));
+        assert_eq!(failure.coverage.scoped_files, 2);
+        assert_eq!(failure.document_scope, None);
         assert_eq!(
             failure.generation.as_deref(),
             Some(indexed.generation.as_str())
@@ -2315,6 +4069,7 @@ mod tests {
     async fn failed_first_stage_has_an_attempt_and_unknown_accounting() -> Result<()> {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("subject.txt"), "source evidence")?;
+        fs::write(directory.path().join("other.txt"), "other background")?;
         index(directory.path(), 10).await?;
         let (client, server) = mock_jev(vec![503]).await?;
         let error = search_with_client(
@@ -2341,9 +4096,809 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transient_status_is_retried_once_and_both_attempts_are_accounted() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("first.txt"), "needle first evidence")?;
+        fs::write(
+            directory.path().join("second.txt"),
+            "needle second evidence",
+        )?;
+        index(directory.path(), 10).await?;
+        let (client, server) = mock_jev(vec![502, 200, 200]).await?;
+        let client = client.with_transient_retry(TransientRetry::with_jitter(|| 0.0));
+        let events: Arc<Mutex<Vec<JevSearchProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = events.clone();
+        let observer = move |progress: &JevSearchProgress| {
+            recorded.lock().unwrap().push(progress.clone());
+            Ok(())
+        };
+        let report = search_with_client_and_observer(
+            directory.path(),
+            "needle",
+            &SearchOptions::default(),
+            &client,
+            &observer,
+        )
+        .await?;
+        let requests = server.await?;
+        assert_eq!(requests.len(), 3);
+        // The retry repeats the identical routing request.
+        assert_eq!(requests[0], requests[1]);
+        assert_eq!(
+            (
+                report.metrics.jev_calls_attempted,
+                report.metrics.jev_requests
+            ),
+            (3, 2)
+        );
+        assert_eq!(report.metrics.jev_requested_models.len(), 3);
+        // Only validated replies carry usage; the failed attempt stays unknown.
+        assert_eq!(report.metrics.jev_usage.len(), 2);
+        assert_eq!(report.metrics.jev_retried_attempts.len(), 1);
+        let retried = &report.metrics.jev_retried_attempts[0];
+        assert_eq!(retried.stage, "document_routing");
+        assert_eq!(retried.attempt.attempt, 1);
+        assert_eq!(retried.attempt.http_status, Some(502));
+        assert!(retried.attempt.reported_usage.is_none());
+        let metrics = serde_json::to_value(&report.metrics)?;
+        assert_eq!(
+            metrics["jev_retried_attempts"][0]["reported_usage"],
+            Value::Null
+        );
+        assert_eq!(
+            metrics["jev_retried_attempts"][0]["stage"],
+            "document_routing"
+        );
+        let roundtrip: Metrics = serde_json::from_value(metrics)?;
+        assert_eq!(
+            roundtrip.jev_retried_attempts,
+            report.metrics.jev_retried_attempts
+        );
+        assert!(!report.hits.is_empty());
+        let events = events.lock().unwrap();
+        let routing: Vec<_> = events
+            .iter()
+            .filter(|event| event.stage == "document_routing")
+            .map(|event| event.event.as_str())
+            .collect();
+        assert_eq!(routing, ["before_call", "before_retry", "after_reply"]);
+        // The retry is counted, with its failed predecessor, before it is sent.
+        let retry = events
+            .iter()
+            .find(|event| event.event == "before_retry")
+            .unwrap();
+        assert_eq!(
+            (
+                retry.metrics.jev_calls_attempted,
+                retry.metrics.jev_requests,
+                retry.metrics.jev_retried_attempts.len()
+            ),
+            (2, 0, 1)
+        );
+        let routed = events
+            .iter()
+            .find(|event| event.stage == "document_routing" && event.event == "after_reply")
+            .unwrap();
+        assert_eq!(routed.metrics.jev_retried_attempts.len(), 1);
+        assert_eq!(
+            (
+                routed.metrics.jev_calls_attempted,
+                routed.metrics.jev_requests
+            ),
+            (2, 1)
+        );
+        Ok(())
+    }
+
+    /// One document, so the rerank is the only logical call.
+    async fn one_document_corpus() -> Result<tempfile::TempDir> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("only.txt"), "needle only evidence")?;
+        index(directory.path(), 10).await?;
+        Ok(directory)
+    }
+
+    #[tokio::test]
+    async fn admitted_retry_is_recorded_before_it_is_sent_and_survives_cancellation() -> Result<()>
+    {
+        let directory = one_document_corpus().await?;
+        // The rerank gets HTTP 502, then its admitted retry hangs in flight.
+        let (client, server) = mock_jev(vec![502, 0]).await?;
+        let context = gptgrep_jev::ExecutionContext::new(
+            "synthetic-retry-cancellation",
+            &"c".repeat(64),
+            std::time::SystemTime::now() + Duration::from_secs(60),
+            4,
+        )?;
+        let client = client
+            .with_execution_context(context.clone())
+            .with_transient_retry(TransientRetry::with_jitter(|| 0.0));
+        let events: Arc<Mutex<Vec<JevSearchProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = events.clone();
+        let observer = move |progress: &JevSearchProgress| {
+            recorded.lock().unwrap().push(progress.clone());
+            Ok(())
+        };
+        let options = SearchOptions::default();
+        let mut search = Box::pin(search_with_client_and_observer(
+            directory.path(),
+            "needle",
+            &options,
+            &client,
+            &observer,
+        ));
+        // Drive the search until the retry has been sent, then cancel it.
+        let started = tokio::time::Instant::now();
+        while context.snapshot()?.send_start_observations < 2 {
+            tokio::select! {
+                _ = &mut search => panic!("a hanging retry cannot complete"),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "retry never sent"
+            );
+        }
+        drop(search);
+        server.abort();
+        let snapshot = context.snapshot()?;
+        assert_eq!(snapshot.logical_reservations, 2);
+        let events = events.lock().unwrap();
+        let last = events.last().unwrap();
+        assert_eq!(
+            (last.stage.as_str(), last.event.as_str()),
+            ("evidence_reranking", "before_retry")
+        );
+        // Both submissions are on record although the logical call never returned.
+        assert_eq!(
+            (last.metrics.jev_calls_attempted, last.metrics.jev_requests),
+            (2, 0)
+        );
+        assert_eq!(last.metrics.jev_requested_models.len(), 2);
+        assert!(last.metrics.jev_usage.is_empty());
+        let retried = &last.metrics.jev_retried_attempts;
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0].stage, "evidence_reranking");
+        assert_eq!(retried[0].attempt.http_status, Some(502));
+        assert!(retried[0].attempt.reported_usage.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refused_before_retry_receipt_stops_the_retry_and_keeps_its_attempt() -> Result<()> {
+        let directory = one_document_corpus().await?;
+        let (client, server) = mock_jev(vec![502]).await?;
+        let client = client.with_transient_retry(TransientRetry::with_jitter(|| 0.0));
+        let observer = |progress: &JevSearchProgress| {
+            anyhow::ensure!(progress.event != "before_retry", "synthetic-ledger-refusal");
+            Ok(())
+        };
+        let error = search_with_client_and_observer(
+            directory.path(),
+            "needle",
+            &SearchOptions::default(),
+            &client,
+            &observer,
+        )
+        .await
+        .unwrap_err();
+        // No retry is sent when its receipt cannot be recorded.
+        assert_eq!(server.await?.len(), 1);
+        let failure = error
+            .downcast_ref::<JevSearchError>()
+            .context("missing typed Jev error")?;
+        assert_eq!(failure.stage, "evidence_reranking");
+        assert_eq!(
+            failure.cause,
+            "Jev progress observer failed before the bounded retry; the retry was not sent"
+        );
+        // The stopped retry stays a logical attempt; no usage is invented.
+        assert_eq!(
+            (
+                failure.metrics.jev_calls_attempted,
+                failure.metrics.jev_requests
+            ),
+            (2, 0)
+        );
+        assert!(failure.metrics.jev_usage.is_empty());
+        assert_eq!(failure.metrics.jev_retried_attempts.len(), 1);
+        assert_eq!(
+            failure.metrics.jev_retried_attempts[0].attempt.http_status,
+            Some(502)
+        );
+        assert!(!format!("{error:#}").contains("synthetic-ledger-refusal"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repeated_transient_failure_keeps_both_attempts_in_typed_error() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("first.txt"), "needle first evidence")?;
+        fs::write(
+            directory.path().join("second.txt"),
+            "needle second evidence",
+        )?;
+        index(directory.path(), 10).await?;
+        let (client, server) = mock_jev(vec![200, 503, 503]).await?;
+        let client = client.with_transient_retry(TransientRetry::with_jitter(|| 0.0));
+        let error = search_with_client(
+            directory.path(),
+            "needle",
+            &SearchOptions::default(),
+            &client,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(server.await?.len(), 3);
+        let failure = error
+            .downcast_ref::<JevSearchError>()
+            .context("missing typed Jev error")?;
+        assert_eq!(failure.stage, "evidence_reranking");
+        assert_eq!(
+            (
+                failure.metrics.jev_calls_attempted,
+                failure.metrics.jev_requests
+            ),
+            (3, 1)
+        );
+        assert_eq!(failure.metrics.jev_usage.len(), 1);
+        assert_eq!(failure.metrics.jev_retried_attempts.len(), 1);
+        assert_eq!(
+            failure.metrics.jev_retried_attempts[0].stage,
+            "evidence_reranking"
+        );
+        assert_eq!(
+            failure.metrics.jev_retried_attempts[0].attempt.http_status,
+            Some(503)
+        );
+        assert!(failure.cause.contains("after one bounded retry"));
+        assert!(failure.cause.contains("attempt 2: HTTP 503"));
+        assert!(!failure.accounting_complete);
+        let serialized = serde_json::to_string(failure)?;
+        assert!(!serialized.contains("secret-provider-body-sentinel"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn validated_retry_reply_keeps_its_usage_when_a_local_step_fails() -> Result<()> {
+        let directory = one_document_corpus().await?;
+        // The rerank gets HTTP 502; its retry is sent and validated, then a
+        // local observer step rejects the reply.
+        let (client, server) = mock_jev(vec![502, 200]).await?;
+        let client = client
+            .with_transient_retry(TransientRetry::with_jitter(|| 0.0))
+            .with_decision_observer(Arc::new(RejectValidated));
+        let events: Arc<Mutex<Vec<JevSearchProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = events.clone();
+        let observer = move |progress: &JevSearchProgress| {
+            recorded.lock().unwrap().push(progress.clone());
+            Ok(())
+        };
+        let error = search_with_client_and_observer(
+            directory.path(),
+            "needle",
+            &SearchOptions::default(),
+            &client,
+            &observer,
+        )
+        .await
+        .unwrap_err();
+        // Both submissions were sent.
+        assert_eq!(server.await?.len(), 2);
+        let failure = error
+            .downcast_ref::<JevSearchError>()
+            .context("missing typed Jev error")?;
+        assert_eq!(failure.stage, "evidence_reranking");
+        assert_eq!(
+            (
+                failure.metrics.jev_calls_attempted,
+                failure.metrics.jev_requests
+            ),
+            (2, 1)
+        );
+        // The validated retry's served model and checked usage are kept; the
+        // failed first attempt stays unknown, never zero.
+        assert_eq!(
+            failure.metrics.jev_models,
+            ["openai/gpt-6-luna-decisions-20261006"]
+        );
+        assert_eq!(
+            failure.metrics.jev_usage,
+            [json!({"input_tokens":101,"output_tokens":2,"cost":0.002})]
+        );
+        assert_eq!(failure.metrics.jev_requested_models.len(), 2);
+        let retried = &failure.metrics.jev_retried_attempts;
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0].attempt.http_status, Some(502));
+        assert!(retried[0].attempt.reported_usage.is_none());
+        assert!(
+            failure.cause.contains("attempt 2: sent and validated"),
+            "{}",
+            failure.cause
+        );
+        assert!(failure.cause.contains("its reported usage is retained"));
+        assert!(!failure.accounting_complete);
+        assert!(!format!("{error:#}").contains("synthetic-local-ledger-failure"));
+        let roundtrip: JevSearchError = serde_json::from_str(&serde_json::to_string(failure)?)?;
+        assert_eq!(roundtrip.metrics.jev_usage, failure.metrics.jev_usage);
+        // The retry was on record before it was sent.
+        let events = events.lock().unwrap();
+        let retry = events
+            .iter()
+            .find(|event| event.event == "before_retry")
+            .unwrap();
+        assert_eq!(
+            (
+                retry.metrics.jev_calls_attempted,
+                retry.metrics.jev_requests
+            ),
+            (2, 0)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn initial_observer_failures_count_only_validated_provider_replies() -> Result<()> {
+        struct RejectInitial {
+            before_send: bool,
+        }
+        impl gptgrep_jev::DecisionObserver for RejectInitial {
+            fn send_started(&self, _: &gptgrep_jev::DecisionRequestObservation<'_>) -> Result<()> {
+                ensure!(!self.before_send, "synthetic-private-send-error");
+                Ok(())
+            }
+            fn validated_response(
+                &self,
+                _: &gptgrep_jev::DecisionRequestObservation<'_>,
+                _: &gptgrep_jev::DecisionResponse,
+            ) -> Result<()> {
+                bail!("synthetic-private-validated-error")
+            }
+            fn failed(&self, _: &gptgrep_jev::DecisionRequestObservation<'_>) -> Result<()> {
+                bail!("synthetic-private-failed-error")
+            }
+        }
+        let directory = one_document_corpus().await?;
+        for (before_send, http_status) in [(false, 200), (true, 200), (false, 503)] {
+            let (client, server) = mock_jev(if before_send {
+                vec![]
+            } else {
+                vec![http_status]
+            })
+            .await?;
+            let client = client
+                .with_transient_retry(TransientRetry::with_jitter(|| 0.0))
+                .with_decision_observer(Arc::new(RejectInitial { before_send }));
+            let error = search_with_client(
+                directory.path(),
+                "needle",
+                &SearchOptions::default(),
+                &client,
+            )
+            .await
+            .unwrap_err();
+            let requests = usize::from(!before_send);
+            let validated = usize::from(!before_send && http_status == 200);
+            assert_eq!(server.await?.len(), requests);
+            let failure = error.downcast_ref::<JevSearchError>().unwrap();
+            assert_eq!(failure.stage, "evidence_reranking");
+            assert_eq!(failure.metrics.jev_calls_attempted, 1);
+            assert_eq!(failure.metrics.jev_requests, validated);
+            assert_eq!(
+                failure.metrics.jev_requested_models,
+                [gptgrep_jev::DEFAULT_MODEL]
+            );
+            assert!(failure.metrics.jev_retried_attempts.is_empty());
+            if validated == 0 {
+                assert!(failure.metrics.jev_models.is_empty());
+                assert!(failure.metrics.jev_usage.is_empty());
+            } else {
+                assert_eq!(
+                    failure.metrics.jev_models,
+                    ["openai/gpt-6-luna-decisions-20261006"]
+                );
+                assert_eq!(
+                    failure.metrics.jev_usage,
+                    [json!({"input_tokens":100,"output_tokens":2,"cost":0.001})]
+                );
+            }
+            assert!(!failure.accounting_complete);
+            let serialized = serde_json::to_string(failure)?;
+            assert!(!serialized.contains("synthetic-private-"));
+            assert!(serialized.contains("observer callbacks failed"));
+            if http_status == 503 {
+                assert!(failure.cause.contains("HTTP 503"));
+                assert!(failure.cause.contains("observer callbacks failed: failed"));
+                assert!(!serialized.contains("secret-provider-body-sentinel"));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn checked_usage_keeps_reported_fields_and_never_invents_zero() {
+        use UsagePresence::{Absent, Invalid, Null, Reported};
+        fn observation<T>(presence: UsagePresence, value: Option<T>) -> UsageObservation<T> {
+            UsageObservation { presence, value }
+        }
+        let usage = |input_tokens, output_tokens, cost| FailedResponseUsage {
+            input_tokens,
+            output_tokens,
+            cost,
+        };
+        assert_eq!(
+            checked_usage(&usage(
+                observation(Reported, Some(7)),
+                observation(Reported, Some(1)),
+                observation(Reported, Some(0.0002)),
+            )),
+            json!({"input_tokens":7,"output_tokens":1,"cost":0.0002})
+        );
+        // A reply without usage (or with only null fields) has unknown usage.
+        assert_eq!(
+            checked_usage(&usage(
+                observation(Null, None),
+                observation(Null, None),
+                observation(Null, None),
+            )),
+            Value::Null
+        );
+        assert_eq!(
+            checked_usage(&usage(
+                observation(Absent, None),
+                observation(Null, None),
+                observation(Invalid, None),
+            )),
+            json!({"output_tokens":null,"cost":null})
+        );
+        assert_eq!(
+            checked_usage(&usage(
+                observation(Absent, None),
+                observation(Absent, None),
+                observation(Reported, Some(0.001)),
+            )),
+            json!({"cost":0.001})
+        );
+    }
+
+    #[tokio::test]
+    async fn unusable_retry_after_is_named_in_the_search_failure() -> Result<()> {
+        let directory = one_document_corpus().await?;
+        let (client, server) = mock_jev_replies(
+            vec![(503, "Retry-After: Wed, 21 Oct 2099 07:28:00 GMT\r\n")],
+            Arc::new(|_| 3.0),
+        )
+        .await?;
+        let client = client.with_transient_retry(TransientRetry::with_jitter(|| 0.0));
+        let error = search_with_client(
+            directory.path(),
+            "needle",
+            &SearchOptions::default(),
+            &client,
+        )
+        .await
+        .unwrap_err();
+        // The unusable wait refuses the retry: exactly one submission.
+        assert_eq!(server.await?.len(), 1);
+        let failure = error
+            .downcast_ref::<JevSearchError>()
+            .context("missing typed Jev error")?;
+        assert_eq!(
+            failure.cause,
+            "Jev provider returned HTTP 503; request was not retried because its Retry-After was not a non-negative integer number of seconds"
+        );
+        assert_eq!(
+            (
+                failure.metrics.jev_calls_attempted,
+                failure.metrics.jev_requests
+            ),
+            (1, 0)
+        );
+        assert!(failure.metrics.jev_retried_attempts.is_empty());
+        assert!(failure.metrics.jev_usage.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exhausted_submission_budget_is_reported_as_such() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("first.txt"), "needle first evidence")?;
+        fs::write(
+            directory.path().join("second.txt"),
+            "needle second evidence",
+        )?;
+        index(directory.path(), 10).await?;
+        // Routing uses the only submission; the rerank cannot be reserved.
+        let (client, server) = mock_jev(vec![200]).await?;
+        let context = gptgrep_jev::ExecutionContext::new(
+            "synthetic-budget-exhaustion",
+            &"e".repeat(64),
+            std::time::SystemTime::now() + Duration::from_secs(30),
+            1,
+        )?;
+        let client = client
+            .with_execution_context(context.clone())
+            .with_transient_retry(TransientRetry::with_jitter(|| 0.0));
+        let error = search_with_client(
+            directory.path(),
+            "needle",
+            &SearchOptions::default(),
+            &client,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(server.await?.len(), 1);
+        let failure = error
+            .downcast_ref::<JevSearchError>()
+            .context("missing typed Jev error")?;
+        assert_eq!(failure.stage, "evidence_reranking");
+        assert_eq!(
+            failure.cause,
+            "Decisions submission budget exhausted; the call was not sent; no local fallback"
+        );
+        assert_eq!(
+            (
+                failure.metrics.jev_calls_attempted,
+                failure.metrics.jev_requests
+            ),
+            (2, 1)
+        );
+        assert_eq!(context.snapshot()?.logical_reservations, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn default_search_client_uses_the_bounded_retry_but_keeps_supplied_policy() {
+        let endpoint = "http://127.0.0.1:9/api/alpha/decisions";
+        let plain = JevClient::with_endpoint("synthetic-core-test-key", None, endpoint).unwrap();
+        assert!(plain.transient_retry().is_none());
+        assert!(default_retrieval_client(plain).transient_retry().is_some());
+        let supplied = JevClient::with_endpoint("synthetic-core-test-key", None, endpoint)
+            .unwrap()
+            .with_transient_retry(TransientRetry::with_jitter(|| 1.0));
+        assert_eq!(
+            default_retrieval_client(supplied)
+                .transient_retry()
+                .unwrap()
+                .backoff(),
+            Duration::from_millis(1000)
+        );
+    }
+
+    /// One document whose leaf sections carry distinct synthetic markers.
+    async fn floor_corpus() -> Result<tempfile::TempDir> {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("notes.md"),
+            "# Alpha\nmarker-a quartz entry\n# Beta\nmarker-b slate entry\n# Gamma\nmarker-c basalt entry\n# Delta\nmarker-d marble entry\n# Epsilon\nmarker-e chalk entry\n",
+        )?;
+        index(directory.path(), 10).await?;
+        Ok(directory)
+    }
+
+    /// Rubric scores below the 0.5 floor (1.5 of 3), distinct per section.
+    fn below_floor_score(text: &str) -> f64 {
+        [
+            ("marker-a", 0.3),
+            ("marker-b", 1.2),
+            ("marker-c", 0.0),
+            ("marker-d", 0.9),
+            ("marker-e", 0.6),
+        ]
+        .iter()
+        .find(|(marker, _)| text.contains(marker))
+        .map_or(0.0, |(_, score)| *score)
+    }
+
+    #[tokio::test]
+    async fn all_candidates_below_floor_deliver_top_three_flagged_low_confidence() -> Result<()> {
+        let directory = floor_corpus().await?;
+        let (client, server) = mock_jev_scored(vec![200], Arc::new(below_floor_score)).await?;
+        let report = search_with_client(
+            directory.path(),
+            "unrelated survey question",
+            &SearchOptions {
+                mode: "semantic".into(),
+                ..Default::default()
+            },
+            &client,
+        )
+        .await?;
+        assert_eq!(server.await?.len(), 1);
+        assert_eq!(report.coverage.reranked_candidates, 5);
+        // None passed the floor; the best three by score are delivered, flagged.
+        assert_eq!(report.coverage.filtered_candidates, 5);
+        assert_eq!(report.coverage.below_threshold_fallback, 3);
+        assert_eq!(report.minimum_relevance_score, Some(0.5));
+        let delivered: Vec<_> = report.hits.iter().map(|hit| hit.title.as_str()).collect();
+        assert_eq!(delivered, ["Beta", "Delta", "Epsilon"]);
+        assert!(
+            report
+                .hits
+                .windows(2)
+                .all(|pair| pair[0].score > pair[1].score)
+        );
+        assert!(
+            report
+                .hits
+                .iter()
+                .all(|hit| hit.below_threshold && hit.score < 0.5 && !hit.literal_anchor)
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("low-confidence candidates"))
+        );
+        let value = serde_json::to_value(&report)?;
+        assert_eq!(value["hits"][0]["below_threshold"], true);
+        assert_eq!(value["coverage"]["below_threshold_fallback"], 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fallback_count_and_warning_describe_only_delivered_hits() -> Result<()> {
+        let directory = floor_corpus().await?;
+        let (client, server) = mock_jev_scored(vec![200], Arc::new(below_floor_score)).await?;
+        let limited = search_with_client(
+            directory.path(),
+            "unrelated survey question",
+            &SearchOptions {
+                mode: "semantic".into(),
+                limit: 1,
+                ..Default::default()
+            },
+            &client,
+        )
+        .await?;
+        server.await?;
+        // The result limit keeps one flagged candidate; the count matches it.
+        assert_eq!(limited.hits.len(), 1);
+        assert_eq!(limited.hits[0].title, "Beta");
+        assert!(limited.hits[0].is_below_threshold_fallback());
+        assert_eq!(limited.coverage.below_threshold_fallback, 1);
+        assert!(limited.coverage.truncated);
+        let warnings: Vec<_> = limited
+            .warnings
+            .iter()
+            .filter(|warning| warning.contains("low-confidence candidates"))
+            .collect();
+        assert_eq!(warnings.len(), 1);
+        assert!(!warnings[0].contains("top 3"));
+        // A fallback candidate whose source changes before delivery is neither
+        // delivered nor counted, and no low-confidence delivery is announced.
+        let changed = directory.path().join("notes.md");
+        let (client, server) = mock_jev_scored(
+            vec![200],
+            Arc::new(move |text: &str| {
+                fs::write(&changed, "# Alpha\nchanged after reranking\n").unwrap();
+                below_floor_score(text)
+            }),
+        )
+        .await?;
+        let stale = search_with_client(
+            directory.path(),
+            "unrelated survey question",
+            &SearchOptions {
+                mode: "semantic".into(),
+                ..Default::default()
+            },
+            &client,
+        )
+        .await?;
+        server.await?;
+        assert!(stale.hits.is_empty());
+        assert_eq!(stale.coverage.below_threshold_fallback, 0);
+        assert_eq!(stale.coverage.stale_files, ["notes.md"]);
+        assert!(
+            !stale
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("low-confidence"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_passing_candidate_keeps_the_floor_without_fallback() -> Result<()> {
+        let directory = floor_corpus().await?;
+        let (client, server) = mock_jev_scored(
+            vec![200],
+            Arc::new(|text: &str| {
+                if text.contains("marker-c") {
+                    2.4
+                } else {
+                    below_floor_score(text)
+                }
+            }),
+        )
+        .await?;
+        let report = search_with_client(
+            directory.path(),
+            "unrelated survey question",
+            &SearchOptions {
+                mode: "semantic".into(),
+                ..Default::default()
+            },
+            &client,
+        )
+        .await?;
+        server.await?;
+        assert_eq!(report.hits.len(), 1);
+        assert_eq!(report.hits[0].title, "Gamma");
+        assert!(!report.hits[0].below_threshold);
+        assert_eq!(report.coverage.filtered_candidates, 4);
+        assert_eq!(report.coverage.below_threshold_fallback, 0);
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("low-confidence"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_floor_and_literal_anchor_stay_truthful() -> Result<()> {
+        let directory = floor_corpus().await?;
+        // A literal anchor below the floor passes as an anchor: no fallback,
+        // but its score is still flagged as below the floor.
+        let (client, server) = mock_jev_scored(vec![200], Arc::new(below_floor_score)).await?;
+        let anchored = search_with_client(
+            directory.path(),
+            "quartz",
+            &SearchOptions::default(),
+            &client,
+        )
+        .await?;
+        server.await?;
+        assert_eq!(anchored.coverage.below_threshold_fallback, 0);
+        assert_eq!(anchored.coverage.retained_literal_anchors, 1);
+        assert_eq!(anchored.hits.len(), 1);
+        assert!(anchored.hits[0].literal_anchor && anchored.hits[0].below_threshold);
+        // An explicit stricter floor: every candidate scores 2/3, so the
+        // fallback is flagged against the requested floor, never as passing.
+        let (client, server) = mock_jev_scored(vec![200], Arc::new(|_| 2.0)).await?;
+        let strict = search_with_client(
+            directory.path(),
+            "unrelated survey question",
+            &SearchOptions {
+                mode: "semantic".into(),
+                min_score: 0.9,
+                ..Default::default()
+            },
+            &client,
+        )
+        .await?;
+        server.await?;
+        assert_eq!(strict.minimum_relevance_score, Some(0.9));
+        assert_eq!(strict.coverage.below_threshold_fallback, 3);
+        assert!(strict.hits.iter().all(|hit| hit.below_threshold));
+        assert!(
+            strict
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("relevance floor 0.9"))
+        );
+        // Local modes apply no floor and never flag hits.
+        let lexical = search(
+            directory.path(),
+            "quartz",
+            &SearchOptions {
+                mode: "lexical".into(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert!(lexical.hits.iter().all(|hit| !hit.below_threshold));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn observer_failure_after_routing_stops_before_next_provider_call() -> Result<()> {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("subject.txt"), "source evidence")?;
+        fs::write(directory.path().join("other.txt"), "other background")?;
         index(directory.path(), 10).await?;
         let (client, server) = mock_jev(vec![200]).await?;
         let observer = |progress: &JevSearchProgress| {
@@ -2384,6 +4939,7 @@ mod tests {
     async fn cancellation_retains_prior_reply_in_progress_receipts() -> Result<()> {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join("subject.txt"), "source evidence")?;
+        fs::write(directory.path().join("other.txt"), "other background")?;
         index(directory.path(), 10).await?;
         let (client, server) = mock_jev(vec![200, 0]).await?;
         let events: Arc<Mutex<Vec<JevSearchProgress>>> = Arc::new(Mutex::new(Vec::new()));
@@ -2428,6 +4984,107 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn candidate_terms_drop_function_words_and_short_ascii_tokens() {
+        assert_eq!(
+            candidate_terms("What is the role of a Q3 2019 report in 杭州, per the report?"),
+            ["role", "q3", "2019", "report", "杭州"]
+        );
+        // Tokens with digits are kept at any length; other short ASCII tokens drop.
+        assert_eq!(candidate_terms("Is 7 of 12 ok"), ["7", "12"]);
+        // A query of only dropped tokens keeps its tokens.
+        assert_eq!(candidate_terms("is it on"), ["is", "it", "on"]);
+        assert_eq!(
+            candidate_terms("Ledger LEDGER ledger_2"),
+            ["ledger", "ledger_2"]
+        );
+    }
+
+    #[test]
+    fn rarer_terms_rank_first_absent_last_and_ties_keep_question_order() {
+        let terms: Vec<String> = (0..20).map(|i| format!("term{i:02}")).collect();
+        let mut frequencies = vec![5; 20];
+        frequencies[17] = 1;
+        frequencies[19] = 1;
+        frequencies[3] = 0;
+        frequencies[2] = 2;
+        let ranked = rank_terms(terms, &frequencies);
+        assert_eq!(ranked.len(), MAX_LEXICAL_TERMS);
+        assert_eq!(ranked[..3], ["term17", "term19", "term02"]);
+        // Equal frequencies keep first occurrence; the absent term sorts last.
+        assert_eq!(ranked[3..6], ["term00", "term01", "term04"]);
+        assert!(!ranked.contains(&"term03".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn long_question_keeps_distinctive_terms_after_position_sixteen() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let common = [
+            "ledger", "archive", "record", "entry", "update", "review", "status", "note", "budget",
+            "office", "region", "quarter", "metric", "policy", "summary", "filler",
+        ];
+        for index in 0..4 {
+            fs::write(
+                directory.path().join(format!("common-{index}.txt")),
+                format!("{}\nroutine page {index}\n", common.join(" ")),
+            )?;
+        }
+        fs::write(
+            directory.path().join("rare.txt"),
+            format!("{}\nThe zirconium flask holds quinoa.\n", common.join(" ")),
+        )?;
+        index(directory.path(), 10).await?;
+        // Sixteen shared terms come first; the distinctive ones follow them.
+        let question = format!(
+            "Which of the {} lines also mention zirconium and quinoa?",
+            common.join(" ")
+        );
+        let snapshot = Snapshot::open(directory.path())?;
+        let selected = lexical_terms(&snapshot, &question, None)?;
+        assert_eq!(selected.len(), MAX_LEXICAL_TERMS);
+        assert_eq!(selected[..2], ["zirconium", "quinoa"]);
+        // Equal document frequencies keep question order; the last two drop.
+        assert_eq!(selected[2..], common[..14]);
+        // Deterministic across runs and fresh snapshots.
+        assert_eq!(selected, lexical_terms(&snapshot, &question, None)?);
+        assert_eq!(
+            selected,
+            lexical_terms(&Snapshot::open(directory.path())?, &question, None)?
+        );
+        // Previously the first sixteen tokens filled the cap and no lexical
+        // candidate reached the distinctive line.
+        let report = search(
+            directory.path(),
+            &question,
+            &SearchOptions {
+                mode: "lexical".into(),
+                limit: 1,
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(report.hits[0].path, "rare.txt");
+        assert!(report.hits[0].text.contains("zirconium"));
+        // Scoped frequencies use only the selected document.
+        let scoped = lexical_terms(
+            &snapshot,
+            &question,
+            Some(Path::new(&format!(
+                "{}.txt",
+                snapshot
+                    .manifest
+                    .documents
+                    .iter()
+                    .find(|document| document.path == "common-0.txt")
+                    .unwrap()
+                    .id
+            ))),
+        )?;
+        // Absent distinctive terms sort last within one common document.
+        assert_eq!(scoped[..], common[..]);
+        Ok(())
+    }
+
+    #[test]
     fn unicode_boundaries() {
         assert_eq!(truncate("文档abc", 4), ("文", true));
     }
@@ -2440,7 +5097,7 @@ mod tests {
     #[test]
     fn lexical_is_not_semantic() {
         assert_eq!(
-            lexical_score("car speed", &tokens("automobile velocity")),
+            lexical_score("car speed", &candidate_terms("automobile velocity")),
             0.0
         );
     }
@@ -2586,13 +5243,14 @@ mod tests {
                 ..Default::default()
             };
             let report = if mode == "hybrid" {
-                let (client, server) = mock_jev(vec![200, 200]).await?;
+                // One indexed document: routing selects it without a call.
+                let (client, server) = mock_jev(vec![200]).await?;
                 let report =
                     search_with_client(directory.path(), "saffron capacitor", &options, &client)
                         .await?;
                 let requests = server.await?;
-                assert_eq!(requests.len(), 2);
-                let candidates = requests[1]["questions"].as_object().unwrap();
+                assert_eq!(requests.len(), 1);
+                let candidates = requests[0]["questions"].as_object().unwrap();
                 assert_eq!(candidates.len(), 1); // Same-node semantic dedup keeps the winning lexical window.
                 assert!(
                     candidates["candidate_0"]["instructions"]["candidate"]["text"]
@@ -2601,7 +5259,11 @@ mod tests {
                         .contains("threshold is 17 units")
                 );
                 assert_eq!(report.coverage.reranked_candidates, 1);
-                assert_eq!(report.metrics.jev_requests, 2);
+                assert_eq!(
+                    report.coverage.routing_status.as_deref(),
+                    Some("skipped_single_document")
+                );
+                assert_eq!(report.metrics.jev_requests, 1);
                 report
             } else {
                 search(directory.path(), "saffron capacitor", &options).await?

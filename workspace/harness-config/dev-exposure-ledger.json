@@ -1,0 +1,81 @@
+{
+  "schema": "gptgrep.dev-exposure-ledger.v1",
+  "recorded_at": "2026-10-22T04:45:00.000000+00:00",
+  "policy": "Any document exposed during development, historical pilots, adoption tests, or web viewer inspections must be unioned into dev. No exposed document or connected family member may ever enter the frozen confirmation split.",
+  "exposure_events": [
+    {
+      "event_id": "historical_4pair_native_pilot_20261016",
+      "description": "Historical 4-task paired pilot on native raw PDFs (batch xl-live-4pair-20261016-r5)",
+      "task_ids": [
+        "adubench_single_000196",
+        "adubench_single_000144",
+        "adubench_single_000752",
+        "adubench_single_001244"
+      ],
+      "document_ids": [
+        "doc_000032",
+        "doc_000068",
+        "doc_000102",
+        "doc_000286"
+      ]
+    },
+    {
+      "event_id": "historical_prepared_adoption_attempt_20261016",
+      "description": "Historical prepared adoption run (batch xl-opt-prepared-adoption-20261016-r1)",
+      "document_ids": [
+        "doc_000032",
+        "doc_000068",
+        "doc_000102",
+        "doc_000286"
+      ]
+    },
+    {
+      "event_id": "hf_web_viewer_card_lookup_20261021",
+      "description": "Hugging Face dataset landing page embedded viewer examples during source-card lookup (recorded in exposure-review.json)",
+      "observed_document_ids": [
+        "doc_000002",
+        "doc_000003"
+      ],
+      "document_ids": [
+        "doc_000002",
+        "doc_000003",
+        "doc_000076",
+        "doc_000093",
+        "doc_000150",
+        "doc_000156",
+        "doc_000178",
+        "doc_000232",
+        "doc_000310",
+        "doc_000322",
+        "doc_000350"
+      ]
+    },
+    {
+      "event_id": "colab_starter_batch0_20261018",
+      "description": "Colab G4 starter batch 0 OCR qualification (doc_000007 382p + doc_000008 52p)",
+      "document_ids": [
+        "doc_000007",
+        "doc_000008"
+      ]
+    }
+  ],
+  "exposed_document_ids": [
+    "doc_000002",
+    "doc_000003",
+    "doc_000007",
+    "doc_000008",
+    "doc_000032",
+    "doc_000068",
+    "doc_000076",
+    "doc_000093",
+    "doc_000102",
+    "doc_000150",
+    "doc_000156",
+    "doc_000178",
+    "doc_000232",
+    "doc_000286",
+    "doc_000310",
+    "doc_000322",
+    "doc_000350"
+  ]
+}

@@ -1,0 +1,77 @@
+{
+  "schema_version": "devboxes.catalog.example.v1",
+  "status": "planned_template",
+  "domain": "AI Developer DevBoxes",
+  "governance_domain": "SELF-HARNESS/SELF-ENVIRONMENTS",
+  "source_owner": "environments-harness-self",
+  "resource_scope": "project",
+  "domain_entry": "runbooks/26-ai-developer-devboxes.md",
+  "format_owner": "the domain runbook; document data, not an adopted runtime adapter",
+  "private_state_pattern": ".local/devboxes/instances/gcp-gptgrep-devbox-01/",
+  "instance_example": {
+    "id": "gcp-gptgrep-devbox-01",
+    "inventory": ".local/devboxes/instances/gcp-gptgrep-devbox-01/inventory.json",
+    "host_identity": {
+      "provider": "google-compute-engine",
+      "project_id": "gws-personal-20261016",
+      "zone": "us-east4-a",
+      "instance_name": "gptgrep-devbox-01",
+      "machine_type": "n2-standard-16",
+      "fallback_machine_type": "e2-standard-16",
+      "os_image_family": "ubuntu-2404-lts-amd64",
+      "boot_disk_gb": 50,
+      "external_volume": {
+        "disk_name": "gptgrep-dev-vol-01",
+        "size_gb": 250,
+        "type": "pd-balanced",
+        "mount_point": "/mnt/gptgrep-dev",
+        "filesystem": "ext4",
+        "auto_delete": false
+      },
+      "cold_archive_bucket": "gs://gptgrep-xl-docbench-gws-personal-20261016",
+      "bucket_location": "US-EAST4"
+    },
+    "ssh_alias": "gcp-gptgrep-devbox-01",
+    "native_runtime": {
+      "id": "gptgrep-devbox-codex-native",
+      "observed_identity": null,
+      "home": "/mnt/gptgrep-dev/owner-private/codex-canonical-auth-home",
+      "workspace": "/home/arthur/ai-self-library/gptgrep",
+      "binary_pin": {
+        "package": "@openai/codex",
+        "expected_release_channel": "latest_official_oss",
+        "observed_tag_at_planning": "rust-v0.163.0",
+        "binary_sha256": null
+      },
+      "status": "UNKNOWN"
+    },
+    "guest_runtime": {
+      "id": "gptgrep-harbor-docker-engine",
+      "observed_identity": null,
+      "home": "/mnt/gptgrep-dev/docker-data",
+      "workspace": "/mnt/gptgrep-dev/owners/gptgrep/runs",
+      "binary_pin": {
+        "harbor_revision": "f527f8e447038fd242d08ecfa8aaa8029100da97",
+        "rewardkit_version": "0.2.3",
+        "task_schema_version": "1.4"
+      },
+      "backend_adoption": "local_docker_engine_verifier_and_dev_cohort_only",
+      "status": "UNKNOWN"
+    },
+    "acceptance": {
+      "prelogin_current_readonly": "UNKNOWN",
+      "historical_test_evidence": "d6aa1ea71897a70afb4c24c67ad3b26ceb0488f0_macos_arm64_only",
+      "manual_login_after_acceptance": "required_before_live_codex_and_hf_hub",
+      "minimum_model_uat": "not_run",
+      "extended_lifecycle": "not_run",
+      "full_product": "not_accepted"
+    }
+  },
+  "ownership_boundaries": {
+    "host_network_services_toolchains": "existing owner until explicit cutover",
+    "credentials": "selected native client user (codex device-auth + 1Password op CLI for OPENROUTER_API_KEY and HF_TOKEN)",
+    "runtime_adapter": "codex_auth_supervisor.py + environments-harness storage",
+    "full_scale_benchmark_exclusion": "Full-cohort live benchmark jobs reserved for future dedicated Harbor K8s cluster",
+    "automatic_registration_or_apply": false
+  }
+}

@@ -1,0 +1,68 @@
+{
+  "schema_version": "aicatlog.resources.v1",
+  "profile": "onepassword-self.context.v1",
+  "relative_links": "document",
+  "resources": [
+    {
+      "owner": "1password-self",
+      "id": "1password-self:index",
+      "path": "llms.txt",
+      "when": "Choose the exact 1Password local-security workflow or helper.",
+      "document_role": "context_index",
+      "context_format": "llms-txt-v2",
+      "media_type": "text/markdown"
+    },
+    {
+      "owner": "1password-self",
+      "id": "1password-self:rules",
+      "path": "RULES.md",
+      "when": "Handle live credentials or review this package's secret boundary.",
+      "document_role": "prompt_context",
+      "context_format": "markdown",
+      "media_type": "text/markdown"
+    },
+    {
+      "owner": "1password-self",
+      "id": "1password-self:cli",
+      "path": "references/cli.md",
+      "when": "Choose a 1Password CLI authentication mode or inject field references.",
+      "document_role": "prompt_context",
+      "context_format": "markdown",
+      "media_type": "text/markdown"
+    },
+    {
+      "owner": "1password-self",
+      "id": "1password-self:local-configuration",
+      "path": "references/local-configuration.md",
+      "when": "Configure the local vault, Keychain lookup or optional token adoption.",
+      "document_role": "prompt_context",
+      "context_format": "markdown",
+      "media_type": "text/markdown"
+    },
+    {
+      "owner": "1password-self",
+      "id": "1password-self:developer-integrations",
+      "path": "references/developer-integrations.md",
+      "when": "Choose an SDK, Connect server, Environments MCP, hook or browser Autofill workflow.",
+      "document_role": "prompt_context",
+      "context_format": "markdown",
+      "media_type": "text/markdown"
+    },
+    {
+      "owner": "1password-self",
+      "id": "1password-self:config-example",
+      "path": "config.example.json",
+      "when": "Inspect the nonsecret schema for a host-local vault configuration.",
+      "document_role": "configuration",
+      "media_type": "application/json"
+    },
+    {
+      "owner": "1password-self",
+      "id": "1password-self:helper",
+      "path": "bin/op-self",
+      "when": "Run bounded metadata lookup or inject selected fields into a trusted process.",
+      "document_role": "executable",
+      "media_type": "text/x-shellscript"
+    }
+  ]
+}

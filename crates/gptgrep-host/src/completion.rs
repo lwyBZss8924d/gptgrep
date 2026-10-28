@@ -93,6 +93,7 @@ pub(crate) async fn complete_json_until(
     deadline: Option<tokio::time::Instant>,
     options: protocol::RunOptions<'_>,
 ) -> Result<CompletionReport> {
+    crate::native_ptc::enabled(config, true)?;
     validate_config(config, "complete_json")?;
     let (validator, input_bytes) = prepare(instructions, &state, &schema, config.max_input_bytes)?;
     let completed = run_process_until(
@@ -112,6 +113,7 @@ pub(crate) async fn complete_json_until(
         elapsed_ms,
         stderr_bytes,
         stderr_truncated,
+        ..
     } = completed;
     if result.answer.len()
         > options
@@ -206,7 +208,7 @@ impl std::io::Write for InputCounter {
     }
 }
 
-fn external_reference(value: &Value) -> bool {
+pub(crate) fn external_reference(value: &Value) -> bool {
     match value {
         Value::Object(object) => object.iter().any(|(key, value)| {
             (matches!(key.as_str(), "$ref" | "$dynamicRef" | "$recursiveRef")

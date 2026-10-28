@@ -24,6 +24,7 @@ fn hit_window(index: usize, text: &str) -> Hit {
         score: 1.,
         confidence: None,
         literal_anchor: false,
+        below_threshold: false,
         source_sha256: digest(b"invented original"),
         source_fresh: true,
         citation: "invented.txt:L1-L1".into(),
@@ -133,6 +134,79 @@ fn role_order_preserves_anchor_precedence_floor_and_stable_span_ties() -> Result
     };
     diagnostic.order(&mut batch, &SearchOptions::default())?;
     assert_eq!(batch.hits[0].byte_start, 100);
+    Ok(())
+}
+
+#[test]
+fn all_below_floor_judgments_deliver_the_best_few_as_flagged_fallback() -> Result<()> {
+    use EvidenceRole::*;
+    let hits: Vec<_> = (0..5)
+        .map(|index| hit_window(index, &format!("Invented window {index}.")))
+        .collect();
+    let mut diagnostic = prepare(&hits)?;
+    diagnostic.observe(&response(&[
+        (Background, 0.10),
+        (DirectSupport, 0.40),
+        (NoSupport, 0.05),
+        (SourceLocalIncomplete, 0.30),
+        (DirectSupport, 0.20),
+    ]))?;
+    let mut batch = CandidateBatch {
+        hits,
+        coverage: Coverage::default(),
+        warnings: vec![],
+    };
+    diagnostic.order(&mut batch, &SearchOptions::default())?;
+    // No candidate passes: the three highest scores are delivered, flagged.
+    let mut delivered: Vec<_> = batch.hits.iter().map(|hit| hit.byte_start).collect();
+    delivered.sort_unstable();
+    assert_eq!(delivered, [100, 300, 400]);
+    assert!(
+        batch
+            .hits
+            .iter()
+            .all(|hit| hit.below_threshold && hit.is_below_threshold_fallback())
+    );
+    assert_eq!(batch.coverage.below_threshold_fallback, 3);
+    // Every judged candidate stays counted as below the floor.
+    assert_eq!(batch.coverage.filtered_candidates, 5);
+    for index in [1, 3, 4] {
+        assert_eq!(
+            diagnostic.candidates[index].eligibility,
+            Some(CandidateEligibility::BelowFloorFallback)
+        );
+        assert_eq!(
+            diagnostic.candidates[index].disposition,
+            CandidateDisposition::AwaitingDelivery
+        );
+    }
+    for index in [0, 2] {
+        assert_eq!(
+            diagnostic.candidates[index].eligibility,
+            Some(CandidateEligibility::NotEligible)
+        );
+        assert_eq!(
+            diagnostic.candidates[index].disposition,
+            CandidateDisposition::ExcludedRelevanceFloor
+        );
+    }
+    diagnostic.validate_bound()?;
+    // One passing candidate keeps the floor and needs no fallback.
+    let hits: Vec<_> = (0..2)
+        .map(|index| hit_window(index, &format!("Invented window {index}.")))
+        .collect();
+    let mut diagnostic = prepare(&hits)?;
+    diagnostic.observe(&response(&[(Background, 0.10), (DirectSupport, 0.90)]))?;
+    let mut batch = CandidateBatch {
+        hits,
+        coverage: Coverage::default(),
+        warnings: vec![],
+    };
+    diagnostic.order(&mut batch, &SearchOptions::default())?;
+    assert_eq!(batch.hits.len(), 1);
+    assert!(!batch.hits[0].below_threshold);
+    assert_eq!(batch.coverage.below_threshold_fallback, 0);
+    assert_eq!(batch.coverage.filtered_candidates, 1);
     Ok(())
 }
 
@@ -372,7 +446,7 @@ async fn server(direct_fact: String, status: u16) -> Result<Server> {
                 (id.clone(),value)
             }).collect();
             let response = if http_status == 200 {
-                json!({"model":"typesafe/invented","answers":answers,"usage":{"input_tokens":123,"output_tokens":4},"id":"invented-response","provider":"invented-provider"}).to_string()
+                json!({"model":"openai/gpt-6-luna-decisions-20261006","answers":answers,"usage":{"input_tokens":123,"output_tokens":4},"id":"invented-response","provider":"invented-provider"}).to_string()
             } else {
                 "private-error-body".into()
             };
@@ -423,6 +497,8 @@ async fn source_fixture(
 #[tokio::test]
 async fn opt_in_uses_one_mixed_union_request_with_original_query_and_private_dispositions()
 -> Result<()> {
+    // Routing-call mechanics: keep the one-document routing request.
+    let _route = crate::RouteSingleDocument::enable();
     for (name, eol, invert) in [("alpha.md", "\n", false), ("变式.md", "\r\n", true)] {
         let (temp, generation, relation) = source_fixture(name, eol, invert).await?;
         let server = server(relation.clone(), 200).await?;
@@ -527,6 +603,8 @@ async fn opt_in_uses_one_mixed_union_request_with_original_query_and_private_dis
 
 #[tokio::test]
 async fn disabled_policy_omits_new_json_and_keeps_score_only_requests() -> Result<()> {
+    // Routing-call mechanics: keep the one-document routing request.
+    let _route = crate::RouteSingleDocument::enable();
     let (temp, generation, relation) = source_fixture("notes.md", "\n", false).await?;
     let server = server(relation, 200).await?;
     let report = search_planned_with_client_and_observer(
@@ -563,6 +641,8 @@ async fn disabled_policy_omits_new_json_and_keeps_score_only_requests() -> Resul
 
 #[tokio::test]
 async fn union_failure_and_reply_observer_failure_retain_disjoint_accounting() -> Result<()> {
+    // Routing-call mechanics: keep the one-document routing request.
+    let _route = crate::RouteSingleDocument::enable();
     for status in [503, 200] {
         let (temp, generation, relation) = source_fixture("notes.md", "\n", false).await?;
         let server = server(relation, status).await?;
@@ -616,6 +696,8 @@ async fn union_failure_and_reply_observer_failure_retain_disjoint_accounting() -
 
 #[tokio::test]
 async fn dropped_mixed_request_retains_attempt_metadata_with_unknown_roles() -> Result<()> {
+    // Routing-call mechanics: keep the one-document routing request.
+    let _route = crate::RouteSingleDocument::enable();
     let (temp, generation, relation) = source_fixture("notes.md", "\n", false).await?;
     let server = server(relation, 0).await?;
     let events = Mutex::new(Vec::<PlannedSearchEvent>::new());
@@ -661,6 +743,8 @@ async fn dropped_mixed_request_retains_attempt_metadata_with_unknown_roles() -> 
 
 #[tokio::test]
 async fn source_change_after_mixed_reply_excludes_hits_but_preserves_judgments() -> Result<()> {
+    // Routing-call mechanics: keep the one-document routing request.
+    let _route = crate::RouteSingleDocument::enable();
     let (temp, generation, relation) = source_fixture("notes.md", "\r\n", false).await?;
     let server = server(relation, 200).await?;
     let report = search_planned_with_policy_and_observer(

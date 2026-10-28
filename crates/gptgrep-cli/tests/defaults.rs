@@ -42,7 +42,13 @@ fn default_search_requires_jev_while_explicit_regex_is_local() {
     let exact = Command::new(binary)
         .args(["search", "retention"])
         .arg(corpus.path())
-        .args(["--mode", "regex", "--json"])
+        .args([
+            "--mode",
+            "regex",
+            "--decisions-budget",
+            "missing-budget.json",
+            "--json",
+        ])
         .env_remove("OPENROUTER_API_KEY")
         .output()
         .unwrap();
@@ -122,4 +128,37 @@ fn ask_without_jev_credentials_cannot_start_codex() {
         false
     );
     assert!(failure.get("answer").is_none());
+}
+
+#[test]
+fn schema_and_doctor_report_production_defaults_without_opening_a_budget_or_calling_a_model() {
+    let binary = env!("CARGO_BIN_EXE_gptgrep");
+    for command in ["--schema", "doctor"] {
+        let output = Command::new(binary)
+            .args([
+                command,
+                "--decisions-budget",
+                "missing-budget.json",
+                "--json",
+            ])
+            .env_remove("OPENROUTER_API_KEY")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        if command == "--schema" {
+            assert_eq!(
+                body["decisions"]["default_model"],
+                "openai/gpt-6-luna-decisions"
+            );
+            assert_eq!(body["commands"]["ask"]["defaults"]["model"], "gpt-6-luna");
+            assert_eq!(
+                body["global_options"]["decisions-budget"]["initialization"],
+                false
+            );
+        } else {
+            assert_eq!(body["jev"]["default_model"], "openai/gpt-6-luna-decisions");
+            assert_eq!(body["jev"]["network_checked"], false);
+        }
+    }
 }

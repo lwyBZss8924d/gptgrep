@@ -11,6 +11,10 @@ pub const MAX_EVIDENCE_ROLE_METADATA_BYTES: usize = 24 * 1024;
 pub enum CandidateEligibility {
     OriginalLiteralAnchor,
     ScoreFloor,
+    /// No judged candidate met the floor or is an original literal anchor, so
+    /// this one is among the highest-scoring few delivered as a flagged
+    /// `below_threshold` low-confidence candidate; it never passed the floor.
+    BelowFloorFallback,
     NotEligible,
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -371,6 +375,7 @@ impl EvidenceRoleDiagnostics {
                 .relevance_score
                 .context("evidence role relevance is unavailable")?;
             hit.confidence = candidate.relevance_confidence;
+            hit.below_threshold = hit.score < options.min_score;
             candidate.eligibility = Some(if hit.literal_anchor {
                 CandidateEligibility::OriginalLiteralAnchor
             } else if hit.score >= options.min_score {
@@ -391,10 +396,48 @@ impl EvidenceRoleDiagnostics {
             .filter(|hit| hit.literal_anchor && hit.score < options.min_score)
             .count();
         let before = batch.hits.len();
+        let passing = batch
+            .hits
+            .iter()
+            .filter(|hit| hit.literal_anchor || hit.score >= options.min_score)
+            .count();
+        // Never deliver an empty seed when judged candidates exist: as in
+        // ordinary relevance scoring, the highest-scoring few are delivered as
+        // flagged low-confidence candidates. They never count as passing.
+        let mut fallback = Vec::new();
+        if passing == 0 {
+            let mut ranked: Vec<&Hit> = batch.hits.iter().collect();
+            ranked.sort_by(|left, right| {
+                right
+                    .score
+                    .total_cmp(&left.score)
+                    .then(left.path.cmp(&right.path))
+                    .then(left.byte_start.cmp(&right.byte_start))
+                    .then(left.byte_end.cmp(&right.byte_end))
+            });
+            for hit in ranked.into_iter().take(BELOW_THRESHOLD_FALLBACK) {
+                fallback.push(self.index_of(hit)?);
+            }
+            for &index in &fallback {
+                self.candidates[index].eligibility = Some(CandidateEligibility::BelowFloorFallback);
+                self.candidates[index].disposition = CandidateDisposition::AwaitingDelivery;
+            }
+        }
+        let mut keep = Vec::with_capacity(batch.hits.len());
+        for hit in &batch.hits {
+            keep.push(
+                hit.literal_anchor
+                    || hit.score >= options.min_score
+                    || fallback.contains(&self.index_of(hit)?),
+            );
+        }
+        let mut kept = keep.into_iter();
         batch
             .hits
-            .retain(|hit| hit.literal_anchor || hit.score >= options.min_score);
-        batch.coverage.filtered_candidates = before - batch.hits.len();
+            .retain(|_| kept.next().expect("one decision per candidate"));
+        batch.coverage.filtered_candidates = before - passing;
+        // Recounted against the hits actually delivered by finish_candidate_batch.
+        batch.coverage.below_threshold_fallback = fallback.len();
         // Exact identity is already verified above. No probability multiplication
         // or new floor: category priority only inside the protected anchor lane.
         batch.hits.sort_by(|left, right| {

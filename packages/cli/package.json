@@ -1,6 +1,6 @@
 {
   "name": "@gptgrep/cli",
-  "version": "0.1.0-alpha.1",
+  "version": "0.2.0-alpha.1",
   "private": true,
   "type": "module",
   "description": "Optional incur interface for the native GPTgrep binary",

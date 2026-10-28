@@ -1,0 +1,10 @@
+{
+  "schema": "gptgrep.xl-docbench.preprocessing-profile.v1",
+  "id": "mineru-4.0.12-pro-2605",
+  "arm": "gptgrep",
+  "ocrEngine": "MinerU 4.0.12 + MinerU2.5-Pro-2605",
+  "gitCommit": "b7f3dd0c5f6e6d66a298239ffd02b328b873918e",
+  "vlmModelId": "opendatalab/MinerU2.5-Pro-2605-1.2B",
+  "parseMode": "ocr",
+  "requiresOcr": true
+}

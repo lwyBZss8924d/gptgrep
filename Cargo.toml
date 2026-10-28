@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0-alpha.1"
+version = "0.2.0-alpha.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/lwyBZss8924d/gptgrep"
@@ -11,3 +11,6 @@ repository = "https://github.com/lwyBZss8924d/gptgrep"
 [profile.release]
 lto = "thin"
 strip = "debuginfo"
+
+[patch."https://github.com/run-llama/liteparse"]
+liteparse-pdfium = { path = "vendor/liteparse-pdfium" }

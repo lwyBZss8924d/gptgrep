@@ -1,0 +1,688 @@
+The Google Developer Knowledge MCP server gives AI-powered development tools direct access to
+search and retrieve official Google developer documentation for products like
+Firebase, Google Cloud, Android, Google Maps Platform, and more.
+By connecting your coding assistant to Google's authoritative library of
+documentation, you avoid manual web searches, outdated context, and scraping.
+
+To connect to the Developer Knowledge MCP server from your own application or agent code instead
+of an IDE, refer to [Connect using MCP SDKs](https://developers.google.com/knowledge/mcp-sdk).
+
+## MCP server capabilities
+
+The Google Developer Knowledge MCP server provides three core tools to your AI coding assistant:
+
+| Tool name | Description |
+|---|---|
+| `search_documents` | Searches Google developer documentation and returns the most relevant page excerpts alongside their document names. |
+| `get_documents` | Retrieves the full Markdown content of documents using the names returned by `search_documents`. |
+| `answer_query` | Generates structured answers drawn from the Developer Knowledge corpus. |
+
+The `search_documents` tool searches Google's documentation to find the most
+relevant sections matching your query. When you ask a question, the tool
+returns short text passages. If your agent needs the complete page context
+surrounding a passage, it can pass the document's resource name to
+`get_documents` to retrieve the entire page.
+
+Use the `answer_query` tool when you want a direct answer to a question
+drawn from the
+[Developer Knowledge corpus](https://developers.google.com/knowledge/reference/corpus-reference) rather
+than raw search results or full Markdown files.
+
+> [!TIP]
+> **Tip:** Pair the Developer Knowledge MCP server with the [`retrieving-developer-knowledge`](https://github.com/google/skills/tree/main/skills/developers/retrieving-developer-knowledge) agent skill. This skill gives your AI coding assistant built-in instructions on which tool to pick, how to handle errors, and how to call the REST API if the MCP server isn't available. To learn more, check out [Use the Developer Knowledge agent skill](https://developers.google.com/knowledge/mcp#agent-skill).
+
+## Choose your authentication method
+
+The Developer Knowledge MCP server supports two authentication approaches depending on your
+development environment and AI assistant:
+
+- **API key** : best for third-party IDEs and CLI agents such as Claude Code, Cursor, GitHub Copilot, Codex, and other remote MCP clients. Pass the API key in the `X-Goog-Api-Key` header over HTTPS.
+- **OAuth and ADC** : best for Google Antigravity, which has built-in support for [Application Default Credentials (ADC)](https://docs.cloud.google.com/docs/authentication/application-default-credentials), or for enterprise workflows that require an OAuth 2.0 bearer token or standalone OAuth 2.0 client ID instead of an API key.
+
+Generate the credentials required for your chosen authentication method to
+allow your AI assistant or coding agent to authenticate requests with the
+Developer Knowledge MCP server service.
+
+Select a tab to create your credentials:
+
+### API key
+
+#### Prerequisites
+
+Before creating an API key, ensure you have:
+
+- [A Google Cloud project](https://developers.google.com/workspace/guides/create-project).
+- [The gcloud CLI installed](https://cloud.google.com/sdk/docs/install) (if configuring from the command line).
+
+#### Enable the API and create an API key
+
+You can generate an API key using either the Google Cloud
+console or the gcloud CLI:
+
+### Google Cloud Console
+
+1. Open the [Developer Knowledge API page](https://console.cloud.google.com/start/api?id=developerknowledge.googleapis.com) in the Google Cloud console.
+2. Select your Google Cloud project and click **Enable**.
+3. Go to the [Credentials page](https://console.cloud.google.com/apis/credentials).
+4. Click **Create credentials** and select **API key**.
+5. Click the **Edit API key** action to configure restrictions:
+   - Under **API restrictions** , choose **Restrict key**.
+   - Select **Developer Knowledge API**.
+   - If you plan to use this same key for model calls (such as `GEMINI_API_KEY`), also select **Generative Language API**.
+6. Click **Save**, then copy your API key.
+
+### gcloud CLI
+
+1. Enable the Developer Knowledge API in your project, replacing
+   <var translate="no">PROJECT_ID</var> with your project ID:
+
+       gcloud services enable developerknowledge.googleapis.com \
+         --project=PROJECT_ID
+
+2. Create an API key:
+
+       gcloud services api-keys create \
+         --project=PROJECT_ID \
+         --display-name="DK API Key"
+
+   This command returns metadata details about your new key. Copy and
+   save both of the following values from the command output:
+   - `keyString`: this is the raw API key (for example, `AIzaSy...`). You will paste this value into your IDE configuration.
+   - `name`: this is the key's resource path (for example, `projects/PROJECT_ID/locations/global/keys/UNIQUE_ID`). You will use this path to restrict the key in the next step.
+3. Restrict the key to the Developer Knowledge API to help prevent unauthorized
+   use. Replace <var translate="no">KEY_NAME</var> with the full `name` path
+   copied from the previous step:
+
+       gcloud services api-keys update KEY_NAME \
+         --api-target=service=developerknowledge.googleapis.com
+
+   > [!IMPORTANT]
+   > **Important:** If you plan to use this same key for your AI client's general model calls (for example, `GEMINI_API_KEY`), you must also allow the Generative Language API:
+
+       gcloud services api-keys update KEY_NAME \
+         --api-target=service=developerknowledge.googleapis.com \
+         --api-target=service=generativelanguage.googleapis.com
+
+### OAuth and ADC
+
+#### Prerequisites
+
+Before configuring OAuth or ADC, make sure you have:
+
+- [A Google Cloud project](https://developers.google.com/workspace/guides/create-project).
+- [The gcloud CLI installed](https://cloud.google.com/sdk/docs/install).
+
+#### Enable the API
+
+Run the following command to enable the Developer Knowledge API in your project:
+
+    gcloud services enable developerknowledge.googleapis.com \
+      --project=PROJECT_ID
+
+#### Choose your OAuth credential type
+
+Select the credential approach required by your tool:
+
+### ADC
+
+Google Antigravity has built-in support for ADC and refreshes tokens
+automatically. Other MCP clients can use ADC by passing a short-lived
+bearer token in the `Authorization` header:
+
+1. Authenticate with your Google Account and set your quota project:
+
+       gcloud auth application-default login \
+         --project=PROJECT_ID
+
+2. When your browser opens, sign in with your Google Account and grant
+   the requested permissions.
+
+3. *(Optional)* If you're configuring a third-party MCP client that
+   doesn't have built-in ADC support, generate a bearer token (valid
+   for one hour) to use in your client's `Authorization` header:
+
+       gcloud auth application-default print-access-token
+
+### OAuth client ID
+
+Create an OAuth 2.0 client ID and secret if your AI assistant uses an
+interactive OAuth flow because Google remote MCP servers don't support
+OAuth Dynamic Client Registration (DCR).
+
+1. Go to the [Branding page](https://console.cloud.google.com/auth/branding?project=_) and select your project. Enter an **App name** and **User support email** , and click **Save**.
+2. Go to the [Audience page](https://console.cloud.google.com/auth/audience?project=_) and set the **User type** to **External**.
+3. On the same page, click **Add users** under **Test users** , enter your Google email address, and click **Save**.
+4. Go to the [Clients page](https://console.cloud.google.com/auth/clients?project=_), click **Create client** , and choose the application type required by your MCP client:
+   - Select **Desktop app** for desktop clients that prompt for a client ID and secret (such as VS Code).
+   - Select **Web application** and add your client's redirect URI for clients that require static OAuth redirect callbacks (such as Cursor or Claude Code custom connectors). Use the exact redirect URI that your client documents; custom redirect URIs aren't supported. For client-specific redirect URIs, refer to [Configure MCP in an AI application](https://docs.cloud.google.com/mcp/configure-mcp-ai-application#client-specific-guidance).
+5. Click **Create** , then copy your **Client ID** and **Client
+   secret** (or download the JSON client credentials file).
+
+#### OAuth scopes
+
+The Developer Knowledge MCP server accepts the following OAuth scopes:
+
+- `https://www.googleapis.com/auth/cloud-platform`: default scope used by Application Default Credentials (ADC) and the gcloud CLI.
+- `https://www.googleapis.com/auth/devprofiles.full_control`: scope used for OAuth 2.0 client ID consent flows and MCP server discovery.
+- `https://www.googleapis.com/auth/developerprofiles.readonly`: read-only scope supported for service accounts and credentials that don't require an end-user OAuth consent screen.
+
+## Configure your IDE or coding agent
+
+After obtaining your credentials, follow the setup instructions for your coding
+environment. The instructions for each coding environment support the
+following authentication methods:
+
+| Coding environment | Authentication methods |
+|---|---|
+| Google Antigravity | Built-in Google credentials (ADC) or API key |
+| Claude Code, Cursor, GitHub Copilot, Codex | API key |
+| Other | API key, ADC bearer token, or OAuth 2.0 client ID |
+
+To use an ADC bearer token or OAuth 2.0 client ID with Claude Code, Cursor,
+GitHub Copilot, or Codex, follow the instructions in the **Other** tab.
+
+Depending on the template you use, replace the following placeholders:
+
+- **API key** (`YOUR_API_KEY`): replace with your raw API key string.
+- **Project ID** (`PROJECT_ID`): replace with your Google Cloud project ID.
+- **Access token** (`ACCESS_TOKEN`): replace with the bearer token from
+  `gcloud auth application-default print-access-token`.
+
+### Google Antigravity
+
+#### Antigravity IDE and extensions
+
+To configure the MCP server in Antigravity IDE or the Antigravity extension
+(such as in VS Code), select your authentication method:
+
+### Google credentials
+
+To install the MCP server using one-click setup:
+
+1. In the Agent panel, click the **Additional options** () menu and select **MCP Servers**.
+2. Search for **Google Developer Knowledge**.
+3. Click the **Install** () icon. Antigravity automatically configures the server and connects using your active Google credentials.
+
+### API key
+
+To configure an API key in Antigravity IDE or the Antigravity extension:
+
+1. In the Agent panel, click the **Additional options** () menu \> **MCP Servers** \> **Manage MCP Servers** \> **View raw config** (or open `.agents/mcp_config.json`).
+2. Add the following server configuration:
+
+       {
+         "mcpServers": {
+           "google-developer-knowledge": {
+             "serverUrl": "https://developerknowledge.googleapis.com/mcp",
+             "headers": {
+               "X-Goog-Api-Key": "YOUR_API_KEY"
+             }
+           }
+         }
+       }
+
+#### Antigravity CLI
+
+Configure the MCP server in your project's `.agents/mcp_config.json`
+file (or globally in `~/.gemini/config/mcp_config.json`):
+
+### Google credentials
+
+    {
+      "mcpServers": {
+        "google-developer-knowledge": {
+          "httpUrl": "https://developerknowledge.googleapis.com/mcp",
+          "authProviderType": "google_credentials",
+          "oauth": {
+            "scopes": [
+              "https://www.googleapis.com/auth/cloud-platform"
+            ]
+          },
+          "timeout": 30000,
+          "headers": {
+            "X-goog-user-project": "PROJECT_ID"
+          }
+        }
+      }
+    }
+
+### API key
+
+    {
+      "mcpServers": {
+        "google-developer-knowledge": {
+          "serverUrl": "https://developerknowledge.googleapis.com/mcp",
+          "headers": {
+            "X-Goog-Api-Key": "YOUR_API_KEY"
+          }
+        }
+      }
+    }
+
+> [!TIP]
+> **Tip:** If you're using the standalone Antigravity 2.0 application, go to **Settings** \> **Customizations** and click **Open MCP Config** under **Installed MCP Servers** to add your configuration.
+
+### Claude Code
+
+Run the following command in your terminal:
+
+    claude mcp add google-developer-knowledge \
+      --transport http https://developerknowledge.googleapis.com/mcp \
+      --header "X-Goog-Api-Key: YOUR_API_KEY"
+
+### Cursor
+
+To configure Cursor, edit `.cursor/mcp.json` in your project root or
+`~/.cursor/mcp.json` for global access:
+
+    {
+      "mcpServers": {
+        "google-developer-knowledge": {
+          "url": "https://developerknowledge.googleapis.com/mcp",
+          "headers": {
+            "X-Goog-Api-Key": "YOUR_API_KEY"
+          }
+        }
+      }
+    }
+
+### GitHub Copilot
+
+> [!NOTE]
+> **Note:** If you're using the Antigravity extension in VS Code instead of GitHub Copilot, select the **Google Antigravity** tab.
+
+#### Workspace settings
+
+To configure GitHub Copilot in VS Code for a specific workspace, create or
+edit `.vscode/mcp.json`:
+
+    {
+      "servers": {
+        "google-developer-knowledge": {
+          "url": "https://developerknowledge.googleapis.com/mcp",
+          "headers": {
+            "X-Goog-Api-Key": "YOUR_API_KEY"
+          }
+        }
+      }
+    }
+
+#### Global user settings
+
+To make the server available across all VS Code workspaces, open the
+Command Palette, run **MCP: Open User Configuration** , and add the following
+to the `mcp.json` file in your
+[user profile](https://code.visualstudio.com/docs/configure/profiles):
+
+    {
+      "servers": {
+        "google-developer-knowledge": {
+          "url": "https://developerknowledge.googleapis.com/mcp",
+          "headers": {
+            "X-Goog-Api-Key": "YOUR_API_KEY"
+          }
+        }
+      }
+    }
+
+### Codex
+
+To configure Codex CLI or the Codex agent, add the server configuration to
+`~/.codex/config.toml` (or your project's `.codex/config.toml`):
+
+    [mcp_servers.google-developer-knowledge]
+      url = "https://developerknowledge.googleapis.com/mcp"
+      http_headers = { "X-Goog-Api-Key" = "YOUR_API_KEY" }
+
+> [!NOTE]
+> **Note:** After you change the configuration, the server may show a *not logged
+> in* status. This is expected and won't affect your access.
+
+### Other
+
+To configure any other remote MCP client (such as JetBrains AI Assistant,
+Windsurf, Cline, Zed, Continue, or Claude Desktop), or to use an ADC bearer
+token or OAuth 2.0 client ID in a third-party client, select your
+authentication method:
+
+### API key
+
+Configure an HTTP transport server with the following settings:
+
+- **Server URL** : `https://developerknowledge.googleapis.com/mcp`
+- **HTTP Header** : `X-Goog-Api-Key: YOUR_API_KEY`
+
+Standard JSON configuration template:
+
+    {
+      "mcpServers": {
+        "google-developer-knowledge": {
+          "url": "https://developerknowledge.googleapis.com/mcp",
+          "headers": {
+            "X-Goog-Api-Key": "YOUR_API_KEY"
+          }
+        }
+      }
+    }
+
+### ADC bearer token
+
+If your MCP client doesn't have built-in ADC support, you can
+authenticate with ADC by passing the bearer token from
+`gcloud auth application-default print-access-token` and your
+Google Cloud project ID in the request headers:
+
+    {
+      "mcpServers": {
+        "google-developer-knowledge": {
+          "url": "https://developerknowledge.googleapis.com/mcp",
+          "headers": {
+            "Authorization": "Bearer ACCESS_TOKEN",
+            "X-Goog-User-Project": "PROJECT_ID"
+          }
+        }
+      }
+    }
+
+The `X-Goog-User-Project` header requires the
+`serviceusage.services.use` permission on the project. Project owners
+and editors have this permission. Other users need a role that
+includes it, such as Service Usage Consumer
+(`roles/serviceusage.serviceUsageConsumer`).
+
+> [!NOTE]
+> **Note:** ADC bearer tokens expire after one hour. When your token expires, run `gcloud auth application-default print-access-token` again to generate a new token.
+
+### OAuth client ID
+
+To authenticate using a standalone OAuth 2.0 client ID and secret:
+
+1. Add the MCP server endpoint to your client configuration without an
+   API key header:
+
+       {
+         "mcpServers": {
+           "google-developer-knowledge": {
+             "url": "https://developerknowledge.googleapis.com/mcp"
+           }
+         }
+       }
+
+   > [!NOTE]
+   > **Note:** VS Code uses a top-level `servers` key instead of `mcpServers`. Add the server to `.vscode/mcp.json` in the folder that you open as your workspace, or run **MCP: Open User Configuration** from the Command Palette to make it available in all workspaces. For the VS Code file structure, refer to the **GitHub Copilot** tab and omit the `headers` section.
+
+2. Complete the OAuth setup for your client:
+
+   - **Interactive prompt (such as VS Code)** : send a test prompt to the agent. When prompted that Dynamic Client Registration isn't supported, proceed and enter your **Client ID** and **Client
+     secret**, then sign in with your Google Account.
+   - **Static OAuth configuration (such as Cursor or Claude Code)** : provide your OAuth client ID, client secret, and redirect URI in your client's OAuth settings. For client-specific instructions, refer to [Configure MCP in an AI application](https://docs.cloud.google.com/mcp/configure-mcp-ai-application#client-specific-guidance).
+
+   If your client asks you to specify OAuth scopes, use
+   `https://www.googleapis.com/auth/devprofiles.full_control`.
+
+You don't need to specify a Google Cloud project ID in
+this configuration. Requests are attributed to the project that owns
+your OAuth client ID.
+
+## Verify the connection
+
+Once configured, restart your AI assistant or reload its MCP servers. Then send
+a test prompt to verify that the tool integration works:
+
+    How do I list Cloud Storage buckets using the Google Cloud Python SDK?
+
+If the agent invokes `search_documents` or `answer_query` and returns
+information from Google documentation, your server is connected and active.
+
+## Use the Developer Knowledge agent skill
+
+Install the official
+[`retrieving-developer-knowledge`](https://github.com/google/skills/tree/main/skills/developers/retrieving-developer-knowledge)
+agent skill to teach your assistant when and how to use the
+[core tools](https://developers.google.com/knowledge/mcp#mcp-capabilities) offered by the Developer Knowledge MCP server.
+
+An agent skill is a set of instructions that your AI coding assistant reads
+before starting a task. The `retrieving-developer-knowledge` skill works with any assistant that
+supports the [open Agent Skills standard](https://agentskills.io/home) and
+helps your assistant do the following:
+
+- **Pick the right tool** : guides your assistant to use `answer_query` for broad "how-to" questions and comparisons, and `search_documents` (with two to five focused keywords) when looking up exact CLI flags, IAM permissions, or code syntax.
+- **Check for errors before answering**: tells your assistant to make sure a documentation search actually succeeded before writing an answer, so it doesn't mistake an API key or quota error for missing documentation or fall back to guessing from older training data.
+- **Fall back to the REST API** : gives your assistant `curl` commands to call the Developer Knowledge API directly if your editor doesn't support MCP servers or the MCP connection fails.
+
+### Install the agent skill
+
+Select your coding assistant to install the `retrieving-developer-knowledge` skill in your
+project directory:
+
+### Google Antigravity
+
+    npx skills add google/skills --skill retrieving-developer-knowledge \
+      --agent=antigravity
+
+### Claude Code
+
+    npx skills add google/skills --skill retrieving-developer-knowledge \
+      --agent=claude-code
+
+### Cursor
+
+    npx skills add google/skills --skill retrieving-developer-knowledge \
+      --agent=cursor
+
+### Codex
+
+    npx skills add google/skills --skill retrieving-developer-knowledge \
+      --agent=codex
+
+### Other
+
+For other AI assistants supporting the open Agent Skills standard, run:
+
+    npx skills add google/skills --skill retrieving-developer-knowledge
+
+To update your installed skills to the latest version, run:
+
+    npx skills update
+
+To view the full skill instructions and reference guides, check out the
+[`retrieving-developer-knowledge` directory on GitHub](https://github.com/google/skills/tree/main/skills/developers/retrieving-developer-knowledge).
+
+## Optimize context window and token usage
+
+Retrieving full documentation pages into an AI model's context window consumes
+significant tokens. Ingesting multiple large documents can cause high token
+costs, increased latency, and context window overflow.
+
+To ensure fast and cost-effective responses, follow these prompt engineering
+best practices:
+
+- **Install the agent skill (recommended)** :
+  install the [`retrieving-developer-knowledge`](https://developers.google.com/knowledge/mcp#agent-skill) agent skill so your assistant
+  automatically picks the right search tool (`answer_query` or
+  `search_documents`), uses short keyword searches, and only downloads full
+  pages when needed.
+
+- **Rely on two-step retrieval** :
+  let the agent start by calling `search_documents`. This returns focused
+  snippets (chunks) that often contain the exact syntax or API signature you
+  need without consuming tokens for the entire page. Instruct your agent to
+  call `get_documents` only when surrounding context is strictly necessary.
+
+- **Prefer `answer_query` for conceptual questions** :
+  when you need a generated explanation or design comparison, direct your
+  agent to use `answer_query`. This tool generates an answer directly from
+  the Developer Knowledge corpus without returning full raw Markdown pages.
+
+- **Write specific, scoped prompts**:
+  avoid overly broad prompts such as "Explain all of Firebase". Instead,
+  specify the target product, platform, and language:
+
+      How do I write a Firestore transaction in Dart with error handling?
+
+- **Add custom agent rules** :
+  if you aren't using the `retrieving-developer-knowledge` skill, add project-level guidelines
+  to your assistant's instruction files (for example, `.cursorrules`,
+  `CLAUDE.md`, or `.github/copilot-instructions.md`) to restrict automatic
+  full-page fetches:
+
+      When searching Google developer documentation, inspect search_documents
+      snippets first. Do not call get_documents unless the snippet lacks
+      necessary code context.
+
+## Optional security and safety configurations
+
+MCP introduces new security risks and considerations due to the wide variety of
+actions that you can do with the MCP tools. To minimize and manage these risks,
+Google Cloud offers default settings and customizable
+policies to control the use of MCP tools in your Google Cloud
+organization or project.
+
+For more information about MCP security and governance, see
+[AI security and safety](https://docs.cloud.google.com/mcp/ai-security-safety).
+
+### Use Model Armor
+
+[Model Armor](https://docs.cloud.google.com/model-armor/overview) is a
+Google Cloud service designed to enhance the security and
+safety of your AI applications. It works by proactively screening LLM prompts
+and responses, protecting against various risks and supporting responsible AI
+practices. Whether you are deploying AI in your cloud environment, or on
+external cloud providers, Model Armor can help
+you prevent malicious input, verify content safety, protect sensitive data,
+maintain compliance, and enforce your AI safety and security policies
+consistently across your diverse AI landscape.
+
+When Model Armor is enabled with
+[logging enabled](https://docs.cloud.google.com/model-armor/configure-logging), Model Armor logs the entire
+payload. This might expose sensitive information in your logs.
+
+#### MCP request routing to Model Armor
+
+Model Armor is available in [certain regions](https://docs.cloud.google.com/model-armor/locations). When Model Armor is enabled and you use an MCP server in a jurisdiction that Model Armor doesn't support, the routing behavior of the call might be different for different MCP servers and might break data residency compliance for in-use and in-transit data. For more information about the behavior of individual MCP servers, see [Model Armor supported products](https://docs.cloud.google.com/mcp/model-armor-supported-products).
+
+#### Enable Model Armor
+
+Follow the steps in
+[Integrate with Google and Google Cloud MCP servers](https://docs.cloud.google.com/model-armor/model-armor-mcp-google-cloud-integration)
+to enable Model Armor.
+
+#### Configure protection for remote MCP servers
+
+To help protect your MCP tool calls and responses you can use
+Model Armor floor settings. A floor setting defines the minimum
+security filters that apply across the project. This configuration applies a
+consistent set of filters to all MCP tool calls and responses within
+the project.
+
+> [!TIP]
+> **Tip:** Don't enable the prompt injection and jailbreak filter unless your MCP traffic carries natural language data.
+
+Set up a Model Armor floor setting with MCP sanitization
+enabled. For more information, see [Configure Model Armor floor
+settings](https://docs.cloud.google.com/model-armor/configure-floor-settings).
+
+> [!NOTE]
+> **Note:** If the agent and the MCP server are in different projects, you can create floor settings in both projects (the client project and the resource project). In this case, Model Armor is invoked twice, once for each project.
+
+See the following example command:
+
+```bash
+gcloud model-armor floorsettings update \
+--full-uri='projects/PROJECT_ID/locations/global/floorSetting' \
+--enable-floor-setting-enforcement=TRUE \
+--add-integrated-services=GOOGLE_MCP_SERVER \
+--google-mcp-server-enforcement-type=INSPECT_AND_BLOCK \
+--enable-google-mcp-server-cloud-logging \
+--malicious-uri-filter-settings-enforcement=ENABLED \
+--add-rai-settings-filters='[{"confidenceLevel": "MEDIUM_AND_ABOVE", "filterType": "DANGEROUS"}]'
+```
+
+Replace `PROJECT_ID` with your Google Cloud project ID.
+
+Note the following settings:
+
+- <var translate="no">`INSPECT_AND_BLOCK`</var>: The enforcement type that inspects content for the Google MCP server and blocks prompts and responses that match the filters.
+- <var translate="no">`ENABLED`</var>: The setting that enables a filter or enforcement.
+- <var translate="no">`MEDIUM_AND_ABOVE`</var>: The confidence level for the Responsible AI - Dangerous filter settings. You can modify this setting, though lower values might result in more false positives. For more information, see [Model Armor confidence levels](https://docs.cloud.google.com/model-armor/overview#ma-confidence-levels).
+
+#### Disable scanning MCP traffic with Model Armor
+
+To stop Model Armor from automatically scanning traffic to and
+from Google MCP servers based on the project's floor settings, run the following
+command:
+
+    gcloud model-armor floorsettings update \
+      --full-uri='projects/PROJECT_ID/locations/global/floorSetting' \
+      --remove-integrated-services=GOOGLE_MCP_SERVER
+
+Replace `PROJECT_ID` with the Google Cloud project
+ID. Model Armor doesn't automatically apply the rules defined in
+this project's floor settings to any Google MCP server traffic.
+
+Model Armor floor settings and general configuration can impact
+more than just MCP. Because Model Armor integrates with services
+like Vertex AI, any changes you make to floor settings can affect
+traffic scanning and safety behaviors across all integrated services, not just
+MCP.
+
+#### Adjust Model Armor settings
+
+If you're using
+[Model Armor](https://docs.cloud.google.com/model-armor/overview)
+to protect your application, you might encounter `403 PERMISSION_DENIED` errors
+for some queries. Because the Developer Knowledge MCP server only returns public documentation from
+trusted Google sources, we recommend setting Prompt Injection and Jailbreak
+(PIJB) filters to `HIGH_AND_ABOVE` confidence levels to reduce false positives.
+If your use case doesn't involve other tools that access private or sensitive
+data, you can also consider disabling PIJB filters.
+
+## Troubleshooting
+
+If you encounter issues connecting to or querying the Developer Knowledge MCP server, find your
+symptom or error message in the following tables.
+
+### Setup and connection errors
+
+| Symptom or error | Likely cause | Resolution |
+|---|---|---|
+| `404 NOT_FOUND` on `/mcp` endpoint | The API is not enabled for your project. | Enable the Developer Knowledge API in the Google Cloud console or run `gcloud services enable developerknowledge.googleapis.com`. |
+| `403 PERMISSION_DENIED`: `Developer Knowledge API has not been used` | The Developer Knowledge API is not enabled in the Google Cloud project. | Enable the API in the Google Cloud console or run `gcloud services enable developerknowledge.googleapis.com`. |
+| MCP tools missing or connection fails | Your coding tool doesn't support remote HTTP MCP servers or can't connect to the server. | Install the [`retrieving-developer-knowledge` agent skill](https://developers.google.com/knowledge/mcp#agent-skill), which tells your assistant how to fall back to the Developer Knowledge API REST endpoints using `curl` when MCP tools aren't available. |
+
+### API key errors
+
+| Symptom or error | Likely cause | Resolution |
+|---|---|---|
+| `400 Bad Request: API key not valid` | The API key string is missing, invalid, or malformed. | Verify that the API key was copied correctly and configured in the `headers` object with the `X-Goog-Api-Key` key. Don't pass the API key as a query parameter in the URL. |
+| `403 PERMISSION_DENIED: API target restriction` | The API key restriction list excludes the Developer Knowledge API. | Update your API key restrictions on the Credentials page in the Google Cloud console to include Developer Knowledge API. |
+
+### OAuth and ADC errors
+
+| Symptom or error | Likely cause | Resolution |
+|---|---|---|
+| `401 UNAUTHENTICATED` or missing ADC credentials | Application Default Credentials or ADC bearer tokens are expired or not initialized. | Run `gcloud auth application-default login --project=PROJECT_ID` to refresh local credentials, or run `gcloud auth application-default print-access-token` to generate a new bearer token. |
+| `403 PERMISSION_DENIED`: `API requires a quota project, which is not set by default` | The request uses an ADC bearer token without an `X-Goog-User-Project` header. | Add the `X-Goog-User-Project` header with your Google Cloud project ID to your MCP client configuration. |
+| `403 PERMISSION_DENIED` with an `X-Goog-User-Project` header | Your account lacks the `serviceusage.services.use` permission on the project in the header. | Ask a project administrator to grant you the Service Usage Consumer role (`roles/serviceusage.serviceUsageConsumer`). |
+| `403 access_denied` / "Access blocked: authorization error" | Your OAuth consent screen uses the **External** user type in testing mode, and your account isn't listed as a test user. | In **Google Cloud console** \> **Auth Platform** \> **Audience** , add your active Google email address under **Test users**. |
+| OAuth client error or invalid redirect URI | The OAuth client was created with an unsupported application type or missing redirect URI. | Use **Desktop app** for clients with interactive prompts (such as VS Code), or **Web application** with your client's authorized redirect URI (such as Cursor or Claude Code). |
+
+### Quota and safety filter errors
+
+| Symptom or error | Likely cause | Resolution |
+|---|---|---|
+| `429 RESOURCE_EXHAUSTED` | You have reached your project's quota limit. | Check your usage on the [Developer Knowledge API quotas page](https://console.cloud.google.com/apis/api/developerknowledge.googleapis.com/quotas) in the Google Cloud console. To learn about limits and request an increase, refer to [Developer Knowledge API quota](https://developers.google.com/knowledge/quota). |
+| `403 PERMISSION_DENIED` with Model Armor | A false positive from the Model Armor PIJB filter blocked a safe query. | Set PIJB filter confidence to `HIGH_AND_ABOVE` in your Model Armor template settings. |
+
+## Included documentation
+
+See the [Corpus reference](https://developers.google.com/knowledge/reference/corpus-reference) for the full
+list of Google products and documentation repositories indexed by the server.
+
+## Known limitations
+
+- **Public documentation only** : The server indexes only publicly available documentation listed in the [Corpus reference](https://developers.google.com/knowledge/reference/corpus-reference). Internal documents, private repositories, and third-party resources are not included.
+- **English language**: The server indexes and returns documentation in English only.
+- **Network dependency and VPC Service Controls** : Because the Developer Knowledge MCP server is a remote hosted service, your client must have network connectivity to reach `https://developerknowledge.googleapis.com`.
+  - **Inside Google Cloud VPC networks** : Public internet egress is not required. You can reach `developerknowledge.googleapis.com` privately without external IP addresses or Cloud NAT by routing traffic using [Private Google Access](https://cloud.google.com/vpc/docs/private-google-access) (`private.googleapis.com` / `199.36.153.8/30`) or a Private Service Connect (PSC) endpoint targeting the `all-apis` bundle.
+  - **VPC Service Controls (VPC-SC)** : `developerknowledge.googleapis.com` is not supported on the Restricted VIP (`restricted.googleapis.com` / `199.36.153.4/30`) or PSC `vpc-sc` endpoints. If your VPC routes `*.googleapis.com` to `restricted.googleapis.com`, configure a specific Cloud DNS response policy or private DNS record for `developerknowledge.googleapis.com` to resolve to `private.googleapis.com` (`199.36.153.8/30`).

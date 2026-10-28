@@ -1,14 +1,99 @@
 use crate::{
-    DecisionAnswer, DecisionResponse, MAX_PROVIDER_METADATA_BYTES, MAX_QUESTIONS,
-    MAX_RESPONSE_BYTES,
+    DecisionAnswer, DecisionFailure, DecisionResponse, FailedResponseMetadata, FailedResponseUsage,
+    MAX_PROVIDER_METADATA_BYTES, MAX_QUESTIONS, MAX_RESPONSE_BYTES,
 };
 use anyhow::{Result, anyhow, ensure};
 use serde::{
     Deserialize, Deserializer,
     de::{self, MapAccess, SeqAccess, Visitor},
 };
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, value::RawValue};
 use std::{collections::BTreeMap, fmt};
+
+// Serde's internally tagged enum buffering does not preserve arbitrary_precision
+// numbers for f64 fields. Decode the tag separately, then the concrete fields
+// directly from JSON; a real object can never masquerade as a numeric field.
+impl<'de> Deserialize<'de> for DecisionAnswer {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Noul {
+            noul: f64,
+        }
+        #[derive(Deserialize)]
+        struct Choice {
+            choice: String,
+            #[serde(default)]
+            confidence: Option<f64>,
+            #[serde(default)]
+            probabilities: Option<BTreeMap<String, f64>>,
+        }
+        #[derive(Deserialize)]
+        struct Score {
+            score: f64,
+            #[serde(default)]
+            confidence: Option<f64>,
+            #[serde(default)]
+            probabilities: Option<BTreeMap<String, f64>>,
+            #[serde(default)]
+            legend: Option<BTreeMap<String, Box<RawValue>>>,
+        }
+        let raw = Box::<RawValue>::deserialize(deserializer)?;
+        let fields = unique_json(raw.get().as_bytes()).map_err(de::Error::custom)?;
+        let tag = fields
+            .get("type")
+            .ok_or_else(|| de::Error::missing_field("type"))?;
+        let tag = tag
+            .as_str()
+            .ok_or_else(|| de::Error::custom("invalid answer type"))?;
+        match tag {
+            "noul" => {
+                let Noul { noul } = serde_json::from_str(raw.get()).map_err(de::Error::custom)?;
+                Ok(Self::Noul { noul })
+            }
+            "choice" => {
+                let Choice {
+                    choice,
+                    confidence,
+                    probabilities,
+                } = serde_json::from_str(raw.get()).map_err(de::Error::custom)?;
+                Ok(Self::Choice {
+                    choice,
+                    confidence,
+                    probabilities,
+                })
+            }
+            "score" => {
+                let Score {
+                    score,
+                    confidence,
+                    probabilities,
+                    legend,
+                } = serde_json::from_str(raw.get()).map_err(de::Error::custom)?;
+                let legend = legend
+                    .map(|values| {
+                        values
+                            .into_iter()
+                            .map(|(key, raw)| {
+                                unique_json(raw.get().as_bytes()).map(|value| (key, value))
+                            })
+                            .collect::<serde_json::Result<BTreeMap<_, _>>>()
+                    })
+                    .transpose()
+                    .map_err(de::Error::custom)?;
+                Ok(Self::Score {
+                    score,
+                    confidence,
+                    probabilities,
+                    legend,
+                })
+            }
+            _ => Err(de::Error::unknown_variant(
+                tag,
+                &["noul", "choice", "score"],
+            )),
+        }
+    }
+}
 
 fn description(value: &Value) -> bool {
     matches!(value, Value::String(_) | Value::Object(_) | Value::Array(_))
@@ -83,15 +168,51 @@ pub(crate) fn request(state: &Value, questions: &Value) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn response(bytes: &[u8], questions: &Value) -> Result<DecisionResponse> {
+    response_checked(bytes, questions, None)
+}
+
+pub(crate) fn response_for_model(
+    bytes: &[u8],
+    questions: &Value,
+    requested: &str,
+) -> Result<DecisionResponse> {
+    response_checked(bytes, questions, Some(requested))
+}
+
+fn response_checked(
+    bytes: &[u8],
+    questions: &Value,
+    requested: Option<&str>,
+) -> Result<DecisionResponse> {
     ensure!(
         bytes.len() <= MAX_RESPONSE_BYTES,
         "Jev response exceeded the byte limit"
     );
-    let unique: UniqueValue = serde_json::from_slice(bytes)
-        .map_err(|_| anyhow!("Jev response is invalid JSON or contains duplicate keys"))?;
-    let response: DecisionResponse = serde_json::from_value(unique.0)
+    let value = unique_json(bytes).map_err(|_| DecisionFailure::invalid_json())?;
+    let usage = FailedResponseUsage::from_response(&value);
+    let metadata = FailedResponseMetadata::from_response(&value);
+    validate_response(value, questions)
+        .and_then(|response| {
+            // Exact selectors keep equality/canonical mapping; `~` aliases admit
+            // only a concrete same-author, same-family build (see models.rs).
+            ensure!(
+                requested.is_none_or(|model| crate::response_model_matches(model, &response.model)),
+                "Decisions response model does not match the requested model"
+            );
+            Ok(response)
+        })
+        .map_err(|error| DecisionFailure::validation(&error, usage, metadata).into())
+}
+
+pub(crate) fn validate_response(value: Value, questions: &Value) -> Result<DecisionResponse> {
+    // Value's deserializer interprets reserved internal keys. Keep usage from the
+    // raw-token-aware tree so literal objects cannot become numeric cost metadata.
+    let usage = value.get("usage").cloned().unwrap_or(Value::Null);
+    let mut response: DecisionResponse = serde_json::from_value(value)
         .map_err(|_| anyhow!("Jev response does not match the Decisions schema"))?;
+    response.usage = usage;
     ensure!(
         !response.model.trim().is_empty()
             && response.model.len() <= 256
@@ -250,71 +371,61 @@ fn distribution<'a>(
     Ok(())
 }
 
-/// serde_json::Value normally discards duplicate keys. Reject them before typed decoding so
-/// ambiguous answer IDs and conflicting model/usage fields cannot be accepted silently.
-struct UniqueValue(Value);
+/// Decode JSON while rejecting duplicate decoded object keys at every depth.
+///
+/// Nesting is limited to 128 levels. Callers must bound the input byte length.
+/// Raw container tokens distinguish real objects from arbitrary-precision numbers.
+pub fn unique_json(bytes: &[u8]) -> serde_json::Result<Value> {
+    let raw: &RawValue = serde_json::from_slice(bytes)?;
+    unique_value(raw, 0)
+}
 
-impl<'de> Deserialize<'de> for UniqueValue {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
-        struct UniqueVisitor;
-        impl<'de> Visitor<'de> for UniqueVisitor {
-            type Value = Value;
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("JSON without duplicate object keys")
-            }
-            fn visit_bool<E: de::Error>(self, value: bool) -> std::result::Result<Value, E> {
-                Ok(Value::Bool(value))
-            }
-            fn visit_i64<E: de::Error>(self, value: i64) -> std::result::Result<Value, E> {
-                Ok(Value::Number(value.into()))
-            }
-            fn visit_u64<E: de::Error>(self, value: u64) -> std::result::Result<Value, E> {
-                Ok(Value::Number(value.into()))
-            }
-            fn visit_f64<E: de::Error>(self, value: f64) -> std::result::Result<Value, E> {
-                serde_json::Number::from_f64(value)
-                    .map(Value::Number)
-                    .ok_or_else(|| E::custom("non-finite number"))
-            }
-            fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<Value, E> {
-                Ok(Value::String(value.to_owned()))
-            }
-            fn visit_string<E: de::Error>(self, value: String) -> std::result::Result<Value, E> {
-                Ok(Value::String(value))
-            }
-            fn visit_none<E: de::Error>(self) -> std::result::Result<Value, E> {
-                Ok(Value::Null)
-            }
-            fn visit_unit<E: de::Error>(self) -> std::result::Result<Value, E> {
-                Ok(Value::Null)
-            }
-            fn visit_seq<A: SeqAccess<'de>>(
-                self,
-                mut sequence: A,
-            ) -> std::result::Result<Value, A::Error> {
-                let mut values = Vec::new();
-                while let Some(UniqueValue(value)) = sequence.next_element()? {
-                    values.push(value);
-                }
-                Ok(Value::Array(values))
-            }
-            fn visit_map<A: MapAccess<'de>>(
-                self,
-                mut object: A,
-            ) -> std::result::Result<Value, A::Error> {
-                let mut values = Map::new();
-                while let Some((key, UniqueValue(value))) =
-                    object.next_entry::<String, UniqueValue>()?
-                {
-                    if values.insert(key, value).is_some() {
-                        return Err(de::Error::custom("duplicate JSON key"));
-                    }
-                }
-                Ok(Value::Object(values))
-            }
-        }
-        deserializer.deserialize_any(UniqueVisitor).map(Self)
+fn unique_value(raw: &RawValue, depth: usize) -> serde_json::Result<Value> {
+    // Parsing each raw child starts a new deserializer; retain a global depth bound.
+    if depth >= 128 {
+        return Err(de::Error::custom("JSON nesting limit exceeded"));
     }
+    struct UniqueContainer {
+        depth: usize,
+    }
+    impl<'de> Visitor<'de> for UniqueContainer {
+        type Value = Value;
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("JSON without duplicate object keys")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> std::result::Result<Value, A::Error> {
+            let mut values = Vec::new();
+            while let Some(raw) = sequence.next_element::<&RawValue>()? {
+                values.push(unique_value(raw, self.depth + 1).map_err(de::Error::custom)?);
+            }
+            Ok(Value::Array(values))
+        }
+        fn visit_map<A: MapAccess<'de>>(
+            self,
+            mut object: A,
+        ) -> std::result::Result<Value, A::Error> {
+            let mut values = Map::new();
+            while let Some((key, raw)) = object.next_entry::<String, &RawValue>()? {
+                if values.contains_key(&key) {
+                    return Err(de::Error::custom("duplicate JSON key"));
+                }
+                let value = unique_value(raw, self.depth + 1).map_err(de::Error::custom)?;
+                values.insert(key, value);
+            }
+            Ok(Value::Object(values))
+        }
+    }
+    let mut deserializer = serde_json::Deserializer::from_str(raw.get());
+    let value = match raw.get().as_bytes()[0] {
+        b'{' => deserializer.deserialize_map(UniqueContainer { depth })?,
+        b'[' => deserializer.deserialize_seq(UniqueContainer { depth })?,
+        _ => return serde_json::from_str(raw.get()),
+    };
+    deserializer.end()?;
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -340,6 +451,61 @@ mod tests {
 
     fn parse(value: Value) -> Result<DecisionResponse> {
         response(&serde_json::to_vec(&value).unwrap(), &questions())
+    }
+
+    #[test]
+    fn exact_model_admission_preserves_usage_when_identity_is_rejected() {
+        let requested = crate::DEFAULT_MODEL;
+        for actual in [requested, "openai/gpt-6-luna-decisions-20261006"] {
+            let mut value = valid_response();
+            value["model"] = json!(actual);
+            assert!(
+                response_for_model(
+                    &serde_json::to_vec(&value).unwrap(),
+                    &questions(),
+                    requested
+                )
+                .is_ok()
+            );
+        }
+        for actual in [
+            "openai/gpt-6-luna-decisions-20261007",
+            "other/model",
+            "typesafe/jev-1.13",
+        ] {
+            let mut value = valid_response();
+            value["model"] = json!(actual);
+            value["usage"] = json!({"input_tokens":3,"output_tokens":2,"cost":0.001});
+            let error = response_for_model(
+                &serde_json::to_vec(&value).unwrap(),
+                &questions(),
+                requested,
+            )
+            .unwrap_err();
+            let diagnostic = error
+                .downcast_ref::<DecisionFailure>()
+                .unwrap()
+                .diagnostic();
+            assert_eq!(diagnostic.validation_code, Some("model_mismatch"));
+            assert!(diagnostic.reported_usage.is_some());
+            assert!(!error.to_string().contains(actual));
+        }
+        assert!(crate::response_model_matches(
+            crate::LEGACY_MODEL,
+            "typesafe/jev-1.13-20260917"
+        ));
+        assert!(!crate::response_model_matches(
+            crate::LEGACY_MODEL,
+            "typesafe/jev-1.13-20260918"
+        ));
+        assert!(crate::response_model_matches(
+            "explicit/other",
+            "explicit/other"
+        ));
+        assert!(!crate::response_model_matches(
+            "explicit/other",
+            "explicit/other-dated"
+        ));
     }
 
     #[test]
@@ -454,6 +620,74 @@ mod tests {
                 .to_string();
             assert!(!error.contains("secret-sentinel"));
         }
+    }
+
+    #[test]
+    fn decimal_and_exponent_tokens_preserve_answers_and_usage() {
+        let raw = br#"{"model":"m","answers":{
+            "s":{"type":"score","score":8e-1,"probabilities":{"0":0.2,"1":0.8}},
+            "n":{"type":"noul","noul":0.99},
+            "c":{"type":"choice","choice":"yes","confidence":9e-1,
+                 "probabilities":{"yes":0.9,"no":1e-1}}
+        },"usage":{"input_tokens":12,"output_tokens":0,"cost":4.69e-5}}"#;
+        let result = response(raw, &questions()).unwrap();
+        assert!(matches!(result.answers["s"], DecisionAnswer::Score { score, .. } if score == 0.8));
+        assert!(matches!(result.answers["n"], DecisionAnswer::Noul { noul } if noul == 0.99));
+        assert_eq!(result.usage["cost"].as_f64(), Some(0.0000469));
+
+        let invalid = std::str::from_utf8(raw)
+            .unwrap()
+            .replace("\"noul\":0.99", "\"noul\":\"invalid\"");
+        let error = response(invalid.as_bytes(), &questions()).unwrap_err();
+        let diagnostic = error
+            .downcast_ref::<DecisionFailure>()
+            .unwrap()
+            .diagnostic();
+        assert_eq!(diagnostic.validation_code, Some("schema"));
+        let cost = &diagnostic.reported_usage.as_ref().unwrap().cost;
+        assert_eq!(cost.presence, crate::UsagePresence::Reported);
+        assert_eq!(cost.value, Some(0.0000469));
+    }
+
+    #[test]
+    fn reserved_number_key_stays_an_object_and_cannot_supply_a_probability() {
+        let raw = br#"{"$serde_json::private::Number":"0.99"}"#;
+        let value = unique_json(raw).unwrap();
+        assert!(value.is_object());
+        assert_eq!(value["$serde_json::private::Number"], "0.99");
+        let raw = br#"{"model":"m","answers":{
+            "s":{"type":"score","score":0.8},
+            "n":{"type":"noul","noul":{"$serde_json::private::Number":"0.99"}},
+            "c":{"type":"choice","choice":"yes"}
+        }}"#;
+        assert!(response(raw, &questions()).is_err());
+        let mut forged_cost = valid_response();
+        forged_cost["usage"] = json!({"cost":{"$serde_json::private::Number":"0.1"}});
+        assert!(parse(forged_cost).is_err());
+
+        let mut forged_legend = valid_response();
+        forged_legend["answers"]["s"]["legend"] =
+            json!({"0":{"$serde_json::private::Number":"0.1"},"1":"direct"});
+        assert!(parse(forged_legend).is_err());
+    }
+
+    #[test]
+    fn raw_container_validation_rejects_escaped_duplicates_and_deep_nesting() {
+        for raw in [
+            r#"{"usage":{"cost":0.1,"co\u0073t":0.2}}"#,
+            r#"{"answers":{"n":{},"\u006e":{}}}"#,
+            r#"[{"$serde_json::private::Number":"0.1","$serde_json::private::Number":"0.2"}]"#,
+            r#"{"nested":[{"a":1,"a":2}]}"#,
+        ] {
+            assert!(unique_json(raw.as_bytes()).is_err());
+        }
+        let deep = format!("{}0{}", "[".repeat(128), "]".repeat(128));
+        assert!(unique_json(deep.as_bytes()).is_err());
+        assert!(unique_json(b"{\"a\":[1,{\"b\":2}],\"b\":3}").is_ok());
+        assert!(
+            serde_json::from_str::<DecisionAnswer>(r#"{"type":"noul","type":"noul","noul":0.99}"#)
+                .is_err()
+        );
     }
 
     #[test]

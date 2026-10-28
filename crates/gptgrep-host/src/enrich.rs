@@ -292,6 +292,10 @@ pub async fn enrich(root: &Path, config: &EnrichConfig) -> Result<EnrichReport> 
     validate_config(config)?;
     let client = JevClient::from_env(config.host.jev_model.as_deref())
         .map_err(|_| anyhow!("enrich_jev_initialization_failed"))?;
+    let client = match &config.host.decisions_execution {
+        Some(context) => client.with_execution_context(context.clone()),
+        None => client,
+    };
     enrich_with(root, config, &NativeBackend { client }).await
 }
 
@@ -330,6 +334,7 @@ impl Backend for NativeBackend {
             protocol::RunOptions {
                 observer: None,
                 max_output_bytes: Some(16 * 1024),
+                ..Default::default()
             },
         )
         .await
