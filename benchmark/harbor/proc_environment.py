@@ -381,6 +381,7 @@ class ProcOverlayDockerEnvironment(DockerEnvironment):
         self._start_attempted = False
         self._running_verified = False
         self._daemon_checked = False
+        self._image_labels: dict[str, str] | None = None
         self._generation: tuple[int, str] | None = None
         self._identity: dict[str, Any] | None = None
         self._cleanup_attempted = False
@@ -497,12 +498,24 @@ class ProcOverlayDockerEnvironment(DockerEnvironment):
         body = self._create_request
         expected = {key: value for key, value in body.items() if key != "HostConfig"}
         expected["Hostname"] = self._container_id[:12]
+        _need(self._image_labels is not None, "The pinned image labels have not been inspected")
+        expected["Labels"] = {**self._image_labels, **body["Labels"]}
         _need(isinstance(row, dict) and row.get("Id") == self._container_id
               and row.get("Name") == "/" + self._container_name and row.get("Image") == body["Image"]
               and type(row.get("RestartCount")) is int and row["RestartCount"] == 0,
               "The exact container identity or restart generation differs")
         _same(row.get("Config"), expected, "The inspected full container Config differs from its create request")
-        _same(row.get("HostConfig"), body["HostConfig"], "The inspected full HostConfig differs from its create request")
+        host = copy.deepcopy(row.get("HostConfig"))
+        _need(isinstance(host, dict) and isinstance(host.get("Mounts"), list)
+              and all(isinstance(mount, dict) for mount in host["Mounts"]), "Malformed inspected HostConfig mounts")
+        expected_host = copy.deepcopy(body["HostConfig"])
+        # Engine omits false bind flags and serializes the default OOM flag as
+        # false. Admit only these field-specific representations.
+        for mount in [*host["Mounts"], *expected_host["Mounts"]]:
+            mount.setdefault("ReadOnly", False)
+        if expected_host["OomKillDisable"] is None and host.get("OomKillDisable") is False:
+            host["OomKillDisable"] = None
+        _same(host, expected_host, "The inspected full HostConfig differs from its create request")
         _need(row.get("AppArmorProfile") == body["HostConfig"]["SecurityOpt"][2][9:], "The active AppArmor profile differs")
         state = row.get("State")
         _need(isinstance(state, dict) and type(state.get("Running")) is bool
@@ -565,6 +578,14 @@ class ProcOverlayDockerEnvironment(DockerEnvironment):
         row = await self._engine("GET", "/images/" + image_name + "/json")
         _need(isinstance(row, dict) and row.get("Id") == image_name and row.get("Os") == "linux",
               "The pinned local prebuilt Linux image is unavailable")
+        config = row.get("Config")
+        _need(isinstance(config, dict), "The pinned image configuration is unavailable")
+        labels = config.get("Labels")
+        _need(labels is None or (isinstance(labels, dict) and len(labels) <= 32
+              and all(isinstance(key, str) and isinstance(value, str) and 0 < len(key) <= 256
+                      and len(value) <= 4096 and not any(c in key + value for c in "\0\r\n")
+                      for key, value in labels.items())), "The pinned image labels are malformed")
+        self._image_labels = copy.deepcopy(labels or {})
 
     async def _is_rootless_docker(self) -> bool:
         _need(self._daemon_checked, "The pinned Engine mode is not known")

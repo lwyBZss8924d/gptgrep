@@ -202,6 +202,8 @@ class HarnessEnvironment(adapter.ProcOverlayDockerEnvironment):
         self.fail_stop = False
         self.fail_cp = False
         self.host_mutation = None
+        self.config_mutation = None
+        self.image_labels = {"org.example.inherited": "image", "com.docker.compose.service": "image-default"}
         self.server_pid = 1234
         self.started_at = "2026-01-01T00:00:00.000000000Z"
         super().__init__(*args, **kwargs)
@@ -218,7 +220,14 @@ class HarnessEnvironment(adapter.ProcOverlayDockerEnvironment):
         body = copy.deepcopy(self._create_request)
         config = {key: value for key, value in body.items() if key != "HostConfig"}
         config["Hostname"] = CID[:12]
+        config["Labels"] = {**self.image_labels, **config["Labels"]}
+        if self.config_mutation is not None:
+            config.update(self.config_mutation)
         host = body["HostConfig"]
+        host["OomKillDisable"] = False
+        for mount in host["Mounts"]:
+            if mount.get("ReadOnly") is False:
+                del mount["ReadOnly"]
         if self.host_mutation is not None:
             host.update(self.host_mutation)
         return {"Id": CID, "Name": "/" + self._container_name, "Image": body["Image"], "RestartCount": 0,
@@ -234,7 +243,8 @@ class HarnessEnvironment(adapter.ProcOverlayDockerEnvironment):
         if method == "GET" and endpoint == "/info":
             return {"OSType": "linux", "SecurityOptions": ["name=seccomp", "name=apparmor"]}
         if method == "GET" and endpoint.startswith("/images/"):
-            return {"Id": self._create_request["Image"], "Os": "linux"}
+            return {"Id": self._create_request["Image"], "Os": "linux",
+                    "Config": {"Labels": copy.deepcopy(self.image_labels)}}
         if method == "GET" and endpoint.startswith("/containers/json?"):
             ids = [CID] if self.server_created and not self.removed else []
             return [{"Id": value} for value in ids + ([FOREIGN_CID] if self.foreign_project else [])]
@@ -477,6 +487,81 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(endpoint.endswith("/start") for _method, endpoint, _body in env.calls))
         self.assertEqual(env.delegated, [])
 
+    async def test_pinned_image_labels_and_boolean_serialization_preserve_exact_request(self):
+        self.contract["createRequest"]["HostConfig"]["Mounts"][0]["ReadOnly"] = False
+        env = self.environment()
+        request = copy.deepcopy(env._create_request)
+        await env.start(False)
+        row = env.row()
+        self.assertEqual(row["Config"]["Labels"]["org.example.inherited"], "image")
+        self.assertEqual(row["Config"]["Labels"]["com.docker.compose.service"], "main")
+        self.assertNotIn("ReadOnly", row["HostConfig"]["Mounts"][0])
+        self.assertIs(row["HostConfig"]["OomKillDisable"], False)
+        creates = [body for method, endpoint, body in env.calls if method == "POST" and "/create?" in endpoint]
+        self.assertEqual(creates, [request])
+        self.assertEqual(env._create_request, request)
+        await env.stop(True)
+        self.assertTrue(env._cleanup_complete)
+
+    async def test_inherited_extra_missing_changed_and_overridden_label_drift_deny_start(self):
+        for change in ("extra", "missing", "changed", "overridden"):
+            with self.subTest(change=change):
+                env = self.environment()
+                labels = {**env.image_labels, **env._create_request["Labels"]}
+                if change == "extra":
+                    labels["org.example.unpinned"] = "unreviewed"
+                elif change == "missing":
+                    del labels["org.example.inherited"]
+                elif change == "changed":
+                    labels["org.example.inherited"] = "changed"
+                else:
+                    labels["com.docker.compose.service"] = "image-default"
+                env.config_mutation = {"Labels": labels}
+                with self.assertRaises(adapter.ProcEnvironmentError):
+                    await env.start(False)
+                self.assertFalse(any(endpoint.endswith("/start") for _method, endpoint, _body in env.calls))
+                self.assertEqual(env.delegated, [])
+
+    async def test_image_label_snapshot_cannot_follow_later_metadata_drift(self):
+        env = self.environment()
+        await env.start(False)
+        env.image_labels["org.example.inherited"] = "changed"
+        with self.assertRaises(adapter.ProcEnvironmentError):
+            await env._assert_owned()
+        self.assertEqual(env._image_labels["org.example.inherited"], "image")
+
+    async def test_boolean_equivalences_reject_other_values_and_readonly_drift(self):
+        for field, value in (("OomKillDisable", True), ("OomKillDisable", 0), ("OomKillDisable", "false"),
+                             ("ReadOnly", None), ("ReadOnly", 0), ("ReadOnly", "false"), ("ReadOnly", True)):
+            with self.subTest(field=field, value=value):
+                env = self.environment()
+                if field == "ReadOnly":
+                    mounts = copy.deepcopy(env._create_request["HostConfig"]["Mounts"])
+                    mounts[0][field] = value
+                    env.host_mutation = {"Mounts": mounts}
+                else:
+                    env.host_mutation = {field: value}
+                with self.assertRaises(adapter.ProcEnvironmentError):
+                    await env.start(False)
+                self.assertFalse(any(endpoint.endswith("/start") for _method, endpoint, _body in env.calls))
+        self.contract["createRequest"]["HostConfig"]["Mounts"][0]["ReadOnly"] = True
+        env = self.environment()
+        mounts = copy.deepcopy(env._create_request["HostConfig"]["Mounts"])
+        del mounts[0]["ReadOnly"]
+        env.host_mutation = {"Mounts": mounts}
+        with self.assertRaises(adapter.ProcEnvironmentError):
+            await env.start(False)
+        self.assertFalse(any(endpoint.endswith("/start") for _method, endpoint, _body in env.calls))
+
+    async def test_invalid_image_labels_are_rejected_before_create(self):
+        for labels in ([], {"label": 1}, {"bad\nkey": "value"}):
+            with self.subTest(labels=labels):
+                env = self.environment()
+                env.image_labels = labels
+                with self.assertRaises(adapter.ProcEnvironmentError):
+                    await env.start(False)
+                self.assertFalse(any(method in {"POST", "DELETE"} for method, _endpoint, _body in env.calls))
+
     async def test_ambiguous_compose_selection_denies_copy_without_fallback(self):
         env = self.environment()
         await env.start(False)
@@ -684,6 +769,8 @@ class InstalledHarborTests(unittest.IsolatedAsyncioTestCase):
                 self.foreign_project = self.foreign_name = False
                 self.fail_create = self.fail_start = self.fail_stop = self.fail_cp = False
                 self.host_mutation = None
+                self.config_mutation = None
+                self.image_labels = {"org.example.inherited": "image", "com.docker.compose.service": "image-default"}
                 self.server_pid = 1234
                 self.started_at = "2026-01-01T00:00:00.000000000Z"
                 super().__init__(*args, **kwargs)
