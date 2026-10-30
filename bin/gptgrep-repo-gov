@@ -1,0 +1,5 @@
+#!/bin/sh
+# Dispatch only; all repository governance logic lives in workspace/harness-tooling/repo-governance/.
+set -eu
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec python3 "$SELF_DIR/../workspace/harness-tooling/repo-governance/repo_gov.py" "$@"

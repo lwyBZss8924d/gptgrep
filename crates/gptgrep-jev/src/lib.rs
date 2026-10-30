@@ -8,6 +8,7 @@
 mod clock;
 mod execution;
 mod failure;
+pub mod helper_ipc;
 mod input;
 mod models;
 #[cfg(test)]
@@ -330,14 +331,29 @@ pub trait DecisionObserver: Send + Sync {
 /// Credentials are deliberately excluded from Debug and serialization.
 #[derive(Clone)]
 pub struct JevClient {
-    http: Client,
+    backend: ClientBackend,
     endpoint: Url,
     model: String,
-    authorization: HeaderValue,
     identity: Arc<()>,
     execution: ExecutionContext,
     observer: Option<Arc<dyn DecisionObserver>>,
     retry: Option<TransientRetry>,
+}
+
+#[derive(Clone)]
+enum ClientBackend {
+    Http {
+        http: Client,
+        authorization: HeaderValue,
+    },
+    Helper(Arc<helper_ipc::HelperClient>),
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PreparedBodyMode {
+    Ordinary,
+    TypedInput,
 }
 
 /// One exact validated Decisions request prepared before budget/network admission.
@@ -349,6 +365,7 @@ pub struct PreparedDecision {
     endpoint: Url,
     body_sha256: String,
     identity: Arc<()>,
+    mode: PreparedBodyMode,
 }
 
 impl PreparedDecision {
@@ -459,6 +476,9 @@ fn add_ca_bundle_roots(
 impl JevClient {
     /// Read OPENROUTER_API_KEY and optional SSL_CERT_FILE from the process environment.
     pub fn from_env(model: Option<&str>) -> Result<Self> {
+        if helper_ipc::environment_selected() {
+            return helper_ipc::HelperClient::from_environment(model)?.into_client();
+        }
         let key = std::env::var("OPENROUTER_API_KEY")
             .map_err(|_| anyhow!("OPENROUTER_API_KEY is not available"))?;
         Self::new(&key, model)
@@ -516,10 +536,12 @@ impl JevClient {
             .build()
             .map_err(|_| anyhow!("Could not initialize Jev HTTP transport"))?;
         Ok(Self {
-            http,
+            backend: ClientBackend::Http {
+                http,
+                authorization,
+            },
             endpoint,
             model: model.to_owned(),
-            authorization,
             identity: Arc::new(()),
             execution: ExecutionContext::compatibility(),
             observer: None,
@@ -529,7 +551,10 @@ impl JevClient {
 
     /// Attach one shared experimental budget before preparing requests.
     pub fn with_execution_context(mut self, context: ExecutionContext) -> Self {
-        self.execution = context;
+        self.execution = match &self.backend {
+            ClientBackend::Http { .. } => context,
+            ClientBackend::Helper(helper) => helper.delegated_view(context),
+        };
         self.identity = Arc::new(());
         self
     }
@@ -596,6 +621,15 @@ impl JevClient {
     }
 
     fn bind_prepared_body(&self, body: Vec<u8>, questions: Value) -> PreparedDecision {
+        self.bind_prepared_mode(body, questions, PreparedBodyMode::Ordinary)
+    }
+
+    fn bind_prepared_mode(
+        &self,
+        body: Vec<u8>,
+        questions: Value,
+        mode: PreparedBodyMode,
+    ) -> PreparedDecision {
         let body_sha256 = Sha256::digest(&body)
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -607,6 +641,7 @@ impl JevClient {
             endpoint: self.endpoint.clone(),
             body_sha256,
             identity: Arc::clone(&self.identity),
+            mode,
         }
     }
 
@@ -637,6 +672,9 @@ impl JevClient {
                 && Arc::ptr_eq(&prepared.identity, &self.identity),
             "Prepared Jev decision belongs to a different client, model or endpoint"
         );
+        if let ClientBackend::Helper(helper) = &self.backend {
+            return helper.submit(self, prepared, retry, notice).await;
+        }
         self.decide_body(prepared.body, &prepared.questions, retry, notice)
             .await
     }
@@ -880,10 +918,18 @@ impl JevClient {
         }
         // From here the provider may receive and complete the request.
         progress.sent = true;
-        let mut response = self
-            .http
+        let ClientBackend::Http {
+            http,
+            authorization,
+        } = &self.backend
+        else {
+            return Err(anyhow!(
+                "Helper clients cannot submit directly to a provider"
+            ));
+        };
+        let mut response = http
             .post(self.endpoint.clone())
-            .header(AUTHORIZATION, self.authorization.clone())
+            .header(AUTHORIZATION, authorization.clone())
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body)
             .send()

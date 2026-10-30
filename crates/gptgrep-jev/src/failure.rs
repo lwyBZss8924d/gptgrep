@@ -115,12 +115,14 @@ pub enum UsagePresence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct UsageObservation<T> {
     pub presence: UsagePresence,
     pub value: Option<T>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct FailedResponseUsage {
     pub input_tokens: UsageObservation<u64>,
     pub output_tokens: UsageObservation<u64>,
@@ -235,6 +237,7 @@ impl FailedResponseMetadata {
 /// statuses that admit a retry always leave `reported_usage` unknown (`None`),
 /// never zero.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DecisionRetriedAttempt {
     /// One-based submission ordinal within the logical request.
     pub attempt: u32,
@@ -672,3 +675,341 @@ impl fmt::Display for DecisionFailure {
 }
 
 impl std::error::Error for DecisionFailure {}
+
+#[cfg(target_os = "linux")]
+pub(crate) use helper_wire::HelperFailure;
+
+#[cfg(target_os = "linux")]
+mod helper_wire {
+    use super::*;
+    // Only the authenticated helper channel uses these owned DTOs. Provider JSON
+    // continues to use the existing restricted deserializers above.
+    #[derive(Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(crate) struct HelperMetadata {
+        model: UsageObservation<String>,
+        id: UsageObservation<String>,
+        provider: UsageObservation<String>,
+    }
+    impl From<FailedResponseMetadata> for HelperMetadata {
+        fn from(value: FailedResponseMetadata) -> Self {
+            Self {
+                model: value.model,
+                id: value.id,
+                provider: value.provider,
+            }
+        }
+    }
+    impl HelperMetadata {
+        fn into_native(self) -> anyhow::Result<FailedResponseMetadata> {
+            for field in [&self.model, &self.id, &self.provider] {
+                anyhow::ensure!(
+                    field
+                        .value
+                        .as_ref()
+                        .is_none_or(|value| !value.trim().is_empty()
+                            && value.len() <= crate::MAX_PROVIDER_METADATA_BYTES
+                            && !value.chars().any(char::is_control)),
+                    "Invalid helper response metadata"
+                );
+                anyhow::ensure!(
+                    (field.presence == UsagePresence::Reported) == field.value.is_some(),
+                    "Invalid helper metadata presence"
+                );
+            }
+            Ok(FailedResponseMetadata {
+                model: self.model,
+                id: self.id,
+                provider: self.provider,
+            })
+        }
+    }
+
+    #[derive(Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(crate) struct HelperObserverFailure {
+        callbacks: Vec<DecisionObserverCallback>,
+        requested_model: String,
+        send_started: bool,
+        response_validated: bool,
+    }
+    impl From<DecisionObserverFailure> for HelperObserverFailure {
+        fn from(value: DecisionObserverFailure) -> Self {
+            Self {
+                callbacks: value.callbacks,
+                requested_model: value.requested_model,
+                send_started: value.send_started,
+                response_validated: value.response_validated,
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub(crate) enum HelperValidationCode {
+        Schema,
+        ModelIdentifier,
+        ProviderMetadata,
+        AnswerIds,
+        ChoiceOption,
+        ChoiceDistribution,
+        ScoreRange,
+        ScoreDistribution,
+        ScoreLegend,
+        AnswerType,
+        UsageShape,
+        TokenUsage,
+        CostMetadata,
+        Probability,
+        DistributionKeys,
+        DistributionSum,
+        ModelMismatch,
+        OtherValidation,
+    }
+    impl HelperValidationCode {
+        fn from_static(value: &str) -> Option<Self> {
+            Some(match value {
+                "schema" => Self::Schema,
+                "model_identifier" => Self::ModelIdentifier,
+                "provider_metadata" => Self::ProviderMetadata,
+                "answer_ids" => Self::AnswerIds,
+                "choice_option" => Self::ChoiceOption,
+                "choice_distribution" => Self::ChoiceDistribution,
+                "score_range" => Self::ScoreRange,
+                "score_distribution" => Self::ScoreDistribution,
+                "score_legend" => Self::ScoreLegend,
+                "answer_type" => Self::AnswerType,
+                "usage_shape" => Self::UsageShape,
+                "token_usage" => Self::TokenUsage,
+                "cost_metadata" => Self::CostMetadata,
+                "probability" => Self::Probability,
+                "distribution_keys" => Self::DistributionKeys,
+                "distribution_sum" => Self::DistributionSum,
+                "model_mismatch" => Self::ModelMismatch,
+                "other_validation" => Self::OtherValidation,
+                _ => return None,
+            })
+        }
+        fn code(self) -> &'static str {
+            match self {
+                Self::Schema => "schema",
+                Self::ModelIdentifier => "model_identifier",
+                Self::ProviderMetadata => "provider_metadata",
+                Self::AnswerIds => "answer_ids",
+                Self::ChoiceOption => "choice_option",
+                Self::ChoiceDistribution => "choice_distribution",
+                Self::ScoreRange => "score_range",
+                Self::ScoreDistribution => "score_distribution",
+                Self::ScoreLegend => "score_legend",
+                Self::AnswerType => "answer_type",
+                Self::UsageShape => "usage_shape",
+                Self::TokenUsage => "token_usage",
+                Self::CostMetadata => "cost_metadata",
+                Self::Probability => "probability",
+                Self::DistributionKeys => "distribution_keys",
+                Self::DistributionSum => "distribution_sum",
+                Self::ModelMismatch => "model_mismatch",
+                Self::OtherValidation => "other_validation",
+            }
+        }
+        fn message(self) -> &'static str {
+            match self {
+                Self::Schema => "Jev response does not match the Decisions schema",
+                Self::ModelIdentifier => "Jev response has an invalid model identifier",
+                Self::ProviderMetadata => "Jev response has invalid provider metadata",
+                Self::AnswerIds => "Jev response answer IDs do not match the request",
+                Self::ChoiceOption => "Jev response selected an unknown option",
+                Self::ChoiceDistribution => "Jev response choice disagrees with its distribution",
+                Self::ScoreRange => "Jev response score is outside its rubric",
+                Self::ScoreDistribution => "Jev response score disagrees with its distribution",
+                Self::ScoreLegend => "Jev response legend does not match its rubric",
+                Self::AnswerType => "Jev response answer type does not match the request",
+                Self::UsageShape => "Jev response has invalid usage metadata",
+                Self::TokenUsage => "Jev response has invalid token usage",
+                Self::CostMetadata => "Jev response has invalid cost metadata",
+                Self::Probability => "Jev response contains an invalid probability or confidence",
+                Self::DistributionKeys => "Jev response distribution does not match its question",
+                Self::DistributionSum => "Jev response probabilities do not sum to one",
+                Self::ModelMismatch => {
+                    "Decisions response model does not match the requested model"
+                }
+                Self::OtherValidation => "Jev response failed validation",
+            }
+        }
+    }
+
+    #[derive(Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(crate) struct HelperFailure {
+        kind: DecisionFailureKind,
+        http_status: Option<u16>,
+        response_bytes: Option<usize>,
+        validation_code: Option<HelperValidationCode>,
+        reported_usage: Option<FailedResponseUsage>,
+        response_metadata: Option<HelperMetadata>,
+        prior_attempts: Vec<DecisionRetriedAttempt>,
+        retry_after_refusal: Option<RetryAfterRefusal>,
+        observer_failure: Option<HelperObserverFailure>,
+        retry_after_ms: Option<u64>,
+        privacy_refused: bool,
+    }
+    impl DecisionFailure {
+        pub(crate) fn helper_wire(&self) -> HelperFailure {
+            let d = &self.diagnostic;
+            HelperFailure {
+                kind: d.kind,
+                http_status: d.http_status,
+                response_bytes: d.response_bytes,
+                validation_code: d
+                    .validation_code
+                    .and_then(HelperValidationCode::from_static),
+                reported_usage: d.reported_usage.clone(),
+                response_metadata: d.response_metadata.clone().map(Into::into),
+                prior_attempts: d.prior_attempts.clone(),
+                retry_after_refusal: d.retry_after_refusal,
+                observer_failure: d.observer_failure.clone().map(Into::into),
+                retry_after_ms: self
+                    .retry_after()
+                    .and_then(|v| u64::try_from(v.as_millis()).ok()),
+                privacy_refused: false,
+            }
+        }
+        pub(crate) fn from_helper_wire(wire: HelperFailure) -> anyhow::Result<Self> {
+            anyhow::ensure!(
+                wire.http_status.is_none_or(|v| (100..=599).contains(&v))
+                    && wire
+                        .response_bytes
+                        .is_none_or(|v| v <= crate::MAX_RESPONSE_BYTES)
+                    && wire.prior_attempts.len() <= 1
+                    && wire.retry_after_ms.is_none_or(|v| v <= 9_999_999_999_000),
+                "Invalid helper failure bounds"
+            );
+            if let Some(usage) = &wire.reported_usage {
+                validate_helper_usage(usage)?;
+            }
+            for prior in &wire.prior_attempts {
+                prior.validate_helper()?;
+            }
+            let observer = wire
+                .observer_failure
+                .map(|value| {
+                    anyhow::ensure!(
+                        value.callbacks.len() <= 4
+                            && !value.requested_model.is_empty()
+                            && value.requested_model.len() <= 256
+                            && !value.requested_model.chars().any(char::is_control),
+                        "Invalid helper observer failure"
+                    );
+                    Ok::<_, anyhow::Error>(DecisionObserverFailure {
+                        callbacks: value.callbacks,
+                        requested_model: value.requested_model,
+                        send_started: value.send_started,
+                        response_validated: value.response_validated,
+                    })
+                })
+                .transpose()?;
+            let message = if wire.privacy_refused {
+                "Jev helper refused a credential-reflecting response; known numeric usage is retained"
+            } else if let Some(code) = wire.validation_code {
+                code.message()
+            } else {
+                match wire.kind {
+                    DecisionFailureKind::Timeout => {
+                        "Jev request timed out; usage may be unknown and the request was not retried"
+                    }
+                    DecisionFailureKind::Deadline => {
+                        "Jev admission or request deadline expired; any reserved submission remains charged and unknown; request was not retried"
+                    }
+                    DecisionFailureKind::Connect | DecisionFailureKind::Transport => {
+                        "Jev transport failed; usage may be unknown and the request was not retried"
+                    }
+                    DecisionFailureKind::ResponseBody => {
+                        "Jev response transport failed; usage may be unknown and the request was not retried"
+                    }
+                    DecisionFailureKind::HttpStatus => "Jev provider returned HTTP",
+                    DecisionFailureKind::ResponseSize => "Jev response exceeded the byte limit",
+                    DecisionFailureKind::InvalidJson => {
+                        "Jev response is invalid JSON or contains duplicate keys"
+                    }
+                    DecisionFailureKind::ResponseSchema
+                    | DecisionFailureKind::ResponseValidation => "Jev response failed validation",
+                    DecisionFailureKind::RetryAdmission => {
+                        "Jev bounded retry was not admitted or sent; any reserved retry submission remains charged"
+                    }
+                    DecisionFailureKind::LocalPostSend => {
+                        if wire.reported_usage.is_some() {
+                            "Jev request was sent and validated, then a local accounting or observer step failed; its reported usage is retained"
+                        } else {
+                            "Jev request was sent, then a local accounting or observer step failed; the provider may have completed it and its usage is unknown"
+                        }
+                    }
+                    DecisionFailureKind::RetryPostSend => {
+                        "Jev bounded retry was sent, then a local accounting or observer step failed; the provider may have completed it"
+                    }
+                    DecisionFailureKind::ObserverCallback => {
+                        "Jev submission failed during an observer callback; request was not retried"
+                    }
+                }
+            };
+            let mut failure = Self::new(wire.kind, message, wire.http_status, wire.response_bytes);
+            failure.diagnostic.validation_code =
+                wire.validation_code.map(HelperValidationCode::code);
+            failure.diagnostic.reported_usage = wire.reported_usage;
+            failure.diagnostic.response_metadata = wire
+                .response_metadata
+                .map(HelperMetadata::into_native)
+                .transpose()?;
+            failure.diagnostic.prior_attempts = wire.prior_attempts;
+            failure.diagnostic.retry_after_refusal = wire.retry_after_refusal;
+            failure.diagnostic.observer_failure = observer;
+            failure.retry_after = if let Some(refusal) = wire.retry_after_refusal {
+                RetryAfter::Unusable(refusal)
+            } else if let Some(ms) = wire.retry_after_ms {
+                RetryAfter::Seconds(Duration::from_millis(ms))
+            } else {
+                RetryAfter::Absent
+            };
+            Ok(failure)
+        }
+    }
+    impl HelperFailure {
+        pub(crate) fn privacy_refusal(mut self) -> Self {
+            // Only independently checked numeric fields survive a privacy refusal.
+            self.response_metadata = None;
+            self.privacy_refused = true;
+            self
+        }
+    }
+    impl DecisionRetriedAttempt {
+        pub(crate) fn validate_helper(&self) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                self.attempt == 1
+                    && self.kind == DecisionFailureKind::HttpStatus
+                    && self
+                        .http_status
+                        .is_some_and(|value| crate::TRANSIENT_RETRY_STATUSES.contains(&value))
+                    && (250..20_000).contains(&self.retry_wait_ms)
+                    && self
+                        .retry_after_ms
+                        .is_none_or(|value| value % 1000 == 0 && value <= self.retry_wait_ms),
+                "Invalid trusted helper retry observation"
+            );
+            if let Some(usage) = &self.reported_usage {
+                validate_helper_usage(usage)?;
+            }
+            Ok(())
+        }
+    }
+    fn validate_helper_usage(usage: &FailedResponseUsage) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            (usage.input_tokens.presence == UsagePresence::Reported)
+                == usage.input_tokens.value.is_some()
+                && (usage.output_tokens.presence == UsagePresence::Reported)
+                    == usage.output_tokens.value.is_some()
+                && (usage.cost.presence == UsagePresence::Reported) == usage.cost.value.is_some()
+                && usage.cost.value.is_none_or(|v| v.is_finite() && v >= 0.0),
+            "Invalid helper usage observation"
+        );
+        Ok(())
+    }
+}

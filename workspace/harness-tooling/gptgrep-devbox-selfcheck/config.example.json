@@ -1,0 +1,23 @@
+{
+  "schema": "gptgrep.devbox-selfcheck.config.v1",
+  "project_root": "./project",
+  "expected_host": {
+    "hostname": "replace-with-observed-target-hostname",
+    "platform": "replace-with-observed-platform",
+    "arch": "replace-with-observed-architecture"
+  },
+  "storage": {
+    "path": "./registered-volume",
+    "device": 0,
+    "inode": 0,
+    "reserve_bytes": 0
+  },
+  "tools": [
+    {
+      "name": "selected-runtime",
+      "path": "./pinned-runtime",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "links": []
+}

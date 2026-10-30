@@ -1,0 +1,72 @@
+name: Manual Release Sync to CelHive-AI
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_branch:
+        description: 'Verified source branch to sync to CelHive-AI/gptgrep'
+        required: true
+        default: 'main'
+        type: string
+      confirm_release:
+        description: 'Type SYNC_TO_CELHIVE to authorize manual organization sync'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  manual-sync:
+    name: Verified Manual Sync to CelHive-AI/gptgrep
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Verify explicit confirmation token
+        env:
+          CONFIRM_INPUT: ${{ inputs.confirm_release }}
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+        run: |
+          if [ "$CONFIRM_INPUT" != "SYNC_TO_CELHIVE" ]; then
+            echo "ERROR: confirm_release must equal SYNC_TO_CELHIVE" >&2
+            exit 1
+          fi
+          case "$SOURCE_BRANCH" in
+            refs/notes/*|dev/opt-evo/*)
+              echo "ERROR: Experimental opt-evo branches and notes are prohibited from CelHive-AI sync." >&2
+              exit 1
+              ;;
+          esac
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Enforce repository governance and public-safety checks
+        env:
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+        run: |
+          python3 workspace/harness-tooling/repo-governance/repo_gov.py check-branch-name "$SOURCE_BRANCH"
+          python3 workspace/harness-tooling/repo-governance/repo_gov.py check-org-boundary \
+            --role core \
+            --remote-url "https://github.com/CelHive-AI/gptgrep.git" \
+            --refspec "refs/heads/${SOURCE_BRANCH}:refs/heads/${SOURCE_BRANCH}"
+          python3 workspace/harness-tooling/repo-governance/repo_gov.py check-public-safety --repo . --ref HEAD
+
+      - name: Push verified branch to CelHive-AI/gptgrep
+        env:
+          CELHIVE_SYNC_TOKEN: ${{ secrets.CELHIVE_SYNC_TOKEN }}
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+        run: |
+          if [ -z "$CELHIVE_SYNC_TOKEN" ]; then
+            echo "ERROR: CELHIVE_SYNC_TOKEN secret is not configured." >&2
+            exit 1
+          fi
+          git push "https://x-access-token:${CELHIVE_SYNC_TOKEN}@github.com/CelHive-AI/gptgrep.git" \
+            "HEAD:refs/heads/${SOURCE_BRANCH}"

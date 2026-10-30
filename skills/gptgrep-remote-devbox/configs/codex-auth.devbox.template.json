@@ -1,0 +1,137 @@
+{
+  "schema": "gptgrep.codex-auth.config.v1",
+  "auth_source_id": "dev",
+  "canonical_auth_home": "/mnt/gptgrep-dev/development-artifacts/owner-private/codex-auth/canonical-home",
+  "lease_path": "/mnt/gptgrep-dev/development-artifacts/owner-private/codex-auth/lease/gptgrep-codex.lock",
+  "runs_root": "/mnt/gptgrep-dev/development-artifacts/owners/gptgrep/auth-runs",
+  "codex_bin": "/mnt/gptgrep-dev/development-artifacts/toolchains/codex-latest/codex",
+  "codex_bin_sha256": "399ff69c431c066e40de318fba45c2b07f45a76b19939d247ee4828fc70c4215",
+  "binary_pins": [
+    {
+      "name": "codex_code_mode_host",
+      "path": "/mnt/gptgrep-dev/development-artifacts/toolchains/codex-latest/codex-code-mode-host",
+      "sha256": "8724d73ec190536233ab4628d24a071bfbcf27e5124f08fe35129f26fe48b916"
+    }
+  ],
+  "blocker_url": "http://127.0.0.1:0/oauth/token",
+  "blocker_must_be_closed": true,
+  "allow_shared_consumers": false,
+  "refresh_policy": {
+    "max_age_seconds": 43200,
+    "pre_run": "if-stale"
+  },
+  "owner": {
+    "rpc_timeout_seconds": 60,
+    "exit_wait_seconds": 15,
+    "term_grace_seconds": 30,
+    "passthrough_env": []
+  },
+  "extra_denied_paths": [
+    "/home/devbox_operator/gptgrep",
+    "/mnt/gptgrep-dev/development-artifacts/corpora",
+    "/mnt/gptgrep-dev/development-artifacts/owner-private"
+  ],
+  "roles": {
+    "reader_bare": {
+      "tool_permissions": {
+        "extends": ":workspace",
+        "network_enabled": false,
+        "deny_paths": [],
+        "read_paths": [
+          "/usr",
+          "/bin",
+          "/lib",
+          "/lib64",
+          "/etc/ssl",
+          "/etc/ca-certificates"
+        ],
+        "write_paths": [],
+        "minimal_read": true
+      },
+      "allow_openrouter": false,
+      "deadline_seconds": 1800,
+      "stop_scope": "tree",
+      "term_grace_seconds": 20,
+      "passthrough_env": [],
+      "codex_config": {
+        "model": "gpt-6.1-sol"
+      }
+    },
+    "reader_gptgrep": {
+      "tool_permissions": {
+        "extends": ":workspace",
+        "network_enabled": true,
+        "network_allowed_domains": [
+          "openrouter.ai"
+        ],
+        "deny_paths": [],
+        "read_paths": [
+          "/usr",
+          "/bin",
+          "/lib",
+          "/lib64",
+          "/etc/ssl",
+          "/etc/ca-certificates",
+          "/mnt/gptgrep-dev/development-artifacts/toolchains/gptgrep-pinned"
+        ],
+        "write_paths": [],
+        "minimal_read": true
+      },
+      "allow_openrouter": true,
+      "deadline_seconds": 1800,
+      "stop_scope": "tree",
+      "term_grace_seconds": 20,
+      "passthrough_env": [
+        "PDFIUM_LIB_PATH"
+      ],
+      "codex_config": {
+        "model": "gpt-6.1-sol"
+      }
+    },
+    "judge_independent": {
+      "tool_permissions": {
+        "extends": ":read-only",
+        "network_enabled": false,
+        "deny_paths": [],
+        "read_paths": [
+          "/usr",
+          "/bin",
+          "/lib",
+          "/lib64",
+          "/etc/ssl",
+          "/etc/ca-certificates"
+        ],
+        "write_paths": [],
+        "minimal_read": true
+      },
+      "allow_openrouter": false,
+      "deadline_seconds": 1200,
+      "stop_scope": "tree",
+      "term_grace_seconds": 20,
+      "passthrough_env": [],
+      "codex_config": {
+        "model": "gpt-6.1-sol"
+      }
+    },
+    "harbor_dev_runner": {
+      "tool_permissions": "consumer-managed",
+      "path_env": "/usr/local/bin:/usr/bin:/bin",
+      "allow_openrouter": true,
+      "deadline_seconds": 3600,
+      "stop_scope": "root-first",
+      "term_grace_seconds": 45,
+      "passthrough_env": [
+        "DOCKER_HOST"
+      ],
+      "codex_config": {
+        "model": "gpt-6.1-sol"
+      }
+    }
+  },
+  "docker": {
+    "bin": "/usr/bin/docker",
+    "env": {},
+    "wait_seconds": 30,
+    "poll_seconds": 2
+  }
+}

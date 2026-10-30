@@ -11,8 +11,9 @@ import hashlib
 import importlib.util
 import json
 import math
+import os
+import stat
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -21,14 +22,44 @@ sys.dont_write_bytecode = True
 NATIVE_SCORER_SHA256 = "efc56cb25ba136e09ceaccb5d8006ea9461f71a68998f2987073387682a5e547"
 NATIVE_KEYS = ("native_accuracy", "native_token_f1", "native_anls")
 GROUNDING_KEYS = ("grounded_success", "atomic_coverage")
+MAX_INPUT_BYTES = 4 * 1024 * 1024
+MAX_JSON_OUTPUT_BYTES = 1024 * 1024
+MAX_REASON_BYTES = 8 * 1024
+MAX_CRITERION_SOURCE_BYTES = 16 * 1024
 
 
 def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def read_object(path: Path) -> dict[str, Any]:
-    value = json.loads(path.read_text(encoding="utf-8"))
+def read_bounded(path: Path, max_bytes: int = MAX_INPUT_BYTES) -> bytes:
+    """Read one bounded regular artifact; changed or symlinked inputs are unknown."""
+    before = path.lstat()
+    if not stat.S_ISREG(before.st_mode) or before.st_size > max_bytes:
+        raise ValueError("Verifier input is not a bounded regular file")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as stream:
+        current = os.fstat(stream.fileno())
+        if (current.st_dev, current.st_ino, current.st_size) != (before.st_dev, before.st_ino, before.st_size):
+            raise ValueError("Verifier input changed while opening")
+        raw = stream.read(max_bytes + 1)
+        if len(raw) != current.st_size or len(raw) > max_bytes:
+            raise ValueError("Verifier input changed or exceeded its byte bound")
+    return raw
+
+
+def reason_record(text: str, field: str = "reason") -> dict[str, Any]:
+    """Keep a UTF-8 preview and identity; the pinned judgment retains full reasons."""
+    if not isinstance(text, str):
+        raise ValueError("Verifier reason must be a string")
+    raw = text.encode("utf-8")
+    preview = raw[:MAX_REASON_BYTES].decode("utf-8", errors="ignore")
+    return {field: preview, f"{field}_retention": {"sha256": digest(raw), "utf8_bytes": len(raw),
+            "preview_utf8_bytes": len(preview.encode("utf-8")), "truncated": len(raw) > MAX_REASON_BYTES}}
+
+
+def read_object(path: Path, max_bytes: int = MAX_INPUT_BYTES) -> dict[str, Any]:
+    value = json.loads(read_bounded(path, max_bytes))
     if not isinstance(value, dict):
         raise ValueError(f"Expected JSON object: {path.name}")
     return value
@@ -45,7 +76,7 @@ def bounded_score(value: Any) -> bool:
 def read_answer(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return {"status": "missing", "sha256": None, "answer": "", "reason": "answer artifact missing"}
-    raw = path.read_bytes()
+    raw = read_bounded(path)
     result: dict[str, Any] = {"status": "invalid_output", "sha256": digest(raw), "answer": ""}
     try:
         value = json.loads(raw)
@@ -53,7 +84,7 @@ def read_answer(path: Path) -> dict[str, Any]:
             raise ValueError("answer must be a nonempty string")
         result.update(status="success", answer=value["answer"])
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-        result["reason"] = str(exc)
+        result.update(reason_record(str(exc)))
     return result
 
 
@@ -62,7 +93,7 @@ def validate_grounding(judgment_path: Path | None, expected: dict[str, Any], ans
     if not judgment_path or not judgment_path.is_file():
         return {**unknown, "reason": "independent judgment unavailable"}
     try:
-        raw = judgment_path.read_bytes()
+        raw = read_bounded(judgment_path)
         value = json.loads(raw)
         if not isinstance(value, dict) or value.get("schema") != "gptgrep.grounding-judgment.v1":
             raise ValueError("judgment schema mismatch")
@@ -72,25 +103,26 @@ def validate_grounding(judgment_path: Path | None, expected: dict[str, Any], ans
             ("answer_sha256", answer_hash),
             ("corpus_sha256", expected.get("corpus_sha256")),
             ("rubric_sha256", expected.get("rubric_sha256")),
+            ("reader_binding_sha256", expected.get("reader_binding_sha256")),
         ):
             if not valid_hash(expected_value) or value.get(field) != expected_value:
                 raise ValueError(f"judgment {field} binding mismatch or unconfigured")
         if value.get("status") != "complete":
-            return {**unknown, "reason": str(value.get("reason") or "independent judge did not complete"),
+            return {**unknown, **reason_record(value.get("reason") or "independent judge did not complete"),
                     "judgment_sha256": digest(raw)}
         success = value.get("grounded_success")
         coverage = value.get("atomic_coverage")
         if type(success) not in (int, float) or success not in (0, 1) or not bounded_score(coverage):
             raise ValueError("completed judgment has invalid or missing metric values")
         return {"status": "complete", "grounded_success": int(success), "atomic_coverage": coverage,
-                "reason": str(value.get("reason") or ""), "judgment_sha256": digest(raw)}
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-        return {**unknown, "reason": str(exc)}
+                **reason_record(value.get("reason") or ""), "judgment_sha256": digest(raw)}
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        return {**unknown, **reason_record(str(exc))}
 
 
 def native_score(scorer_path: Path, gold_path: Path, task_id: str, answer: dict[str, Any]) -> dict[str, Any]:
     try:
-        if digest(scorer_path.read_bytes()) != NATIVE_SCORER_SHA256:
+        if digest(read_bounded(scorer_path)) != NATIVE_SCORER_SHA256:
             raise ValueError("native scorer SHA-256 mismatch")
         module_name = "gptgrep_xl_native_evaluator"
         spec = importlib.util.spec_from_file_location(module_name, scorer_path)
@@ -117,11 +149,16 @@ def native_score(scorer_path: Path, gold_path: Path, task_id: str, answer: dict[
     except Exception as exc:
         # Operational/scorer failure is not an observed zero-quality answer.
         return {"status": "unknown", "metrics": {}, "enrolled_count": 1,
-                "evaluated_count": 0, "reason": f"{type(exc).__name__}: {exc}"}
+                "evaluated_count": 0, **reason_record(f"{type(exc).__name__}: {exc}")}
 
 
 def write_json(path: Path, value: Any) -> None:
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    raw = (json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf-8")
+    if len(raw) > MAX_JSON_OUTPUT_BYTES:
+        raise ValueError("Verifier JSON output exceeds its byte bound")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(raw)
 
 
 def validate_rewardkit_scores(metrics: dict[str, float], rewards: dict[str, float], details: dict[str, Any]) -> None:
@@ -160,7 +197,7 @@ def run_rewardkit(output_dir: Path, report_path: Path) -> dict[str, float]:
     # replace sys.path. Register our controller-owned module by exact file, once
     # per source digest, without relying on the launcher's working directory.
     checks_path = Path(__file__).resolve().with_name("checks.py")
-    module_name = "gptgrep_rewardkit_checks_" + digest(checks_path.read_bytes())[:16]
+    module_name = "gptgrep_rewardkit_checks_" + digest(read_bounded(checks_path))[:16]
     if module_name not in sys.modules:
         spec = importlib.util.spec_from_file_location(module_name, checks_path)
         if spec is None or spec.loader is None:
@@ -173,29 +210,41 @@ def run_rewardkit(output_dir: Path, report_path: Path) -> dict[str, float]:
             sys.modules.pop(module_name, None)
             raise
 
-    report = read_object(report_path)
+    report = read_object(report_path, MAX_JSON_OUTPUT_BYTES)
+    metrics = report.get("metrics")
+    if (not isinstance(metrics, dict) or not metrics
+            or any(key not in (*NATIVE_KEYS, *GROUNDING_KEYS) or not bounded_score(value)
+                   for key, value in metrics.items())):
+        raise ValueError("RewardKit requires bounded validated metric dimensions")
     # RewardKit 0.2.3 aggregates a flat root into one `reward`. Child
     # directories expose independent dimensions, even when only one exists.
-    # A fresh retained directory also prevents stale dimensions from a prior run.
-    criteria = Path(tempfile.mkdtemp(prefix="rewardkit-criteria-", dir=output_dir))
+    # Exclusive creation prevents stale dimensions or repeated retained-directory
+    # growth. A rerun needs a separately admitted output directory.
+    criteria = output_dir / "rewardkit-criteria"
+    criteria.mkdir()
     # The directory is controller-owned generated code, never an agent artifact.
-    for key in report["metrics"]:
-        if key not in (*NATIVE_KEYS, *GROUNDING_KEYS):
-            raise ValueError("Unexpected reward dimension")
+    for key in metrics:
         dimension = criteria / key
         dimension.mkdir()
         content = ("import rewardkit as rk\n"
                    f"rk.xl_metric({key!r}, {str(report_path)!r})\n")
+        if len(content.encode("utf-8")) > MAX_CRITERION_SOURCE_BYTES:
+            raise ValueError("Generated verifier criterion exceeds its byte bound")
         (dimension / "score.py").write_text(content, encoding="utf-8")
     rewards = rk.run(criteria, workspace=output_dir, output=output_dir / "reward.json")
-    validate_rewardkit_scores(report["metrics"], rewards, read_object(output_dir / "reward-details.json"))
+    # The pinned programmatic route writes only these two files. Criteria return
+    # bounded reason text; this readback checks the library's actual output too.
+    persisted_rewards = read_object(output_dir / "reward.json", MAX_JSON_OUTPUT_BYTES)
+    if persisted_rewards != rewards:
+        raise ValueError("RewardKit persisted rewards differ from its result")
+    validate_rewardkit_scores(metrics, rewards, read_object(output_dir / "reward-details.json", MAX_JSON_OUTPUT_BYTES))
     return rewards
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     here = Path(__file__).resolve().parent
-    parser.add_argument("--answer", type=Path, default=Path("/logs/artifacts/answer.json"))
+    parser.add_argument("--answer", type=Path, default=Path("/app/answer.json"))
     parser.add_argument("--judgment", type=Path)
     parser.add_argument("--expected", type=Path, default=here / "expected.json")
     parser.add_argument("--gold", type=Path, default=here / "gold.jsonl")
@@ -215,16 +264,28 @@ def main() -> int:
     write_json(report_path, pending)
     write_json(args.output_dir / "reward.json", {})
     try:
-        expected = read_object(args.expected)
-        if expected.get("schema") != "gptgrep.verifier-binding.v1":
-            raise ValueError("Expected-binding schema mismatch")
+        expected_bytes = read_bounded(args.expected)
+        expected = json.loads(expected_bytes)
+        if not isinstance(expected, dict):
+            raise ValueError("Expected JSON binding object")
+        if expected.get("schema") != "gptgrep.verifier-binding.v2" or expected.get("execution_mode") != "live":
+            raise ValueError("Controller post-reader binding unavailable")
+        expected["reader_binding_sha256"] = digest(expected_bytes)
+        if (type(expected.get("reader_valid_start")) is not bool
+                or expected.get("reader_status") not in ("completed", "failed", "timeout", "setup_failed", "answer_invalid")
+                or "answer_sha256" not in expected):
+            raise ValueError("Incomplete reader terminal binding")
+        if expected["reader_valid_start"] and (not expected.get("reader_thread_id") or not expected.get("reader_turn_id")):
+            raise ValueError("Started reader lacks native thread/turn identity")
+        if not expected["reader_valid_start"] and expected["reader_status"] != "setup_failed":
+            raise ValueError("Unstarted reader has a scored terminal status")
         if expected.get("native_scorer_sha256", NATIVE_SCORER_SHA256) != NATIVE_SCORER_SHA256:
             raise ValueError("Expected native scorer differs from the pinned release")
         task_id = expected.get("task_id")
         if not isinstance(task_id, str) or not task_id:
             raise ValueError("Missing enrolled task ID")
         answer = read_answer(args.answer)
-        if expected.get("answer_sha256") is not None and expected["answer_sha256"] != answer["sha256"]:
+        if expected["answer_sha256"] != answer["sha256"]:
             raise ValueError("Collected answer differs from controller's frozen artifact")
         reader_status = expected.get("reader_status")
         if reader_status is not None and reader_status not in ("success", "ok", "completed", "complete"):
@@ -233,8 +294,9 @@ def main() -> int:
             answer["status"] = "reader_failed"
             answer["reason"] = f"controller reader status: {reader_status}"
     except (OSError, ValueError, json.JSONDecodeError) as exc:
-        write_json(report_path, {**pending, "reason": f"Verifier input error: {exc}"})
-        print(f"Verifier input error: {exc}", file=sys.stderr)
+        error = reason_record(f"Verifier input error: {exc}")
+        write_json(report_path, {**pending, **error})
+        print(error["reason"], file=sys.stderr)
         return 2
     native = native_score(args.native_scorer, args.gold, task_id, answer)
     independent_grounding = validate_grounding(args.judgment, expected, answer["sha256"])
@@ -258,6 +320,7 @@ def main() -> int:
         "schema": "gptgrep.xl-verifier-feedback.v1", "task_id": task_id,
         "answer_sha256": answer["sha256"], "corpus_sha256": expected.get("corpus_sha256"),
         "rubric_sha256": expected.get("rubric_sha256"), "reader_status": answer["status"],
+        "reader_binding_sha256": expected["reader_binding_sha256"],
         "native": native, "grounding": grounding, "independent_grounding": independent_grounding, "metrics": metrics,
         "status": "complete" if native["status"] == grounding["status"] == "complete" else "unknown",
         "promotion_allowed": False, "rewardkit_status": "not_run",
@@ -271,7 +334,7 @@ def main() -> int:
             feedback["rewardkit_status"] = "complete"
         except Exception as exc:
             feedback["rewardkit_status"] = "unknown"
-            feedback["rewardkit_error"] = f"{type(exc).__name__}: {exc}"
+            feedback.update(reason_record(f"{type(exc).__name__}: {exc}", "rewardkit_error"))
             feedback["status"] = "unknown"
             # Preserve actual native observations; unknown criteria are absent.
             write_json(args.output_dir / "reward.json", metrics)
@@ -289,5 +352,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except (OSError, ValueError, json.JSONDecodeError) as exc:
-        print(f"Verifier input error: {exc}", file=sys.stderr)
+        print(reason_record(f"Verifier input error: {exc}")["reason"], file=sys.stderr)
         raise SystemExit(2)

@@ -61,6 +61,30 @@ never renews the original clock or consumed allowance. A new ledger is created o
 by `gptgrep decisions-budget init`, and `status` observes it read-only. Native
 Codex selection stays separate.
 
+An explicit Linux Decisions helper moves the provider credential and that one
+original ledger into a hardened foreground host process outside the selected
+model container. The trusted owner supplies a pinned private control, active
+storage lease and exact container INIT generation; the key enters only through
+bounded stdin. Reader, controller and native children receive two nonsecret IPC
+control variables. Direct HTTP remains the portable transport when no helper is
+selected. Selecting IPC never permits an automatic HTTP fallback or replay.
+
+The client still prepares its exact source-bound request locally. A closed Unix
+protocol transmits bounded metadata and the unchanged canonical body in separate
+frames; the server validates and binds a fresh prepared request to its own SDK
+client. Only that SDK context mutates reservations, send observations and outcomes.
+Its observer and retry boundaries wait for the caller's synchronous ACK under the
+same original deadline. Reentrant callback snapshots describe that server event;
+other snapshots use bounded readonly status. Four provider slots, four waiting
+submissions and one readonly admission are bounded separately. The keyholder
+screens raw serialized data and decoded JSON strings/keys before any output,
+retaining known numeric usage when it refuses reflected credentials. Socket
+directory/inode identity, peer pidfds, original INIT generation, cgroup ancestry
+and namespace evidence are checked around admission and callbacks. Dead endpoints
+are retained for the outer owner to reconcile after the helper has terminated.
+These implementation boundaries do not establish acceptance of a native
+permission profile or a particular model-container runtime.
+
 The host profile defaults are `model = "gpt-6-luna"` and
 `model_reasoning_effort = "max"`, with `service_tier = "fast"`, as selected for this project. They are local
 helper settings; they do not change the development agent's model. Runtime

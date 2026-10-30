@@ -1,4 +1,30 @@
-# XL verifier boundary
+# Harbor integration and XL verification
+
+`native_agent.py` is the pinned native-reader bridge. Its optional project-owned
+environment, `proc_environment.py`, is selected through Harbor's supported
+`environment.import_path` field as
+`proc_environment:ProcOverlayDockerEnvironment`. The controller and wrapper
+require the exact selected module/contract pins and the existing owner's source,
+mount, security and resource declarations before launch. The bridge accepts
+that exact class and joins its created full container ID to the owner's
+namespace plan; it does not accept arbitrary Docker subclasses.
+
+The environment replaces only the necessary container creation and ownership
+operations. It inherits Harbor's orchestration and Unix task APIs, verifies the
+three framework-generated log binds before suppressing them, and refuses extra
+user mounts. The reviewed request preserves the two `/sys` masks and clears the
+proc masks/readonly overlays needed by the selected native sandbox. Its one-use
+Engine path never retries an ambiguous create/start or adopts a container by
+name. Exact-ID stop/removal cannot prune images, volumes, networks or orphans.
+An actual owner terminal receipt remains necessary after Harbor stop returns.
+
+`test_proc_environment.py` contains isolated transport fixtures. Its additional
+installed-Harbor tests require both `GPTGREP_HARBOR_PROC_TEST_PINS` and
+`GPTGREP_HARBOR_PROC_TEST_PINS_SHA256`, naming an exact source manifest supplied by
+the checked test worker. That layer exercises the real pinned Harbor methods
+with process/Engine edges blocked or simulated; it establishes source
+compatibility only. Neither test layer supplies native reader, E4 or live Harbor
+acceptance.
 
 This directory contains a small Python interface around the exact upstream native
 scorer and RewardKit. Python dependencies are declared in `pyproject.toml` and

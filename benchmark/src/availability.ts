@@ -1,8 +1,8 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import type { DependencyRelease, SourceDocument, TaskDependency } from "./dataset";
-import { canonical, digest, fileHash, physicalPath, readJson, requireStorage } from "./io";
-import { verifiedSource } from "./source-verification";
+import { canonical, digest, fileHash, physicalPath, processCommandIdentity, readJson, requireStorage } from "./io";
+import { validSourceIdentity, verifiedSource } from "./source-verification";
 
 export type RawState = "verified" | "recovery_pending" | "identity_hold" | "frozen_unavailable";
 export type OcrState = "not_required" | "pending" | "partial" | "verified" | "failed" | "blocked_raw_dependency";
@@ -31,6 +31,19 @@ export interface ArmProfile {
 export interface PreprocessingAvailability {
   documentId: string; rawSha256: string; profileSha256: string;
   state: OcrState; pages: number[]; artifacts: Pin[]; provenance: Pin[];
+  /** Required in v2. Omitted only in retained historical v1 assessments. */
+  pageManifest?: Pin | null;
+}
+export interface OcrArtifact extends Pin { bytes: number; relativePath: string; }
+export interface OcrPageAsset {
+  page: number; rawPage: number; markdown: OcrArtifact; images: OcrArtifact[];
+  zeroByteDisposition: "not_empty" | "verified_blank" | "unresolved";
+  blankReview: Pin | null;
+}
+export interface OcrPageManifest {
+  schema: "gptgrep.ocr-page-manifest.v1";
+  documentId: string; rawSha256: string; profileSha256: string;
+  pageAssets: OcrPageAsset[];
 }
 export interface AssessmentInput {
   revision: string; generation: number; recordedAt: string; supersedes: Pin | null;
@@ -45,7 +58,7 @@ export interface TaskAvailability {
   armAvailability: Record<string, { admitted: boolean; profileSha256: string; reasons: string[]; ocr: Record<string, OcrState> }>;
 }
 export interface AvailabilityAssessment extends AssessmentInput {
-  schema: "gptgrep.task-availability.v1"; dependencySha256: string; tasks: TaskAvailability[];
+  schema: "gptgrep.task-availability.v1" | "gptgrep.task-availability.v2"; dependencySha256: string; tasks: TaskAvailability[];
 }
 export interface ControllerAcceptance {
   schema: "gptgrep.availability-controller.v1"; status: "accepted";
@@ -112,7 +125,8 @@ export function minimalSourceVerification(record: any): Record<string, unknown> 
   if (!proof || typeof proof !== "object") throw new Error("Acquired identity proof is missing");
   return { status: record.status, sha256: record.sha256, pageCountVerified: record.pageCountVerified, pageCount: record.pageCount,
     sourceVerification: { status: proof.status, sha256: proof.sha256, expectedPageCount: proof.expectedPageCount,
-      observedPageCount: proof.observedPageCount, method: proof.method, identityEvidence: proof.identityEvidence } };
+      observedPageCount: proof.observedPageCount, method: proof.method, identityEvidence: proof.identityEvidence,
+      identity: proof.identity } };
 }
 
 /** The CLI supplies the RAW list only after hashing its physical files in acquiredInputs. */
@@ -138,7 +152,18 @@ function validateFreeze(value: FreezeDecision, document: DocumentAvailability, r
     nonempty(route.reason, "recovery rationale"); if (!route.evidence.length) throw new Error("Recovery evidence required"); route.evidence.forEach(pin);
   }
 }
-function validateInput(input: AssessmentInput): void {
+/** Only used when checking immutable historical predecessors; never live admission. */
+function historicalVerifiedSource(record: any, expectedPageCount: number): boolean {
+  const proof = record?.sourceVerification;
+  return record?.status === "ready" && record.pageCountVerified === true &&
+    Number.isSafeInteger(expectedPageCount) && expectedPageCount > 0 && record.pageCount === expectedPageCount &&
+    proof?.status === "verified" && proof.sha256 === record.sha256 && /^[a-f0-9]{64}$/.test(record.sha256) &&
+    proof.expectedPageCount === expectedPageCount && proof.observedPageCount === expectedPageCount &&
+    typeof proof.method === "string" && proof.method.length > 0 &&
+    typeof proof.identityEvidence === "string" && proof.identityEvidence.length > 0;
+}
+
+function validateInput(input: AssessmentInput, historical = false): void {
   closed(input, ["revision", "generation", "recordedAt", "supersedes", "release", "documents", "profiles", "preprocessing"], "assessment input");
   nonempty(input.revision, "assessment revision");
   if (!Number.isSafeInteger(input.generation) || input.generation < 1 || !Number.isFinite(Date.parse(input.recordedAt))) throw new Error("Assessment generation and timestamp required");
@@ -182,7 +207,7 @@ function validateInput(input: AssessmentInput): void {
     nonempty(doc.reason, "document reason"); doc.evidence.forEach(pin); if (doc.rawSha256 !== null) hash(doc.rawSha256);
     if (doc.verification !== null) {
       closed(doc.verification, ["status", "sha256", "pageCountVerified", "pageCount", "sourceVerification"], "minimal source verification");
-      closed(doc.verification.sourceVerification, ["status", "sha256", "expectedPageCount", "observedPageCount", "method", "identityEvidence"], "minimal identity proof");
+      closed(doc.verification.sourceVerification, ["status", "sha256", "expectedPageCount", "observedPageCount", "method", "identityEvidence", ...(historical ? [] : ["identity"])], "minimal identity proof");
       const record = doc.verification, proof = record.sourceVerification as Record<string, unknown>;
       nonempty(record.status, "verification status"); hash(record.sha256);
       nonempty(proof.status, "identity proof status"); hash(proof.sha256);
@@ -190,8 +215,12 @@ function validateInput(input: AssessmentInput): void {
       if (typeof record.pageCountVerified !== "boolean" || !Number.isSafeInteger(record.pageCount) || (record.pageCount as number) < 1 ||
           !Number.isSafeInteger(proof.expectedPageCount) || (proof.expectedPageCount as number) < 1 ||
           !Number.isSafeInteger(proof.observedPageCount) || (proof.observedPageCount as number) < 0) throw new Error("Identity proof requires scalar verification and physical page counts");
+      if (!historical && (!validSourceIdentity(proof.identity) ||
+          proof.identity.expectedIdentitySha256 !== doc.expectedIdentitySha256 || proof.identity.sourceUrl !== sources.get(doc.documentId)!.url)) {
+        throw new Error("Structured source identity must bind exact released metadata and evidence");
+      }
     }
-    if (doc.rawState === "verified" && (!doc.rawSha256 || !verifiedSource(doc.verification, sources.get(doc.documentId)!.pageCount) || doc.verification!.sha256 !== doc.rawSha256 || !doc.evidence.length)) throw new Error("Verified RAW requires exact source identity proof");
+    if (doc.rawState === "verified" && (!doc.rawSha256 || !(historical ? historicalVerifiedSource : verifiedSource)(doc.verification, sources.get(doc.documentId)!.pageCount) || doc.verification!.sha256 !== doc.rawSha256 || !doc.evidence.length)) throw new Error("Verified RAW requires exact source identity proof");
     if (doc.rawState === "frozen_unavailable") { if (!doc.freeze) throw new Error("Reviewed final freeze required"); validateFreeze(doc.freeze, doc, release); }
     else if (doc.freeze !== null) throw new Error("Only terminal freeze may carry a freeze decision");
   }
@@ -203,7 +232,7 @@ function validateInput(input: AssessmentInput): void {
   }
   const prepKeys = new Set<string>();
   for (const prep of input.preprocessing) {
-    closed(prep, ["documentId", "rawSha256", "profileSha256", "state", "pages", "artifacts", "provenance"], "preprocessing");
+    closed(prep, ["documentId", "rawSha256", "profileSha256", "state", "pages", "artifacts", "provenance", ...(historical ? [] : ["pageManifest"])], "preprocessing");
     hash(prep.rawSha256); hash(prep.profileSha256);
     const key = `${prep.documentId}:${prep.rawSha256}:${prep.profileSha256}`;
     if (prepKeys.has(key) || !sources.has(prep.documentId)) throw new Error("Duplicate or foreign preprocessing"); prepKeys.add(key);
@@ -212,12 +241,97 @@ function validateInput(input: AssessmentInput): void {
     if (!Array.isArray(prep.pages) || new Set(prep.pages).size !== prep.pages.length || prep.pages.some(p => !Number.isSafeInteger(p) || p < 1 || p > pages)) throw new Error("Invalid physical page coverage");
     prep.artifacts.forEach(pin); prep.provenance.forEach(pin);
     if (prep.state === "verified" && (prep.pages.length !== pages || !prep.artifacts.length || !prep.provenance.length)) throw new Error("Verified OCR requires every physical page and artifact/provenance pins");
+    if (!historical) {
+      if (prep.pageManifest !== null) pin(prep.pageManifest!);
+      if (canonical(prep.artifacts) !== canonical(prep.pageManifest === null ? [] : [prep.pageManifest])) throw new Error("OCR artifacts must select exactly the per-document page manifest");
+      if (prep.pages.length && !prep.pageManifest) throw new Error("Per-page OCR manifest required for declared page coverage");
+    }
   }
+}
+
+/** A bounded document shard avoids duplicating every corpus asset in the assessment. */
+export function validateOcrPageManifest(manifest: OcrPageManifest, prep: PreprocessingAvailability, pages: number): void {
+  closed(manifest, ["schema", "documentId", "rawSha256", "profileSha256", "pageAssets"], "OCR page manifest");
+  if (manifest.schema !== "gptgrep.ocr-page-manifest.v1" || manifest.documentId !== prep.documentId || manifest.rawSha256 !== prep.rawSha256 || manifest.profileSha256 !== prep.profileSha256 || !Array.isArray(manifest.pageAssets)) throw new Error("OCR page manifest identity mismatch");
+  const mappedPages = new Set<number>(), rawPages = new Set<number>(), assets: OcrArtifact[] = [];
+  for (const page of manifest.pageAssets) {
+        closed(page, ["page", "rawPage", "markdown", "images", "zeroByteDisposition", "blankReview"], "OCR page");
+        if (![page.page, page.rawPage].every(p => Number.isSafeInteger(p) && p >= 1 && p <= pages) || mappedPages.has(page.page) || rawPages.has(page.rawPage)) throw new Error("Invalid or duplicate OCR page mapping");
+        mappedPages.add(page.page); rawPages.add(page.rawPage);
+        if (!Array.isArray(page.images)) throw new Error("OCR images must be an array");
+        for (const artifact of [page.markdown, ...page.images]) {
+          closed(artifact, ["path", "sha256", "bytes", "relativePath"], "OCR page artifact");
+          pin({ path: artifact.path, sha256: artifact.sha256 });
+          validatePreparedRelativePath(artifact.relativePath);
+          if (!Number.isSafeInteger(artifact.bytes) || artifact.bytes < 0) throw new Error("OCR artifact byte count required");
+          assets.push(artifact);
+        }
+        if (page.images.some(image => image.bytes === 0)) throw new Error("Empty OCR image cannot establish page material");
+        if (!["not_empty", "verified_blank", "unresolved"].includes(page.zeroByteDisposition)) throw new Error("Explicit zero-byte OCR disposition required");
+        if (page.blankReview !== null) pin(page.blankReview);
+        if (page.markdown.bytes > 0 && (page.zeroByteDisposition !== "not_empty" || page.blankReview !== null) ||
+            page.markdown.bytes === 0 && (page.zeroByteDisposition === "not_empty" ||
+              page.zeroByteDisposition === "verified_blank" && page.blankReview === null)) throw new Error("OCR blank-page disposition is inconsistent");
+        if (prep.state === "verified" && page.zeroByteDisposition === "unresolved") throw new Error("Unresolved zero-byte OCR page blocks verified preprocessing");
+  }
+  if (canonical([...mappedPages].sort((a, b) => a - b)) !== canonical([...prep.pages].sort((a, b) => a - b))) throw new Error("OCR page list differs from actual asset bindings");
+  unique(assets.map(asset => asset.path), "OCR page artifact paths");
+  unique(assets.map(asset => asset.relativePath), "OCR page workspace paths");
+}
+
+function validatePreparedRelativePath(path: string): void {
+  if (typeof path !== "string" || !path || path.includes("\\") || path.includes(":") ||
+      path.split("/").some(part => !part || part === "." || part === "..")) throw new Error("Safe relative OCR workspace path required");
+}
+
+function independentReview(review: Record<string, any>): void {
+  nonempty(review.proposedBy, "review proposer"); nonempty(review.reviewedBy, "independent reviewer");
+  if (review.proposedBy === review.reviewedBy) throw new Error("Independent review cannot be self-authored");
+}
+
+export async function verifySourceIdentityReview(document: DocumentAvailability): Promise<void> {
+  if (!document.verification) return;
+  const identity = (document.verification.sourceVerification as any).identity;
+  for (const evidence of identity.evidence) await verifyPin(evidence);
+  if (identity.review === null) return;
+  await verifyPin(identity.review);
+  if (document.rawState !== "verified") return;
+  const review = await readExactJson(identity.review.path);
+  closed(review, ["schema", "status", "documentId", "rawSha256", "identitySha256", "proposedBy", "reviewedBy"], "source identity review");
+  const { review: ignored, ...decision } = identity;
+  if (review.schema !== "gptgrep.source-identity-review.v1" || review.status !== "accepted" || review.documentId !== document.documentId ||
+      review.rawSha256 !== document.rawSha256 || review.identitySha256 !== digest(decision)) throw new Error("Source identity review does not accept the exact source decision");
+  independentReview(review);
+}
+
+async function readOcrPageManifest(prep: PreprocessingAvailability, pageCount: number, verifyAssets: boolean): Promise<OcrPageManifest> {
+  if (!prep.pageManifest) throw new Error("Per-document OCR page manifest required");
+  await verifyPin(prep.pageManifest);
+  const manifest = await readExactJson<OcrPageManifest>(prep.pageManifest.path); validateOcrPageManifest(manifest, prep, pageCount);
+  if (verifyAssets) for (const page of manifest.pageAssets) {
+    for (const artifact of [page.markdown, ...page.images]) {
+      await verifyPin({ path: artifact.path, sha256: artifact.sha256 });
+      if ((await lstat(artifact.path)).size !== artifact.bytes) throw new Error("OCR artifact byte count changed");
+    }
+    if (page.blankReview) {
+      await verifyPin(page.blankReview);
+      if (page.zeroByteDisposition !== "verified_blank") continue;
+      const review = await readExactJson(page.blankReview.path);
+      closed(review, ["schema", "status", "documentId", "rawSha256", "profileSha256", "page", "rawPage", "markdownSha256", "proposedBy", "reviewedBy"], "blank-page review");
+      if (review.schema !== "gptgrep.ocr-blank-review.v1" || review.status !== "accepted" || review.documentId !== prep.documentId || review.rawSha256 !== prep.rawSha256 ||
+          review.profileSha256 !== prep.profileSha256 || review.page !== page.page || review.rawPage !== page.rawPage || review.markdownSha256 !== page.markdown.sha256) throw new Error("Blank-page review does not accept the exact page");
+      independentReview(review);
+    }
+  }
+  return manifest;
 }
 
 /** Pure full-release projection. No acquisition, model call or scoring. */
 export function assessAvailability(input: AssessmentInput): AvailabilityAssessment {
-  validateInput(input);
+  return projectAvailability(input, false);
+}
+function projectAvailability(input: AssessmentInput, historical: boolean): AvailabilityAssessment {
+  validateInput(input, historical);
   const docs = new Map(input.documents.map(d => [d.documentId, d]));
   const tasks = input.release.tasks.map(task => {
     const required = task.contextDocumentIds.map(id => docs.get(id)!);
@@ -241,12 +355,12 @@ export function assessAvailability(input: AssessmentInput): AvailabilityAssessme
       documentStateReferences: Object.fromEntries(required.map(d => [d.documentId, digest(d)])), assessmentRevision: input.revision, armAvailability };
   });
   // Round-trip disconnects the immutable revision from caller-owned mutable objects.
-  return JSON.parse(JSON.stringify({ ...input, schema: "gptgrep.task-availability.v1", dependencySha256: digest(input.release), tasks }));
+  return JSON.parse(JSON.stringify({ ...input, schema: historical ? "gptgrep.task-availability.v1" : "gptgrep.task-availability.v2", dependencySha256: digest(input.release), tasks }));
 }
 export function validateAssessment(value: AvailabilityAssessment): void {
   closed(value, ["schema", "revision", "generation", "recordedAt", "supersedes", "release", "documents", "profiles", "preprocessing", "dependencySha256", "tasks"], "assessment");
   const { schema, dependencySha256, tasks, ...input } = value;
-  if (schema !== "gptgrep.task-availability.v1" || digest(assessAvailability(input)) !== digest(value)) throw new Error("Assessment projection or digest mismatch");
+  if (!["gptgrep.task-availability.v1", "gptgrep.task-availability.v2"].includes(schema) || digest(projectAvailability(input, schema === "gptgrep.task-availability.v1")) !== digest(value)) throw new Error("Assessment projection or digest mismatch");
 }
 export function availabilityCoverage(assessment: AvailabilityAssessment, enrolled: string[] = []) {
   validateAssessment(assessment); unique(enrolled, "enrolled cohort");
@@ -268,9 +382,14 @@ export function availabilityCoverage(assessment: AvailabilityAssessment, enrolle
 /** Creates only a new revision; never overwrites an assessment, run or result. */
 export async function writeAssessment(path: string, value: AvailabilityAssessment): Promise<void> {
   await requireStorage(path); validateAssessment(value); await physicalPath(path);
+  if (value.schema !== "gptgrep.task-availability.v2") throw new Error("New assessment must use v2; v1 is historical only");
+  for (const document of value.documents) await verifySourceIdentityReview(document);
+  for (const prep of value.preprocessing) if (prep.pageManifest) await readOcrPageManifest(prep, value.release.documents.find(doc => doc.documentId === prep.documentId)!.pageCount, true);
   if (value.supersedes) { await verifyPin(value.supersedes); const prior = await readJson<AvailabilityAssessment>(value.supersedes.path); validateAssessment(prior);
     if (prior.generation >= value.generation || prior.revision === value.revision || prior.release.revision !== value.release.revision) throw new Error("New assessment must advance the prior revision"); }
-  await mkdir(dirname(path), { recursive: true }); await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+  const bytes = `${JSON.stringify(value, null, 2)}\n`;
+  if (Buffer.byteLength(bytes) > 64 * 1024 * 1024) throw new Error("Assessment exceeds the bounded JSON reader; shard page assets before writing");
+  await mkdir(dirname(path), { recursive: true }); await writeFile(path, bytes, { flag: "wx", mode: 0o600 });
 }
 
 /** Exact project acceptance selected by the already owner-admitted argv. */
@@ -278,6 +397,7 @@ export async function loadAdmission(reference: AdmissionReference, output: strin
   closed(reference, ["acceptance", "profileId"], "admission reference");
   const storage = await requireStorage(output), binding = await readJson(storage.binding), plan = binding.plan;
   await verifyPin(reference.acceptance);
+  if (storage.container && canonical(storage.container.acceptance) !== canonical(reference.acceptance)) throw new Error("Project acceptance differs from the exact guest command binding");
   const acceptance = await readExactJson<ControllerAcceptance>(reference.acceptance.path);
   closed(acceptance, ["schema", "status", "current", "assessment", "generation", "assessmentRevision", "taskIds", "profileIds", "sourcePins", "storage", "controllerArgv", "childArgv", "runtime", "harborExport"], "controller acceptance");
   const expand = (template: string[]) => {
@@ -286,9 +406,10 @@ export async function loadAdmission(reference: AdmissionReference, output: strin
   };
   if (acceptance.controllerArgv.filter(v => v === "@ACCEPTANCE_PATH@").length !== 1 || acceptance.controllerArgv.filter(v => v === "@ACCEPTANCE_SHA256@").length !== 1) throw new Error("Controller command must select exact acceptance bytes");
   const controller = expand(acceptance.controllerArgv), allowed = [controller, ...acceptance.childArgv.map(expand)];
+  const observed = await processCommandIdentity();
   if (!plan || digest(controller) !== plan.command?.argv_sha256 || controller[0] !== plan.command.executable ||
       await fileHash(controller[0]!) !== plan.command.executable_sha256 || resolve(process.cwd()) !== plan.cwd ||
-      !allowed.some(argv => canonical(argv) === canonical(process.argv))) throw new Error("Process is outside the exact owner-admitted controller/child closure");
+      !allowed.some(argv => digest(argv) === observed.argvSha256)) throw new Error("Process is outside the exact owner-admitted controller/child closure");
   closed(acceptance.storage, ["runId", "workloadSha256", "cwd"], "controller storage binding");
   if (acceptance.schema !== "gptgrep.availability-controller.v1" || acceptance.status !== "accepted" || acceptance.storage.runId !== plan.run_id ||
       acceptance.storage.workloadSha256 !== plan.workload_sha256 || resolve(acceptance.storage.cwd) !== plan.cwd) throw new Error("Controller acceptance does not bind this checked workload");
@@ -296,14 +417,16 @@ export async function loadAdmission(reference: AdmissionReference, output: strin
   if (!acceptance.profileIds.includes(reference.profileId) || !acceptance.taskIds.length || !acceptance.sourcePins.length) throw new Error("Profile or source pins not accepted");
   unique(acceptance.sourcePins.map(p => resolve(p.path)), "controller source pins");
   const pinned = new Set(acceptance.sourcePins.map(p => resolve(p.path)));
-  const requiredSources = ["availability.ts", "adapter.ts", "harbor-launch.ts", "dataset.ts", "runner.ts", "native.ts", "io.ts", "source-verification.ts"];
+  const requiredSources = ["availability.ts", "adapter.ts", "harbor-launch.ts", "dataset.ts", "runner.ts", "native.ts", "io.ts", "source-verification.ts",
+    "episode.ts", "trajectory.ts", "judge.ts", "controller.ts", "campaign.ts", "container.ts", "process.ts", "harbor-wrapper.ts", "../harbor/native_agent.py", "../../self-opt/src/evaluate.ts"];
   // These project inputs and script entrypoints supplement the reviewed exact command;
   // this is not discovery of arbitrary custom-controller input semantics.
-  const inputFlags = new Set(["--config", "--cohort", "--parent", "--runtime-artifacts"]);
+  const inputFlags = new Set(["--config", "--job", "--review", "--cohort", "--parent", "--runtime-artifacts", "--source-families", "--exposed-ledger", "--states"]);
   const commandInputs = allowed.flatMap(argv => {
     const paths = [resolve(plan.cwd, argv[0]!)];
     for (let i = 1; i < argv.length; i++) {
       const arg = argv[i]!;
+      if (arg.startsWith("--config=")) { paths.push(resolve(plan.cwd, arg.slice("--config=".length))); continue; }
       if (inputFlags.has(arg) || arg === "--output" || arg === "--acceptance") {
         const value = argv[++i];
         if (!value || value.startsWith("--")) throw new Error("Selected input/output flag requires an exact path");
@@ -320,10 +443,12 @@ export async function loadAdmission(reference: AdmissionReference, output: strin
   if (current.schema !== "gptgrep.availability-current.v1" || current.status !== "current" || current.generation !== acceptance.generation ||
       current.assessmentRevision !== acceptance.assessmentRevision || current.assessmentSha256 !== acceptance.assessment.sha256) throw new Error("Assessment is absent, stale or superseded");
   const assessment = await readExactJson<AvailabilityAssessment>(acceptance.assessment.path); validateAssessment(assessment);
+  if (assessment.schema !== "gptgrep.task-availability.v2") throw new Error("Live admission requires v2 source and per-page asset evidence");
   if (assessment.generation !== acceptance.generation || assessment.revision !== acceptance.assessmentRevision) throw new Error("Assessment generation mismatch");
   if (acceptance.taskIds.some(id => !assessment.tasks.some(task => task.taskId === id)) || acceptance.profileIds.some(id => !assessment.profiles.some(profile => profile.id === id))) throw new Error("Accepted task/profile outside assessment");
   for (const doc of assessment.documents) {
     for (const evidence of doc.evidence) await verifyPin(evidence);
+    await verifySourceIdentityReview(doc);
     if (doc.freeze) {
       await verifyPin(doc.freeze.review);
       const review = await readExactJson(doc.freeze.review.path);
@@ -339,6 +464,7 @@ export async function loadAdmission(reference: AdmissionReference, output: strin
 
 export function assertTaskAdmitted(admission: Admission, task: TaskDependency, arm: string, raw: { documentId: string; sha256: string }[]): TaskAvailability {
   validateAssessment(admission.assessment);
+  if (admission.assessment.schema !== "gptgrep.task-availability.v2") throw new Error("Live admission requires v2 source and per-page asset evidence");
   const dependency = admission.assessment.release.tasks.find(t => t.id === task.id);
   if (!dependency || canonical(dependency) !== canonical(dependencyProjection(task))) throw new Error("Task dependencies differ from the complete assessed context");
   const record = admission.assessment.tasks.find(t => t.taskId === task.id)!;
@@ -351,24 +477,39 @@ export function assertTaskAdmitted(admission: Admission, task: TaskDependency, a
 
 /** Artifact-only current check for enrollment/planning, which have no staged workspace yet. */
 export async function verifyPreprocessingPins(admission: Admission, tasks: TaskDependency[]): Promise<void> {
+  validateAssessment(admission.assessment);
+  if (admission.assessment.schema !== "gptgrep.task-availability.v2") throw new Error("Live admission requires v2 source and per-page asset evidence");
   const profile = admission.assessment.profiles.find(p => p.id === admission.reference.profileId)!;
   if (!profile.requiresOcr) return;
   for (const id of new Set(tasks.flatMap(t => t.contextDocumentIds))) {
     const raw = admission.assessment.documents.find(d => d.documentId === id)!;
     const prep = admission.assessment.preprocessing.find(p => p.documentId === id && p.rawSha256 === raw.rawSha256 && p.profileSha256 === profile.preprocessingProfileSha256);
     if (!prep || prep.state !== "verified") throw new Error("Required preprocessing unavailable");
-    for (const artifact of [...prep.artifacts, ...prep.provenance]) await verifyPin(artifact);
+    for (const provenance of prep.provenance) await verifyPin(provenance);
+    await readOcrPageManifest(prep, admission.assessment.release.documents.find(doc => doc.documentId === id)!.pageCount, true);
   }
 }
 
 /** In addition to current source pins, every required artifact must be in this task workspace. */
-export async function verifyRequiredPreprocessing(admission: Admission, tasks: TaskDependency[], suppliedHashes: string[]): Promise<void> {
+export async function verifyRequiredPreprocessing(admission: Admission, tasks: TaskDependency[], suppliedArtifacts: { relativePath: string; sha256: string }[]): Promise<void> {
   await verifyPreprocessingPins(admission, tasks);
   const profile = admission.assessment.profiles.find(p => p.id === admission.reference.profileId)!;
   if (!profile.requiresOcr) return;
+  const supplied = new Map<string, string>();
+  for (const artifact of suppliedArtifacts) {
+    validatePreparedRelativePath(artifact?.relativePath); hash(artifact.sha256);
+    if (supplied.has(artifact.relativePath)) throw new Error("Duplicate supplied preprocessing workspace path");
+    supplied.set(artifact.relativePath, artifact.sha256);
+  }
+  const requiredPaths = new Set<string>();
   for (const id of new Set(tasks.flatMap(t => t.contextDocumentIds))) {
     const raw = admission.assessment.documents.find(d => d.documentId === id)!;
     const prep = admission.assessment.preprocessing.find(p => p.documentId === id && p.rawSha256 === raw.rawSha256 && p.profileSha256 === profile.preprocessingProfileSha256)!;
-    if (prep.artifacts.some(p => !suppliedHashes.includes(p.sha256))) throw new Error("Required OCR artifacts absent from selected workspace");
+    const manifest = await readOcrPageManifest(prep, admission.assessment.release.documents.find(doc => doc.documentId === id)!.pageCount, false);
+    for (const artifact of manifest.pageAssets.flatMap(page => [page.markdown, ...page.images])) {
+      if (requiredPaths.has(artifact.relativePath)) throw new Error("OCR document manifests collide in workspace paths");
+      requiredPaths.add(artifact.relativePath);
+      if (supplied.get(artifact.relativePath) !== artifact.sha256) throw new Error("Required OCR page artifact absent or at the wrong workspace path");
+    }
   }
 }

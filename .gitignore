@@ -18,3 +18,8 @@ __pycache__/
 docs/research/
 workspace/exec-plans/
 workspace/issues/
+.agents/
+sitecustomize.py
+workspace/*.py
+workspace/*.patch
+workspace/openbenchmark-release

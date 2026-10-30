@@ -3,8 +3,8 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { normalizeDependencyRelease, projectReaderTask, XL_RELEASE_REVISION, type DependencyRelease } from "../src/dataset";
-import { assessAvailability, assertAcquiredStates, assertTaskAdmitted, availabilityCoverage, expectedIdentity, validateAssessment, verifyPreprocessingPins, verifyRequiredPreprocessing,
-  type Admission, type AssessmentInput, type DocumentAvailability, type FreezeDecision } from "../src/availability";
+import { assessAvailability, assertAcquiredStates, assertTaskAdmitted, availabilityCoverage, expectedIdentity, validateAssessment, validateOcrPageManifest, verifyPreprocessingPins, verifyRequiredPreprocessing, verifySourceIdentityReview,
+  type Admission, type AssessmentInput, type DocumentAvailability, type FreezeDecision, type OcrPageManifest, type PreprocessingAvailability } from "../src/availability";
 import { digest, sha256 } from "../src/io";
 import { summarize, type EvaluationRun } from "../../self-opt/src/evaluate";
 
@@ -21,7 +21,9 @@ function fixture(): AssessmentInput {
   const documents: DocumentAvailability[] = release.documents.map(d => ({ documentId: d.documentId, expectedIdentitySha256: digest(expectedIdentity(d)), rawState: "verified",
     rawSha256: sha256(d.documentId), reason: "Verified exact released identity", evidence: [{ path: `/synthetic/${d.documentId}.receipt`, sha256: sha256("receipt") }], freeze: null,
     verification: { status: "ready", sha256: sha256(d.documentId), pageCountVerified: true, pageCount: 3,
-      sourceVerification: { status: "verified", sha256: sha256(d.documentId), expectedPageCount: 3, observedPageCount: 3, method: "synthetic", identityEvidence: "synthetic exact identity" } } }));
+      sourceVerification: { status: "verified", sha256: sha256(d.documentId), expectedPageCount: 3, observedPageCount: 3, method: "synthetic", identityEvidence: "synthetic exact identity",
+        identity: { status: "verified", basis: "publisher_release_metadata", expectedIdentitySha256: digest(expectedIdentity(d)), sourceUrl: d.url,
+          evidence: [{ path: `/synthetic/${d.documentId}.source`, sha256: sha256("source") }], review: null } } } }));
   return { revision: "assessment-1", generation: 1, recordedAt: "2026-10-16T00:00:00Z", supersedes: null, release, documents,
     profiles: [{ id: "bare-raw", arm: "bare", implementation: "implemented", requiresOcr: false, preprocessingProfileSha256: null },
       { id: "gptgrep-raw", arm: "gptgrep", implementation: "implemented", requiresOcr: false, preprocessingProfileSha256: null },
@@ -37,6 +39,17 @@ function admit(input: AssessmentInput, profileId = "bare-raw"): Admission {
       storage: { runId: "synthetic", workloadSha256: sha256("workload"), cwd: "/synthetic" }, runtime: null, harborExport: null } };
 }
 function raw(input: AssessmentInput) { return input.documents.map(d => ({ documentId: d.documentId, sha256: d.rawSha256! })); }
+function pageManifest(documentId: string, pages = [1, 2, 3]): OcrPageManifest {
+  const pageAssets = pages.map(page => ({ page, rawPage: page,
+    markdown: { path: `/synthetic/${documentId}/${page}.md`, relativePath: `ocr/${documentId}/${page}.md`, sha256: sha256(`page ${page}`), bytes: 6 }, images: [],
+    zeroByteDisposition: "not_empty" as const, blankReview: null }));
+  return { schema: "gptgrep.ocr-page-manifest.v1", documentId, rawSha256: sha256(documentId), profileSha256: sha256("ocr"), pageAssets };
+}
+function preprocessing(documentId: string, pages = [1, 2, 3], state: PreprocessingAvailability["state"] = "verified"): PreprocessingAvailability {
+  const manifest = { path: `/synthetic/${documentId}.pages.json`, sha256: sha256(JSON.stringify(pageManifest(documentId, pages))) };
+  return { documentId, rawSha256: sha256(documentId), profileSha256: sha256("ocr"), state, pages, pageManifest: manifest, artifacts: [manifest],
+    provenance: [{ path: "/synthetic/parser.json", sha256: sha256("parser") }] };
+}
 function freeze(input: AssessmentInput, documentId: string): FreezeDecision {
   const doc = input.documents.find(d => d.documentId === documentId)!;
   return { releaseRevision: input.release.revision, documentId, expectedIdentitySha256: doc.expectedIdentitySha256,
@@ -86,15 +99,19 @@ describe("full-release dependency availability", () => {
   test("enrollment/planning rehash required OCR bytes even without a staged workspace", async () => {
     const root = await mkdtemp(join(tmpdir(), "availability-ocr-"));
     try {
-      const artifact = join(root, "pages.json"), provenance = join(root, "parser.json");
-      await writeFile(artifact, "synthetic complete pages"); await writeFile(provenance, "synthetic exact parser");
-      const input = fixture(); input.preprocessing = [{ documentId: "d1", rawSha256: sha256("d1"), profileSha256: sha256("ocr"), state: "verified", pages: [1, 2, 3],
-        artifacts: [{ path: artifact, sha256: sha256("synthetic complete pages") }], provenance: [{ path: provenance, sha256: sha256("synthetic exact parser") }] }];
+      const provenance = join(root, "parser.json"); await writeFile(provenance, "synthetic exact parser");
+      const prep = preprocessing("d1"), manifest = pageManifest("d1");
+      for (const page of manifest.pageAssets) { page.markdown.path = join(root, `${page.page}.md`); await writeFile(page.markdown.path, `page ${page.page}`); }
+      prep.pageManifest = { path: join(root, "pages.json"), sha256: sha256(JSON.stringify(manifest)) };
+      await writeFile(prep.pageManifest.path, JSON.stringify(manifest)); prep.artifacts = [prep.pageManifest];
+      prep.provenance = [{ path: provenance, sha256: sha256("synthetic exact parser") }];
+      const artifact = manifest.pageAssets[0]!.markdown.path;
+      const input = fixture(); input.preprocessing = [prep];
       const admission = admit(input, "ocr"), tasks = [input.release.tasks.find(t => t.id === "q1")!];
       await verifyPreprocessingPins(admission, tasks);
       await writeFile(artifact, "stale or partial replacement");
       await expect(verifyPreprocessingPins(admission, tasks)).rejects.toThrow("Pinned input changed");
-      await expect(verifyRequiredPreprocessing(admission, tasks, [sha256("synthetic complete pages")])).rejects.toThrow("Pinned input changed");
+      await expect(verifyRequiredPreprocessing(admission, tasks, [{ relativePath: "summary.json", sha256: sha256("synthetic complete pages") }])).rejects.toThrow("Pinned input changed");
       await rm(artifact); await expect(verifyPreprocessingPins(admission, tasks)).rejects.toThrow();
     } finally { await rm(root, { recursive: true, force: true }); }
   });
@@ -143,20 +160,87 @@ describe("full-release dependency availability", () => {
   });
   test("RAW readiness is independent of partial OCR and planned-arm availability", () => {
     const input = fixture();
-    input.preprocessing = input.documents.map(d => ({ documentId: d.documentId, rawSha256: d.rawSha256!, profileSha256: sha256("ocr"), state: "partial", pages: [1],
-      artifacts: [{ path: "/synthetic/pages.json", sha256: sha256("pages") }], provenance: [{ path: "/synthetic/parser.json", sha256: sha256("parser") }] }));
+    input.preprocessing = input.documents.map(d => preprocessing(d.documentId, [1], "partial"));
     const task = assessAvailability(input).tasks.find(t => t.taskId === "series")!;
     expect(task.armAvailability["bare-raw"]!.admitted).toBe(true); expect(task.armAvailability["gptgrep-raw"]!.admitted).toBe(true);
     expect(task.armAvailability.ocr!.admitted).toBe(false); expect(task.armAvailability.planned!.admitted).toBe(false);
-    input.preprocessing.forEach(p => { p.state = "verified"; p.pages = [1, 2, 3]; });
+    input.preprocessing = input.documents.map(d => preprocessing(d.documentId));
     expect(assessAvailability(input).tasks[0]!.armAvailability.ocr!.admitted).toBe(true);
     input.profiles[3]!.implementation = "implemented"; expect(() => assessAvailability(input)).toThrow("not implemented");
   });
   test("complete physical OCR coverage, exact RAW and profile are mandatory", () => {
-    const input = fixture(); input.preprocessing = [{ documentId: "d1", rawSha256: sha256("d1"), profileSha256: sha256("ocr"), state: "verified", pages: [1, 2], artifacts: [], provenance: [] }];
+    const input = fixture(); input.preprocessing = [{ ...preprocessing("d1", [1, 2]), artifacts: [], provenance: [] }];
     expect(() => assessAvailability(input)).toThrow("every physical page");
-    input.preprocessing[0] = { ...input.preprocessing[0]!, pages: [1, 2, 3], artifacts: [{ path: "/synthetic/a", sha256: sha256("a") }], provenance: [{ path: "/synthetic/p", sha256: sha256("p") }], rawSha256: sha256("different") };
+    input.preprocessing[0] = { ...preprocessing("d1"), rawSha256: sha256("different") };
     expect(assessAvailability(input).tasks.find(t => t.taskId === "q1")!.armAvailability.ocr!.admitted).toBe(false);
+  });
+  test("inventory summaries and unresolved blank pages cannot establish OCR readiness", () => {
+    const input = fixture(), prep = preprocessing("d1"); input.preprocessing = [prep];
+    prep.artifacts = [{ path: "/synthetic/inventory.json", sha256: sha256("inventory") }];
+    expect(() => assessAvailability(input)).toThrow("page manifest");
+    input.preprocessing = [preprocessing("d1")];
+    const manifest = pageManifest("d1"), blank = manifest.pageAssets[0]!;
+    blank.markdown.bytes = 0; blank.markdown.sha256 = sha256(""); blank.zeroByteDisposition = "unresolved";
+    expect(() => validateOcrPageManifest(manifest, input.preprocessing[0]!, 3)).toThrow("Unresolved zero-byte");
+    blank.zeroByteDisposition = "verified_blank";
+    expect(() => validateOcrPageManifest(manifest, input.preprocessing[0]!, 3)).toThrow("inconsistent");
+    blank.blankReview = { path: "/synthetic/blank-review.json", sha256: sha256("review") };
+    expect(() => validateOcrPageManifest(manifest, input.preprocessing[0]!, 3)).not.toThrow();
+  });
+  test("source identity review rejects rejected, foreign and self-authored decisions despite valid hashes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "identity-review-"));
+    try {
+      const input = fixture(), doc = input.documents[0]!, identity = (doc.verification!.sourceVerification as any).identity;
+      const evidence = join(root, "source.json"); await writeFile(evidence, "{}");
+      identity.evidence = [{ path: evidence, sha256: sha256("{}") }]; identity.basis = "independent_equivalence_review";
+      const { review: ignored, ...decision } = identity;
+      const review = { schema: "gptgrep.source-identity-review.v1", status: "accepted", documentId: doc.documentId, rawSha256: doc.rawSha256,
+        identitySha256: digest(decision), proposedBy: "producer", reviewedBy: "reviewer" };
+      const publish = async () => { const bytes = JSON.stringify(review); const path = join(root, "review.json"); await writeFile(path, bytes); identity.review = { path, sha256: sha256(bytes) }; };
+      await publish(); await verifySourceIdentityReview(doc);
+      review.status = "rejected"; await publish(); await expect(verifySourceIdentityReview(doc)).rejects.toThrow("exact source decision");
+      review.status = "accepted"; review.rawSha256 = sha256("other"); await publish(); await expect(verifySourceIdentityReview(doc)).rejects.toThrow("exact source decision");
+      review.rawSha256 = doc.rawSha256; review.reviewedBy = review.proposedBy; await publish(); await expect(verifySourceIdentityReview(doc)).rejects.toThrow("self-authored");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+  test("sharded OCR requires actual task assets and an accepted exact blank-page review", async () => {
+    const root = await mkdtemp(join(tmpdir(), "blank-review-"));
+    try {
+      const input = fixture(), prep = preprocessing("d1"), manifest = pageManifest("d1"); input.preprocessing = [prep];
+      for (const page of manifest.pageAssets) {
+        const bytes = page.page === 1 ? "" : `page ${page.page}`;
+        page.markdown = { path: join(root, `${page.page}.md`), relativePath: `ocr/d1/${page.page}.md`, sha256: sha256(bytes), bytes: Buffer.byteLength(bytes) };
+        await writeFile(page.markdown.path, bytes);
+      }
+      const blank = manifest.pageAssets[0]!; blank.zeroByteDisposition = "verified_blank";
+      const review = { schema: "gptgrep.ocr-blank-review.v1", status: "accepted", documentId: "d1", rawSha256: prep.rawSha256,
+        profileSha256: prep.profileSha256, page: 1, rawPage: 1, markdownSha256: sha256(""), proposedBy: "producer", reviewedBy: "reviewer" };
+      const provenance = join(root, "provenance.json"); await writeFile(provenance, "{}"); prep.provenance = [{ path: provenance, sha256: sha256("{}") }];
+      const publish = async () => {
+        const reviewBytes = JSON.stringify(review), reviewPath = join(root, "blank.json"); await writeFile(reviewPath, reviewBytes);
+        blank.blankReview = { path: reviewPath, sha256: sha256(reviewBytes) };
+        const manifestBytes = JSON.stringify(manifest), path = join(root, "pages.json"); await writeFile(path, manifestBytes);
+        prep.pageManifest = { path, sha256: sha256(manifestBytes) }; prep.artifacts = [prep.pageManifest];
+      };
+      const tasks = [input.release.tasks.find(task => task.id === "q1")!];
+      await publish();
+      await expect(verifyRequiredPreprocessing(admit(input, "ocr"), tasks, [{ relativePath: "pages.json", sha256: prep.pageManifest!.sha256 }])).rejects.toThrow("absent");
+      const supplied = manifest.pageAssets.map(page => ({ relativePath: page.markdown.relativePath, sha256: page.markdown.sha256 }));
+      await verifyRequiredPreprocessing(admit(input, "ocr"), tasks, supplied);
+      await expect(verifyRequiredPreprocessing(admit(input, "ocr"), tasks, supplied.map((asset, index) => index === 0 ? { ...asset, relativePath: "unrelated/blank.md" } : asset))).rejects.toThrow("wrong workspace path");
+      review.status = "rejected"; await publish(); await expect(verifyPreprocessingPins(admit(input, "ocr"), tasks)).rejects.toThrow("exact page");
+      review.status = "accepted"; review.rawPage = 2; await publish(); await expect(verifyPreprocessingPins(admit(input, "ocr"), tasks)).rejects.toThrow("exact page");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+  test("historical v1 remains verifiable but cannot be used for new live admission", () => {
+    const input = fixture(), current = assessAvailability(input);
+    expect(current.schema).toBe("gptgrep.task-availability.v2");
+    const historic = structuredClone(current); historic.schema = "gptgrep.task-availability.v1";
+    for (const doc of historic.documents) delete (doc.verification!.sourceVerification as any).identity;
+    for (const task of historic.tasks) task.documentStateReferences = Object.fromEntries(task.requiredDocumentIds.map(id => [id, digest(historic.documents.find(doc => doc.documentId === id))]));
+    expect(() => validateAssessment(historic)).not.toThrow();
+    const admission = admit(input); admission.assessment = historic;
+    expect(() => assertTaskAdmitted(admission, input.release.tasks[0]!, "bare", raw(input))).toThrow("v2");
   });
   test("duplicate, foreign, omitted and narrowed dependencies fail closed", () => {
     for (const mutate of [

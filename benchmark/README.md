@@ -64,7 +64,7 @@ acceptance. A Linux Harbor image needs its own qualified tool/runtime artifacts.
 
 ## Current availability and launch admission
 
-`assess-availability --release ROOT --corpus ROOT --states JSON --output JSON`
+`assess-availability --release ROOT --corpus ROOT --states JSON --output JSON --source-families JSON`
 creates a new immutable assessment from a dependency-only release projection.
 The state input contains `revision`, `generation`, `recordedAt`, `supersedes`,
 `documents`, `profiles` and `preprocessing`; the controller derives the complete
@@ -75,6 +75,13 @@ the metadata artifact must never be built by shrinking context to judged pages.
 Each `verified` state must match the current physically hashed acquisition and
 its minimal source-identity proof. Verification objects have closed field sets;
 extra question, answer or evidence payloads are rejected rather than retained.
+New assessments use `gptgrep.task-availability.v2`. Pinned v1 assessments remain
+verifiable historical predecessors, but cannot authorize live work. The identity
+proof includes `identity.status`, `basis`, `expectedIdentitySha256`, `sourceUrl`,
+evidence pins and a review pin. Equivalence-based acceptance requires that review;
+page-count equality and nonempty prose cannot independently admit a source.
+The source URL and expected identity digest must match the released metadata.
+Evidence semantics and independent acceptance still require actual review.
 
 RAW states are `verified`, `recovery_pending`, `identity_hold` and
 `frozen_unavailable`. A failed download remains pending recovery. A changed
@@ -97,6 +104,36 @@ its artifacts exist. A partial pilot is not complete-document OCR readiness.
 Enrollment and prospective planning rehash required preprocessing files even
 before a reader workspace exists. Export and launch additionally verify artifact
 presence separately for every task; one task cannot borrow another's OCR files.
+Each v2 preprocessing record pins one per-document `pageManifest`; `artifacts`
+contains exactly that pin. The shard uses `gptgrep.ocr-page-manifest.v1`, binds
+document/RAW/profile identity, and contains `pageAssets`: benchmark page and RAW page,
+Markdown source path/hash/bytes/relative workspace path, corresponding image fields, zero-byte disposition and optional
+blank-page review pin. Shards keep the full release assessment within the bounded
+JSON reader. Runtime expands and verifies the actual assets; the shard hash alone
+cannot satisfy task workspace material. Every page asset must match its exact
+relative destination and hash; one empty file cannot stand in for other blank
+page destinations. A corpus inventory summary cannot replace
+them. Empty Markdown remains unresolved
+unless a reviewed blank-page disposition exists; unresolved pages block OCR
+readiness. Current-file verification rechecks both hashes and byte counts. Review
+receipts must explicitly accept the exact identity/page and name distinct proposer
+and reviewer identities; a hash of a rejected or unrelated review cannot admit it.
+
+Assessment and freeze must use the same frozen family map and physically verified
+RAW hashes. Freeze compares every released dependency/group before sampling, and
+records family/exposure input pins. Exposure events are authoritative: their exact
+document union must match the ledger summary. Malformed family entries, duplicate
+events and missing exposure context fail closed.
+
+`reader-publication.ts` provides a closed source/task projection and an upload
+verification front door. It strips arbitrary nested metadata, checks all staged
+paths against an exact hash manifest, rejects caches/private path markers, and
+requires canonical JSONL bytes and actual Parquet decoding followed by complete
+JSONL row parity. Parquet footer/schema/field metadata must be empty; create files
+without pandas attributes or stored Arrow schema metadata. Supply
+a separately pinned decoder; the negative interface fixtures do not qualify a
+Parquet runtime. The caller verifies this manifest immediately before an
+authorized upload. This module performs no publication itself.
 
 New freeze, export, native and prospective Opt work requires a project-owned
 `gptgrep.availability-controller.v1` acceptance receipt. It binds the current
@@ -172,6 +209,120 @@ The Harbor adapter creates a separate verifier environment. `harbor/verify.py`
 uses the pinned native scorer and independent judgment artifact; its RewardKit
 integration emits separate metric criteria. It never supplies gold to a reader
 or calls a separate LLM for every criterion.
+
+The task's exported `expected.json` is a pre-reader v1 binding and cannot finish
+verification. Harbor restores the collected answer at `/app/answer.json` in the
+separate verifier. After the reader has exited, the controller calls
+`sealReaderEpisode` with exact attempt, exported-expected and evaluation-plan
+pins. The resulting v2 binding is immutable and stays outside the reader.
+`judgeAnswer` requires that binding, verifies the frozen question/reference and
+copied PDFs, and records a fresh native judge identity. Pass the same v2 binding
+as `verifyCommand.expectedPath`; a missing binding or judge remains unknown.
+The runtime-specific controller must deliver these controller-owned artifacts
+to the verifier after collection. Task export alone does not implement that route.
+
+The evaluation plan has schema `gptgrep.evaluation-plan.v1` and contains `run`
+(the exact `EvaluationRun` identity including `arm`, without outcomes), `runtime`
+(`sourceRevision`, `binarySha256`, `runtimeManifestSha256`, `codexBinarySha256`,
+`buildReceipt` pin), and a `tasks` map keyed by enrolled task ID. Each task binds
+`commonPromptSha256`, `contextSha256`, `corpusSha256` and `preparationSha256`.
+The product build receipt uses `gptgrep.product-build.v1` and binds
+`sourceRevision`, `binarySha256` and `runtimeManifestSha256`; the build owner must
+produce it from actual build evidence. `preparationDigest` computes the declared
+task-local preparation identity. `writeEvaluationRun` derives scores from exact
+episode/judgment/verifier artifacts, validates the frozen plan and retains every
+enrolled slot. It refuses overwrite, foreign episodes and changed artifacts.
+
+Native private capture now retains supported app-server item payloads and tool
+outputs separately from the compact `NativeRunResult`. Authentication/config RPC
+responses and reasoning items are excluded; known and labelled secrets are
+redacted with counters. The finite capture ceiling is 64 MiB; exceeding it fails
+the run. `writeNativeTrajectory` produces ATIF-v1.8 plus a separate coverage
+record, pinning converter bytes, the upstream schema revision/spec digest, native
+runtime bytes and source trace. Tool results point to their call IDs and source
+lines. Only the selected root turn and explicitly delegated children are joined.
+Missing child input, usage, terminal events, media, interrupted calls or unknown
+item types stay visible gaps. Nested tool media currently requires further
+mapping and therefore prevents complete coverage. A schema-shaped trajectory
+or fixture conversion cannot establish live tool/page-reading qualification.
+
+`benchmark/src/controller.ts` supplies the paired execution entrypoint. Its
+`batch` mode consumes a pinned v2 manifest, finite v2 campaign envelope and independent
+review pin. The shared ledger charges preparation, reader, judge, repair,
+calibration, optimization and offline verifier admissions before dispatch. Its
+per-purpose counts, deadlines and cumulative byte reservations cannot reset with
+a new experiment ID; failed or uncertain submissions are not refunded. These
+logical reservations are separate from physical storage measurements. The custom Harbor
+agent is `native_agent:NativeCodexAgent`; its bridge contract pins the imported
+module and runs the controller's `preflight` and `reader` modes inside the task
+environment. The controller then seals the reader, dispatches a fresh judge,
+runs the offline verifier and derives fixed-denominator reports. Actual Harbor
+import resolution, container storage/auth isolation and live capability coverage
+must be qualified separately.
+
+The v2 reader route uses the adapter's explicit `prebuiltImage` digest pin,
+`/app/task` workspace and reviewed owner binds. Harbor environment uploads are
+disabled, and the actual environment must preserve that exact mount graph.
+The outer storage worker runs the controller's
+`harbor` wrapper, which launches the selected auth supervisor and Harbor, then
+performs container and post-broker finalization before the storage worker exits.
+The bridge uses exact-CID owner commands and sealed host originals; collection
+does not copy those originals or establish final cleanup. Parent, container and
+per-command bindings remain distinct. Guest acceptance is supplied separately
+from the immutable reader job, avoiding a self-referential job hash.
+The bridge also pins `bunConfig` to the empty `benchmark/empty.bunfig.toml`,
+mounted read-only. Both phases include `--no-env-file --no-install --config=PATH`
+before the controller entrypoint. The source closure includes those runtime
+inputs; host validation resolves guest pins through the frozen bind map and
+uses the explicit host job pin until the owner materializes its guest copy.
+
+An owner may explicitly select `proc_environment:ProcOverlayDockerEnvironment`
+through `containerOwner.procEnvironment`, containing separate `module` and
+`contract` pins. This project-owned Harbor environment supports the native
+sandbox's proc overlay while retaining the two `/sys` masks: its exact Engine
+request uses `MaskedPaths=["/sys/devices/virtual/powercap","/sys/firmware"]` and
+`ReadonlyPaths=[]`. All other security, resource and bind settings must match
+the existing owner template. The selection uses a pre-existing local immutable
+image ID, finite seccomp/AppArmor profiles and a pinned local Engine endpoint
+and Compose executable. It does not patch the installed Harbor or Compose source.
+
+The selected import route verifies and suppresses only Harbor's three generated
+log binds; additional user binds are refused. Reader outputs continue through
+the explicit owner mounts and sealed host projection. The contract pins Harbor's
+trial derivation instead of predicting its random session suffix; only the
+Compose project label and corresponding container name derive from the actual
+session. One fixed create/start sequence supplies the full container ID, which
+the bridge must join to the owner-observed namespace before admission. Later
+exec/copy selection requires that singleton ID. Teardown addresses only that
+created container and retains failed or uncertain outcomes, with no image,
+volume, network or orphan cleanup. Actual Harbor startup, owner admission,
+native capability and finalization still require fresh runtime qualification.
+
+Judges may select `documentSourceMode: "pinned-read-only"` to use exact original
+RAW files with a fresh workspace and native session. Actual permission readback
+must grant those files and the five staged judge inputs read-only access. Source
+identity and input hashes are checked after success or failure; changes invalidate
+the judgment. The default judge route still copies PDFs. The source-access receipt
+records zero harness PDF copies and does not claim that native tools created no
+additional files. Live storage accounting must verify that distinction.
+
+Capture ceilings are explicit in the envelope and bridge jobs. Source outputs
+are sized before create-once writes; oversized native results remain started
+failures with a bounded omission record. The reservation includes both answer
+copies, startup/denial metadata, source and host artifacts, and both projected
+ATIF copies. Image bytes are captured on direct item completion; aggregate
+terminal/readback records cannot establish a new image binding. Retained child
+capture is opt-in and uses read-only full-turn queries for explicitly delegated
+threads. These controls do not establish OS-wide disk quotas or provider/USD
+request ceilings.
+
+Offline verification has its own shared admission and storage terminal. Authored
+JSON writes are bounded before writing, and feedback keeps bounded reason previews
+with original hashes and byte counts. RewardKit output accounting depends on the
+pinned, finite programmatic criteria route; its readback check is not a filesystem
+quota. Exact Linux command checks use `/proc/self/cmdline`, retaining Bun runtime
+guard flags that are omitted from script `process.argv`. Use `--config=PATH` for
+the explicit Bun configuration.
 
 ## Checks
 

@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { selectReaderTasks, sha256, XL_NATIVE_SCORER_SHA256, type ReaderTask, type XlRelease } from "./dataset";
 import { assertTaskAdmitted, dependencyProjection, loadAdmission, verifyRequiredPreprocessing, type AdmissionReference } from "./availability";
 import { digest, writeJson } from "./io";
-import { indexTaskFiles } from "./harbor-launch";
+import { indexTaskFiles, validImmutableImage } from "./harbor-launch";
 
 export interface RawDocument {
   documentId: string;
@@ -35,6 +35,8 @@ export interface HarborAdapterOptions {
   overwrite?: boolean;
   arm: "bare" | "gptgrep";
   image?: string;
+  /** Existing immutable image plus separately reviewed binds; no task image build. */
+  prebuiltImage?: string;
   agentTimeoutSec?: number;
   verifierTimeoutSec?: number;
   rubricSha256?: string;
@@ -108,10 +110,10 @@ async function copyRegular(source: string, destination: string): Promise<void> {
   await copyFile(source, destination, constants.COPYFILE_FICLONE);
 }
 
-function taskInstruction(task: ReaderTask): string {
+function taskInstruction(task: ReaderTask, workspace: "/app" | "/app/task"): string {
   return `${task.question}\n\n` +
-    "Use the supplied original PDF documents in /app/documents. " +
-    "The mapping from document IDs to files is /app/context.json. " +
+    `Use the supplied original PDF documents in ${workspace}/documents. ` +
+    `The mapping from document IDs to files is ${workspace}/context.json. ` +
     "Do not use the internet to obtain an answer.\n\n" +
     "Write /app/answer.json as a JSON object with a short string answer and a citations array. " +
     'Each citation must have document_id and page (one-based PDF page index). ' +
@@ -131,7 +133,8 @@ function taskToml(options: HarborAdapterOptions, task: ReaderTask): string {
     `[metadata]\nsource_revision = ${JSON.stringify(options.release.revision)}\nupstream_question_id = ${JSON.stringify(task.id)}\n` +
     `context_id = ${JSON.stringify(task.contextId)}\ngroup_id = ${JSON.stringify(task.groupId)}\narm = ${JSON.stringify(options.arm)}\n\n` +
     `[agent]\ntimeout_sec = ${timeout}\n\n` +
-    `[environment]\nbuild_timeout_sec = 600\ncpus = 2\nmemory_mb = 4096\nstorage_mb = 20480\n` +
+    `[environment]\n` + (options.prebuiltImage ? `docker_image = ${JSON.stringify(options.prebuiltImage)}\n` : "") +
+    `build_timeout_sec = 600\ncpus = 2\nmemory_mb = 4096\nstorage_mb = 20480\n` +
     `network_mode = ${JSON.stringify(hosts.length ? "allowlist" : "no-network")}\n` +
     (hosts.length ? `allowed_hosts = ${JSON.stringify(hosts)}\n` : "") + "\n" +
     `[verifier]\ntimeout_sec = ${verifierTimeout}\nenvironment_mode = "separate"\n\n` +
@@ -139,6 +142,7 @@ function taskToml(options: HarborAdapterOptions, task: ReaderTask): string {
 }
 
 function agentDockerfile(options: HarborAdapterOptions): string {
+  if (options.prebuiltImage) return "# This task requires the pinned prebuilt image and reviewed bind mounts.\nFROM scratch\nRUN [\"/prebuilt-bind-required\"]\n";
   const image = options.image ?? "ubuntu:24.04";
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._/:@-]*$/.test(image)) throw new Error("Invalid container image reference");
   return `FROM ${image}\nWORKDIR /app\nCOPY documents/ /app/documents/\nCOPY context.json /app/context.json\n` +
@@ -153,6 +157,8 @@ function agentDockerfile(options: HarborAdapterOptions): string {
  */
 export async function writeHarborTasks(options: HarborAdapterOptions): Promise<GeneratedHarborTask[]> {
   if (options.arm !== "bare" && options.arm !== "gptgrep") throw new Error("Unknown experiment arm");
+  if (options.prebuiltImage !== undefined && (!validImmutableImage(options.prebuiltImage) || options.image !== undefined)) throw new Error("Prebuilt export requires one immutable image and cannot select a build base");
+  const workspace = options.prebuiltImage ? "/app/task" : "/app";
   if (options.arm === "bare" && options.preparedArtifacts?.length) throw new Error("Bare arm cannot receive prepared artifacts");
   if (options.rubricSha256) requireHash(options.rubricSha256, "rubricSha256");
   const tasks = selectReaderTasks(options.release.readerTasks, options);
@@ -160,7 +166,7 @@ export async function writeHarborTasks(options: HarborAdapterOptions): Promise<G
   const admission = await loadAdmission(options.admission, options.outputDir);
   if (admission.assessment.release.revision !== options.release.revision || digest(admission.assessment.release.fileHashes) !== digest(options.release.fileHashes)) throw new Error("Release differs from assessed source");
   for (const task of tasks) assertTaskAdmitted(admission, task, options.arm, options.rawDocuments);
-  await verifyRequiredPreprocessing(admission, tasks, (options.preparedArtifacts ?? []).map(p => p.sha256));
+  await verifyRequiredPreprocessing(admission, tasks, options.preparedArtifacts ?? []);
   const outputRoot = resolve(options.outputDir);
   const sourceRoot = options.release.releaseRoot && resolve(options.release.releaseRoot);
   if (sourceRoot && (outputRoot === sourceRoot || !relative(sourceRoot, outputRoot).startsWith(`..${sep}`) && !isAbsolute(relative(sourceRoot, outputRoot)))) {
@@ -224,7 +230,7 @@ export async function writeHarborTasks(options: HarborAdapterOptions): Promise<G
       const context = {
         schema: "gptgrep.xl-reader-context.v1", task_id: task.id, context_id: task.contextId, corpus_sha256: corpusSha256,
         documents: taskRaw.map((d) => ({ document_id: d.documentId,
-          path: `/app/documents/${pdfFilename(d.documentId)}`, sha256: d.sha256.toLowerCase(),
+          path: `${workspace}/documents/${pdfFilename(d.documentId)}`, sha256: d.sha256.toLowerCase(),
           page_count: sources.get(d.documentId)!.pageCount })),
       };
       for (const document of taskRaw) await copyRegular(document.path, resolve(staging, "environment/documents", pdfFilename(document.documentId)));
@@ -232,17 +238,19 @@ export async function writeHarborTasks(options: HarborAdapterOptions): Promise<G
       for (const filename of verifierFiles) await copyRegular(resolve(verifierRoot, filename), resolve(staging, "tests", filename));
       await copyRegular(scorerPath, resolve(staging, "tests/upstream_evaluate.py"));
       await Promise.all([
-        writeFile(resolve(staging, "instruction.md"), taskInstruction(task)),
+        writeFile(resolve(staging, "instruction.md"), taskInstruction(task, workspace)),
         writeFile(resolve(staging, "task.toml"), taskToml(options, task)),
         writeFile(resolve(staging, "environment/Dockerfile"), agentDockerfile(options)),
         writeFile(resolve(staging, "environment/context.json"), JSON.stringify(context, null, 2) + "\n"),
         writeFile(resolve(staging, "tests/gold.jsonl"), JSON.stringify(judge.originalRow) + "\n"),
-        writeFile(resolve(staging, "tests/expected.json"), JSON.stringify({ schema: "gptgrep.verifier-binding.v1",
+        writeFile(resolve(staging, "tests/expected.json"), JSON.stringify({ schema: "gptgrep.verifier-binding.v1", status: "awaiting_reader_terminal",
           task_id: task.id, corpus_sha256: corpusSha256, rubric_sha256: options.rubricSha256 ?? null,
+          reader_task_sha256: digest(task), judge_reference_sha256: digest(judge.originalRow),
           native_scorer_sha256: XL_NATIVE_SCORER_SHA256 }, null, 2) + "\n"),
         writeFile(resolve(staging, "adapter-manifest.json"), JSON.stringify({ schema: "gptgrep.xl-harbor-task.v1",
           task_id: task.id, source_revision: options.release.revision, source_file_hashes: options.release.fileHashes,
           group_id: task.groupId, context_id: task.contextId, corpus_sha256: corpusSha256, arm: options.arm,
+          ...(options.prebuiltImage ? { execution: { kind: "prebuilt-bind", image: options.prebuiltImage, workspace } } : {}),
           availability: { assessmentSha256: admission.acceptance.assessment.sha256, assessmentRevision: admission.assessment.revision,
             generation: admission.assessment.generation, dependencySha256: admission.assessment.dependencySha256,
             profileId: options.admission.profileId, profileSha256: digest(admission.assessment.profiles.find(p => p.id === options.admission.profileId)),
@@ -273,6 +281,7 @@ export function verifyCommand(options: {
   answerPath: string; judgmentPath?: string; expectedPath: string; outputDir: string;
   verifierRoot: string; goldPath?: string; nativeScorerPath?: string;
 }): { command: string; args: string[] } {
+  // expectedPath is the controller's sealed v2 binding, produced after reader exit.
   const root = resolve(options.verifierRoot);
   const args = ["run", "--project", root, "--no-sync", "--offline", "python", resolve(root, "verify.py"),
     "--answer", resolve(options.answerPath), "--expected", resolve(options.expectedPath),

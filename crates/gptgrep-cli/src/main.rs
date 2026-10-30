@@ -3,6 +3,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use gptgrep_core::SearchOptions;
 
 mod decisions_budget;
+mod decisions_helper;
 mod judge;
 mod parse_agent;
 mod parse_agent_index;
@@ -456,6 +457,11 @@ impl std::error::Error for OcrServeError {}
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Explicit foreground Linux Decisions keyholder and provider-disabled probe.
+    DecisionsHelper {
+        #[command(subcommand)]
+        command: decisions_helper::Command,
+    },
     /// In-package document toolbox and explicit parse/OCR orchestration.
     ParseAgent {
         #[command(subcommand)]
@@ -973,6 +979,21 @@ fn contract() -> Value {
         "join":"pass the control file to --decisions-budget for paid commands; reservations are permanent, so a joined run stops at max_submissions with 'Decisions submission budget exhausted' before any POST",
         "network":false,"output":"always JSON; errors use gptgrep.error.v1 with code decisions_budget_failed"
     });
+    contract["commands"]["decisions-helper"] = json!({
+        "serve_usage":"gptgrep decisions-helper serve --control PRIVATE_JSON --expected-control-sha256 SHA [--key-stdin]",
+        "probe_usage":"gptgrep decisions-helper probe --control PRIVATE_JSON --expected-control-sha256 SHA",
+        "platform":"Linux only; explicit foreground process, never implicitly started",
+        "control_schema":gptgrep_jev::helper_ipc::SERVER_SCHEMA,
+        "client_schema":gptgrep_jev::helper_ipc::CLIENT_SCHEMA,
+        "credential":"bounded stdin followed by EOF, live serve only; no credential environment, argv or control field",
+        "client_environment":[gptgrep_jev::helper_ipc::CONTROL_ENV,gptgrep_jev::helper_ipc::CONTROL_SHA_ENV],
+        "budget":"one existing private original-clock ledger; only server reserves, sends, retries and records outcomes",
+        "readiness":"screened metadata on stdout plus new private client.json; terminal metadata on shutdown",
+        "probe":"provider-disabled only; no reservation or provider send",
+        "transport":"closed bounded Unix protocol; no reconnect, replay or HTTP fallback",
+        "refusals":"missing active owner binding, nonprivate umask, changed endpoint/peer generation or incompatible budget",
+        "qualification":"source tests do not establish native permission-profile or container namespace acceptance"
+    });
     contract["decisions"] = json!({"default_model":gptgrep_jev::DEFAULT_MODEL,
         "legacy_model":gptgrep_jev::LEGACY_MODEL, "legacy_images":false,
         "model_admission":"exact requested identifier; the observed canonical builds for Luna Decisions and legacy Jev; or, for a ~author/family-latest alias, a concrete author/family-VERSION build of the same author and family (VERSION starts with a digit). No other aliases, families, authors or fallback",
@@ -1377,6 +1398,9 @@ async fn run(cli: Cli) -> Result<i32> {
         return Ok(0);
     };
     match command {
+        Command::DecisionsHelper { command } => {
+            return decisions_helper::run(command, cli.decisions_budget.is_some()).await;
+        }
         Command::ParseAgent { command } => {
             if cli.decisions_budget.is_some() {
                 bail!("parse_agent_incompatible_decisions_budget");
@@ -2189,7 +2213,11 @@ async fn main() {
     let as_json = cli.json
         || matches!(
             &cli.command,
-            Some(Command::Ocr { .. } | Command::DecisionsBudget { .. })
+            Some(
+                Command::Ocr { .. }
+                    | Command::DecisionsBudget { .. }
+                    | Command::DecisionsHelper { .. }
+            )
         )
         || matches!(
             &cli.command,

@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { lstat, mkdir, readdir, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { assertTaskAdmitted, closed, dependencyProjection, loadAdmission, readExactJson, verifyPin,
   verifyRequiredPreprocessing, type AdmissionReference, type Pin } from "./availability";
@@ -18,6 +18,12 @@ interface RuntimeAcceptance {
   transport: "codex-auth-supervisor-direct-harbor"; environment: "linux";
   python: Pin; supervisor: Pin; harbor: Pin; authConfig: Pin; qualification: Pin;
   agent: string; runId: string; deadlineSeconds: number;
+}
+
+/** A digest is required; mutable tags and shell/TOML syntax are not image pins. */
+export function validImmutableImage(value: unknown): value is string {
+  return typeof value === "string" && value.length <= 512 &&
+    /^(?:sha256:[a-f0-9]{64}|[A-Za-z0-9][A-Za-z0-9._/:\-]*@sha256:[a-f0-9]{64})$/.test(value);
 }
 
 /** Inventory every regular byte, including verifier material, without reading its content. */
@@ -59,6 +65,7 @@ async function inspectHarbor(options: HarborLaunchOptions) {
   const root = resolve(exported.generated.path, "..");
   const expectedEntries = [basename(exported.generated.path), ...index.tasks.map(t => basename(t.directory))].sort();
   if (canonical((await readdir(root)).sort()) !== canonical(expectedEntries)) throw new Error("Export root contains unaccepted tasks or files");
+  let requiresPairedController = false;
   for (const entry of index.tasks) {
     closed(entry, ["taskId", "directory", "files"], "export task entry");
     if (resolve(entry.directory, "..") !== root || !within(root, entry.directory)) throw new Error("Export task escapes the accepted root");
@@ -74,13 +81,23 @@ async function inspectHarbor(options: HarborLaunchOptions) {
         manifest.availability?.assessmentSha256 !== acceptance.assessment.sha256 || manifest.availability.generation !== assessment.generation ||
         manifest.availability.assessmentRevision !== assessment.revision || manifest.availability.dependencySha256 !== assessment.dependencySha256 ||
         manifest.availability.profileId !== index.profileId || manifest.availability.taskDependencySha256 !== digest(dependencyProjection(dependency))) throw new Error("Generated manifest identity mismatch");
+    let workspace = "/app";
+    if (manifest.execution !== undefined) {
+      closed(manifest.execution, ["kind", "image", "workspace"], "generated execution binding");
+      if (manifest.execution.kind !== "prebuilt-bind" || !validImmutableImage(manifest.execution.image) || manifest.execution.workspace !== "/app/task") throw new Error("Invalid generated prebuilt execution binding");
+      const config = Bun.TOML.parse(await readFile(join(entry.directory, "task.toml"), "utf8")) as { environment?: { docker_image?: unknown } };
+      if (config.environment?.docker_image !== manifest.execution.image) throw new Error("Prebuilt task image differs from its generated binding");
+      workspace = manifest.execution.workspace;
+      requiresPairedController = true;
+    }
     const context = await readExactJson(join(entry.directory, "environment/context.json"));
     closed(context, ["schema", "task_id", "context_id", "corpus_sha256", "documents"], "generated context");
     if (context.schema !== "gptgrep.xl-reader-context.v1" || context.task_id !== dependency.id || context.context_id !== dependency.contextId || canonical(context.documents.map((d: any) => d.document_id).sort()) !== canonical([...dependency.contextDocumentIds].sort())) throw new Error("Generated context is narrowed or foreign");
     const raw = [];
     for (const document of context.documents) {
       closed(document, ["document_id", "path", "sha256", "page_count"], "generated document");
-      if (typeof document.path !== "string" || !document.path.startsWith("/app/documents/") || basename(document.path) !== document.path.slice("/app/documents/".length)) throw new Error("Unsafe generated RAW path");
+      const prefix = `${workspace}/documents/`;
+      if (typeof document.path !== "string" || !document.path.startsWith(prefix) || basename(document.path) !== document.path.slice(prefix.length)) throw new Error("Unsafe generated RAW path");
       const path = join(entry.directory, "environment/documents", basename(document.path));
       if (await fileHash(path) !== document.sha256 || document.page_count !== assessment.release.documents.find(d => d.documentId === document.document_id)?.pageCount) throw new Error("Generated RAW identity changed");
       raw.push({ documentId: document.document_id, sha256: document.sha256 });
@@ -89,20 +106,22 @@ async function inspectHarbor(options: HarborLaunchOptions) {
     if (context.corpus_sha256 !== corpus || manifest.corpus_sha256 !== corpus) throw new Error("Generated corpus digest mismatch");
     const record = assertTaskAdmitted(admission, dependency, index.arm, raw);
     if (manifest.availability.profileSha256 !== record.armAvailability[index.profileId]!.profileSha256) throw new Error("Generated profile changed");
-    const preparedHashes: string[] = [];
+    const preparedFiles: Array<{ relativePath: string; sha256: string }> = [];
     for (const artifact of manifest.prepared_artifacts ?? []) {
       if (artifact.scope !== "tool" && canonical([...(manifest.prepared_context_document_ids ?? [])].sort()) !== canonical([...dependency.contextDocumentIds].sort())) throw new Error("Generated preprocessing context differs from task");
       const path = resolve(entry.directory, "environment/prepared", artifact.relative_path);
       if (!within(join(entry.directory, "environment/prepared"), path) || await fileHash(path) !== artifact.sha256) throw new Error("Generated preprocessing changed");
-      preparedHashes.push(artifact.sha256);
+      preparedFiles.push({ relativePath: artifact.relative_path, sha256: artifact.sha256 });
     }
-    await verifyRequiredPreprocessing(admission, [dependency], preparedHashes);
+    await verifyRequiredPreprocessing(admission, [dependency], preparedFiles);
   }
+  // This older --path/--agent route cannot supply the exact owner container job.
+  if (requiresPairedController) throw new Error("Prebuilt bind exports require the paired controller v2 and its exact container owner admission");
   const runtime = await readExactJson<RuntimeAcceptance>(acceptance.runtime.path);
   closed(runtime, ["schema", "status", "cliContract", "transport", "environment", "python", "supervisor", "harbor", "authConfig", "qualification", "agent", "runId", "deadlineSeconds"], "runtime acceptance");
   if (runtime.schema !== "gptgrep.harbor-runtime-acceptance.v1" || runtime.status !== "qualified" || runtime.cliContract !== "harbor-run-path-agent-job-name-v1" ||
       runtime.transport !== "codex-auth-supervisor-direct-harbor" || runtime.environment !== "linux" ||
-      !/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,100}$/.test(runtime.agent) || !/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,100}$/.test(runtime.runId) ||
+      !validHarborAgent(runtime.agent) || !/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,100}$/.test(runtime.runId) ||
       !Number.isSafeInteger(runtime.deadlineSeconds) || runtime.deadlineSeconds < 1 || runtime.deadlineSeconds > 86400) throw new Error("Runtime is not qualified for the closed launch contract");
   for (const pin of [runtime.python, runtime.supervisor, runtime.harbor, runtime.authConfig, runtime.qualification]) await verifyPin(pin);
   const qualification = await readExactJson(runtime.qualification.path);
@@ -117,6 +136,13 @@ async function inspectHarbor(options: HarborLaunchOptions) {
     runtime.harbor.path, "run", "--path", root, "--agent", runtime.agent, "--job-name", runtime.runId];
   return { schema: "gptgrep.harbor-preflight.v1", status: "admitted", taskIds: ids, arm: index.arm,
     assessmentSha256: acceptance.assessment.sha256, generation: assessment.generation, argv };
+}
+
+/** Harbor accepts a registered name or an explicit Python module:Class route. */
+export function validHarborAgent(value: unknown): value is string {
+  return typeof value === "string" && value.length <= 200 &&
+    (/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,100}$/.test(value) ||
+     /^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*:[A-Za-z_]\w*$/.test(value));
 }
 
 async function recordDenial(options: HarborLaunchOptions, error: unknown, executionMode: "live" | "test" | "preflight") {

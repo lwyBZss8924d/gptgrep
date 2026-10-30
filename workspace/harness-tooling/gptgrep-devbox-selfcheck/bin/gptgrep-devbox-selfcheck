@@ -1,0 +1,17 @@
+#!/bin/sh
+# Dispatch only; all observation/qualification logic lives in the canonical owner.
+set -eu
+SELF_PATH=$0
+link_count=0
+while [ -L "$SELF_PATH" ]; do
+  link_count=$((link_count + 1))
+  [ "$link_count" -le 40 ] || { echo "Selfcheck launcher symlink cycle" >&2; exit 1; }
+  SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$SELF_PATH")" && pwd)
+  SELF_LINK=$(readlink "$SELF_PATH")
+  case "$SELF_LINK" in
+    /*) SELF_PATH=$SELF_LINK ;;
+    *) SELF_PATH=$SELF_DIR/$SELF_LINK ;;
+  esac
+done
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$SELF_PATH")" && pwd)
+exec bun "$SELF_DIR/../src/selfcheck.ts" "$@"

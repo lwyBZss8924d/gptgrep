@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { compare, planLoop, summarize, type EvaluationRun, type Outcome } from "../src/evaluate";
+import { compare, normalizeOutcome, normalizeRun, planLoop, summarize, type EvaluationRun, type Outcome } from "../src/evaluate";
 const hash = "a".repeat(64), rev = "b".repeat(40);
 const result = (taskId: string, groundedSuccess: 0 | 1): Outcome => ({ taskId, status: "complete", groundedSuccess, nativeAccuracy: groundedSuccess, atomicCoverage: groundedSuccess, latencyMs: 10, costUsd: null });
 function run(outcomes: Outcome[]): EvaluationRun {
@@ -53,3 +53,102 @@ test("loop planner isolates baseline and excludes evaluation/judge mutation", ()
   expect(() => planLoop({ baselineRevision: rev, parent, iteration: 1, mutationPaths: ["benchmark/src/judge.ts"] })).toThrow();
   expect(() => planLoop({ baselineRevision: rev, parent, iteration: 1, mutationPaths: ["crates/../benchmark/judge.ts"] })).toThrow();
 });
+
+test("explicit prelaunch denials normalize to unknown without document-specific routing", () => {
+  const denied1 = normalizeOutcome({ taskId: "a", status: "denied_before_dispatch", documentIds: ["arbitrary"], nativeAccuracy: 0.8 });
+  expect(denied1.status).toBe("setup_failed");
+  expect(denied1.groundedSuccess).toBeNull();
+  expect(denied1.nativeAccuracy).toBe(0.8);
+
+  const denied2 = normalizeOutcome({ taskId: "b", status: "denied_before_reader" });
+  expect(denied2.status).toBe("setup_failed");
+  expect(denied2.groundedSuccess).toBeNull();
+
+  const setupFailure = normalizeOutcome({ taskId: "b", status: "setup_failed" });
+  expect(setupFailure.status).toBe("setup_failed");
+  expect(setupFailure.groundedSuccess).toBeNull();
+
+  const r = run([
+    result("a", 1),
+    { ...denied2, taskId: "b" },
+  ]);
+  const s = summarize(r);
+  expect(s.enrolled).toBe(2);
+  expect(s.unknown).toBe(1);
+  expect(s.successes).toBe(1);
+  expect(s.bounds).toEqual([0.5, 1.0]);
+  expect(s.groundedSuccess.lowerBound).toBe(0.5);
+  expect(s.groundedSuccess.upperBound).toBe(1.0);
+  expect(s.comparable).toBe(false);
+});
+
+test("normalizes raw statuses before validating and never classifies by document ID", () => {
+  const raw = { ...run([]), outcomes: [{ taskId: "a", status: "timeout" as const },
+    { taskId: "b", status: "complete" as const, documentIds: ["doc_000236", "doc_000165"], groundedSuccess: 1 as const }] };
+  const normalized = normalizeRun(raw);
+  expect(normalized.outcomes.map(o => o.status)).toEqual(["operational_failure", "complete"]);
+  expect(normalizeOutcome({ taskId: "a", status: "timeout", validStart: false }).status).toBe("setup_failed");
+  expect(() => normalizeRun({ ...raw, outcomes: [{ taskId: "a", status: "made_up" as any }] })).toThrow("Unknown raw outcome");
+});
+
+test("postlaunch operational failures receive numeric score 0", () => {
+  const failure = normalizeOutcome({ taskId: "b", status: "timeout", nativeAccuracy: 0.0 });
+  expect(failure.status).toBe("operational_failure");
+  expect(failure.groundedSuccess).toBe(0);
+  expect(failure.groundedAccuracy).toBe(0);
+
+  const crash = normalizeOutcome({ taskId: "b", status: "crashed" });
+  expect(crash.status).toBe("operational_failure");
+  expect(crash.groundedSuccess).toBe(0);
+
+  const r = run([result("a", 1), failure]);
+  const s = summarize(r);
+  expect(s.enrolled).toBe(2);
+  expect(s.failures).toBe(1);
+  expect(s.unknown).toBe(0);
+  expect(s.successes).toBe(1);
+  expect(s.bounds).toEqual([0.5, 0.5]);
+  expect(s.groundedSuccess.final).toBe(0.5);
+  expect(s.comparable).toBe(true);
+});
+
+test("native accuracy and grounded accuracy separation", () => {
+  const o: Outcome = {
+    taskId: "a",
+    status: "complete",
+    groundedSuccess: 0,
+    groundedAccuracy: 0,
+    nativeAccuracy: 0.85,
+    accuracy: 0.85,
+    atomicCoverage: 0.5,
+    latencyMs: 120,
+    costUsd: 0.01,
+  };
+  const s = summarize(run([o, result("b", 1)]));
+  expect(s.nativeAccuracy.observed).toBe(2);
+  expect(s.accuracy.observed).toBe(2);
+  expect(s.nativeAccuracy.fullCohortMean).toBe((0.85 + 1.0) / 2);
+  expect(s.groundedSuccess.final).toBe(0.5);
+  expect(s.groundedAccuracy.final).toBe(0.5);
+});
+
+test("compare disables automated win when unknown counts differ or delta is within uncertainty bounds", () => {
+  // unknown counts differ
+  const r1 = run([result("a", 1), { ...result("b", 0), status: "judge_unknown", groundedSuccess: null }]);
+  const r2 = { ...run([result("a", 1), result("b", 1)]), revision: "c".repeat(40), parentRevision: rev };
+  const comp1 = compare(r1, r2);
+  expect(comp1.eligibleNextParent).toBe(false);
+  expect(comp1.reasons).toContain("unknown_count_differs");
+
+  // delta within uncertainty bounds
+  const rInc = run([result("a", 1), { ...result("b", 0), status: "judge_unknown", groundedSuccess: null }]);
+  const rCand = {
+    ...run([result("a", 0), { ...result("b", 0), status: "judge_unknown", groundedSuccess: null }]),
+    revision: "c".repeat(40),
+    parentRevision: rev,
+  };
+  const comp2 = compare(rInc, rCand);
+  expect(comp2.eligibleNextParent).toBe(false);
+  expect(comp2.reasons).toContain("delta_within_uncertainty_bounds");
+});
+

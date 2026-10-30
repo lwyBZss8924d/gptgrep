@@ -37,6 +37,8 @@ struct Inner {
     /// write its initialization header itself. Cleared after attachment.
     ledger_create_new_pending: AtomicBool,
     clock_anchor: Mutex<Option<RunClockAnchor>>,
+    helper: Mutex<Option<Arc<crate::helper_ipc::RemoteContext>>>,
+    helper_binding_error: bool,
     state: Mutex<State>,
 }
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -498,16 +500,108 @@ impl std::fmt::Debug for ExecutionContext {
         formatter
             .debug_struct("ExecutionContext")
             .field("shared_ledger", &self.0.ledger.is_some())
+            .field(
+                "delegated_helper",
+                &self.helper_target().map(|v| v.is_some()).unwrap_or(true),
+            )
             .field("max_submissions", &self.0.header.max_submissions)
             .finish_non_exhaustive()
     }
 }
 
 impl ExecutionContext {
+    pub(crate) fn helper_view(
+        helper: Arc<crate::helper_ipc::RemoteContext>,
+        local: Option<&Self>,
+    ) -> Self {
+        let budget = &helper.control.budget;
+        let mut mismatched = local.is_some_and(|context| {
+            context.0.header.deadline_unix_ms.is_some()
+                && (context.run_id() != Some(budget.run_id.as_str())
+                    || context.plan_digest() != Some(budget.plan_digest.as_str())
+                    || context.0.header.deadline_unix_ms != Some(budget.deadline_unix_ms)
+                    || context.0.header.max_submissions != budget.max_submissions
+                    || context.0.helper_binding_error)
+        });
+        if let Some(local) = local.filter(|value| value.0.header.deadline_unix_ms.is_some())
+            && !mismatched
+        {
+            let compatible = (|| -> Result<bool> {
+                let mut target = local
+                    .0
+                    .helper
+                    .lock()
+                    .map_err(|_| anyhow!("Helper context unavailable"))?;
+                if let Some(current) = target.as_ref() {
+                    return Ok(current.equivalent(&helper));
+                }
+                if local.0.ledger.is_some() {
+                    return Ok(false);
+                }
+                let state = local
+                    .0
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow!("Decisions budget state unavailable"))?;
+                if !state.reservations.is_empty() || state.submission_observations != 0 {
+                    return Ok(false);
+                }
+                *local
+                    .0
+                    .clock_anchor
+                    .lock()
+                    .map_err(|_| anyhow!("Decisions run clock unavailable"))? =
+                    Some(budget.clock_anchor.clone());
+                *target = Some(Arc::clone(&helper));
+                Ok(true)
+            })()
+            .unwrap_or(false);
+            if compatible {
+                return Self(Arc::clone(&local.0), local.1);
+            }
+            mismatched = true;
+        }
+        let remaining = SystemTime::UNIX_EPOCH
+            .checked_add(Duration::from_millis(budget.deadline_unix_ms))
+            .and_then(|deadline| deadline.duration_since(SystemTime::now()).ok())
+            .unwrap_or(Duration::ZERO);
+        let deadline = Instant::now()
+            .checked_add(remaining)
+            .unwrap_or_else(Instant::now);
+        let header = Header {
+            schema: LEDGER_SCHEMA.into(),
+            run_id: budget.run_id.clone(),
+            plan_digest: budget.plan_digest.clone(),
+            deadline_unix_ms: Some(budget.deadline_unix_ms),
+            max_submissions: budget.max_submissions,
+            max_concurrent_requests: MAX_CONCURRENT_REQUESTS,
+        };
+        let mut context = Self::create(header, Some(deadline)).expect("local context construction");
+        let inner = Arc::get_mut(&mut context.0).expect("new context is unshared");
+        inner.clock_anchor = Mutex::new(Some(budget.clock_anchor.clone()));
+        inner.helper = Mutex::new(Some(helper));
+        inner.helper_binding_error = mismatched;
+        context.1 = local.and_then(|context| context.1);
+        context
+    }
+
+    fn helper_target(&self) -> Result<Option<Arc<crate::helper_ipc::RemoteContext>>> {
+        Ok(self
+            .0
+            .helper
+            .lock()
+            .map_err(|_| anyhow!("Helper context unavailable"))?
+            .clone())
+    }
+
     /// Read a bounded portable budget contract and join its existing ledger.
     /// No missing journal, lock, or clock anchor is initialized by this front door.
     pub fn from_budget_file(path: impl AsRef<Path>) -> Result<Self> {
-        DecisionsBudget::read(path)?.join()
+        let budget = DecisionsBudget::read(path)?;
+        if crate::helper_ipc::environment_selected() {
+            return crate::helper_ipc::execution_from_budget(&budget);
+        }
+        budget.join()
     }
 
     /// An explicit experiment context. The absolute deadline also has a monotonic backstop.
@@ -572,6 +666,10 @@ impl ExecutionContext {
     }
 
     fn attach_ledger(self, path: &Path, existing_only: bool, create_new: bool) -> Result<Self> {
+        ensure!(
+            self.helper_target()?.is_none(),
+            "Only the helper may own its provider ledger"
+        );
         ensure!(
             self.0.header.deadline_unix_ms.is_some(),
             "A ledger requires an explicit absolute deadline"
@@ -645,6 +743,23 @@ impl ExecutionContext {
     }
 
     pub fn snapshot(&self) -> Result<ExecutionSnapshot> {
+        ensure!(
+            !self.0.helper_binding_error,
+            "Caller budget differs from the fixed helper budget"
+        );
+        let helper = self.helper_target()?;
+        if let Some(snapshot) = crate::helper_ipc::callback_snapshot(
+            self.run_id(),
+            self.plan_digest(),
+            self.0.header.deadline_unix_ms,
+            self.0.header.max_submissions,
+            helper.as_ref().map(|value| value.control.instance.as_str()),
+        ) {
+            return Ok(snapshot);
+        }
+        if let Some(helper) = helper {
+            return helper.snapshot();
+        }
         self.access(|state| {
             Ok(ExecutionSnapshot {
                 scope: if self.0.ledger.is_some() {
@@ -719,6 +834,10 @@ impl ExecutionContext {
     /// request timeout cap. No anchor, ledger attachment or admission is created.
     /// Legacy invocation-only contexts have no finite run deadline and reject.
     pub fn original_run_remaining(&self) -> Result<Duration> {
+        ensure!(
+            !self.0.helper_binding_error,
+            "Caller budget differs from the fixed helper budget"
+        );
         let deadline = self
             .0
             .header
@@ -777,6 +896,8 @@ impl ExecutionContext {
                 ledger_existing_only: false,
                 ledger_create_new_pending: AtomicBool::new(false),
                 clock_anchor: Mutex::new(None),
+                helper: Mutex::new(None),
+                helper_binding_error: false,
             }),
             None,
         ))
@@ -798,6 +919,10 @@ impl ExecutionContext {
     }
 
     pub(crate) fn remaining(&self) -> Result<Duration> {
+        ensure!(
+            !self.0.helper_binding_error,
+            "Caller budget differs from the fixed helper budget"
+        );
         let wall = match self.0.header.deadline_unix_ms {
             Some(deadline) => SystemTime::UNIX_EPOCH
                 .checked_add(Duration::from_millis(deadline))
@@ -838,6 +963,9 @@ impl ExecutionContext {
     /// It reserves nothing and does not wait for a concurrency slot; an
     /// unavailable or unreadable budget counts as no remaining submission.
     pub(crate) async fn submission_available(&self) -> bool {
+        if self.helper_target().is_ok_and(|value| value.is_some()) {
+            return false;
+        }
         self.wait_access(|state| {
             Ok(state.reservations.len() < state.header.max_submissions as usize)
         })
@@ -845,6 +973,10 @@ impl ExecutionContext {
         .unwrap_or(false)
     }
     pub(crate) async fn observe_submission(&self) -> Result<()> {
+        ensure!(
+            self.helper_target()?.is_none(),
+            "Only the helper may observe provider submissions"
+        );
         self.remaining()?;
         self.wait_access(|s| {
             self.remaining()?;
@@ -869,6 +1001,10 @@ impl ExecutionContext {
         body_sha256: &str,
         requested_model: &str,
     ) -> Result<Reservation> {
+        ensure!(
+            self.helper_target()?.is_none(),
+            "Only the helper may reserve provider submissions"
+        );
         loop {
             self.remaining()?;
             let result = self.access(|state| {
@@ -912,6 +1048,15 @@ impl ExecutionContext {
         }
     }
     fn access<T>(&self, action: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
+        let helper = self
+            .0
+            .helper
+            .lock()
+            .map_err(|_| anyhow!("Helper context unavailable"))?;
+        ensure!(
+            helper.is_none(),
+            "Only the helper may mutate or read its provider ledger directly"
+        );
         let mut local = self
             .0
             .state
@@ -2089,7 +2234,7 @@ mod tests {
                     // Process termination bypasses Drop: the durable InFlight slot must remain.
                     std::process::exit(0);
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::sleep(Duration::from_millis(250)).await;
                 reservation.terminal().await.unwrap();
             }
             Err(error) => assert!(error.to_string().contains("budget exhausted")),

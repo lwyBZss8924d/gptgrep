@@ -206,7 +206,7 @@ fn response_checked(
         .map_err(|error| DecisionFailure::validation(&error, usage, metadata).into())
 }
 
-fn validate_response(value: Value, questions: &Value) -> Result<DecisionResponse> {
+pub(crate) fn validate_response(value: Value, questions: &Value) -> Result<DecisionResponse> {
     // Value's deserializer interprets reserved internal keys. Keep usage from the
     // raw-token-aware tree so literal objects cannot become numeric cost metadata.
     let usage = value.get("usage").cloned().unwrap_or(Value::Null);

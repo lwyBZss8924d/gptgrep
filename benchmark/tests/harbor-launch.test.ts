@@ -1,15 +1,15 @@
 import { describe, expect, test } from "bun:test";
-import { cp, mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { assessAvailability, expectedIdentity, loadAdmission, readExactJson, type ControllerAcceptance, type Pin } from "../src/availability";
 import { normalizeDependencyRelease } from "../src/dataset";
-import { harborPreflight, indexTaskFiles, runHarborForTest } from "../src/harbor-launch";
+import { harborPreflight, indexTaskFiles, runHarborForTest, validHarborAgent, validImmutableImage } from "../src/harbor-launch";
 import { writeHarborTasks } from "../src/adapter";
-import { digest, fileHash, sha256 } from "../src/io";
+import { digest, fileHash, processCommandIdentity, sha256 } from "../src/io";
 
 async function fixture() {
-  const root = await mkdtemp(join(tmpdir(), "availability-harbor-"));
+  const root = await mkdtemp(join(await realpath(tmpdir()), "availability-harbor-"));
   const keys = ["ENVIRONMENTS_HARNESS_STORAGE_BINDING", "ENVIRONMENTS_HARNESS_STORAGE_DIGEST"] as const;
   const previous = Object.fromEntries(keys.map(key => [key, process.env[key]]));
   const write = async (path: string, value: unknown) => { await mkdir(dirname(path), { recursive: true }); await writeFile(path, JSON.stringify(value) + "\n"); };
@@ -29,7 +29,8 @@ async function fixture() {
       documents: await Promise.all(release.documents.map(async doc => ({ documentId: doc.documentId, expectedIdentitySha256: digest(expectedIdentity(doc)), rawState: "verified" as const,
         rawSha256: sha256(doc.documentId), reason: "Synthetic exact identity", evidence: [await pin(evidence)], freeze: null,
         verification: { status: "ready", sha256: sha256(doc.documentId), pageCountVerified: true, pageCount: 1,
-          sourceVerification: { status: "verified", sha256: sha256(doc.documentId), expectedPageCount: 1, observedPageCount: 1, method: "synthetic", identityEvidence: "synthetic" } } }))),
+          sourceVerification: { status: "verified", sha256: sha256(doc.documentId), expectedPageCount: 1, observedPageCount: 1, method: "synthetic", identityEvidence: "synthetic",
+            identity: { status: "verified", basis: "publisher_release_metadata", expectedIdentitySha256: digest(expectedIdentity(doc)), sourceUrl: doc.url, evidence: [await pin(evidence)], review: null } } } }))),
       profiles: [{ id: "bare-raw", arm: "bare", implementation: "implemented", requiresOcr: false, preprocessingProfileSha256: null }], preprocessing: [] });
     const assessmentPath = join(root, "assessment.json"); await write(assessmentPath, assessment);
     const assessmentPin = await pin(assessmentPath), currentPath = join(root, "current.json");
@@ -67,11 +68,15 @@ async function fixture() {
     await write(qualificationPath, qualification); runtime.qualification = await pin(qualificationPath);
     await write(runtimePath, runtime);
     const controllerPath = join(root, "controller.ts"); await writeFile(controllerPath, "// synthetic accepted controller closure\n");
-    const sourcePaths = new Set([process.argv[0]!, controllerPath, ...["availability.ts", "adapter.ts", "harbor-launch.ts", "dataset.ts", "runner.ts", "native.ts", "io.ts", "source-verification.ts"].map(name => resolve(import.meta.dir, "../src", name))]);
-    for (const arg of process.argv.slice(1)) if (/\.(?:py|[cm]?[jt]s|tsx|jsx)$/.test(arg)) sourcePaths.add(resolve(arg));
+    const sourcePaths = new Set([process.argv[0]!, controllerPath, resolve(import.meta.dir, "../harbor/native_agent.py"), resolve(import.meta.dir, "../../self-opt/src/evaluate.ts"), ...["availability.ts", "adapter.ts", "harbor-launch.ts", "dataset.ts", "runner.ts", "native.ts", "io.ts", "source-verification.ts", "episode.ts", "trajectory.ts", "judge.ts", "controller.ts", "campaign.ts", "container.ts", "process.ts", "harbor-wrapper.ts"].map(name => resolve(import.meta.dir, "../src", name))]);
+    const actualArgv = (await processCommandIdentity()).argv;
+    for (const arg of actualArgv.slice(1)) {
+      if (/\.(?:py|[cm]?[jt]s|tsx|jsx)$/.test(arg)) sourcePaths.add(resolve(arg));
+      if (arg.startsWith("--config=")) sourcePaths.add(resolve(arg.slice("--config=".length)));
+    }
     const acceptance: ControllerAcceptance = { schema: "gptgrep.availability-controller.v1", status: "accepted", current: await pin(currentPath), assessment: assessmentPin,
       generation: 1, assessmentRevision: assessment.revision, taskIds: [task.id], profileIds: ["bare-raw"], sourcePins: await Promise.all([...sourcePaths].map(pin)),
-      controllerArgv: [process.argv[0]!, controllerPath, "--acceptance", "@ACCEPTANCE_PATH@", "--acceptance-sha256", "@ACCEPTANCE_SHA256@"], childArgv: [[...process.argv]],
+      controllerArgv: [process.argv[0]!, controllerPath, "--acceptance", "@ACCEPTANCE_PATH@", "--acceptance-sha256", "@ACCEPTANCE_SHA256@"], childArgv: [actualArgv],
       storage: { runId: "synthetic-storage", workloadSha256: sha256("synthetic-workload"), cwd: process.cwd() }, runtime: await pin(runtimePath), harborExport: await pin(exportAcceptancePath) };
     const acceptancePath = join(root, "controller-acceptance.json"), bindingPath = join(root, "binding.json");
     const options = { admission: { acceptance: { path: acceptancePath, sha256: "" }, profileId: "bare-raw" }, outputDir };
@@ -96,15 +101,27 @@ async function fixture() {
 
 async function refusesBeforeCallback(f: Awaited<ReturnType<typeof fixture>>) {
   let launches = 0;
+  const before = new Set(await readdir(f.options.outputDir).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return []; throw error; }));
   await expect(runHarborForTest(f.options, async () => { launches++; return 0; })).rejects.toThrow();
   expect(launches).toBe(0);
-  const denials = (await readdir(f.options.outputDir)).filter(name => name.startsWith("prelaunch-denial-"));
-  expect(denials.length).toBeGreaterThan(0);
-  const receipt = JSON.parse(await readFile(join(f.options.outputDir, denials.at(-1)!), "utf8"));
+  const denials = (await readdir(f.options.outputDir)).filter(name => name.startsWith("prelaunch-denial-") && !before.has(name));
+  expect(denials).toHaveLength(1);
+  const receipt = JSON.parse(await readFile(join(f.options.outputDir, denials[0]!), "utf8"));
   expect(receipt.processStarted).toBe(false); expect(receipt.measurement).toBeNull(); expect(receipt.executionMode).toBe("test");
 }
 
 describe("closed task-aware Harbor dispatch", () => {
+  test("prebuilt images require immutable digest references without injected syntax", () => {
+    const hash = sha256("synthetic image");
+    for (const value of [`sha256:${hash}`, `registry.example.invalid:5000/team/reader@sha256:${hash}`, `reader:reviewed@sha256:${hash}`]) expect(validImmutableImage(value)).toBe(true);
+    for (const value of ["reader:latest", `reader@sha256:${hash.slice(1)}`, `reader@sha256:${hash.toUpperCase()}`, `reader@other@sha256:${hash}`,
+      `reader@sha256:${hash}\nextra = true`, `reader@sha256:${hash};touch /tmp/file`, null]) expect(validImmutableImage(value)).toBe(false);
+  });
+  test("custom agent import syntax is explicit and cannot inject command arguments", () => {
+    expect(validHarborAgent("gptgrep_harbor.native:NativeCodexAgent")).toBe(true);
+    expect(validHarborAgent("codex")).toBe(true);
+    for (const value of ["module:Class --flag", "/tmp/agent.py:Agent", "module:", "module:Class:Other", "module;command"]) expect(validHarborAgent(value)).toBe(false);
+  });
   test("synthetic accepted nested controller closure constructs the fixed direct-supervisor argv", async () => {
     const f = await fixture();
     try {
@@ -112,6 +129,31 @@ describe("closed task-aware Harbor dispatch", () => {
       expect(ready.taskIds).toEqual(["series"]); expect(ready.argv.slice(-8)).toEqual([f.runtime.harbor.path, "run", "--path", join(f.root, "export"), "--agent", "synthetic-agent", "--job-name", "synthetic-run"]);
       let launches = 0; const result = await runHarborForTest(f.options, async argv => { launches++; expect(argv).toEqual(ready.argv); return 0; });
       expect(launches).toBe(1); expect(result.executionMode).toBe("test");
+    } finally { await f.restore(); }
+  });
+  test("prebuilt exports validate image and workspace bindings but cannot use the legacy launcher", async () => {
+    const f = await fixture();
+    try {
+      const image = `reader@sha256:${sha256("synthetic prebuilt image")}`;
+      const execution = { kind: "prebuilt-bind", image, workspace: "/app/task" };
+      (f.manifest as any).execution = execution;
+      for (const document of f.context.documents) document.path = document.path.replace("/app/documents/", "/app/task/documents/");
+      const taskConfig = (selected: string) => `[environment]\ndocker_image = ${JSON.stringify(selected)}\n`;
+      await f.write(join(f.taskDir, "adapter-manifest.json"), f.manifest);
+      await f.write(join(f.taskDir, "environment/context.json"), f.context);
+      await writeFile(join(f.taskDir, "task.toml"), taskConfig(image)); await f.repinExport();
+      await expect(harborPreflight(f.options)).rejects.toThrow("paired controller v2");
+      await refusesBeforeCallback(f);
+
+      await writeFile(join(f.taskDir, "task.toml"), taskConfig(`reader@sha256:${sha256("foreign image")}`));
+      await f.repinExport(); await expect(harborPreflight(f.options)).rejects.toThrow("image differs"); await refusesBeforeCallback(f);
+      await writeFile(join(f.taskDir, "task.toml"), taskConfig(image));
+      execution.workspace = "/app"; await f.write(join(f.taskDir, "adapter-manifest.json"), f.manifest);
+      await f.repinExport(); await expect(harborPreflight(f.options)).rejects.toThrow("execution binding"); await refusesBeforeCallback(f);
+      execution.workspace = "/app/task"; await f.write(join(f.taskDir, "adapter-manifest.json"), f.manifest);
+      f.context.documents[0]!.path = f.context.documents[0]!.path.replace("/app/task/documents/", "/app/documents/");
+      await f.write(join(f.taskDir, "environment/context.json"), f.context); await f.repinExport();
+      await expect(harborPreflight(f.options)).rejects.toThrow("Unsafe generated RAW path"); await refusesBeforeCallback(f);
     } finally { await f.restore(); }
   });
   test("absent or unqualified runtime/export denies before any callback", async () => {
@@ -151,9 +193,14 @@ describe("closed task-aware Harbor dispatch", () => {
       const provenance = join(f.root, "ocr-provenance.json"); await writeFile(provenance, "synthetic parser");
       input.preprocessing = [];
       for (const doc of input.documents) {
-        const artifact = join(f.root, `${doc.documentId}-ocr.json`); await writeFile(artifact, `synthetic OCR ${doc.documentId}`);
+        const artifact = join(f.root, `${doc.documentId}-ocr.md`), text = `synthetic OCR ${doc.documentId}`; await writeFile(artifact, text);
+        const pageManifestPath = join(f.root, `${doc.documentId}-pages.json`);
+        await f.write(pageManifestPath, { schema: "gptgrep.ocr-page-manifest.v1", documentId: doc.documentId, rawSha256: doc.rawSha256, profileSha256: sha256("ocr"),
+          pageAssets: [{ page: 1, rawPage: 1, markdown: { ...await f.pin(artifact), relativePath: `ocr/${doc.documentId}/1.md`, bytes: Buffer.byteLength(text) },
+            images: [], zeroByteDisposition: "not_empty", blankReview: null }] });
+        const pageManifest = await f.pin(pageManifestPath);
         input.preprocessing.push({ documentId: doc.documentId, rawSha256: doc.rawSha256!, profileSha256: sha256("ocr"), state: "verified", pages: [1],
-          artifacts: [await f.pin(artifact)], provenance: [await f.pin(provenance)] });
+          pageManifest, artifacts: [pageManifest], provenance: [await f.pin(provenance)] });
       }
       const next = assessAvailability({ ...input, revision: "assessment-ocr", generation: 2, supersedes: f.acceptance.assessment });
       const path = join(f.root, "assessment-ocr.json"); await f.write(path, next); f.acceptance.assessment = await f.pin(path);
@@ -169,16 +216,17 @@ describe("closed task-aware Harbor dispatch", () => {
       secondManifest.availability.taskDependencySha256 = digest(second); secondManifest.prepared_context_document_ids = [...second.contextDocumentIds];
       secondManifest.prepared_artifacts = [];
       for (const prep of input.preprocessing) {
-        const relative = `${prep.documentId}.json`, target = join(secondDir, "environment/prepared", relative);
-        await mkdir(dirname(target), { recursive: true }); await cp(prep.artifacts[0]!.path, target);
-        secondManifest.prepared_artifacts.push({ relative_path: relative, sha256: prep.artifacts[0]!.sha256, scope: "context" });
+        const pages = await readExactJson(prep.pageManifest!.path), markdown = pages.pageAssets[0].markdown;
+        const relative = markdown.relativePath, target = join(secondDir, "environment/prepared", relative);
+        await mkdir(dirname(target), { recursive: true }); await cp(markdown.path, target);
+        secondManifest.prepared_artifacts.push({ relative_path: relative, sha256: markdown.sha256, scope: "context" });
       }
       await f.write(join(secondDir, "adapter-manifest.json"), secondManifest);
       await f.write(join(secondDir, "environment/context.json"), { ...f.context, task_id: second.id });
       Object.assign(f.generated, { assessmentSha256: f.acceptance.assessment.sha256, generation: 2, profileId: "gptgrep-ocr", arm: "gptgrep" });
       f.generated.tasks.push({ taskId: second.id, directory: secondDir, files: await indexTaskFiles(secondDir) }); await f.repinExport();
       let launches = 0;
-      await expect(runHarborForTest(f.options, async () => { launches++; return 0; })).rejects.toThrow("Required OCR artifacts absent");
+      await expect(runHarborForTest(f.options, async () => { launches++; return 0; })).rejects.toThrow("Required OCR page artifact absent or at the wrong workspace path");
       expect(launches).toBe(0);
     } finally { await f.restore(); }
   });
@@ -229,7 +277,7 @@ describe("closed task-aware Harbor dispatch", () => {
   test("binding to a different command or child closure is not acceptance", async () => {
     const f = await fixture(); try {
       f.acceptance.childArgv = []; await f.seal(); await refusesBeforeCallback(f);
-      f.acceptance.childArgv = [[...process.argv]]; await f.seal();
+      f.acceptance.childArgv = [(await processCommandIdentity()).argv]; await f.seal();
       const binding = JSON.parse(await readFile(f.bindingPath, "utf8")); binding.plan.command.argv_sha256 = sha256("different command");
       await f.write(f.bindingPath, binding); process.env.ENVIRONMENTS_HARNESS_STORAGE_DIGEST = await fileHash(f.bindingPath);
       await refusesBeforeCallback(f);
@@ -257,6 +305,15 @@ describe("closed task-aware Harbor dispatch", () => {
       await expect(loadAdmission(f.options.admission, f.options.outputDir)).rejects.toThrow("source closure is not pinned");
     } finally { await f.restore(); }
   });
+  test("episode, capture, judge and scoring code belong to the accepted source closure", async () => {
+    const f = await fixture(); try {
+      const original = [...f.acceptance.sourcePins];
+      for (const path of ["../src/episode.ts", "../src/trajectory.ts", "../src/judge.ts", "../src/controller.ts", "../src/campaign.ts", "../src/container.ts", "../src/process.ts", "../src/harbor-wrapper.ts", "../harbor/native_agent.py", "../../self-opt/src/evaluate.ts"]) {
+        f.acceptance.sourcePins = original.filter(pin => pin.path !== resolve(import.meta.dir, path)); await f.seal();
+        await expect(loadAdmission(f.options.admission, f.options.outputDir)).rejects.toThrow("source closure is not pinned");
+      }
+    } finally { await f.restore(); }
+  });
   test("runtime argv/environment override fields and duplicate JSON keys are rejected", async () => {
     const f = await fixture(); try {
       f.runtime.args = ["--path", "/other"]; await f.write(f.runtimePath, f.runtime); f.acceptance.runtime = await f.pin(f.runtimePath); await f.seal();
@@ -272,6 +329,15 @@ describe("closed task-aware Harbor dispatch", () => {
         rawDocuments: [], outputDir: target, arm: "bare" } as any)).rejects.toThrow();
       await expect(stat(target)).rejects.toThrow();
       const admission = await loadAdmission(f.options.admission, f.options.outputDir); expect(admission.assessment.tasks).toHaveLength(1);
+    } finally { await f.restore(); }
+  });
+  test("prebuilt export refuses mutable images and an ambiguous build base before materializing files", async () => {
+    const f = await fixture(); try {
+      const target = join(f.root, "denied-prebuilt-export"), options = { admission: f.options.admission,
+        release: { readerTasks: [{ ...f.task, question: "synthetic" }] }, rawDocuments: [], outputDir: target, arm: "bare" };
+      await expect(writeHarborTasks({ ...options, prebuiltImage: "reader:latest" } as any)).rejects.toThrow("immutable image");
+      await expect(writeHarborTasks({ ...options, prebuiltImage: `reader@sha256:${sha256("image")}`, image: "ubuntu:24.04" } as any)).rejects.toThrow("build base");
+      await expect(stat(target)).rejects.toThrow();
     } finally { await f.restore(); }
   });
 });

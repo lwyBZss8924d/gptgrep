@@ -1,0 +1,5 @@
+#!/bin/sh
+# Dispatch only; all observation/qualification logic lives in the canonical owner.
+set -eu
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec bun "$SELF_DIR/../../../workspace/harness-tooling/gptgrep-devbox-selfcheck/src/selfcheck.ts" "$@"

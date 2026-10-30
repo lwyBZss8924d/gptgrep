@@ -3,13 +3,14 @@ import { chmod, copyFile, lstat, mkdir, readFile, readdir, writeFile } from "nod
 import { dirname, isAbsolute, resolve } from "node:path";
 import { corpusDigest } from "./adapter";
 import type { ReaderTask } from "./dataset";
-import { canonical, digest, fileHash, physicalPath, readJson, requireStorage, sha256, within, writeJson } from "./io";
-import { runNative, type NativeRunOptions, type NativeRunResult } from "./native";
-import { assertTaskAdmitted, loadAdmission, verifyRequiredPreprocessing, type AdmissionReference } from "./availability";
+import { canonical, digest, fileHash, physicalPath, readJson, requireStorage, sha256, within, writeJson, writeJsonExclusive } from "./io";
+import { boundNativeResult, runNative, type NativeRunOptions, type NativeRunResult } from "./native";
+import { assertTaskAdmitted, loadAdmission, verifyPin, verifyRequiredPreprocessing, type AdmissionReference, type Pin } from "./availability";
 
 export const SUPERVISOR_MODEL = "gpt-6.1-sol";
 export const WORKER_MODEL = "gpt-6-luna";
 export const HELPER_MODELS = ["openai/gpt-6-luna-decisions", "typesafe/jev-1.14"] as const;
+export class StartedReaderArtifactError extends Error {}
 export type ReaderArm = "bare" | "gptgrep";
 export interface WorkspaceDocument { documentId: string; relativePath: string; sha256: string; }
 export interface ReaderWorkspace {
@@ -23,6 +24,8 @@ export interface ReaderWorkspace {
   preparedIndex?: { relativeRoot: string; generation: string; manifestSha256: string };
 }
 export interface PinnedRuntime {
+  sourceRevision: string;
+  buildReceipt: Pin;
   packageRoot: string;
   manifestSha256: string;
   binaryPath: string;
@@ -69,6 +72,10 @@ export interface ReaderArmOptions {
   helperModel: typeof HELPER_MODELS[number];
 }
 export interface ReaderArmResult extends ReaderAttempt {
+  productRevision: string;
+  buildReceiptSha256: string;
+  preparationSha256: string;
+  readerTaskSha256: string;
   authRunId: string | null;
   storageBindingSha256: string;
   corpusSha256: string | null;
@@ -162,6 +169,21 @@ export async function stageTreatmentRuntime(runtime: PinnedRuntime, cwd: string)
     await regular(destination, file.hash);
   }
   return staged.map(file => file.target);
+}
+
+async function verifyProductRuntime(runtime: PinnedRuntime): Promise<void> {
+  await verifyPin(runtime.buildReceipt);
+  const build = await readJson(runtime.buildReceipt.path);
+  if (build.schema !== "gptgrep.product-build.v1" || !/^[a-f0-9]{40,64}$/.test(runtime.sourceRevision) ||
+      build.sourceRevision !== runtime.sourceRevision || build.binarySha256 !== runtime.binarySha256 ||
+      build.runtimeManifestSha256 !== runtime.manifestSha256) throw new Error("Product source/build/runtime binding differs");
+  await regular(runtime.binaryPath, runtime.binarySha256);
+  await regular(resolve(runtime.packageRoot, "runtime/codex/manifest.json"), runtime.manifestSha256);
+}
+
+export function preparationDigest(workspace: ReaderWorkspace): string {
+  return digest({ artifacts: [...(workspace.preparedArtifacts ?? [])].sort((a, b) => a.relativePath.localeCompare(b.relativePath)),
+    contextDocumentIds: [...(workspace.preparedContextDocumentIds ?? [])].sort(), index: workspace.preparedIndex ?? null });
 }
 
 export function readerOrder(seed: string, pairIndex: number): ReaderArm[] {
@@ -281,6 +303,7 @@ export function parseReaderAnswer(text: string, task: ReaderTask): unknown {
 export async function runReaderArm(options: ReaderArmOptions): Promise<ReaderArmResult> {
   const storage = await requireStorage(options.outputDir, options.workspace.cwd);
   await admitReader(options.admission, options.task, options.arm, options.workspace, options.outputDir);
+  await verifyProductRuntime(options.runtime);
   if (!HELPER_MODELS.includes(options.helperModel)) throw new Error("Unsupported frozen helper model");
   if (options.arm !== "bare" && options.arm !== "gptgrep") throw new Error("Unknown reader arm");
   for (const root of options.native.readableRoots) {
@@ -294,8 +317,10 @@ export async function runReaderArm(options: ReaderArmOptions): Promise<ReaderArm
   const attempt: ReaderArmResult = { schema: "gptgrep.reader-attempt.v1", arm: options.arm, taskId: options.task.id, executionMode: "live", order: options.order,
     startedAt, completedAt: startedAt, validStart: false, status: "setup_failed", native: null, answerPath: null, answerSha256: null, error: null,
     authRunId: process.env.GPTGREP_AUTH_RUN_ID ?? null, storageBindingSha256: storage.sha256, corpusSha256: null, contextSha256: null,
-    commonPromptSha256: digest(prompt), runtimeManifestSha256: options.runtime.manifestSha256, binarySha256: options.runtime.binarySha256 };
-  await writeJson(resolve(directory, "attempt-start.json"), { ...attempt, completedAt: null, status: "starting" });
+    commonPromptSha256: digest(prompt), runtimeManifestSha256: options.runtime.manifestSha256, binarySha256: options.runtime.binarySha256,
+    productRevision: options.runtime.sourceRevision, buildReceiptSha256: options.runtime.buildReceipt.sha256,
+    preparationSha256: preparationDigest(options.workspace), readerTaskSha256: digest(options.task) };
+  await writeJsonExclusive(resolve(directory, "attempt-start.json"), { ...attempt, completedAt: null, status: "starting" }, 1024 * 1024);
   try {
       const runtimeFiles = options.arm === "gptgrep" ? await stageTreatmentRuntime(options.runtime, options.workspace.cwd) : [];
       await stagePreparedWorkspace(options.workspace, options.task, options.arm, runtimeFiles);
@@ -303,9 +328,9 @@ export async function runReaderArm(options: ReaderArmOptions): Promise<ReaderArm
       attempt.corpusSha256 = verified.corpus;
       attempt.contextSha256 = verified.context;
       await admitReader(options.admission, options.task, options.arm, options.workspace, options.outputDir);
-      attempt.native = await runNative({ ...options.native, cwd: options.workspace.cwd, model: SUPERVISOR_MODEL, input: prompt,
+      attempt.native = boundNativeResult(await runNative({ ...options.native, cwd: options.workspace.cwd, model: SUPERVISOR_MODEL, input: prompt,
         tracePath: resolve(directory, "native-trace.jsonl"), readableRoots: [...options.native.readableRoots, options.workspace.cwd],
-        config: { ...options.native.config, "agents.default_subagent_model": WORKER_MODEL }, outputSchema: ANSWER_SCHEMA });
+        config: { ...options.native.config, "agents.default_subagent_model": WORKER_MODEL }, outputSchema: ANSWER_SCHEMA }));
       if (attempt.native.executionMode !== "live") throw new Error("Test execution cannot enter a live pair");
       attempt.validStart = attempt.native.validStart;
       attempt.status = attempt.native.status;
@@ -313,19 +338,20 @@ export async function runReaderArm(options: ReaderArmOptions): Promise<ReaderArm
       if (attempt.native.status === "completed") {
         try {
           const answer = parseReaderAnswer(attempt.native.answerText, options.task);
-          attempt.answerPath = resolve(directory, "answer.json");
-          await writeJson(attempt.answerPath, answer);
-          attempt.answerSha256 = await fileHash(attempt.answerPath);
+          const answerPath = resolve(directory, "answer.json");
+          await writeJsonExclusive(answerPath, answer, 4 * 1024 * 1024);
+          const answerSha256 = await fileHash(answerPath);
+          attempt.answerPath = answerPath; attempt.answerSha256 = answerSha256;
         } catch (error) { attempt.status = "answer_invalid"; attempt.error = error instanceof Error ? error.message : String(error); }
       }
-      // Raw final text stays private and is not silently repaired or retried.
-      await writeFile(resolve(directory, "answer.txt"), attempt.native.answerText, { flag: "wx", mode: 0o600 });
+      // Raw final text is already retained by the native capture and bounded attempt.
   } catch (error) {
     if (attempt.status === "completed") attempt.status = "failed";
     attempt.error = error instanceof Error ? error.message : String(error);
   }
   attempt.completedAt = new Date().toISOString();
-  await writeJson(resolve(directory, "attempt.json"), attempt);
+  try { await writeJsonExclusive(resolve(directory, "attempt.json"), attempt, 4 * 1024 * 1024); }
+  catch (error) { if (attempt.validStart) throw new StartedReaderArtifactError(`Started reader artifact could not be retained: ${error instanceof Error ? error.message : String(error)}`); throw error; }
   return attempt;
 }
 
@@ -368,13 +394,15 @@ async function admitReader(reference: AdmissionReference, task: ReaderTask, arm:
   try {
     const admission = await loadAdmission(reference, output);
     assertTaskAdmitted(admission, task, arm, workspace.documents);
-    await verifyRequiredPreprocessing(admission, [task], (workspace.preparedArtifacts ?? []).map(p => p.sha256));
+    await verifyRequiredPreprocessing(admission, [task], (workspace.preparedArtifacts ?? []).map(p => ({
+      relativePath: p.relativePath.startsWith("prepared/") ? p.relativePath.slice("prepared/".length) : p.relativePath,
+      sha256: p.sha256,
+    })));
   } catch (error) {
-    await mkdir(output, { recursive: true });
-    await writeFile(resolve(output, `prelaunch-denial-${crypto.randomUUID()}.json`), JSON.stringify({
+    await writeJsonExclusive(resolve(output, "prelaunch-denial.json"), {
       schema: "gptgrep.reader-prelaunch-denial.v1", taskId: task.id, arm, status: "denied_before_reader",
       readerStarted: false, measurement: null, reason: error instanceof Error ? error.message : "Admission failed",
-    }) + "\n", { flag: "wx", mode: 0o600 });
+    }, 1024 * 1024);
     throw error;
   }
 }
